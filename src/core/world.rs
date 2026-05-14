@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::core::components::{
     Building, HappinessEffect, PollutionSource, Population, Position, PowerConsumer, PowerProvider,
 };
@@ -7,8 +9,9 @@ use crate::core::entity::Entity;
 use crate::core::grid::Grid;
 use crate::core::resources::{CityResources, CityStats};
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct World {
+    #[serde(rename = "next_entity_id")]
     pub next_entity: u32,
     pub grid: Grid,
     pub resources: CityResources,

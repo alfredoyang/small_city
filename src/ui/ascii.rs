@@ -19,6 +19,12 @@ enum AsciiCommand {
         y: usize,
     },
     Status,
+    Save {
+        filename: String,
+    },
+    Load {
+        filename: String,
+    },
     Quit,
     Help,
 }
@@ -44,6 +50,17 @@ pub fn run() -> io::Result<()> {
             Ok(AsciiCommand::Next) => print_result(&game.tick()),
             Ok(AsciiCommand::Inspect { x, y }) => render_inspect(&game.inspect(x, y)),
             Ok(AsciiCommand::Status) => render_status(&game.view()),
+            Ok(AsciiCommand::Save { filename }) => match game.save_to_file(&filename) {
+                Ok(()) => println!("Saved {filename}"),
+                Err(error) => println!("{error}"),
+            },
+            Ok(AsciiCommand::Load { filename }) => match Game::load_from_file(&filename) {
+                Ok(loaded_game) => {
+                    game = loaded_game;
+                    println!("Loaded {filename}");
+                }
+                Err(error) => println!("{error}"),
+            },
             Ok(AsciiCommand::Quit) => return Ok(()),
             Ok(AsciiCommand::Help) => print_help(),
             Err(message) => println!("{message}"),
@@ -113,6 +130,8 @@ fn print_help() {
     println!("  next");
     println!("  inspect x y");
     println!("  status");
+    println!("  save filename");
+    println!("  load filename");
     println!("  quit");
 }
 
@@ -130,6 +149,12 @@ fn parse_command(input: &str) -> Result<AsciiCommand, String> {
             y: parse_coordinate(y)?,
         }),
         ["status"] => Ok(AsciiCommand::Status),
+        ["save", filename] => Ok(AsciiCommand::Save {
+            filename: filename.to_string(),
+        }),
+        ["load", filename] => Ok(AsciiCommand::Load {
+            filename: filename.to_string(),
+        }),
         ["quit"] => Ok(AsciiCommand::Quit),
         ["help"] => Ok(AsciiCommand::Help),
         [] => Ok(AsciiCommand::Help),

@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 use crate::core::entity::Entity;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Grid {
     width: usize,
     height: usize,
