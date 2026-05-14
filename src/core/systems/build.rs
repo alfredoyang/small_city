@@ -1,9 +1,9 @@
 use crate::core::components::{
-    Building, BuildingKind, HappinessEffect, PollutionSource, Population, Position, PowerConsumer,
-    PowerProvider,
+    Building, HappinessEffect, PollutionSource, Population, Position, PowerConsumer, PowerProvider,
 };
 use crate::core::world::World;
 use crate::interface::events::{CommandResult, GameEventView};
+use crate::interface::input::BuildingKind;
 
 pub(crate) fn build(world: &mut World, x: usize, y: usize, kind: BuildingKind) -> CommandResult {
     if !world.grid.contains(x, y) {

@@ -1,5 +1,5 @@
-use crate::core::components::BuildingKind;
 use crate::core::world::World;
+use crate::interface::input::BuildingKind;
 
 pub(crate) fn run(world: &mut World) {
     let produced: i32 = world

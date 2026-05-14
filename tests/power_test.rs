@@ -1,5 +1,5 @@
-use small_city::core::components::BuildingKind;
 use small_city::core::game::Game;
+use small_city::interface::input::BuildingKind;
 
 #[test]
 fn power_plant_powers_nearby_residential() {

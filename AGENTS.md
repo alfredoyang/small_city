@@ -15,6 +15,7 @@ The core uses a custom minimal ECS.
 - Prefer simple readable Rust over clever abstractions.
 - Avoid external dependencies unless clearly necessary.
 - Run cargo fmt and cargo test after changes.
+- Add comments to complicated logic, interface and purpose of important for easy understanding.
 
 ## Architecture
 

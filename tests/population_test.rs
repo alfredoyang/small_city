@@ -1,5 +1,5 @@
-use small_city::core::components::BuildingKind;
 use small_city::core::game::Game;
+use small_city::interface::input::BuildingKind;
 
 #[test]
 fn residential_population_grows_when_powered_and_jobs_are_available() {

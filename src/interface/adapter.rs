@@ -1,5 +1,5 @@
-use crate::core::components::BuildingKind;
 use crate::core::world::World;
+use crate::interface::input::BuildingKind;
 use crate::interface::view::{
     BuildOptionView, CellView, CityStatusView, GameView, InspectView, MapView,
 };

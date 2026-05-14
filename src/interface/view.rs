@@ -1,4 +1,4 @@
-use crate::core::components::BuildingKind;
+use crate::interface::input::BuildingKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameView {

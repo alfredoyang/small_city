@@ -1,8 +1,8 @@
-use crate::core::components::BuildingKind;
 use crate::core::systems::{build, economy, happiness, pollution, population, power, stats};
 use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world};
 use crate::interface::events::{CommandResult, GameEventView};
+use crate::interface::input::BuildingKind;
 use crate::interface::view::{GameView, InspectView};
 
 #[derive(Debug)]

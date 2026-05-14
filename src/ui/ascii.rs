@@ -1,9 +1,26 @@
 use std::io::{self, Write};
 
 use crate::core::game::Game;
-use crate::interface::events::GameEventView;
-use crate::interface::input::{UiCommand, parse_command};
-use crate::interface::view::{CityStatusView, GameView, InspectView};
+use crate::interface::events::CommandResult;
+use crate::interface::input::BuildingKind;
+use crate::interface::view::{GameView, InspectView};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AsciiCommand {
+    Build {
+        kind: BuildingKind,
+        x: usize,
+        y: usize,
+    },
+    Next,
+    Inspect {
+        x: usize,
+        y: usize,
+    },
+    Status,
+    Quit,
+    Help,
+}
 
 pub fn run() -> io::Result<()> {
     let mut game = Game::default();
@@ -21,19 +38,19 @@ pub fn run() -> io::Result<()> {
         }
 
         match parse_command(&input) {
-            Ok(UiCommand::Build { kind, x, y }) => print_event(game.build(x, y, kind).event),
-            Ok(UiCommand::Next) => print_event(game.tick().event),
-            Ok(UiCommand::Inspect { x, y }) => render_inspect(&game.inspect(x, y)),
-            Ok(UiCommand::Status) => render_status(&game.view().status),
-            Ok(UiCommand::Quit) => return Ok(()),
-            Ok(UiCommand::Help) => print_help(),
+            Ok(AsciiCommand::Build { kind, x, y }) => print_result(&game.build(x, y, kind)),
+            Ok(AsciiCommand::Next) => print_result(&game.tick()),
+            Ok(AsciiCommand::Inspect { x, y }) => render_inspect(&game.inspect(x, y)),
+            Ok(AsciiCommand::Status) => render_status(&game.view()),
+            Ok(AsciiCommand::Quit) => return Ok(()),
+            Ok(AsciiCommand::Help) => print_help(),
             Err(message) => println!("{message}"),
         }
     }
 }
 
 pub fn render(view: &GameView) {
-    render_status(&view.status);
+    render_status(view);
     for y in 0..view.map.height {
         for x in 0..view.map.width {
             let index = y * view.map.width + x;
@@ -43,7 +60,8 @@ pub fn render(view: &GameView) {
     }
 }
 
-fn render_status(status: &CityStatusView) {
+fn render_status(view: &GameView) {
+    let status = &view.status;
     println!(
         "Turn {} | Money {} | Pop {} | Jobs {} | Unemployed {} | Pollution {} | Happiness {}",
         status.turn,
@@ -77,14 +95,8 @@ fn render_inspect(inspect: &InspectView) {
     println!();
 }
 
-fn print_event(event: GameEventView) {
-    match event {
-        GameEventView::Built { x, y, kind } => {
-            println!("Built {} at ({}, {})", kind.label(), x, y);
-        }
-        GameEventView::BuildFailed { reason } => println!("{reason}"),
-        GameEventView::TurnAdvanced { turn } => println!("Advanced to turn {turn}"),
-    }
+fn print_result(result: &CommandResult) {
+    println!("{}", result.message());
 }
 
 fn print_help() {
@@ -99,4 +111,43 @@ fn print_help() {
     println!("  inspect x y");
     println!("  status");
     println!("  quit");
+}
+
+fn parse_command(input: &str) -> Result<AsciiCommand, String> {
+    let parts: Vec<_> = input.split_whitespace().collect();
+    match parts.as_slice() {
+        ["build", kind, x, y] => Ok(AsciiCommand::Build {
+            kind: parse_building_kind(kind)?,
+            x: parse_coordinate(x)?,
+            y: parse_coordinate(y)?,
+        }),
+        ["next"] => Ok(AsciiCommand::Next),
+        ["inspect", x, y] => Ok(AsciiCommand::Inspect {
+            x: parse_coordinate(x)?,
+            y: parse_coordinate(y)?,
+        }),
+        ["status"] => Ok(AsciiCommand::Status),
+        ["quit"] => Ok(AsciiCommand::Quit),
+        ["help"] => Ok(AsciiCommand::Help),
+        [] => Ok(AsciiCommand::Help),
+        _ => Err("Unknown command".to_string()),
+    }
+}
+
+fn parse_coordinate(value: &str) -> Result<usize, String> {
+    value
+        .parse()
+        .map_err(|_| format!("Invalid coordinate: {value}"))
+}
+
+fn parse_building_kind(value: &str) -> Result<BuildingKind, String> {
+    match value {
+        "road" => Ok(BuildingKind::Road),
+        "residential" => Ok(BuildingKind::Residential),
+        "commercial" => Ok(BuildingKind::Commercial),
+        "industrial" => Ok(BuildingKind::Industrial),
+        "power" => Ok(BuildingKind::PowerPlant),
+        "park" => Ok(BuildingKind::Park),
+        _ => Err(format!("Unknown building kind: {value}")),
+    }
 }

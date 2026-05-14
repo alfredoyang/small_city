@@ -1,4 +1,4 @@
-use crate::core::components::BuildingKind;
+use crate::interface::input::BuildingKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
@@ -18,6 +18,16 @@ impl CommandResult {
         Self {
             success: false,
             event,
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match &self.event {
+            GameEventView::Built { x, y, kind } => {
+                format!("Built {} at ({}, {})", kind.label(), x, y)
+            }
+            GameEventView::BuildFailed { reason } => reason.clone(),
+            GameEventView::TurnAdvanced { turn } => format!("Advanced to turn {turn}"),
         }
     }
 }

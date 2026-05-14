@@ -1,5 +1,5 @@
-use small_city::core::components::BuildingKind;
 use small_city::core::game::Game;
+use small_city::interface::input::BuildingKind;
 
 #[test]
 fn building_cost_is_deducted_correctly() {

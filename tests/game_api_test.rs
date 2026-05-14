@@ -1,5 +1,5 @@
-use small_city::core::components::BuildingKind;
 use small_city::core::game::Game;
+use small_city::interface::input::BuildingKind;
 
 #[test]
 fn industrial_creates_pollution() {

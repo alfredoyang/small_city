@@ -1,6 +1,5 @@
-use small_city::core::components::BuildingKind;
 use small_city::core::game::Game;
-use small_city::interface::input::{UiCommand, parse_command};
+use small_city::interface::input::{BuildingKind, UiCommand, parse_command};
 use small_city::interface::view::GameView;
 
 #[test]
@@ -56,4 +55,22 @@ fn parse_build_command() {
             y: 2
         }
     );
+}
+
+#[test]
+fn ascii_ui_does_not_import_ecs_internals() {
+    let source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii ui source");
+
+    for forbidden_import in [
+        "crate::core::world",
+        "crate::core::components",
+        "crate::core::systems",
+        "crate::core::resources",
+        "crate::core::grid",
+    ] {
+        assert!(
+            !source.contains(forbidden_import),
+            "ASCII UI must not import ECS internals via {forbidden_import}"
+        );
+    }
 }
