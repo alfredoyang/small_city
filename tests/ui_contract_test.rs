@@ -74,3 +74,17 @@ fn ascii_ui_does_not_import_ecs_internals() {
         );
     }
 }
+
+#[test]
+fn ascii_ui_save_load_uses_game_api_only() {
+    let source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii ui source");
+
+    assert!(source.contains("game.save_to_file"));
+    assert!(source.contains("Game::load_from_file"));
+    for forbidden in ["serde", "serde_json", "std::fs", "File::"] {
+        assert!(
+            !source.contains(forbidden),
+            "ASCII UI save/load must not use {forbidden} directly"
+        );
+    }
+}

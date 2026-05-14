@@ -16,9 +16,9 @@ fn saving_a_game_creates_a_file() {
 }
 
 #[test]
-fn loading_restores_city_state_visible_through_game_view() {
-    let path = save_path("restore-state");
-    let game = populated_game();
+fn save_load_roundtrip_restores_city_state_visible_through_game_view() {
+    let path = save_path("roundtrip");
+    let game = full_city_game();
     game.save_to_file(&path).expect("save succeeds");
 
     let loaded = Game::load_from_file(&path).expect("load succeeds");
@@ -27,45 +27,68 @@ fn loading_restores_city_state_visible_through_game_view() {
 
     assert_eq!(loaded_view.status.money, original_view.status.money);
     assert_eq!(loaded_view.status.turn, original_view.status.turn);
-    assert_eq!(loaded_view.map.width, 6);
+    assert_eq!(loaded_view.map.width, 7);
     assert_eq!(loaded_view.map.height, 5);
-    assert_eq!(building_count(&loaded), 3);
+    assert_eq!(
+        loaded_view.map.cells.len(),
+        loaded_view.map.width * loaded_view.map.height
+    );
+    assert_eq!(building_count(&loaded), 5);
+    assert_eq!(loaded_view.status.population, 3);
+    assert_eq!(loaded_view.status.pollution, 1);
+    assert_eq!(loaded_view.status.happiness, 52);
 
+    assert_eq!(
+        loaded.inspect(0, 0).cell.expect("power plant").building,
+        Some(BuildingKind::PowerPlant)
+    );
     let residential = loaded.inspect(1, 0).cell.expect("residential cell");
-    assert_eq!(residential.population, Some(1));
-    assert_eq!(residential.powered, Some(true));
+    let commercial = loaded.inspect(2, 0).cell.expect("commercial cell");
+    let industrial = loaded.inspect(3, 0).cell.expect("industrial cell");
+    let park = loaded.inspect(4, 0).cell.expect("park cell");
 
-    std::fs::remove_file(path).expect("remove save file");
+    assert_eq!(residential.building, Some(BuildingKind::Residential));
+    assert_eq!(residential.population, Some(3));
+    assert_eq!(residential.powered, Some(true));
+    assert_eq!(commercial.building, Some(BuildingKind::Commercial));
+    assert_eq!(commercial.powered, Some(true));
+    assert_eq!(industrial.building, Some(BuildingKind::Industrial));
+    assert_eq!(industrial.powered, Some(true));
+    assert_eq!(park.building, Some(BuildingKind::Park));
+
+    remove_save_file(path);
+}
+
+#[test]
+fn loaded_game_can_tick_again() {
+    let path = save_path("continues");
+    let game = full_city_game();
+    game.save_to_file(&path).expect("save succeeds");
+
+    let mut loaded = Game::load_from_file(&path).expect("load succeeds");
+    let before = loaded.view();
+
+    loaded.tick();
+    let after = loaded.view();
+
+    assert_eq!(after.status.turn, before.status.turn + 1);
+    assert!(after.status.money > before.status.money);
+    assert!(after.status.population >= before.status.population);
+    assert_eq!(after.map.cells.len(), after.map.width * after.map.height);
+    remove_save_file(path);
 }
 
 #[test]
 fn loaded_game_view_has_width_times_height_cells() {
     let path = save_path("cell-count");
-    let game = populated_game();
+    let game = full_city_game();
     game.save_to_file(&path).expect("save succeeds");
 
     let loaded = Game::load_from_file(&path).expect("load succeeds");
     let view = loaded.view();
 
     assert_eq!(view.map.cells.len(), view.map.width * view.map.height);
-    std::fs::remove_file(path).expect("remove save file");
-}
-
-#[test]
-fn simulation_can_continue_after_loading() {
-    let path = save_path("continues");
-    let game = populated_game();
-    game.save_to_file(&path).expect("save succeeds");
-
-    let mut loaded = Game::load_from_file(&path).expect("load succeeds");
-    let before = loaded.view().status.turn;
-
-    loaded.tick();
-    assert!(loaded.build(3, 0, BuildingKind::Park).success);
-
-    assert_eq!(loaded.view().status.turn, before + 1);
-    assert_eq!(building_count(&loaded), 4);
-    std::fs::remove_file(path).expect("remove save file");
+    remove_save_file(path);
 }
 
 #[test]
@@ -78,12 +101,36 @@ fn invalid_file_path_returns_error() {
     assert!(matches!(result, Err(GameError::Io(_))));
 }
 
-fn populated_game() -> Game {
-    let mut game = Game::new(6, 5);
+#[test]
+fn missing_save_file_returns_error() {
+    let path = save_path("missing-file");
+
+    let result = Game::load_from_file(path);
+
+    assert!(matches!(result, Err(GameError::Io(_))));
+}
+
+#[test]
+fn invalid_json_returns_error() {
+    let path = save_path("invalid-json");
+    std::fs::write(&path, "not valid json").expect("write invalid save file");
+
+    let result = Game::load_from_file(&path);
+
+    assert!(matches!(result, Err(GameError::SaveFormat(_))));
+    remove_save_file(path);
+}
+
+fn full_city_game() -> Game {
+    let mut game = Game::new(7, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
-    assert!(game.build(2, 0, BuildingKind::Industrial).success);
-    game.tick();
+    assert!(game.build(2, 0, BuildingKind::Commercial).success);
+    assert!(game.build(3, 0, BuildingKind::Industrial).success);
+    assert!(game.build(4, 0, BuildingKind::Park).success);
+    for _ in 0..3 {
+        game.tick();
+    }
     game
 }
 
@@ -106,4 +153,8 @@ fn save_path(name: &str) -> PathBuf {
         std::process::id(),
         unique
     ))
+}
+
+fn remove_save_file(path: PathBuf) {
+    std::fs::remove_file(path).expect("remove save file");
 }
