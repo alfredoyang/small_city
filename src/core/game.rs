@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::core::systems::{build, economy, happiness, pollution, population, power, stats};
 use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world};
-use crate::interface::events::{CommandResult, GameEventView};
+use crate::interface::events::{CommandResult, GameEventView, MetricChange};
 use crate::interface::input::BuildingKind;
 use crate::interface::view::{GameView, InspectView};
 
@@ -75,6 +75,7 @@ impl Game {
 
     /// Advances the simulation by one deterministic turn.
     pub fn tick(&mut self) -> CommandResult {
+        let before = TickSummarySnapshot::from_world(&self.world);
         power::run(&mut self.world);
         stats::run(&mut self.world);
         population::run(&mut self.world);
@@ -83,8 +84,16 @@ impl Game {
         pollution::run(&mut self.world);
         happiness::run(&mut self.world);
         self.world.resources.turn += 1;
-        CommandResult::success(GameEventView::TurnAdvanced {
+        let after = TickSummarySnapshot::from_world(&self.world);
+
+        CommandResult::success(GameEventView::TickSummary {
             turn: self.world.resources.turn,
+            population: metric_change(before.population, after.population),
+            money: metric_change(before.money, after.money),
+            happiness: metric_change(before.happiness, after.happiness),
+            pollution: metric_change(before.pollution, after.pollution),
+            unemployment: metric_change(before.unemployment, after.unemployment),
+            powered_buildings: metric_change(before.powered_buildings, after.powered_buildings),
         })
     }
 
@@ -122,4 +131,35 @@ impl Default for Game {
     fn default() -> Self {
         Self::new(10, 10)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TickSummarySnapshot {
+    population: i32,
+    money: i32,
+    happiness: i32,
+    pollution: i32,
+    unemployment: i32,
+    powered_buildings: i32,
+}
+
+impl TickSummarySnapshot {
+    fn from_world(world: &World) -> Self {
+        Self {
+            population: world.stats.population,
+            money: world.resources.money,
+            happiness: world.stats.happiness,
+            pollution: world.stats.pollution,
+            unemployment: world.stats.unemployment,
+            powered_buildings: world
+                .power_consumers
+                .values()
+                .filter(|consumer| consumer.powered)
+                .count() as i32,
+        }
+    }
+}
+
+fn metric_change<T>(before: T, after: T) -> MetricChange<T> {
+    MetricChange { before, after }
 }

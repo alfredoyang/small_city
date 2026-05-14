@@ -1,4 +1,5 @@
 use small_city::core::game::Game;
+use small_city::interface::events::{GameEventView, MetricChange};
 use small_city::interface::input::BuildingKind;
 
 #[test]
@@ -40,4 +41,65 @@ fn tick_advances_turn_deterministically() {
     game.tick();
 
     assert_eq!(game.view().status.turn, 2);
+}
+
+#[test]
+fn tick_returns_structured_summary_events() {
+    let mut game = Game::new(10, 10);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(2, 0, BuildingKind::Commercial).success);
+    assert!(game.build(3, 0, BuildingKind::Industrial).success);
+    assert!(game.build(4, 0, BuildingKind::Park).success);
+
+    let result = game.tick();
+
+    assert!(result.success);
+    assert_eq!(result.events.len(), 1);
+    assert_eq!(result.event, result.events[0]);
+    assert_eq!(
+        result.events[0],
+        GameEventView::TickSummary {
+            turn: 1,
+            population: MetricChange {
+                before: 0,
+                after: 1
+            },
+            money: MetricChange {
+                before: 51,
+                after: 57
+            },
+            happiness: MetricChange {
+                before: 52,
+                after: 52
+            },
+            pollution: MetricChange {
+                before: 1,
+                after: 1
+            },
+            unemployment: MetricChange {
+                before: 0,
+                after: 0
+            },
+            powered_buildings: MetricChange {
+                before: 0,
+                after: 3
+            },
+        }
+    );
+}
+
+#[test]
+fn tick_summary_message_includes_metric_changes() {
+    let mut game = Game::new(10, 10);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(2, 0, BuildingKind::Commercial).success);
+    assert!(game.build(3, 0, BuildingKind::Industrial).success);
+
+    let message = game.tick().message();
+
+    assert!(message.contains("population 1 (+1)"));
+    assert!(message.contains("money 63 (+6)"));
+    assert!(message.contains("powered buildings 3 (+3)"));
 }

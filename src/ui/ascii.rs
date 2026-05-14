@@ -116,7 +116,9 @@ fn render_inspect(inspect: &InspectView) {
 }
 
 fn print_result(result: &CommandResult) {
-    println!("{}", result.message());
+    for event in &result.events {
+        println!("{}", event.message());
+    }
 }
 
 fn print_help() {
