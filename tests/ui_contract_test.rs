@@ -1,0 +1,59 @@
+use small_city::core::components::BuildingKind;
+use small_city::core::game::Game;
+use small_city::interface::input::{UiCommand, parse_command};
+use small_city::interface::view::GameView;
+
+#[test]
+fn game_view_contains_width_times_height_cells() {
+    let game = Game::new(4, 3);
+    let view = game.view();
+
+    assert_eq!(view.map.cells.len(), 12);
+}
+
+#[test]
+fn empty_cells_are_buildable() {
+    let game = Game::new(2, 2);
+    let cell = game.inspect(1, 1).cell.expect("cell");
+
+    assert!(cell.buildable);
+}
+
+#[test]
+fn occupied_cells_are_not_buildable() {
+    let mut game = Game::new(2, 2);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    let cell = game.inspect(1, 1).cell.expect("cell");
+
+    assert!(!cell.buildable);
+}
+
+#[test]
+fn residential_cell_view_includes_population_data() {
+    let mut game = Game::new(2, 2);
+    assert!(game.build(1, 1, BuildingKind::Residential).success);
+    let cell = game.inspect(1, 1).cell.expect("cell");
+
+    assert_eq!(cell.population, Some(0));
+    assert_eq!(cell.max_population, Some(5));
+}
+
+#[test]
+fn ui_contract_returns_game_view_not_world() {
+    let game = Game::new(2, 2);
+    let _: GameView = game.view();
+}
+
+#[test]
+fn parse_build_command() {
+    let command = parse_command("build residential 1 2").expect("valid command");
+
+    assert_eq!(
+        command,
+        UiCommand::Build {
+            kind: BuildingKind::Residential,
+            x: 1,
+            y: 2
+        }
+    );
+}

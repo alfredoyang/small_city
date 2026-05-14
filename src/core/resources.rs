@@ -1,0 +1,35 @@
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CityResources {
+    pub money: i32,
+    pub turn: u32,
+}
+
+impl Default for CityResources {
+    fn default() -> Self {
+        Self {
+            money: 100,
+            turn: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CityStats {
+    pub population: i32,
+    pub jobs: i32,
+    pub unemployment: i32,
+    pub pollution: i32,
+    pub happiness: i32,
+}
+
+impl Default for CityStats {
+    fn default() -> Self {
+        Self {
+            population: 0,
+            jobs: 0,
+            unemployment: 0,
+            pollution: 0,
+            happiness: 50,
+        }
+    }
+}

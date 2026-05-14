@@ -1,0 +1,6 @@
+[package]
+name = "small_city"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
