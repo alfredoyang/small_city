@@ -3,6 +3,7 @@ use crate::core::world::World;
 pub(crate) fn run(world: &mut World) {
     let mut available_jobs = (world.stats.jobs - world.stats.population).max(0);
     let mut residential_entities: Vec<_> = world.populations.keys().copied().collect();
+    // Sort by entity id so population growth is deterministic across HashMap iteration orders.
     residential_entities.sort_by_key(|entity| entity.0);
 
     for entity in residential_entities {

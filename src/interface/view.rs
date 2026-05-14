@@ -1,5 +1,6 @@
 use crate::interface::input::BuildingKind;
 
+/// Complete read-only snapshot required to render the city UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameView {
     pub map: MapView,
@@ -7,6 +8,7 @@ pub struct GameView {
     pub build_options: Vec<BuildOptionView>,
 }
 
+/// Map dimensions plus cells in row-major order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapView {
     pub width: usize,
@@ -14,6 +16,7 @@ pub struct MapView {
     pub cells: Vec<CellView>,
 }
 
+/// UI-safe description of one map cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CellView {
     pub x: usize,
@@ -27,6 +30,7 @@ pub struct CellView {
     pub powered: Option<bool>,
 }
 
+/// Aggregate city numbers shown by status panels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CityStatusView {
     pub money: i32,
@@ -38,6 +42,7 @@ pub struct CityStatusView {
     pub happiness: i32,
 }
 
+/// Build menu entry exposed to UI without requiring access to core systems or resources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildOptionView {
     pub kind: BuildingKind,
@@ -45,6 +50,7 @@ pub struct BuildOptionView {
     pub cost: i32,
 }
 
+/// Result of inspecting one coordinate, including out-of-bounds information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectView {
     pub x: usize,

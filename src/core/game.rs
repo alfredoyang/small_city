@@ -11,24 +11,29 @@ pub struct Game {
 }
 
 impl Game {
+    /// Creates a deterministic game state with a private ECS world.
     pub fn new(width: usize, height: usize) -> Self {
         Self {
             world: World::new(width, height),
         }
     }
 
+    /// Returns a UI-safe snapshot. Callers must render from this instead of reading World.
     pub fn view(&self) -> GameView {
         view_world(&self.world)
     }
 
+    /// Applies one player build command through the core systems and returns UI-safe feedback.
     pub fn build(&mut self, x: usize, y: usize, kind: BuildingKind) -> CommandResult {
         let result = build::build(&mut self.world, x, y, kind);
+        // Build changes can affect derived city stats immediately, before the next turn.
         stats::refresh_population_and_jobs(&mut self.world);
         pollution::run(&mut self.world);
         happiness::run(&mut self.world);
         result
     }
 
+    /// Advances the simulation by one deterministic turn.
     pub fn tick(&mut self) -> CommandResult {
         power::run(&mut self.world);
         stats::run(&mut self.world);
@@ -43,6 +48,7 @@ impl Game {
         })
     }
 
+    /// Returns a UI-safe view of one map coordinate without exposing ECS storage.
     pub fn inspect(&self, x: usize, y: usize) -> InspectView {
         inspect_world(&self.world, x, y)
     }

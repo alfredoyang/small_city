@@ -1,3 +1,5 @@
+/// Building kind is shared by UI input, Game API calls, and core building components.
+/// It lives in the interface layer so UI code never needs to import ECS component modules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildingKind {
     Road,
@@ -9,6 +11,7 @@ pub enum BuildingKind {
 }
 
 impl BuildingKind {
+    /// Money spent immediately when the building is placed.
     pub fn cost(self) -> i32 {
         match self {
             Self::Road => 1,
@@ -20,6 +23,7 @@ impl BuildingKind {
         }
     }
 
+    /// Jobs contributed to city statistics by workplace buildings.
     pub fn jobs(self) -> i32 {
         match self {
             Self::Commercial => 2,
@@ -28,6 +32,7 @@ impl BuildingKind {
         }
     }
 
+    /// Single-character map representation used by view adapters and terminal UI.
     pub fn symbol(self) -> char {
         match self {
             Self::Road => '=',
@@ -39,6 +44,7 @@ impl BuildingKind {
         }
     }
 
+    /// Human-readable name used in view models and command feedback.
     pub fn label(self) -> &'static str {
         match self {
             Self::Road => "Road",
@@ -51,6 +57,7 @@ impl BuildingKind {
     }
 }
 
+/// Parsed command vocabulary for text-based frontends and command tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
     Build {
@@ -68,6 +75,7 @@ pub enum UiCommand {
     Help,
 }
 
+/// Parses a user-facing command string into UI-safe input types.
 pub fn parse_command(input: &str) -> Result<UiCommand, String> {
     let parts: Vec<_> = input.split_whitespace().collect();
     match parts.as_slice() {

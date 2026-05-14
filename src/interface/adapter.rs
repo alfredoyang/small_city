@@ -4,6 +4,7 @@ use crate::interface::view::{
     BuildOptionView, CellView, CityStatusView, GameView, InspectView, MapView,
 };
 
+/// Converts the private ECS World into the only render model the UI may consume.
 pub(crate) fn view_world(world: &World) -> GameView {
     let mut cells = Vec::with_capacity(world.grid.width() * world.grid.height());
     for y in 0..world.grid.height() {
@@ -45,6 +46,7 @@ pub(crate) fn view_world(world: &World) -> GameView {
     }
 }
 
+/// Converts a map coordinate lookup into a UI-safe inspection result.
 pub(crate) fn inspect_world(world: &World, x: usize, y: usize) -> InspectView {
     InspectView {
         x,
@@ -54,6 +56,7 @@ pub(crate) fn inspect_world(world: &World, x: usize, y: usize) -> InspectView {
     }
 }
 
+/// Builds a cell view from ECS storage while keeping all World access inside the adapter.
 fn cell_view(world: &World, x: usize, y: usize) -> CellView {
     let Some(entity) = world.grid.get(x, y) else {
         return CellView {

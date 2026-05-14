@@ -31,6 +31,7 @@ pub(crate) fn build(world: &mut World, x: usize, y: usize, kind: BuildingKind) -
     world.positions.insert(entity, Position { x, y });
     world.buildings.insert(entity, Building { kind });
 
+    // Attach only the components that make this building participate in later systems.
     match kind {
         BuildingKind::Residential => {
             world
@@ -58,6 +59,7 @@ pub(crate) fn build(world: &mut World, x: usize, y: usize, kind: BuildingKind) -
         BuildingKind::Road => {}
     }
 
+    // Industrial buildings affect pollution but do not need a separate behavior component.
     if kind == BuildingKind::Industrial {
         world
             .pollution_sources

@@ -1,5 +1,6 @@
 use crate::interface::input::BuildingKind;
 
+/// UI-safe result returned by Game API commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
     pub success: bool,
@@ -21,6 +22,7 @@ impl CommandResult {
         }
     }
 
+    /// Converts command feedback into terminal-ready text without exposing event matching to UI.
     pub fn message(&self) -> String {
         match &self.event {
             GameEventView::Built { x, y, kind } => {
@@ -32,6 +34,7 @@ impl CommandResult {
     }
 }
 
+/// Event vocabulary emitted by the Game API after commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GameEventView {
     Built {

@@ -5,6 +5,7 @@ use crate::interface::events::CommandResult;
 use crate::interface::input::BuildingKind;
 use crate::interface::view::{GameView, InspectView};
 
+// Terminal-only command shape. The UI converts text into Game API inputs, then drops it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AsciiCommand {
     Build {
@@ -22,6 +23,7 @@ enum AsciiCommand {
     Help,
 }
 
+/// Runs the ASCII terminal UI using only the public Game API and interface view models.
 pub fn run() -> io::Result<()> {
     let mut game = Game::default();
     println!("Small City");
@@ -49,6 +51,7 @@ pub fn run() -> io::Result<()> {
     }
 }
 
+/// Renders the city from GameView only, preserving the UI boundary around ECS internals.
 pub fn render(view: &GameView) {
     render_status(view);
     for y in 0..view.map.height {

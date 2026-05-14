@@ -1,6 +1,7 @@
 use crate::core::world::World;
 
 pub(crate) fn run(world: &mut World) {
+    // Snapshot providers before mutating consumers to avoid order-dependent borrowing behavior.
     let providers: Vec<_> = world
         .power_providers
         .iter()
@@ -18,6 +19,7 @@ pub(crate) fn run(world: &mut World) {
             continue;
         };
 
+        // Power uses Manhattan distance so coverage is deterministic on the square grid.
         consumer.powered = providers.iter().any(|(provider_position, radius)| {
             position.x.abs_diff(provider_position.x) + position.y.abs_diff(provider_position.y)
                 <= *radius
