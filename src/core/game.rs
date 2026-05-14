@@ -4,9 +4,9 @@ use std::path::Path;
 
 use crate::core::systems::{build, economy, happiness, pollution, population, power, stats};
 use crate::core::world::World;
-use crate::interface::adapter::{inspect_world, view_world};
+use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
 use crate::interface::events::{CommandResult, GameEventView, MetricChange};
-use crate::interface::input::BuildingKind;
+use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{GameView, InspectView};
 
 #[derive(Debug)]
@@ -61,6 +61,11 @@ impl Game {
     /// Returns a UI-safe snapshot. Callers must render from this instead of reading World.
     pub fn view(&self) -> GameView {
         view_world(&self.world)
+    }
+
+    /// Returns a UI-safe snapshot using the requested map overlay.
+    pub fn view_with_overlay(&self, overlay: MapOverlayInput) -> GameView {
+        view_world_with_overlay(&self.world, overlay)
     }
 
     /// Applies one player build command through the core systems and returns UI-safe feedback.

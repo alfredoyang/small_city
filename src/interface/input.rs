@@ -12,6 +12,15 @@ pub enum BuildingKind {
     Park,
 }
 
+/// Map render mode requested by UI without exposing ECS internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapOverlayInput {
+    Normal,
+    Power,
+    Pollution,
+    Population,
+}
+
 impl BuildingKind {
     /// Money spent immediately when the building is placed.
     pub fn cost(self) -> i32 {
@@ -73,6 +82,9 @@ pub enum UiCommand {
         y: usize,
     },
     Status,
+    View {
+        overlay: MapOverlayInput,
+    },
     Quit,
     Help,
 }
@@ -92,6 +104,9 @@ pub fn parse_command(input: &str) -> Result<UiCommand, String> {
             y: parse_coordinate(y)?,
         }),
         ["status"] => Ok(UiCommand::Status),
+        ["view", overlay] => Ok(UiCommand::View {
+            overlay: parse_overlay(overlay)?,
+        }),
         ["quit"] => Ok(UiCommand::Quit),
         ["help"] => Ok(UiCommand::Help),
         [] => Ok(UiCommand::Help),
@@ -103,6 +118,16 @@ fn parse_coordinate(value: &str) -> Result<usize, String> {
     value
         .parse()
         .map_err(|_| format!("Invalid coordinate: {value}"))
+}
+
+fn parse_overlay(value: &str) -> Result<MapOverlayInput, String> {
+    match value {
+        "normal" => Ok(MapOverlayInput::Normal),
+        "power" => Ok(MapOverlayInput::Power),
+        "pollution" => Ok(MapOverlayInput::Pollution),
+        "population" => Ok(MapOverlayInput::Population),
+        _ => Err(format!("Unknown view overlay: {value}")),
+    }
 }
 
 fn parse_building_kind(value: &str) -> Result<BuildingKind, String> {

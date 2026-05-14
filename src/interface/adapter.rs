@@ -1,15 +1,20 @@
 use crate::core::world::World;
-use crate::interface::input::BuildingKind;
+use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
     BuildOptionView, CellView, CityStatusView, GameView, InspectDetailsView, InspectView, MapView,
 };
 
 /// Converts the private ECS World into the only render model the UI may consume.
 pub(crate) fn view_world(world: &World) -> GameView {
+    view_world_with_overlay(world, MapOverlayInput::Normal)
+}
+
+/// Converts the private ECS World into a render model using the requested map overlay.
+pub(crate) fn view_world_with_overlay(world: &World, overlay: MapOverlayInput) -> GameView {
     let mut cells = Vec::with_capacity(world.grid.width() * world.grid.height());
     for y in 0..world.grid.height() {
         for x in 0..world.grid.width() {
-            cells.push(cell_view(world, x, y));
+            cells.push(cell_view_with_overlay(world, x, y, overlay));
         }
     }
 
@@ -117,11 +122,15 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
 
 /// Builds a cell view from ECS storage while keeping all World access inside the adapter.
 fn cell_view(world: &World, x: usize, y: usize) -> CellView {
+    cell_view_with_overlay(world, x, y, MapOverlayInput::Normal)
+}
+
+fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlayInput) -> CellView {
     let Some(entity) = world.grid.get(x, y) else {
         return CellView {
             x,
             y,
-            symbol: '.',
+            symbol: empty_symbol(world, x, y, overlay),
             building: None,
             label: "Empty".to_string(),
             buildable: true,
@@ -137,11 +146,12 @@ fn cell_view(world: &World, x: usize, y: usize) -> CellView {
         .power_consumers
         .get(&entity)
         .map(|consumer| consumer.powered);
+    let normal_symbol = building.map_or('?', BuildingKind::symbol);
 
     CellView {
         x,
         y,
-        symbol: building.map_or('?', BuildingKind::symbol),
+        symbol: overlay_symbol(world, entity, x, y, normal_symbol, overlay),
         building,
         label: building.map_or("Unknown", BuildingKind::label).to_string(),
         buildable: false,
@@ -149,4 +159,65 @@ fn cell_view(world: &World, x: usize, y: usize) -> CellView {
         max_population: population.map(|population| population.max),
         powered,
     }
+}
+
+fn overlay_symbol(
+    world: &World,
+    entity: crate::core::entity::Entity,
+    x: usize,
+    y: usize,
+    normal_symbol: char,
+    overlay: MapOverlayInput,
+) -> char {
+    match overlay {
+        MapOverlayInput::Normal => normal_symbol,
+        MapOverlayInput::Power => {
+            if world.power_providers.contains_key(&entity) {
+                'P'
+            } else {
+                world
+                    .power_consumers
+                    .get(&entity)
+                    .map(|consumer| if consumer.powered { '+' } else { '-' })
+                    .unwrap_or_else(|| power_coverage_symbol(world, x, y))
+            }
+        }
+        MapOverlayInput::Pollution => world
+            .pollution_sources
+            .get(&entity)
+            .map(|source| digit_symbol(source.amount))
+            .unwrap_or('.'),
+        MapOverlayInput::Population => world
+            .populations
+            .get(&entity)
+            .map(|population| digit_symbol(population.current))
+            .unwrap_or('.'),
+    }
+}
+
+fn empty_symbol(world: &World, x: usize, y: usize, overlay: MapOverlayInput) -> char {
+    match overlay {
+        MapOverlayInput::Power => power_coverage_symbol(world, x, y),
+        _ => '.',
+    }
+}
+
+fn power_coverage_symbol(world: &World, x: usize, y: usize) -> char {
+    if is_power_covered(world, x, y) {
+        '*'
+    } else {
+        '.'
+    }
+}
+
+fn is_power_covered(world: &World, x: usize, y: usize) -> bool {
+    world.power_providers.iter().any(|(entity, provider)| {
+        world.positions.get(entity).is_some_and(|position| {
+            x.abs_diff(position.x) + y.abs_diff(position.y) <= provider.radius
+        })
+    })
+}
+
+fn digit_symbol(value: i32) -> char {
+    char::from_digit(value.clamp(0, 9) as u32, 10).unwrap_or('0')
 }
