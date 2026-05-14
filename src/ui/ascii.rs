@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use crate::core::game::Game;
 use crate::interface::events::CommandResult;
 use crate::interface::input::BuildingKind;
-use crate::interface::view::{GameView, InspectView};
+use crate::interface::view::{GameView, InspectDetailsView, InspectView};
 
 // Terminal-only command shape. The UI converts text into Game API inputs, then drops it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,24 +95,49 @@ fn render_status(view: &GameView) {
 }
 
 fn render_inspect(inspect: &InspectView) {
-    let Some(cell) = &inspect.cell else {
-        println!("({}, {}) is outside the map", inspect.x, inspect.y);
-        return;
+    println!("{}", format_inspect(inspect));
+}
+
+/// Formats inspect output from InspectView only, preserving the UI boundary around ECS internals.
+pub fn format_inspect(inspect: &InspectView) -> String {
+    let Some(details) = &inspect.details else {
+        return format!("({}, {}) is outside the map", inspect.x, inspect.y);
     };
 
-    if cell.buildable {
-        println!("({}, {}) Empty", cell.x, cell.y);
-        return;
+    match details {
+        InspectDetailsView::Empty { buildable } => {
+            format!(
+                "({}, {}) Empty | buildable {}",
+                inspect.x, inspect.y, buildable
+            )
+        }
+        InspectDetailsView::Road => format!("({}, {}) Road", inspect.x, inspect.y),
+        InspectDetailsView::Residential {
+            powered,
+            population,
+            max_population,
+        } => format!(
+            "({}, {}) Residential | powered {} | population {}/{}",
+            inspect.x, inspect.y, powered, population, max_population
+        ),
+        InspectDetailsView::Commercial { powered, jobs } => format!(
+            "({}, {}) Commercial | powered {} | jobs {}",
+            inspect.x, inspect.y, powered, jobs
+        ),
+        InspectDetailsView::Industrial { powered, jobs } => format!(
+            "({}, {}) Industrial | powered {} | jobs {}",
+            inspect.x, inspect.y, powered, jobs
+        ),
+        InspectDetailsView::PowerPlant { power_radius } => format!(
+            "({}, {}) Power Plant | power radius {}",
+            inspect.x, inspect.y, power_radius
+        ),
+        InspectDetailsView::Park { happiness_effect } => format!(
+            "({}, {}) Park | happiness effect +{}",
+            inspect.x, inspect.y, happiness_effect
+        ),
+        InspectDetailsView::Unknown => format!("({}, {}) Unknown", inspect.x, inspect.y),
     }
-
-    print!("({}, {}) {}", cell.x, cell.y, cell.label);
-    if let (Some(population), Some(max_population)) = (cell.population, cell.max_population) {
-        print!(" population {population}/{max_population}");
-    }
-    if let Some(powered) = cell.powered {
-        print!(" powered {powered}");
-    }
-    println!();
 }
 
 fn print_result(result: &CommandResult) {

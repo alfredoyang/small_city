@@ -57,4 +57,34 @@ pub struct InspectView {
     pub y: usize,
     pub in_bounds: bool,
     pub cell: Option<CellView>,
+    pub details: Option<InspectDetailsView>,
+}
+
+/// Type-specific details for the inspected coordinate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InspectDetailsView {
+    Empty {
+        buildable: bool,
+    },
+    Road,
+    Residential {
+        powered: bool,
+        population: i32,
+        max_population: i32,
+    },
+    Commercial {
+        powered: bool,
+        jobs: i32,
+    },
+    Industrial {
+        powered: bool,
+        jobs: i32,
+    },
+    PowerPlant {
+        power_radius: usize,
+    },
+    Park {
+        happiness_effect: i32,
+    },
+    Unknown,
 }

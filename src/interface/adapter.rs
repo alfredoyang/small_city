@@ -1,7 +1,7 @@
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;
 use crate::interface::view::{
-    BuildOptionView, CellView, CityStatusView, GameView, InspectView, MapView,
+    BuildOptionView, CellView, CityStatusView, GameView, InspectDetailsView, InspectView, MapView,
 };
 
 /// Converts the private ECS World into the only render model the UI may consume.
@@ -48,11 +48,70 @@ pub(crate) fn view_world(world: &World) -> GameView {
 
 /// Converts a map coordinate lookup into a UI-safe inspection result.
 pub(crate) fn inspect_world(world: &World, x: usize, y: usize) -> InspectView {
+    let in_bounds = world.grid.contains(x, y);
     InspectView {
         x,
         y,
-        in_bounds: world.grid.contains(x, y),
-        cell: world.grid.contains(x, y).then(|| cell_view(world, x, y)),
+        in_bounds,
+        cell: in_bounds.then(|| cell_view(world, x, y)),
+        details: in_bounds.then(|| inspect_details(world, x, y)),
+    }
+}
+
+/// Builds type-specific inspect data while keeping ECS details inside the adapter.
+fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
+    let Some(entity) = world.grid.get(x, y) else {
+        return InspectDetailsView::Empty { buildable: true };
+    };
+
+    let Some(building) = world.buildings.get(&entity) else {
+        return InspectDetailsView::Unknown;
+    };
+
+    match building.kind {
+        BuildingKind::Road => InspectDetailsView::Road,
+        BuildingKind::Residential => {
+            let population = world.populations.get(&entity);
+            InspectDetailsView::Residential {
+                powered: world
+                    .power_consumers
+                    .get(&entity)
+                    .map(|consumer| consumer.powered)
+                    .unwrap_or(false),
+                population: population.map(|population| population.current).unwrap_or(0),
+                max_population: population.map(|population| population.max).unwrap_or(0),
+            }
+        }
+        BuildingKind::Commercial => InspectDetailsView::Commercial {
+            powered: world
+                .power_consumers
+                .get(&entity)
+                .map(|consumer| consumer.powered)
+                .unwrap_or(false),
+            jobs: building.kind.jobs(),
+        },
+        BuildingKind::Industrial => InspectDetailsView::Industrial {
+            powered: world
+                .power_consumers
+                .get(&entity)
+                .map(|consumer| consumer.powered)
+                .unwrap_or(false),
+            jobs: building.kind.jobs(),
+        },
+        BuildingKind::PowerPlant => InspectDetailsView::PowerPlant {
+            power_radius: world
+                .power_providers
+                .get(&entity)
+                .map(|provider| provider.radius)
+                .unwrap_or(0),
+        },
+        BuildingKind::Park => InspectDetailsView::Park {
+            happiness_effect: world
+                .happiness_effects
+                .get(&entity)
+                .map(|effect| effect.amount)
+                .unwrap_or(0),
+        },
     }
 }
 
