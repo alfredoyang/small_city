@@ -51,7 +51,9 @@ impl AsciiUiState {
             MapOverlayInput::Normal => MapOverlayInput::Power,
             MapOverlayInput::Power => MapOverlayInput::Pollution,
             MapOverlayInput::Pollution => MapOverlayInput::Population,
-            MapOverlayInput::Population => MapOverlayInput::Normal,
+            MapOverlayInput::Population => MapOverlayInput::LandValue,
+            MapOverlayInput::LandValue => MapOverlayInput::Desirability,
+            MapOverlayInput::Desirability => MapOverlayInput::Normal,
         };
     }
 }
@@ -160,6 +162,7 @@ pub fn render(view: &GameView) {
         in_bounds: false,
         cell: None,
         details: None,
+        local_effects: None,
         explanations: Vec::new(),
     };
     let preview = BuildPreviewView {
@@ -198,6 +201,7 @@ fn render_screen(
     render_map(&mut stdout, view, state)?;
     writeln!(stdout)?;
     writeln!(stdout, "Selected: {}", format_inspect(inspect))?;
+    render_local_effects(&mut stdout, inspect)?;
     render_inspect_explanations(&mut stdout, inspect)?;
     render_build_preview(&mut stdout, preview)?;
     if !message.is_empty() {
@@ -229,6 +233,18 @@ fn render_inspect_explanations(stdout: &mut impl Write, inspect: &InspectView) -
         return Ok(());
     }
     writeln!(stdout, "Inspect Notes: {}", inspect.explanations.join("; "))
+}
+
+fn render_local_effects(stdout: &mut impl Write, inspect: &InspectView) -> io::Result<()> {
+    let Some(effects) = inspect.local_effects else {
+        return Ok(());
+    };
+
+    writeln!(
+        stdout,
+        "Local: Land {} | Pollution Pressure {} | Access {} | Desirability {}",
+        effects.land_value, effects.pollution_pressure, effects.accessibility, effects.desirability
+    )
 }
 
 fn render_status(stdout: &mut impl Write, view: &GameView) -> io::Result<()> {
@@ -357,6 +373,8 @@ fn overlay_legend(overlay: MapOverlayInput) -> &'static str {
         }
         MapOverlayInput::Pollution => "0-9 pollution level | . none",
         MapOverlayInput::Population => "0-9 population | . none",
+        MapOverlayInput::LandValue => "0-9 land value | higher is better",
+        MapOverlayInput::Desirability => "0-9 desirability | high grows faster, low blocks growth",
     }
 }
 
@@ -389,6 +407,8 @@ fn overlay_label(overlay: MapOverlayInput) -> &'static str {
         MapOverlayInput::Power => "Power",
         MapOverlayInput::Pollution => "Pollution",
         MapOverlayInput::Population => "Population",
+        MapOverlayInput::LandValue => "Land Value",
+        MapOverlayInput::Desirability => "Desirability",
     }
 }
 
@@ -671,6 +691,10 @@ mod tests {
         state.cycle_overlay();
         assert_eq!(state.current_overlay, MapOverlayInput::Population);
         state.cycle_overlay();
+        assert_eq!(state.current_overlay, MapOverlayInput::LandValue);
+        state.cycle_overlay();
+        assert_eq!(state.current_overlay, MapOverlayInput::Desirability);
+        state.cycle_overlay();
         assert_eq!(state.current_overlay, MapOverlayInput::Normal);
     }
 
@@ -679,6 +703,8 @@ mod tests {
         assert!(overlay_legend(MapOverlayInput::Power).contains("* powered road"));
         assert!(overlay_legend(MapOverlayInput::Power).contains("+ powered building"));
         assert!(overlay_legend(MapOverlayInput::Pollution).contains("0-9 pollution"));
+        assert!(overlay_legend(MapOverlayInput::LandValue).contains("land value"));
+        assert!(overlay_legend(MapOverlayInput::Desirability).contains("desirability"));
     }
 
     #[test]

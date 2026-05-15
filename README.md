@@ -19,15 +19,15 @@ The ECS is intentionally small:
 - `Entity`: stable ID for things placed in the city.
 - `Components`: plain data such as `Position`, `Building` with level, `Population`, `PowerProvider`, `PowerConsumer`, `PollutionSource`, and `HappinessEffect`.
 - `World`: private storage for entities, components, grid, resources, and city stats.
-- `Systems`: deterministic functions that operate on `World`, including build, replace, upgrade, bulldoze, power, road connectivity, stats, population, economy, pollution, and happiness.
+- `Systems`: deterministic functions that operate on `World`, including build, replace, upgrade, bulldoze, power, road connectivity, local effects, stats, population, economy, pollution, and happiness.
 - `Grid`: stores entity IDs for occupied map cells.
-- `Resources`: global city state such as money, turn, population, jobs, pollution, unemployment, and happiness.
+- `Resources`: global city state such as money, turn, population, jobs, pollution, unemployment, happiness, power stats, and derived local effects.
 
 ## UI Boundary
 
 UI code must not access ECS internals. It must use the public `Game` API and render only from interface view models such as `GameView`, `CellView`, and `InspectView`.
 
-The adapter in `src/interface/adapter.rs` is the boundary where private ECS data becomes UI-safe view data. Map overlays, demand, road-connected status, build previews, and inspect details are generated before the ASCII UI renders them.
+The adapter in `src/interface/adapter.rs` is the boundary where private ECS data becomes UI-safe view data. Map overlays, demand, road-connected status, local effects, build previews, and inspect details are generated before the ASCII UI renders them.
 
 ## ASCII UI
 
@@ -83,6 +83,13 @@ P power plant
 + powered consumer
 - unpowered consumer
 . no power overlay data
+```
+
+Local overlays:
+
+```text
+land value      0-9, higher means parks and commercial activity improved nearby land
+desirability    0-9, combines land value, pollution pressure, and road accessibility
 ```
 
 Status panels show turn, money, population, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, overlay legend, demand notes, selected cell details, inspect notes, build preview explanations, and the latest command message.
@@ -141,20 +148,26 @@ Scenario-style integration tests cover longer multi-turn cities that combine pow
 - Limited power capacity and consumer demand: power plants provide 10 capacity, residential uses 1, commercial uses 2, and industrial uses 3.
 - Deterministic power shortage handling by map position, y first then x.
 - Power status totals for capacity, demand, supplied power, and shortage.
-- Population growth only when residential buildings are powered, road-connected, and jobs are available; high residential demand can grow by 2 population per tick, medium demand grows by 1, and low demand does not grow.
+- Population growth only when residential buildings are powered, road-connected, jobs are available, and desirability is not low; high desirability grows faster, medium desirability grows normally, and low desirability blocks growth.
 - Commercial and industrial effective job counts and income only when powered and road-connected.
 - Ongoing economy balance: commercial, industrial, power plant, and park buildings each cost 1 maintenance per turn; roads and residential buildings have no upkeep. Tick summaries include population income, commercial income, industrial income, maintenance, and net money change.
 - Industrial pollution and park happiness effects.
 - Basic residential, commercial, and industrial demand levels.
-- Basic map overlays for normal, power, pollution, and population views.
+- Basic map overlays for normal, power, pollution, population, land value, and desirability views.
 - In-game overlay legends and short demand explanations in the ASCII UI.
 - Inspect notes explain blockers and local effects such as missing roads, unpowered networks, power shortage, no available jobs, pollution, and happiness.
 - Building levels start at 1 and currently max at 2.
 - Upgrade effects at level 2: residential max population increases from 5 to 8, power plant capacity increases from 10 to 15, and park happiness effect increases from +3 to +5.
 
-## v0.3 Scope
-- land value
-- desirability
-- local pollution pressure
-- land value overlay
-- desirability overlay
+## v0.3 Completed Scope
+
+- Deterministic local effects system for every map cell.
+- Derived cell values for land value, pollution pressure, accessibility, and desirability.
+- Parks improve nearby land value and desirability.
+- Industrial buildings increase nearby pollution pressure and reduce nearby land value.
+- Commercial buildings slightly improve nearby land value.
+- Roads improve accessibility for adjacent cells.
+- Residential growth now considers desirability.
+- Inspect and cell views expose local effects through UI-safe view models.
+- Land value and desirability map overlays.
+- Integration tests cover local effects, growth behavior, overlays, and save/load refresh.

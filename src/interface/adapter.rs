@@ -3,7 +3,7 @@ use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
     BuildOptionView, CellView, CityDemand, CityStatusView, DemandLevel, GameView,
-    InspectDetailsView, InspectView, MapView, PowerStatusView,
+    InspectDetailsView, InspectView, LocalEffectsView, MapView, PowerStatusView,
 };
 
 /// Converts the private ECS World into the only render model the UI may consume.
@@ -110,6 +110,7 @@ pub(crate) fn inspect_world(world: &World, x: usize, y: usize) -> InspectView {
         in_bounds,
         cell: in_bounds.then(|| cell_view(world, x, y)),
         details: in_bounds.then(|| inspect_details(world, x, y)),
+        local_effects: in_bounds.then(|| local_effects_view(world, x, y)),
         explanations: in_bounds
             .then(|| inspect_explanations(world, x, y))
             .unwrap_or_default(),
@@ -287,6 +288,12 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
         explanations.push(format!("Can be upgraded for {cost}."));
     }
 
+    let effects = world.local_effects.get(x, y);
+    explanations.push(format!(
+        "Local effects: land value {}, pollution pressure {}, accessibility {}, desirability {}.",
+        effects.land_value, effects.pollution_pressure, effects.accessibility, effects.desirability
+    ));
+
     explanations
 }
 
@@ -359,6 +366,7 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
             power_demand: None,
             road_connected: None,
             upgrade_level: None,
+            local_effects: local_effects_view(world, x, y),
         };
     };
 
@@ -391,6 +399,17 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
                 .then(|| road_connectivity::is_road_connected(world, entity))
         }),
         upgrade_level: (upgrade_level > 0).then_some(upgrade_level),
+        local_effects: local_effects_view(world, x, y),
+    }
+}
+
+fn local_effects_view(world: &World, x: usize, y: usize) -> LocalEffectsView {
+    let effects = world.local_effects.get(x, y);
+    LocalEffectsView {
+        land_value: effects.land_value,
+        pollution_pressure: effects.pollution_pressure,
+        accessibility: effects.accessibility,
+        desirability: effects.desirability,
     }
 }
 
@@ -452,6 +471,8 @@ fn overlay_symbol(
             .get(&entity)
             .map(|population| digit_symbol(population.current))
             .unwrap_or('.'),
+        MapOverlayInput::LandValue => digit_symbol(world.local_effects.get(x, y).land_value),
+        MapOverlayInput::Desirability => digit_symbol(world.local_effects.get(x, y).desirability),
     }
 }
 
@@ -464,6 +485,8 @@ fn empty_symbol(world: &World, x: usize, y: usize, overlay: MapOverlayInput) -> 
                 '.'
             }
         }
+        MapOverlayInput::LandValue => digit_symbol(world.local_effects.get(x, y).land_value),
+        MapOverlayInput::Desirability => digit_symbol(world.local_effects.get(x, y).desirability),
         _ => '.',
     }
 }

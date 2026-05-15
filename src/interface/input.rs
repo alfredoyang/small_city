@@ -19,6 +19,8 @@ pub enum MapOverlayInput {
     Power,
     Pollution,
     Population,
+    LandValue,
+    Desirability,
 }
 
 impl BuildingKind {
@@ -144,6 +146,8 @@ fn parse_overlay(value: &str) -> Result<MapOverlayInput, String> {
         "power" => Ok(MapOverlayInput::Power),
         "pollution" => Ok(MapOverlayInput::Pollution),
         "population" => Ok(MapOverlayInput::Population),
+        "land" | "landvalue" | "land_value" => Ok(MapOverlayInput::LandValue),
+        "desirability" => Ok(MapOverlayInput::Desirability),
         _ => Err(format!("Unknown view overlay: {value}")),
     }
 }

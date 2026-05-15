@@ -3,7 +3,8 @@ use std::fs::File;
 use std::path::Path;
 
 use crate::core::systems::{
-    build, bulldoze, economy, happiness, pollution, population, power, replace, stats, upgrade,
+    build, bulldoze, economy, happiness, local_effects, pollution, population, power, replace,
+    stats, upgrade,
 };
 use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
@@ -169,6 +170,7 @@ impl Game {
         stats::refresh_population_and_jobs(&mut self.world);
         pollution::run(&mut self.world);
         happiness::run(&mut self.world);
+        local_effects::run(&mut self.world);
     }
 }
 

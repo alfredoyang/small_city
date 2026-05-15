@@ -19,6 +19,8 @@ fn map_overlays_return_width_times_height_cells() {
         MapOverlayInput::Power,
         MapOverlayInput::Pollution,
         MapOverlayInput::Population,
+        MapOverlayInput::LandValue,
+        MapOverlayInput::Desirability,
     ] {
         let view = game.view_with_overlay(overlay);
 
@@ -124,6 +126,15 @@ fn parse_view_overlay_command() {
         command,
         UiCommand::View {
             overlay: MapOverlayInput::Power
+        }
+    );
+
+    let command = parse_command("view desirability").expect("valid command");
+
+    assert_eq!(
+        command,
+        UiCommand::View {
+            overlay: MapOverlayInput::Desirability
         }
     );
 }

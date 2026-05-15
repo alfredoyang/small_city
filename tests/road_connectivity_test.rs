@@ -23,7 +23,7 @@ fn residential_with_adjacent_road_grows() {
     assert!(game.build(1, 0, BuildingKind::Road).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);
     assert!(game.build(2, 0, BuildingKind::Residential).success);
-    assert!(game.build(2, 1, BuildingKind::Industrial).success);
+    assert!(game.build(2, 1, BuildingKind::Commercial).success);
 
     game.tick();
 

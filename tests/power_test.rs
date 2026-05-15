@@ -134,7 +134,7 @@ fn population_only_grows_when_powered_by_network() {
     assert!(game.build(1, 1, BuildingKind::Road).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 1, BuildingKind::Road).success);
-    assert!(game.build(2, 0, BuildingKind::Industrial).success);
+    assert!(game.build(2, 0, BuildingKind::Commercial).success);
 
     game.tick();
 

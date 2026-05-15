@@ -31,6 +31,15 @@ pub struct CellView {
     pub power_demand: Option<i32>,
     pub road_connected: Option<bool>,
     pub upgrade_level: Option<u8>,
+    pub local_effects: LocalEffectsView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalEffectsView {
+    pub land_value: i32,
+    pub pollution_pressure: i32,
+    pub accessibility: i32,
+    pub desirability: i32,
 }
 
 /// Aggregate city numbers shown by status panels.
@@ -99,6 +108,7 @@ pub struct InspectView {
     pub in_bounds: bool,
     pub cell: Option<CellView>,
     pub details: Option<InspectDetailsView>,
+    pub local_effects: Option<LocalEffectsView>,
     pub explanations: Vec<String>,
 }
 

@@ -7,7 +7,7 @@ use crate::core::components::{
 };
 use crate::core::entity::Entity;
 use crate::core::grid::Grid;
-use crate::core::resources::{CityResources, CityStats};
+use crate::core::resources::{CityResources, CityStats, LocalEffectsMap};
 use crate::interface::input::BuildingKind;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -19,6 +19,8 @@ pub(crate) struct World {
     pub grid: Grid,
     pub resources: CityResources,
     pub stats: CityStats,
+    #[serde(default)]
+    pub local_effects: LocalEffectsMap,
     pub positions: HashMap<Entity, Position>,
     pub buildings: HashMap<Entity, Building>,
     pub populations: HashMap<Entity, Population>,
@@ -48,6 +50,7 @@ impl World {
             grid: Grid::new(width, height),
             resources: CityResources::default(),
             stats: CityStats::default(),
+            local_effects: LocalEffectsMap::new(width, height),
             positions: HashMap::new(),
             buildings: HashMap::new(),
             populations: HashMap::new(),
