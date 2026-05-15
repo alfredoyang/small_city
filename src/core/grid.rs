@@ -43,6 +43,10 @@ impl Grid {
         }
     }
 
+    pub fn clear(&mut self, x: usize, y: usize) -> Option<Entity> {
+        self.index(x, y).and_then(|index| self.cells[index].take())
+    }
+
     fn index(&self, x: usize, y: usize) -> Option<usize> {
         self.contains(x, y).then_some(y * self.width + x)
     }

@@ -59,6 +59,10 @@ impl GameEventView {
                 format!("Built {} at ({}, {})", kind.label(), x, y)
             }
             GameEventView::BuildFailed { reason } => reason.clone(),
+            GameEventView::BuildingBulldozed { x, y } => {
+                format!("Bulldozed building at ({x}, {y})")
+            }
+            GameEventView::BulldozeFailed { reason } => reason.clone(),
             GameEventView::TurnAdvanced { turn } => format!("Advanced to turn {turn}"),
             GameEventView::TickSummary {
                 turn,
@@ -96,6 +100,13 @@ pub enum GameEventView {
         kind: BuildingKind,
     },
     BuildFailed {
+        reason: String,
+    },
+    BuildingBulldozed {
+        x: usize,
+        y: usize,
+    },
+    BulldozeFailed {
         reason: String,
     },
     TurnAdvanced {

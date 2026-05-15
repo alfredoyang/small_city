@@ -2,7 +2,9 @@ use std::fmt;
 use std::fs::File;
 use std::path::Path;
 
-use crate::core::systems::{build, economy, happiness, pollution, population, power, stats};
+use crate::core::systems::{
+    build, bulldoze, economy, happiness, pollution, population, power, stats,
+};
 use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
 use crate::interface::events::{CommandResult, GameEventView, MetricChange};
@@ -75,6 +77,15 @@ impl Game {
         stats::refresh_population_and_jobs(&mut self.world);
         pollution::run(&mut self.world);
         happiness::run(&mut self.world);
+        result
+    }
+
+    /// Removes one occupied cell through the core systems and returns UI-safe feedback.
+    pub fn bulldoze(&mut self, x: usize, y: usize) -> CommandResult {
+        let result = bulldoze::bulldoze(&mut self.world, x, y);
+        if result.success {
+            self.refresh_derived_state();
+        }
         result
     }
 

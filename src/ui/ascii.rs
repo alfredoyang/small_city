@@ -57,6 +57,7 @@ enum UiAction {
     MoveRight,
     SelectBuild(BuildingKind),
     Build,
+    Bulldoze,
     Inspect,
     NextTurn,
     CycleOverlay,
@@ -92,6 +93,9 @@ pub fn run() -> io::Result<()> {
                 message = game
                     .build(state.cursor_x, state.cursor_y, state.selected_build)
                     .message();
+            }
+            UiAction::Bulldoze => {
+                message = game.bulldoze(state.cursor_x, state.cursor_y).message();
             }
             UiAction::Inspect => {
                 message = format_inspect(&game.inspect(state.cursor_x, state.cursor_y));
@@ -233,7 +237,7 @@ fn render_controls(stdout: &mut impl Write) -> io::Result<()> {
     writeln!(stdout, "B / Enter = Build selected type")?;
     writeln!(
         stdout,
-        "I = Inspect | N = Next turn | V = Change overlay | S = Save | L = Load | Q = Quit"
+        "X = Bulldoze | I = Inspect | N = Next turn | V = Change overlay | S = Save | L = Load | Q = Quit"
     )
 }
 
@@ -289,6 +293,7 @@ fn parse_key_sequence(bytes: &[u8]) -> UiAction {
         [b'5'] => UiAction::SelectBuild(BuildingKind::PowerPlant),
         [b'6'] => UiAction::SelectBuild(BuildingKind::Park),
         [b'b'] | [b'B'] | [b'\r'] | [b'\n'] => UiAction::Build,
+        [b'x'] | [b'X'] => UiAction::Bulldoze,
         [b'i'] | [b'I'] => UiAction::Inspect,
         [b'n'] | [b'N'] => UiAction::NextTurn,
         [b'v'] | [b'V'] => UiAction::CycleOverlay,
@@ -428,6 +433,7 @@ mod tests {
         );
         assert_eq!(parse_key_sequence(b"b"), UiAction::Build);
         assert_eq!(parse_key_sequence(b"\n"), UiAction::Build);
+        assert_eq!(parse_key_sequence(b"x"), UiAction::Bulldoze);
         assert_eq!(parse_key_sequence(b"n"), UiAction::NextTurn);
         assert_eq!(parse_key_sequence(b"v"), UiAction::CycleOverlay);
         assert_eq!(parse_key_sequence(b"S"), UiAction::Save);
