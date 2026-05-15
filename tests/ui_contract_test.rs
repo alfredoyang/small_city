@@ -162,7 +162,7 @@ fn ascii_ui_save_load_uses_game_api_only() {
 fn ascii_ui_renders_command_result_events() {
     let source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii ui source");
 
-    assert!(source.contains("result.events"));
+    assert!(source.contains(".message()"));
 }
 
 #[test]

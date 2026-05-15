@@ -12,7 +12,10 @@ fn inspect_empty_cell_shows_buildable_status() {
         inspect.details,
         Some(InspectDetailsView::Empty { buildable: true })
     );
-    assert_eq!(format_inspect(&inspect), "(1, 1) Empty | buildable true");
+    assert_eq!(
+        format_inspect(&inspect),
+        "(1, 1) Empty Land | Buildable: Yes"
+    );
 }
 
 #[test]
@@ -36,7 +39,7 @@ fn inspect_residential_shows_powered_state_and_population() {
     );
     assert_eq!(
         format_inspect(&inspect),
-        "(1, 0) Residential | powered true | road-connected true | population 0/5"
+        "(1, 0) Residential | Powered: Yes | Road: Yes | Population: 0/5"
     );
 }
 
@@ -71,11 +74,11 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
     );
     assert_eq!(
         format_inspect(&commercial),
-        "(1, 0) Commercial | powered true | road-connected true | jobs 2"
+        "(1, 0) Commercial | Powered: Yes | Road: Yes | Jobs: 2"
     );
     assert_eq!(
         format_inspect(&industrial),
-        "(2, 0) Industrial | powered true | road-connected true | jobs 3"
+        "(2, 0) Industrial | Powered: Yes | Road: Yes | Jobs: 3"
     );
 }
 
@@ -115,11 +118,11 @@ fn inspect_power_plant_and_park_show_special_effects() {
     );
     assert_eq!(
         format_inspect(&power_plant),
-        "(0, 0) Power Plant | road-connected false | power radius 3"
+        "(0, 0) Power Plant | Road: No | Power Radius: 3"
     );
     assert_eq!(
         format_inspect(&park),
-        "(1, 0) Park | road-connected false | happiness effect +3"
+        "(1, 0) Park | Road: No | Happiness: +3"
     );
 }
 
