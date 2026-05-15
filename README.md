@@ -83,7 +83,7 @@ P power plant
 . no power overlay data
 ```
 
-Status panels show turn, money, population, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, selected cell details, build preview explanations, and the latest command message.
+Status panels show turn, money, population, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, overlay legend, demand notes, selected cell details, build preview explanations, and the latest command message.
 
 ## Save And Load
 
@@ -140,10 +140,10 @@ Tests cover core simulation rules, road connectivity, demand, bulldoze, build pr
 - Industrial pollution and park happiness effects.
 - Basic residential, commercial, and industrial demand levels.
 - Basic map overlays for normal, power, pollution, and population views.
+- In-game overlay legends and short demand explanations in the ASCII UI.
 
 ## Proposed v0.2 Roadmap
 
-- Add richer overlay legends and demand explanations in the ASCII UI.
 - Add richer inspect details for road blockers and local effects.
 - Add stronger demand-driven growth behavior.
 - Add replace/upgrade commands.

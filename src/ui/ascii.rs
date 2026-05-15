@@ -180,6 +180,8 @@ fn render_screen(
         selected_build_cost(view, state.selected_build),
         overlay_label(state.current_overlay)
     )?;
+    render_overlay_legend(&mut stdout, state.current_overlay)?;
+    render_demand_notes(&mut stdout, view)?;
     writeln!(stdout)?;
     render_map(&mut stdout, view, state)?;
     writeln!(stdout)?;
@@ -290,12 +292,55 @@ fn render_controls(stdout: &mut impl Write) -> io::Result<()> {
     )
 }
 
+fn render_overlay_legend(stdout: &mut impl Write, overlay: MapOverlayInput) -> io::Result<()> {
+    writeln!(stdout, "Overlay Legend: {}", overlay_legend(overlay))
+}
+
+fn render_demand_notes(stdout: &mut impl Write, view: &GameView) -> io::Result<()> {
+    let demand = view.status.demand;
+    writeln!(
+        stdout,
+        "Demand Notes: R {} | C {} | I {}",
+        demand_note(BuildingKind::Residential, demand.residential),
+        demand_note(BuildingKind::Commercial, demand.commercial),
+        demand_note(BuildingKind::Industrial, demand.industrial)
+    )
+}
+
 fn selected_build_cost(view: &GameView, selected_build: BuildingKind) -> i32 {
     view.build_options
         .iter()
         .find(|option| option.kind == selected_build)
         .map(|option| option.cost)
         .unwrap_or_else(|| selected_build.cost())
+}
+
+fn overlay_legend(overlay: MapOverlayInput) -> &'static str {
+    match overlay {
+        MapOverlayInput::Normal => {
+            ". empty | = road | R residential | C commercial | I industrial | T power | P park"
+        }
+        MapOverlayInput::Power => {
+            "P plant | * powered road | + powered building | - unpowered building | . none"
+        }
+        MapOverlayInput::Pollution => "0-9 pollution level | . none",
+        MapOverlayInput::Population => "0-9 population | . none",
+    }
+}
+
+fn demand_note(kind: BuildingKind, level: DemandLevel) -> &'static str {
+    match (kind, level) {
+        (BuildingKind::Residential, DemandLevel::High) => "High: jobs and happiness support growth",
+        (BuildingKind::Residential, DemandLevel::Medium) => "Medium: some room for growth",
+        (BuildingKind::Residential, DemandLevel::Low) => "Low: add jobs or improve happiness",
+        (BuildingKind::Commercial, DemandLevel::High) => "High: residents can support more shops",
+        (BuildingKind::Commercial, DemandLevel::Medium) => "Medium: shops are near balance",
+        (BuildingKind::Commercial, DemandLevel::Low) => "Low: grow population first",
+        (BuildingKind::Industrial, DemandLevel::High) => "High: unemployed residents need jobs",
+        (BuildingKind::Industrial, DemandLevel::Medium) => "Medium: industry is near balance",
+        (BuildingKind::Industrial, DemandLevel::Low) => "Low: jobs or pollution are limiting",
+        _ => "",
+    }
 }
 
 fn demand_label(level: DemandLevel) -> &'static str {
@@ -512,9 +557,10 @@ impl Drop for KeyModeRestore {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsciiUiState, UiAction, parse_key_sequence};
+    use super::{AsciiUiState, UiAction, demand_note, overlay_legend, parse_key_sequence};
     use crate::core::game::Game;
     use crate::interface::input::{BuildingKind, MapOverlayInput};
+    use crate::interface::view::DemandLevel;
 
     #[test]
     fn parses_single_key_build_selection_and_actions() {
@@ -584,5 +630,19 @@ mod tests {
         assert_eq!(state.current_overlay, MapOverlayInput::Population);
         state.cycle_overlay();
         assert_eq!(state.current_overlay, MapOverlayInput::Normal);
+    }
+
+    #[test]
+    fn overlay_legend_explains_active_overlay_symbols() {
+        assert!(overlay_legend(MapOverlayInput::Power).contains("* powered road"));
+        assert!(overlay_legend(MapOverlayInput::Power).contains("+ powered building"));
+        assert!(overlay_legend(MapOverlayInput::Pollution).contains("0-9 pollution"));
+    }
+
+    #[test]
+    fn demand_notes_explain_zone_demand_levels() {
+        assert!(demand_note(BuildingKind::Residential, DemandLevel::High).contains("jobs"));
+        assert!(demand_note(BuildingKind::Commercial, DemandLevel::Low).contains("population"));
+        assert!(demand_note(BuildingKind::Industrial, DemandLevel::High).contains("jobs"));
     }
 }
