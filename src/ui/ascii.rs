@@ -251,10 +251,11 @@ fn render_status(stdout: &mut impl Write, view: &GameView) -> io::Result<()> {
     let status = &view.status;
     writeln!(
         stdout,
-        "Turn: {} | Money: ${} | Pop: {} | Jobs: {} | Happiness: {} | Pollution: {}",
+        "Turn: {} | Money: ${} | Pop: {} | Citizens: {} | Jobs: {} | Happiness: {} | Pollution: {}",
         status.turn,
         status.money,
         status.population,
+        status.citizens,
         status.jobs,
         status.happiness,
         status.pollution
@@ -474,8 +475,10 @@ pub fn format_inspect(inspect: &InspectView) -> String {
             upgrade_level,
             population,
             max_population,
+            citizens,
+            average_happiness,
         } => format!(
-            "({}, {}) Residential | Powered: {} | Demand: {} | Road: {} | Level: {} | Population: {}/{}",
+            "({}, {}) Residential | Powered: {} | Demand: {} | Road: {} | Level: {} | Population: {}/{} | Citizens: {} | Avg Happiness: {}",
             inspect.x,
             inspect.y,
             yes_no(*powered),
@@ -483,7 +486,9 @@ pub fn format_inspect(inspect: &InspectView) -> String {
             yes_no(*road_connected),
             upgrade_level,
             population,
-            max_population
+            max_population,
+            citizens,
+            optional_number(*average_happiness)
         ),
         InspectDetailsView::Commercial {
             powered,
@@ -545,6 +550,12 @@ pub fn format_inspect(inspect: &InspectView) -> String {
 
 fn yes_no(value: bool) -> &'static str {
     if value { "Yes" } else { "No" }
+}
+
+fn optional_number(value: Option<i32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "None".to_string())
 }
 
 fn prompt_filename(label: &str, default: &str) -> io::Result<String> {

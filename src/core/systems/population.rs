@@ -1,4 +1,5 @@
 use crate::core::systems::{
+    citizens,
     local_effects::{self, DesirabilityLevel},
     road_connectivity,
 };
@@ -33,18 +34,21 @@ pub(crate) fn run(world: &mut World) {
             .map(|position| local_effects::desirability_level(world, position.x, position.y))
             .unwrap_or(DesirabilityLevel::Low);
 
-        let Some(population) = world.populations.get_mut(&entity) else {
+        let Some(population) = world.populations.get(&entity) else {
             continue;
         };
+        let current_population = citizens::citizen_count_for_home(world, entity);
         let growth =
             residential_growth_per_tick(available_jobs, world.stats.happiness, desirability)
-                .min(population.max - population.current)
+                .min(population.max - current_population)
                 .min(available_jobs);
         if growth > 0 {
-            population.current += growth;
+            citizens::spawn_for_home(world, entity, growth);
             available_jobs -= growth;
         }
     }
+
+    citizens::sync_population_from_citizens(world);
 }
 
 fn residential_growth_per_tick(

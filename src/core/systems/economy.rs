@@ -1,4 +1,4 @@
-use crate::core::systems::road_connectivity;
+use crate::core::systems::{citizens, road_connectivity};
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;
 
@@ -12,11 +12,7 @@ pub(crate) struct EconomyBreakdown {
 }
 
 pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
-    let population_income: i32 = world
-        .populations
-        .values()
-        .map(|population| population.current)
-        .sum();
+    let population_income: i32 = citizens::citizen_count(world);
     let mut commercial_income = 0;
     let mut industrial_income = 0;
     let mut maintenance_cost = 0;

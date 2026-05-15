@@ -1,4 +1,4 @@
-use crate::core::systems::{power, road_connectivity};
+use crate::core::systems::{citizens, power, road_connectivity};
 use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
@@ -30,10 +30,12 @@ pub(crate) fn view_world_with_overlay(world: &World, overlay: MapOverlayInput) -
             money: world.resources.money,
             turn: world.resources.turn,
             population: world.stats.population,
+            citizens: citizens::citizen_count(world),
             jobs: world.stats.jobs,
             unemployment: world.stats.unemployment,
             pollution: world.stats.pollution,
             happiness: world.stats.happiness,
+            average_citizen_happiness: citizens::average_happiness(world),
             demand: calculate_demand(
                 world.stats.population,
                 world.stats.jobs,
@@ -139,6 +141,8 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 upgrade_level: building.level,
                 population: population.map(|population| population.current).unwrap_or(0),
                 max_population: population.map(|population| population.max).unwrap_or(0),
+                citizens: citizens::citizen_count_for_home(world, entity),
+                average_happiness: citizens::average_happiness_for_home(world, entity),
             }
         }
         BuildingKind::Commercial => InspectDetailsView::Commercial {

@@ -3,8 +3,8 @@ use std::fs::File;
 use std::path::Path;
 
 use crate::core::systems::{
-    build, bulldoze, economy, happiness, local_effects, pollution, population, power, replace,
-    stats, upgrade,
+    build, bulldoze, citizens, economy, happiness, local_effects, pollution, population, power,
+    replace, stats, upgrade,
 };
 use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
@@ -116,7 +116,10 @@ impl Game {
         let before = TickSummarySnapshot::from_world(&self.world);
         power::run(&mut self.world);
         stats::run(&mut self.world);
+        local_effects::run(&mut self.world);
         population::run(&mut self.world);
+        citizens::update_happiness(&mut self.world);
+        local_effects::run(&mut self.world);
         let economy = economy::run(&mut self.world);
         stats::refresh_population_and_jobs(&mut self.world);
         pollution::run(&mut self.world);
@@ -169,6 +172,7 @@ impl Game {
         power::run(&mut self.world);
         stats::refresh_population_and_jobs(&mut self.world);
         pollution::run(&mut self.world);
+        citizens::update_happiness(&mut self.world);
         happiness::run(&mut self.world);
         local_effects::run(&mut self.world);
     }

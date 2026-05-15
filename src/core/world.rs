@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::core::components::{
-    Building, HappinessEffect, PollutionSource, Population, Position, PowerConsumer, PowerProvider,
+    Building, Citizen, CitizenHappiness, Employment, HappinessEffect, Home, PollutionSource,
+    Population, Position, PowerConsumer, PowerProvider,
 };
 use crate::core::entity::Entity;
 use crate::core::grid::Grid;
@@ -24,6 +25,14 @@ pub(crate) struct World {
     pub positions: HashMap<Entity, Position>,
     pub buildings: HashMap<Entity, Building>,
     pub populations: HashMap<Entity, Population>,
+    #[serde(default)]
+    pub citizens: HashMap<Entity, Citizen>,
+    #[serde(default)]
+    pub homes: HashMap<Entity, Home>,
+    #[serde(default)]
+    pub employments: HashMap<Entity, Employment>,
+    #[serde(default)]
+    pub citizen_happiness: HashMap<Entity, CitizenHappiness>,
     pub power_providers: HashMap<Entity, PowerProvider>,
     pub power_consumers: HashMap<Entity, PowerConsumer>,
     pub pollution_sources: HashMap<Entity, PollutionSource>,
@@ -36,6 +45,10 @@ pub(crate) struct EntityRecord {
     pub kind: Option<BuildingKind>,
     pub has_position: bool,
     pub has_population: bool,
+    pub has_citizen: bool,
+    pub has_home: bool,
+    pub has_employment: bool,
+    pub has_citizen_happiness: bool,
     pub has_power_provider: bool,
     pub has_power_consumer: bool,
     pub has_pollution_source: bool,
@@ -54,6 +67,10 @@ impl World {
             positions: HashMap::new(),
             buildings: HashMap::new(),
             populations: HashMap::new(),
+            citizens: HashMap::new(),
+            homes: HashMap::new(),
+            employments: HashMap::new(),
+            citizen_happiness: HashMap::new(),
             power_providers: HashMap::new(),
             power_consumers: HashMap::new(),
             pollution_sources: HashMap::new(),
@@ -81,6 +98,26 @@ impl World {
     pub(crate) fn attach_population(&mut self, entity: Entity, population: Population) {
         self.populations.insert(entity, population);
         self.record_mut(entity).has_population = true;
+    }
+
+    pub(crate) fn attach_citizen(&mut self, entity: Entity, citizen: Citizen) {
+        self.citizens.insert(entity, citizen);
+        self.record_mut(entity).has_citizen = true;
+    }
+
+    pub(crate) fn attach_home(&mut self, entity: Entity, home: Home) {
+        self.homes.insert(entity, home);
+        self.record_mut(entity).has_home = true;
+    }
+
+    pub(crate) fn attach_employment(&mut self, entity: Entity, employment: Employment) {
+        self.employments.insert(entity, employment);
+        self.record_mut(entity).has_employment = true;
+    }
+
+    pub(crate) fn attach_citizen_happiness(&mut self, entity: Entity, happiness: CitizenHappiness) {
+        self.citizen_happiness.insert(entity, happiness);
+        self.record_mut(entity).has_citizen_happiness = true;
     }
 
     pub(crate) fn attach_power_provider(&mut self, entity: Entity, provider: PowerProvider) {
@@ -114,6 +151,18 @@ impl World {
         for entity in self.populations.keys().copied().collect::<Vec<_>>() {
             self.record_mut(entity).has_population = true;
         }
+        for entity in self.citizens.keys().copied().collect::<Vec<_>>() {
+            self.record_mut(entity).has_citizen = true;
+        }
+        for entity in self.homes.keys().copied().collect::<Vec<_>>() {
+            self.record_mut(entity).has_home = true;
+        }
+        for entity in self.employments.keys().copied().collect::<Vec<_>>() {
+            self.record_mut(entity).has_employment = true;
+        }
+        for entity in self.citizen_happiness.keys().copied().collect::<Vec<_>>() {
+            self.record_mut(entity).has_citizen_happiness = true;
+        }
         for entity in self.power_providers.keys().copied().collect::<Vec<_>>() {
             self.record_mut(entity).has_power_provider = true;
         }
@@ -136,7 +185,9 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::World;
-    use crate::core::components::{Building, Population, Position};
+    use crate::core::components::{
+        Building, Citizen, CitizenHappiness, Home, Population, Position,
+    };
     use crate::interface::input::BuildingKind;
 
     #[test]
@@ -158,7 +209,26 @@ mod tests {
         assert_eq!(record.kind, Some(BuildingKind::Residential));
         assert!(record.has_position);
         assert!(record.has_population);
+        assert!(!record.has_citizen);
         assert!(!record.has_power_provider);
+    }
+
+    #[test]
+    fn attach_helpers_record_citizen_shape() {
+        let mut world = World::new(2, 2);
+        let residential = world.spawn();
+        let citizen = world.spawn();
+
+        world.attach_citizen(citizen, Citizen { age: 0 });
+        world.attach_home(citizen, Home { residential });
+        world.attach_citizen_happiness(citizen, CitizenHappiness { value: 50 });
+
+        let record = world.entities.get(&citizen).expect("citizen record");
+        assert!(record.has_citizen);
+        assert!(record.has_home);
+        assert!(record.has_citizen_happiness);
+        assert!(!record.has_position);
+        assert_eq!(record.kind, None);
     }
 
     #[test]

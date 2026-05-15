@@ -17,11 +17,13 @@ The main public API is `Game`, which owns the private ECS `World` and exposes op
 The ECS is intentionally small:
 
 - `Entity`: stable ID for things placed in the city.
-- `Components`: plain data such as `Position`, `Building` with level, `Population`, `PowerProvider`, `PowerConsumer`, `PollutionSource`, and `HappinessEffect`.
+- `Components`: plain data such as `Position`, `Building` with level, `Population`, `Citizen`, `Home`, `Employment`, `CitizenHappiness`, `PowerProvider`, `PowerConsumer`, `PollutionSource`, and `HappinessEffect`.
 - `World`: private storage for entities, components, grid, resources, and city stats.
-- `Systems`: deterministic functions that operate on `World`, including build, replace, upgrade, bulldoze, power, road connectivity, local effects, stats, population, economy, pollution, and happiness.
+- `Systems`: deterministic functions that operate on `World`, including build, replace, upgrade, bulldoze, power, road connectivity, citizens, local effects, stats, population, economy, pollution, and happiness.
 - `Grid`: stores entity IDs for occupied map cells.
 - `Resources`: global city state such as money, turn, population, jobs, pollution, unemployment, happiness, power stats, and derived local effects.
+
+Citizens are ECS entities, but they do not occupy grid cells. Buildings remain the only grid occupants. A citizen has a home residential building, optional employment, and individual happiness. Residential population is kept as a cache derived from citizens so existing views can stay simple while future behavior can become more individual.
 
 ## UI Boundary
 
@@ -92,7 +94,7 @@ land value      0-9, higher means parks and commercial activity improved nearby 
 desirability    0-9, combines land value, pollution pressure, and road accessibility
 ```
 
-Status panels show turn, money, population, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, overlay legend, demand notes, selected cell details, inspect notes, build preview explanations, and the latest command message.
+Status panels show turn, money, population, citizen count, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, overlay legend, demand notes, selected cell details, inspect notes, build preview explanations, and the latest command message.
 
 ## Save And Load
 
@@ -168,6 +170,11 @@ Scenario-style integration tests cover longer multi-turn cities that combine pow
 - Commercial buildings slightly improve nearby land value.
 - Roads improve accessibility for adjacent cells.
 - Residential growth now considers desirability.
+- Residential growth now spawns citizen entities instead of only incrementing a counter.
+- Residential population is derived from citizens assigned to that home.
+- Citizens have individual happiness derived from home conditions and local effects.
+- City happiness uses average citizen happiness once citizens exist.
+- Happy or unhappy citizens can slightly affect nearby local effects.
 - Inspect and cell views expose local effects through UI-safe view models.
 - Land value and desirability map overlays.
-- Integration tests cover local effects, growth behavior, overlays, and save/load refresh.
+- Integration tests cover local effects, citizen spawning, citizen cleanup, growth behavior, overlays, and save/load refresh.

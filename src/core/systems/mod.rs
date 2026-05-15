@@ -1,5 +1,6 @@
 pub mod build;
 pub mod bulldoze;
+pub mod citizens;
 pub mod economy;
 pub mod entity_cleanup;
 pub mod happiness;

@@ -1,6 +1,12 @@
+use crate::core::systems::citizens;
 use crate::core::world::World;
 
 pub(crate) fn run(world: &mut World) {
+    if let Some(average_happiness) = citizens::average_happiness(world) {
+        world.stats.happiness = (average_happiness - world.stats.unemployment * 2).clamp(0, 100);
+        return;
+    }
+
     let park_bonus: i32 = world
         .happiness_effects
         .values()

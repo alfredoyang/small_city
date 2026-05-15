@@ -27,6 +27,27 @@ pub struct Population {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Citizen {
+    #[serde(default)]
+    pub age: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Home {
+    pub residential: crate::core::entity::Entity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Employment {
+    pub workplace: Option<crate::core::entity::Entity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CitizenHappiness {
+    pub value: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PowerProvider {
     #[serde(default = "default_power_capacity", alias = "radius")]
     pub capacity: i32,

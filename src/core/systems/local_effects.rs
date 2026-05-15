@@ -5,6 +5,7 @@ use crate::interface::input::BuildingKind;
 const PARK_RADIUS: usize = 2;
 const INDUSTRIAL_RADIUS: usize = 2;
 const COMMERCIAL_RADIUS: usize = 1;
+const CITIZEN_RADIUS: usize = 1;
 
 pub(crate) fn run(world: &mut World) {
     let width = world.grid.width();
@@ -38,6 +39,26 @@ pub(crate) fn run(world: &mut World) {
                         effects.land_value += 1;
                     }
                     _ => {}
+                }
+            }
+
+            for (citizen, home) in &world.homes {
+                let Some(happiness) = world.citizen_happiness.get(citizen) else {
+                    continue;
+                };
+                let Some(position) = world.positions.get(&home.residential) else {
+                    continue;
+                };
+                let distance = manhattan_distance(x, y, position.x, position.y);
+                if distance > CITIZEN_RADIUS {
+                    continue;
+                }
+
+                if happiness.value >= 60 {
+                    effects.land_value += 1;
+                } else if happiness.value < 40 {
+                    effects.pollution_pressure += 1;
+                    effects.land_value -= 1;
                 }
             }
 

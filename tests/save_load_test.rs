@@ -35,8 +35,9 @@ fn save_load_roundtrip_restores_city_state_visible_through_game_view() {
     );
     assert_eq!(building_count(&loaded), 10);
     assert_eq!(loaded_view.status.population, 5);
+    assert_eq!(loaded_view.status.citizens, 5);
     assert_eq!(loaded_view.status.pollution, 1);
-    assert_eq!(loaded_view.status.happiness, 52);
+    assert_eq!(loaded_view.status.happiness, 86);
 
     assert_eq!(
         loaded.inspect(0, 0).cell.expect("power plant").building,

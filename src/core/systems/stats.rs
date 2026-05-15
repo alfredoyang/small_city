@@ -1,4 +1,4 @@
-use crate::core::systems::road_connectivity;
+use crate::core::systems::{citizens, road_connectivity};
 use crate::core::world::World;
 
 pub(crate) fn run(world: &mut World) {
@@ -6,11 +6,8 @@ pub(crate) fn run(world: &mut World) {
 }
 
 pub(crate) fn refresh_population_and_jobs(world: &mut World) {
-    let population = world
-        .populations
-        .values()
-        .map(|population| population.current)
-        .sum();
+    citizens::sync_population_from_citizens(world);
+    let population = citizens::citizen_count(world);
     let jobs = world
         .buildings
         .iter()
