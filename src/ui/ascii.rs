@@ -176,9 +176,10 @@ fn render_screen(
     render_status(&mut stdout, view)?;
     writeln!(
         stdout,
-        "Mode: Build {} | Cost: {} | Overlay: {}",
+        "Mode: Build {} | Cost: {} | Upkeep: {} | Overlay: {}",
         state.selected_build.label(),
         selected_build_cost(view, state.selected_build),
+        selected_build_maintenance_cost(view, state.selected_build),
         overlay_label(state.current_overlay)
     )?;
     render_overlay_legend(&mut stdout, state.current_overlay)?;
@@ -322,6 +323,14 @@ fn selected_build_cost(view: &GameView, selected_build: BuildingKind) -> i32 {
         .find(|option| option.kind == selected_build)
         .map(|option| option.cost)
         .unwrap_or_else(|| selected_build.cost())
+}
+
+fn selected_build_maintenance_cost(view: &GameView, selected_build: BuildingKind) -> i32 {
+    view.build_options
+        .iter()
+        .find(|option| option.kind == selected_build)
+        .map(|option| option.maintenance_cost)
+        .unwrap_or_else(|| selected_build.maintenance_cost())
 }
 
 fn overlay_legend(overlay: MapOverlayInput) -> &'static str {

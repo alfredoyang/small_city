@@ -34,6 +34,14 @@ impl BuildingKind {
         }
     }
 
+    /// Ongoing money spent each turn to keep one building operating.
+    pub fn maintenance_cost(self) -> i32 {
+        match self {
+            Self::Commercial | Self::Industrial | Self::PowerPlant | Self::Park => 1,
+            Self::Road | Self::Residential => 0,
+        }
+    }
+
     /// Jobs contributed to city statistics by workplace buildings.
     pub fn jobs(self) -> i32 {
         match self {

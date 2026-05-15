@@ -137,6 +137,7 @@ Tests cover core simulation rules, road connectivity, demand, bulldoze, build pr
 - Power status totals for capacity, demand, supplied power, and shortage.
 - Population growth only when residential buildings are powered, road-connected, and jobs are available.
 - Commercial and industrial effective job counts and income only when powered and road-connected.
+- Ongoing economy balance: commercial, industrial, power plant, and park buildings each cost 1 maintenance per turn; roads and residential buildings have no upkeep.
 - Industrial pollution and park happiness effects.
 - Basic residential, commercial, and industrial demand levels.
 - Basic map overlays for normal, power, pollution, and population views.
@@ -147,5 +148,4 @@ Tests cover core simulation rules, road connectivity, demand, bulldoze, build pr
 
 - Add stronger demand-driven growth behavior.
 - Add replace/upgrade commands.
-- Add per-building maintenance costs and stronger economy balancing.
 - Add more scenario-style integration tests for longer simulations.

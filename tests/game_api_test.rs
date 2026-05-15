@@ -71,7 +71,7 @@ fn tick_returns_structured_summary_events() {
             },
             money: MetricChange {
                 before: 47,
-                after: 53
+                after: 49
             },
             happiness: MetricChange {
                 before: 52,
@@ -108,6 +108,6 @@ fn tick_summary_message_includes_metric_changes() {
     let message = game.tick().message();
 
     assert!(message.contains("population 1 (+1)"));
-    assert!(message.contains("money 59 (+6)"));
+    assert!(message.contains("money 56 (+3)"));
     assert!(message.contains("powered buildings 3 (+0)"));
 }

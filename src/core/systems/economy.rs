@@ -9,8 +9,11 @@ pub(crate) fn run(world: &mut World) {
         .map(|population| population.current)
         .sum();
     let mut income = citizens;
+    let mut maintenance = 0;
 
     for (entity, building) in world.buildings.iter() {
+        maintenance += building.kind.maintenance_cost();
+
         let powered = world
             .power_consumers
             .get(entity)
@@ -25,5 +28,5 @@ pub(crate) fn run(world: &mut World) {
         };
     }
 
-    world.resources.money += income;
+    world.resources.money += income - maintenance;
 }

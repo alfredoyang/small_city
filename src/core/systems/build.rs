@@ -132,14 +132,23 @@ fn build_effects(kind: BuildingKind) -> Vec<String> {
         BuildingKind::Commercial => vec![
             "Provides 2 effective jobs when powered and road-connected".to_string(),
             "Earns income when powered and road-connected".to_string(),
+            "Costs 1 maintenance each turn".to_string(),
         ],
         BuildingKind::Industrial => vec![
             "Provides 3 effective jobs when powered and road-connected".to_string(),
+            "Earns income when powered and road-connected".to_string(),
+            "Costs 1 maintenance each turn".to_string(),
             "Creates 2 pollution".to_string(),
         ],
         BuildingKind::PowerPlant => {
-            vec!["Adds 10 power capacity to adjacent road network".to_string()]
+            vec![
+                "Adds 10 power capacity to adjacent road network".to_string(),
+                "Costs 1 maintenance each turn".to_string(),
+            ]
         }
-        BuildingKind::Park => vec!["Adds +3 happiness effect".to_string()],
+        BuildingKind::Park => vec![
+            "Adds +3 happiness effect".to_string(),
+            "Costs 1 maintenance each turn".to_string(),
+        ],
     }
 }

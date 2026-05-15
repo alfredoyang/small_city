@@ -61,6 +61,7 @@ pub(crate) fn view_world_with_overlay(world: &World, overlay: MapOverlayInput) -
             kind,
             label: kind.label().to_string(),
             cost: kind.cost(),
+            maintenance_cost: kind.maintenance_cost(),
         })
         .collect(),
     }

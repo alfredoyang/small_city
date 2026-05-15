@@ -76,6 +76,7 @@ pub struct BuildOptionView {
     pub kind: BuildingKind,
     pub label: String,
     pub cost: i32,
+    pub maintenance_cost: i32,
 }
 
 /// UI-safe explanation of whether a build command would succeed at a coordinate.
