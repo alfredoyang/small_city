@@ -10,7 +10,7 @@ The project is split into three layers:
 - `interface`: UI-safe input types, events, view models, and adapters from ECS state to renderable data.
 - `ui`: cursor-based ASCII terminal UI.
 
-The main public API is `Game`, which owns the private ECS `World` and exposes operations such as `build`, `tick`, `inspect`, `view`, `view_with_overlay`, `save_to_file`, and `load_from_file`.
+The main public API is `Game`, which owns the private ECS `World` and exposes operations such as `build`, `preview_build`, `bulldoze`, `tick`, `inspect`, `view`, `view_with_overlay`, `save_to_file`, and `load_from_file`.
 
 ## ECS Core
 
@@ -19,7 +19,7 @@ The ECS is intentionally small:
 - `Entity`: stable ID for things placed in the city.
 - `Components`: plain data such as `Position`, `Building`, `Population`, `PowerProvider`, `PowerConsumer`, `PollutionSource`, and `HappinessEffect`.
 - `World`: private storage for entities, components, grid, resources, and city stats.
-- `Systems`: deterministic functions that operate on `World`, including build, power, road connectivity, stats, population, economy, pollution, and happiness.
+- `Systems`: deterministic functions that operate on `World`, including build, bulldoze, power, road connectivity, stats, population, economy, pollution, and happiness.
 - `Grid`: stores entity IDs for occupied map cells.
 - `Resources`: global city state such as money, turn, population, jobs, pollution, unemployment, and happiness.
 
@@ -27,7 +27,7 @@ The ECS is intentionally small:
 
 UI code must not access ECS internals. It must use the public `Game` API and render only from interface view models such as `GameView`, `CellView`, and `InspectView`.
 
-The adapter in `src/interface/adapter.rs` is the boundary where private ECS data becomes UI-safe view data. Map overlays, demand, road-connected status, and inspect details are generated there, not in the ASCII UI.
+The adapter in `src/interface/adapter.rs` is the boundary where private ECS data becomes UI-safe view data. Map overlays, demand, road-connected status, build previews, and inspect details are generated before the ASCII UI renders them.
 
 ## ASCII UI
 
@@ -50,11 +50,12 @@ W/A/S/D or Arrow Keys  move cursor
 5                       select Power Plant
 6                       select Park
 B or Enter              build selected type at cursor
+X                       bulldoze selected cell
 I                       inspect selected cell
 N                       next turn
 V                       cycle overlay
-S                       save to city1
-L                       load from city1
+S                       prompt for save filename
+L                       prompt for load filename
 Q                       quit
 ```
 
@@ -82,7 +83,7 @@ P power plant
 . no power overlay data
 ```
 
-Status panels show turn, money, population, jobs, happiness, pollution, zone demand, current build tool and cost, current overlay, selected cell details, and the latest command message.
+Status panels show turn, money, population, jobs, happiness, pollution, zone demand, current build tool and cost, current overlay, selected cell details, build preview explanations, and the latest command message.
 
 ## Save And Load
 
@@ -92,13 +93,15 @@ Save the current city from the ASCII UI:
 S
 ```
 
-Load the default save from the ASCII UI:
+Load a saved city from the ASCII UI:
 
 ```text
 L
 ```
 
-The cursor UI currently saves to and loads from `city1`. Save files are JSON snapshots of the private game state. Loading refreshes derived state before the game continues.
+Save/load prompts for a filename. Press Enter at the prompt to use the default `city1`.
+
+Save files are JSON snapshots of the private game state. Loading refreshes derived state before the game continues and resets the UI cursor to the loaded map.
 
 ## Tests
 
@@ -110,7 +113,7 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
-Tests cover core simulation rules, road connectivity, demand, save/load behavior, inspect output, map overlays, cursor/action parsing, and UI boundary contracts.
+Tests cover core simulation rules, road connectivity, demand, bulldoze, build previews, save/load behavior, inspect output, map overlays, cursor/action parsing, and UI boundary contracts.
 
 ## v0.1 Completed Scope
 
@@ -125,16 +128,17 @@ Tests cover core simulation rules, road connectivity, demand, save/load behavior
 - Basic residential, commercial, and industrial demand levels.
 - Deterministic tick order and structured tick summary events.
 - Cursor-based ASCII UI using only `Game` and view models.
-- Save/load support.
+- Bulldoze support with component cleanup and derived-state refresh.
+- Build preview explanations for selected cursor cell and build tool.
+- Prompted save/load filenames with default `city1`.
 - Inspect output with building-specific details.
 - Basic map overlays for normal, power, pollution, and population views.
 
-## Proposed v0.2 Roadmap
+## Proposed v0.22 Roadmap
 
 - Add richer overlay legends and demand explanations.
 - Add richer inspect details for nearby power coverage, road blockers, and local effects.
 - Add stronger demand-driven growth behavior.
-- Add bulldoze or replace commands.
-- Add configurable save/load filenames from the cursor UI.
+- Add replace/upgrade commands.
 - Add per-building maintenance costs and stronger economy balancing.
 - Add more scenario-style integration tests for longer simulations.
