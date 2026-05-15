@@ -117,6 +117,8 @@ cargo clippy -- -D warnings
 
 Tests cover core simulation rules, road connectivity, demand, bulldoze, build previews, save/load behavior, inspect output, map overlays, cursor/action parsing, and UI boundary contracts.
 
+Scenario-style integration tests cover longer multi-turn cities that combine power networks, demand-driven growth, upgrades, replace, bulldoze, overlays, and save/load.
+
 ## v0.1 Completed Scope
 
 - Fixed-size grid with one entity per occupied cell.
@@ -150,6 +152,6 @@ Tests cover core simulation rules, road connectivity, demand, bulldoze, build pr
 - Building levels start at 1 and currently max at 2.
 - Upgrade effects at level 2: residential max population increases from 5 to 8, power plant capacity increases from 10 to 15, and park happiness effect increases from +3 to +5.
 
-## Proposed v0.2 Roadmap
+## Proposed Roadmap
 
-- Add more scenario-style integration tests for longer simulations.
+- Add new scenarios and balancing tests as gameplay systems grow.
