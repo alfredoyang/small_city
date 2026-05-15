@@ -82,6 +82,19 @@ fn cell_view_includes_road_connected_status_for_non_road_buildings() {
 }
 
 #[test]
+fn city_status_view_includes_demand_data() {
+    let game = Game::new(2, 2);
+    let demand = game.view().status.demand;
+
+    assert_eq!(
+        demand,
+        game.view_with_overlay(MapOverlayInput::Normal)
+            .status
+            .demand
+    );
+}
+
+#[test]
 fn ui_contract_returns_game_view_not_world() {
     let game = Game::new(2, 2);
     let _: GameView = game.view();
@@ -150,4 +163,11 @@ fn ascii_ui_renders_command_result_events() {
     let source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii ui source");
 
     assert!(source.contains("result.events"));
+}
+
+#[test]
+fn ascii_ui_renders_demand_from_status_view() {
+    let source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii ui source");
+
+    assert!(source.contains("status.demand"));
 }

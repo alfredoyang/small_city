@@ -2,7 +2,8 @@ use crate::core::systems::road_connectivity;
 use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
-    BuildOptionView, CellView, CityStatusView, GameView, InspectDetailsView, InspectView, MapView,
+    BuildOptionView, CellView, CityDemand, CityStatusView, DemandLevel, GameView,
+    InspectDetailsView, InspectView, MapView,
 };
 
 /// Converts the private ECS World into the only render model the UI may consume.
@@ -33,6 +34,13 @@ pub(crate) fn view_world_with_overlay(world: &World, overlay: MapOverlayInput) -
             unemployment: world.stats.unemployment,
             pollution: world.stats.pollution,
             happiness: world.stats.happiness,
+            demand: calculate_demand(
+                world.stats.population,
+                world.stats.jobs,
+                world.stats.unemployment,
+                world.stats.pollution,
+                world.stats.happiness,
+            ),
         },
         build_options: [
             BuildingKind::Road,
@@ -49,6 +57,40 @@ pub(crate) fn view_world_with_overlay(world: &World, overlay: MapOverlayInput) -
             cost: kind.cost(),
         })
         .collect(),
+    }
+}
+
+pub(crate) fn calculate_demand(
+    population: i32,
+    jobs: i32,
+    unemployment: i32,
+    pollution: i32,
+    happiness: i32,
+) -> CityDemand {
+    let available_jobs = jobs - population;
+
+    CityDemand {
+        residential: if available_jobs >= 3 && happiness >= 50 {
+            DemandLevel::High
+        } else if available_jobs > 0 && happiness >= 35 {
+            DemandLevel::Medium
+        } else {
+            DemandLevel::Low
+        },
+        commercial: if population > jobs + 3 {
+            DemandLevel::High
+        } else if population > 0 && population >= jobs {
+            DemandLevel::Medium
+        } else {
+            DemandLevel::Low
+        },
+        industrial: if unemployment >= 3 && pollution <= 4 {
+            DemandLevel::High
+        } else if unemployment > 0 && pollution <= 8 {
+            DemandLevel::Medium
+        } else {
+            DemandLevel::Low
+        },
     }
 }
 
@@ -243,4 +285,62 @@ fn is_power_covered(world: &World, x: usize, y: usize) -> bool {
 
 fn digit_symbol(value: i32) -> char {
     char::from_digit(value.clamp(0, 9) as u32, 10).unwrap_or('0')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::calculate_demand;
+    use crate::interface::view::{CityDemand, DemandLevel};
+
+    #[test]
+    fn demand_is_low_without_population_or_available_jobs() {
+        assert_eq!(
+            calculate_demand(0, 0, 0, 0, 50),
+            CityDemand {
+                residential: DemandLevel::Low,
+                commercial: DemandLevel::Low,
+                industrial: DemandLevel::Low,
+            }
+        );
+    }
+
+    #[test]
+    fn residential_demand_rises_when_jobs_and_happiness_are_available() {
+        assert_eq!(
+            calculate_demand(1, 3, 0, 0, 45).residential,
+            DemandLevel::Medium
+        );
+        assert_eq!(
+            calculate_demand(1, 4, 0, 0, 55).residential,
+            DemandLevel::High
+        );
+    }
+
+    #[test]
+    fn commercial_demand_rises_when_population_exceeds_jobs() {
+        assert_eq!(
+            calculate_demand(2, 2, 0, 0, 50).commercial,
+            DemandLevel::Medium
+        );
+        assert_eq!(
+            calculate_demand(7, 3, 4, 0, 50).commercial,
+            DemandLevel::High
+        );
+    }
+
+    #[test]
+    fn industrial_demand_rises_with_unemployment_but_drops_when_pollution_is_high() {
+        assert_eq!(
+            calculate_demand(2, 1, 1, 2, 50).industrial,
+            DemandLevel::Medium
+        );
+        assert_eq!(
+            calculate_demand(6, 2, 4, 2, 50).industrial,
+            DemandLevel::High
+        );
+        assert_eq!(
+            calculate_demand(6, 2, 4, 9, 50).industrial,
+            DemandLevel::Low
+        );
+    }
 }

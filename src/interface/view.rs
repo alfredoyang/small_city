@@ -41,6 +41,23 @@ pub struct CityStatusView {
     pub unemployment: i32,
     pub pollution: i32,
     pub happiness: i32,
+    pub demand: CityDemand,
+}
+
+/// Simple zone demand levels derived from current city stats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DemandLevel {
+    Low,
+    Medium,
+    High,
+}
+
+/// Residential, commercial, and industrial demand exposed through the UI boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CityDemand {
+    pub residential: DemandLevel,
+    pub commercial: DemandLevel,
+    pub industrial: DemandLevel,
 }
 
 /// Build menu entry exposed to UI without requiring access to core systems or resources.

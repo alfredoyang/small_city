@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use crate::core::game::Game;
 use crate::interface::events::CommandResult;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
-use crate::interface::view::{GameView, InspectDetailsView, InspectView};
+use crate::interface::view::{DemandLevel, GameView, InspectDetailsView, InspectView};
 
 // Terminal-only command shape. The UI converts text into Game API inputs, then drops it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,15 +92,26 @@ pub fn render(view: &GameView) {
 fn render_status(view: &GameView) {
     let status = &view.status;
     println!(
-        "Turn {} | Money {} | Pop {} | Jobs {} | Unemployed {} | Pollution {} | Happiness {}",
+        "Turn {} | Money {} | Pop {} | Jobs {} | Unemployed {} | Pollution {} | Happiness {} | Demand R:{} C:{} I:{}",
         status.turn,
         status.money,
         status.population,
         status.jobs,
         status.unemployment,
         status.pollution,
-        status.happiness
+        status.happiness,
+        demand_label(status.demand.residential),
+        demand_label(status.demand.commercial),
+        demand_label(status.demand.industrial)
     );
+}
+
+fn demand_label(level: DemandLevel) -> &'static str {
+    match level {
+        DemandLevel::Low => "Low",
+        DemandLevel::Medium => "Medium",
+        DemandLevel::High => "High",
+    }
 }
 
 fn render_inspect(inspect: &InspectView) {
