@@ -51,6 +51,9 @@ fn tick_returns_structured_summary_events() {
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
     assert!(game.build(3, 0, BuildingKind::Industrial).success);
     assert!(game.build(4, 0, BuildingKind::Park).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
+    assert!(game.build(3, 1, BuildingKind::Road).success);
 
     let result = game.tick();
 
@@ -66,8 +69,8 @@ fn tick_returns_structured_summary_events() {
                 after: 1
             },
             money: MetricChange {
-                before: 51,
-                after: 57
+                before: 48,
+                after: 54
             },
             happiness: MetricChange {
                 before: 52,
@@ -96,10 +99,13 @@ fn tick_summary_message_includes_metric_changes() {
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
     assert!(game.build(3, 0, BuildingKind::Industrial).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
+    assert!(game.build(3, 1, BuildingKind::Road).success);
 
     let message = game.tick().message();
 
     assert!(message.contains("population 1 (+1)"));
-    assert!(message.contains("money 63 (+6)"));
+    assert!(message.contains("money 60 (+6)"));
     assert!(message.contains("powered buildings 3 (+3)"));
 }

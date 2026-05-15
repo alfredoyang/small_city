@@ -1,3 +1,4 @@
+use crate::core::systems::road_connectivity;
 use crate::core::world::World;
 
 pub(crate) fn run(world: &mut World) {
@@ -17,6 +18,9 @@ pub(crate) fn run(world: &mut World) {
             .map(|consumer| consumer.powered)
             .unwrap_or(false);
         if !powered {
+            continue;
+        }
+        if !road_connectivity::is_road_connected(world, entity) {
             continue;
         }
 

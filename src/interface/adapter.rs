@@ -1,3 +1,4 @@
+use crate::core::systems::road_connectivity;
 use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
@@ -83,6 +84,7 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                     .get(&entity)
                     .map(|consumer| consumer.powered)
                     .unwrap_or(false),
+                road_connected: road_connectivity::is_road_connected(world, entity),
                 population: population.map(|population| population.current).unwrap_or(0),
                 max_population: population.map(|population| population.max).unwrap_or(0),
             }
@@ -93,7 +95,8 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 .get(&entity)
                 .map(|consumer| consumer.powered)
                 .unwrap_or(false),
-            jobs: building.kind.jobs(),
+            road_connected: road_connectivity::is_road_connected(world, entity),
+            jobs: effective_jobs(world, entity, building.kind),
         },
         BuildingKind::Industrial => InspectDetailsView::Industrial {
             powered: world
@@ -101,9 +104,11 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 .get(&entity)
                 .map(|consumer| consumer.powered)
                 .unwrap_or(false),
-            jobs: building.kind.jobs(),
+            road_connected: road_connectivity::is_road_connected(world, entity),
+            jobs: effective_jobs(world, entity, building.kind),
         },
         BuildingKind::PowerPlant => InspectDetailsView::PowerPlant {
+            road_connected: road_connectivity::is_road_connected(world, entity),
             power_radius: world
                 .power_providers
                 .get(&entity)
@@ -111,6 +116,7 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 .unwrap_or(0),
         },
         BuildingKind::Park => InspectDetailsView::Park {
+            road_connected: road_connectivity::is_road_connected(world, entity),
             happiness_effect: world
                 .happiness_effects
                 .get(&entity)
@@ -137,6 +143,7 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
             population: None,
             max_population: None,
             powered: None,
+            road_connected: None,
         };
     };
 
@@ -158,6 +165,22 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
         population: population.map(|population| population.current),
         max_population: population.map(|population| population.max),
         powered,
+        road_connected: building.and_then(|kind| {
+            (kind != BuildingKind::Road)
+                .then(|| road_connectivity::is_road_connected(world, entity))
+        }),
+    }
+}
+
+fn effective_jobs(world: &World, entity: crate::core::entity::Entity, kind: BuildingKind) -> i32 {
+    let powered = world
+        .power_consumers
+        .get(&entity)
+        .is_some_and(|consumer| consumer.powered);
+    if powered && road_connectivity::is_road_connected(world, entity) {
+        kind.jobs()
+    } else {
+        0
     }
 }
 

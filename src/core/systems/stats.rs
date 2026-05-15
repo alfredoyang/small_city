@@ -1,3 +1,4 @@
+use crate::core::systems::road_connectivity;
 use crate::core::world::World;
 
 pub(crate) fn run(world: &mut World) {
@@ -12,8 +13,15 @@ pub(crate) fn refresh_population_and_jobs(world: &mut World) {
         .sum();
     let jobs = world
         .buildings
-        .values()
-        .map(|building| building.kind.jobs())
+        .iter()
+        .filter(|(entity, _building)| {
+            world
+                .power_consumers
+                .get(entity)
+                .is_some_and(|consumer| consumer.powered)
+                && road_connectivity::is_road_connected(world, **entity)
+        })
+        .map(|(_entity, building)| building.kind.jobs())
         .sum();
 
     world.stats.population = population;

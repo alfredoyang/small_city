@@ -28,6 +28,7 @@ pub struct CellView {
     pub population: Option<i32>,
     pub max_population: Option<i32>,
     pub powered: Option<bool>,
+    pub road_connected: Option<bool>,
 }
 
 /// Aggregate city numbers shown by status panels.
@@ -69,21 +70,26 @@ pub enum InspectDetailsView {
     Road,
     Residential {
         powered: bool,
+        road_connected: bool,
         population: i32,
         max_population: i32,
     },
     Commercial {
         powered: bool,
+        road_connected: bool,
         jobs: i32,
     },
     Industrial {
         powered: bool,
+        road_connected: bool,
         jobs: i32,
     },
     PowerPlant {
+        road_connected: bool,
         power_radius: usize,
     },
     Park {
+        road_connected: bool,
         happiness_effect: i32,
     },
     Unknown,

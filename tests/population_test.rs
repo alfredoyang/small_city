@@ -7,6 +7,8 @@ fn residential_population_grows_when_powered_and_jobs_are_available() {
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Industrial).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
 
     game.tick();
     let cell = game.inspect(1, 0).cell.expect("residential cell");

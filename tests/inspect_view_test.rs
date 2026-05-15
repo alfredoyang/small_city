@@ -20,6 +20,7 @@ fn inspect_residential_shows_powered_state_and_population() {
     let mut game = Game::new(4, 4);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
     game.tick();
 
     let inspect = game.inspect(1, 0);
@@ -28,13 +29,14 @@ fn inspect_residential_shows_powered_state_and_population() {
         inspect.details,
         Some(InspectDetailsView::Residential {
             powered: true,
+            road_connected: true,
             population: 0,
             max_population: 5
         })
     );
     assert_eq!(
         format_inspect(&inspect),
-        "(1, 0) Residential | powered true | population 0/5"
+        "(1, 0) Residential | powered true | road-connected true | population 0/5"
     );
 }
 
@@ -44,6 +46,8 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Commercial).success);
     assert!(game.build(2, 0, BuildingKind::Industrial).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
     game.tick();
 
     let commercial = game.inspect(1, 0);
@@ -53,6 +57,7 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
         commercial.details,
         Some(InspectDetailsView::Commercial {
             powered: true,
+            road_connected: true,
             jobs: 2
         })
     );
@@ -60,16 +65,17 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
         industrial.details,
         Some(InspectDetailsView::Industrial {
             powered: true,
+            road_connected: true,
             jobs: 3
         })
     );
     assert_eq!(
         format_inspect(&commercial),
-        "(1, 0) Commercial | powered true | jobs 2"
+        "(1, 0) Commercial | powered true | road-connected true | jobs 2"
     );
     assert_eq!(
         format_inspect(&industrial),
-        "(2, 0) Industrial | powered true | jobs 3"
+        "(2, 0) Industrial | powered true | road-connected true | jobs 3"
     );
 }
 
@@ -95,19 +101,26 @@ fn inspect_power_plant_and_park_show_special_effects() {
 
     assert_eq!(
         power_plant.details,
-        Some(InspectDetailsView::PowerPlant { power_radius: 3 })
+        Some(InspectDetailsView::PowerPlant {
+            road_connected: false,
+            power_radius: 3
+        })
     );
     assert_eq!(
         park.details,
         Some(InspectDetailsView::Park {
+            road_connected: false,
             happiness_effect: 3
         })
     );
     assert_eq!(
         format_inspect(&power_plant),
-        "(0, 0) Power Plant | power radius 3"
+        "(0, 0) Power Plant | road-connected false | power radius 3"
     );
-    assert_eq!(format_inspect(&park), "(1, 0) Park | happiness effect +3");
+    assert_eq!(
+        format_inspect(&park),
+        "(1, 0) Park | road-connected false | happiness effect +3"
+    );
 }
 
 #[test]

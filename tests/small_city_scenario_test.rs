@@ -8,6 +8,8 @@ fn powered_residential_and_commercial_city_grows_over_five_ticks() {
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
 
     let starting_view = game.view();
     let starting_money = starting_view.status.money;

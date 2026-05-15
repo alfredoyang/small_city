@@ -71,6 +71,17 @@ fn residential_cell_view_includes_population_data() {
 }
 
 #[test]
+fn cell_view_includes_road_connected_status_for_non_road_buildings() {
+    let mut game = Game::new(3, 3);
+    assert!(game.build(1, 1, BuildingKind::Residential).success);
+    assert!(game.build(1, 2, BuildingKind::Road).success);
+
+    let cell = game.inspect(1, 1).cell.expect("cell");
+
+    assert_eq!(cell.road_connected, Some(true));
+}
+
+#[test]
 fn ui_contract_returns_game_view_not_world() {
     let game = Game::new(2, 2);
     let _: GameView = game.view();

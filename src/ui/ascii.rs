@@ -123,27 +123,42 @@ pub fn format_inspect(inspect: &InspectView) -> String {
         InspectDetailsView::Road => format!("({}, {}) Road", inspect.x, inspect.y),
         InspectDetailsView::Residential {
             powered,
+            road_connected,
             population,
             max_population,
         } => format!(
-            "({}, {}) Residential | powered {} | population {}/{}",
-            inspect.x, inspect.y, powered, population, max_population
+            "({}, {}) Residential | powered {} | road-connected {} | population {}/{}",
+            inspect.x, inspect.y, powered, road_connected, population, max_population
         ),
-        InspectDetailsView::Commercial { powered, jobs } => format!(
-            "({}, {}) Commercial | powered {} | jobs {}",
-            inspect.x, inspect.y, powered, jobs
+        InspectDetailsView::Commercial {
+            powered,
+            road_connected,
+            jobs,
+        } => format!(
+            "({}, {}) Commercial | powered {} | road-connected {} | jobs {}",
+            inspect.x, inspect.y, powered, road_connected, jobs
         ),
-        InspectDetailsView::Industrial { powered, jobs } => format!(
-            "({}, {}) Industrial | powered {} | jobs {}",
-            inspect.x, inspect.y, powered, jobs
+        InspectDetailsView::Industrial {
+            powered,
+            road_connected,
+            jobs,
+        } => format!(
+            "({}, {}) Industrial | powered {} | road-connected {} | jobs {}",
+            inspect.x, inspect.y, powered, road_connected, jobs
         ),
-        InspectDetailsView::PowerPlant { power_radius } => format!(
-            "({}, {}) Power Plant | power radius {}",
-            inspect.x, inspect.y, power_radius
+        InspectDetailsView::PowerPlant {
+            road_connected,
+            power_radius,
+        } => format!(
+            "({}, {}) Power Plant | road-connected {} | power radius {}",
+            inspect.x, inspect.y, road_connected, power_radius
         ),
-        InspectDetailsView::Park { happiness_effect } => format!(
-            "({}, {}) Park | happiness effect +{}",
-            inspect.x, inspect.y, happiness_effect
+        InspectDetailsView::Park {
+            road_connected,
+            happiness_effect,
+        } => format!(
+            "({}, {}) Park | road-connected {} | happiness effect +{}",
+            inspect.x, inspect.y, road_connected, happiness_effect
         ),
         InspectDetailsView::Unknown => format!("({}, {}) Unknown", inspect.x, inspect.y),
     }

@@ -33,7 +33,7 @@ fn save_load_roundtrip_restores_city_state_visible_through_game_view() {
         loaded_view.map.cells.len(),
         loaded_view.map.width * loaded_view.map.height
     );
-    assert_eq!(building_count(&loaded), 5);
+    assert_eq!(building_count(&loaded), 9);
     assert_eq!(loaded_view.status.population, 3);
     assert_eq!(loaded_view.status.pollution, 1);
     assert_eq!(loaded_view.status.happiness, 52);
@@ -50,10 +50,13 @@ fn save_load_roundtrip_restores_city_state_visible_through_game_view() {
     assert_eq!(residential.building, Some(BuildingKind::Residential));
     assert_eq!(residential.population, Some(3));
     assert_eq!(residential.powered, Some(true));
+    assert_eq!(residential.road_connected, Some(true));
     assert_eq!(commercial.building, Some(BuildingKind::Commercial));
     assert_eq!(commercial.powered, Some(true));
+    assert_eq!(commercial.road_connected, Some(true));
     assert_eq!(industrial.building, Some(BuildingKind::Industrial));
     assert_eq!(industrial.powered, Some(true));
+    assert_eq!(industrial.road_connected, Some(true));
     assert_eq!(park.building, Some(BuildingKind::Park));
 
     remove_save_file(path);
@@ -128,6 +131,10 @@ fn full_city_game() -> Game {
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
     assert!(game.build(3, 0, BuildingKind::Industrial).success);
     assert!(game.build(4, 0, BuildingKind::Park).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
+    assert!(game.build(3, 1, BuildingKind::Road).success);
+    assert!(game.build(4, 1, BuildingKind::Road).success);
     for _ in 0..3 {
         game.tick();
     }
