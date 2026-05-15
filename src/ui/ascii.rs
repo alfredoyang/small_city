@@ -41,6 +41,11 @@ impl AsciiUiState {
         self.cursor_y = self.cursor_y.min(view.map.height.saturating_sub(1));
     }
 
+    fn reset_cursor(&mut self) {
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+    }
+
     fn cycle_overlay(&mut self) {
         self.current_overlay = match self.current_overlay {
             MapOverlayInput::Normal => MapOverlayInput::Power,
@@ -111,18 +116,21 @@ pub fn run() -> io::Result<()> {
                 message = format!("Overlay: {}", overlay_label(state.current_overlay));
             }
             UiAction::Save => {
-                message = match game.save_to_file(DEFAULT_SAVE_FILE) {
-                    Ok(()) => format!("Saved {DEFAULT_SAVE_FILE}"),
+                let filename = prompt_filename("Save filename", DEFAULT_SAVE_FILE)?;
+                message = match game.save_to_file(&filename) {
+                    Ok(()) => format!("Saved {filename}"),
                     Err(error) => error.to_string(),
                 };
             }
             UiAction::Load => {
-                message = match Game::load_from_file(DEFAULT_SAVE_FILE) {
+                let filename = prompt_filename("Load filename", DEFAULT_SAVE_FILE)?;
+                message = match Game::load_from_file(&filename) {
                     Ok(loaded_game) => {
                         game = loaded_game;
                         let loaded_view = game.view_with_overlay(state.current_overlay);
+                        state.reset_cursor();
                         state.clamp_cursor(&loaded_view);
-                        format!("Loaded {DEFAULT_SAVE_FILE}")
+                        format!("Loaded {filename}")
                     }
                     Err(error) => error.to_string(),
                 };
@@ -267,6 +275,10 @@ fn render_controls(stdout: &mut impl Write) -> io::Result<()> {
     writeln!(
         stdout,
         "X = Bulldoze | I = Inspect | N = Next turn | V = Change overlay | S = Save | L = Load | Q = Quit"
+    )?;
+    writeln!(
+        stdout,
+        "Save/Load prompts for filename; Enter uses {DEFAULT_SAVE_FILE}"
     )
 }
 
@@ -414,6 +426,26 @@ fn yes_no(value: bool) -> &'static str {
     if value { "Yes" } else { "No" }
 }
 
+fn prompt_filename(label: &str, default: &str) -> io::Result<String> {
+    RawTerminal::temporarily_restore(|| {
+        let mut stdout = io::stdout();
+        write!(stdout, "\n{label} [{default}]: ")?;
+        stdout.flush()?;
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input)? == 0 {
+            return Ok(default.to_string());
+        }
+
+        let filename = input.trim();
+        if filename.is_empty() {
+            Ok(default.to_string())
+        } else {
+            Ok(filename.to_string())
+        }
+    })
+}
+
 struct RawTerminal {
     original_state: Option<String>,
 }
@@ -434,6 +466,16 @@ impl RawTerminal {
             original_state: Some(original_state),
         })
     }
+
+    fn temporarily_restore<T>(operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        if !io::stdin().is_terminal() {
+            return operation();
+        }
+
+        Command::new("stty").arg("sane").status()?;
+        let _restore = KeyModeRestore;
+        operation()
+    }
 }
 
 impl Drop for RawTerminal {
@@ -441,6 +483,14 @@ impl Drop for RawTerminal {
         if let Some(original_state) = &self.original_state {
             let _ = Command::new("stty").arg(original_state).status();
         }
+    }
+}
+
+struct KeyModeRestore;
+
+impl Drop for KeyModeRestore {
+    fn drop(&mut self) {
+        let _ = Command::new("stty").args(["cbreak", "-echo"]).status();
     }
 }
 
@@ -492,6 +542,18 @@ mod tests {
 
         state.move_cursor(10, 10, &view);
         assert_eq!((state.cursor_x, state.cursor_y), (2, 1));
+    }
+
+    #[test]
+    fn cursor_can_reset_after_loading_game() {
+        let game = Game::new(3, 2);
+        let view = game.view();
+        let mut state = AsciiUiState::default();
+        state.move_cursor(10, 10, &view);
+
+        state.reset_cursor();
+
+        assert_eq!((state.cursor_x, state.cursor_y), (0, 0));
     }
 
     #[test]
