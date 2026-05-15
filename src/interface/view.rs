@@ -68,6 +68,17 @@ pub struct BuildOptionView {
     pub cost: i32,
 }
 
+/// UI-safe explanation of whether a build command would succeed at a coordinate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildPreviewView {
+    pub kind: BuildingKind,
+    pub label: String,
+    pub cost: i32,
+    pub can_build: bool,
+    pub reason: Option<String>,
+    pub effects: Vec<String>,
+}
+
 /// Result of inspecting one coordinate, including out-of-bounds information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectView {

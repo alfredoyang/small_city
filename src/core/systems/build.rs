@@ -4,27 +4,16 @@ use crate::core::components::{
 use crate::core::world::World;
 use crate::interface::events::{CommandResult, GameEventView};
 use crate::interface::input::BuildingKind;
+use crate::interface::view::BuildPreviewView;
 
 pub(crate) fn build(world: &mut World, x: usize, y: usize, kind: BuildingKind) -> CommandResult {
-    if !world.grid.contains(x, y) {
+    if let Err(reason) = validate_build(world, x, y, kind) {
         return CommandResult::failure(GameEventView::BuildFailed {
-            reason: "Cannot build outside the map".to_string(),
-        });
-    }
-
-    if world.grid.get(x, y).is_some() {
-        return CommandResult::failure(GameEventView::BuildFailed {
-            reason: "Cell is already occupied".to_string(),
+            reason: reason.to_string(),
         });
     }
 
     let cost = kind.cost();
-    if world.resources.money < cost {
-        return CommandResult::failure(GameEventView::BuildFailed {
-            reason: "Not enough money".to_string(),
-        });
-    }
-
     let entity = world.spawn();
     world.resources.money -= cost;
     world.grid.set(x, y, entity);
@@ -67,4 +56,71 @@ pub(crate) fn build(world: &mut World, x: usize, y: usize, kind: BuildingKind) -
     }
 
     CommandResult::success(GameEventView::Built { x, y, kind })
+}
+
+pub(crate) fn preview_build(
+    world: &World,
+    x: usize,
+    y: usize,
+    kind: BuildingKind,
+) -> BuildPreviewView {
+    match validate_build(world, x, y, kind) {
+        Ok(()) => BuildPreviewView {
+            kind,
+            label: kind.label().to_string(),
+            cost: kind.cost(),
+            can_build: true,
+            reason: None,
+            effects: build_effects(kind),
+        },
+        Err(reason) => BuildPreviewView {
+            kind,
+            label: kind.label().to_string(),
+            cost: kind.cost(),
+            can_build: false,
+            reason: Some(reason.to_string()),
+            effects: build_effects(kind),
+        },
+    }
+}
+
+fn validate_build(
+    world: &World,
+    x: usize,
+    y: usize,
+    kind: BuildingKind,
+) -> Result<(), &'static str> {
+    if !world.grid.contains(x, y) {
+        return Err("Cannot build outside the map");
+    }
+
+    if world.grid.get(x, y).is_some() {
+        return Err("Cell is already occupied");
+    }
+
+    if world.resources.money < kind.cost() {
+        return Err("Not enough money");
+    }
+
+    Ok(())
+}
+
+fn build_effects(kind: BuildingKind) -> Vec<String> {
+    match kind {
+        BuildingKind::Road => vec!["Connects adjacent buildings to the road network".to_string()],
+        BuildingKind::Residential => vec![
+            "Adds housing for up to 5 people".to_string(),
+            "Needs power, road access, and available jobs to grow".to_string(),
+        ],
+        BuildingKind::Commercial => vec![
+            "Provides 2 effective jobs when powered and road-connected".to_string(),
+            "Earns income when powered and road-connected".to_string(),
+        ],
+        BuildingKind::Industrial => vec![
+            "Provides 3 effective jobs when powered and road-connected".to_string(),
+            "Creates 2 pollution".to_string(),
+        ],
+        BuildingKind::PowerPlant => vec!["Powers consumers within radius 3".to_string()],
+        BuildingKind::Park => vec!["Adds +3 happiness effect".to_string()],
+    }
 }

@@ -9,7 +9,7 @@ use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
 use crate::interface::events::{CommandResult, GameEventView, MetricChange};
 use crate::interface::input::{BuildingKind, MapOverlayInput};
-use crate::interface::view::{GameView, InspectView};
+use crate::interface::view::{BuildPreviewView, GameView, InspectView};
 
 #[derive(Debug)]
 pub struct Game {
@@ -78,6 +78,11 @@ impl Game {
         pollution::run(&mut self.world);
         happiness::run(&mut self.world);
         result
+    }
+
+    /// Explains whether a build command would succeed without mutating game state.
+    pub fn preview_build(&self, x: usize, y: usize, kind: BuildingKind) -> BuildPreviewView {
+        build::preview_build(&self.world, x, y, kind)
     }
 
     /// Removes one occupied cell through the core systems and returns UI-safe feedback.

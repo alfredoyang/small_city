@@ -3,7 +3,9 @@ use std::process::Command;
 
 use crate::core::game::Game;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
-use crate::interface::view::{DemandLevel, GameView, InspectDetailsView, InspectView};
+use crate::interface::view::{
+    BuildPreviewView, DemandLevel, GameView, InspectDetailsView, InspectView,
+};
 
 const DEFAULT_SAVE_FILE: &str = "city1";
 
@@ -78,7 +80,8 @@ pub fn run() -> io::Result<()> {
         let view = game.view_with_overlay(state.current_overlay);
         state.clamp_cursor(&view);
         let inspect = game.inspect(state.cursor_x, state.cursor_y);
-        render_screen(&view, &inspect, &state, &message)?;
+        let preview = game.preview_build(state.cursor_x, state.cursor_y, state.selected_build);
+        render_screen(&view, &inspect, &preview, &state, &message)?;
 
         match read_action()? {
             UiAction::MoveUp => state.move_cursor(0, -1, &view),
@@ -140,12 +143,21 @@ pub fn render(view: &GameView) {
         cell: None,
         details: None,
     };
-    let _ = render_screen(view, &inspect, &state, "");
+    let preview = BuildPreviewView {
+        kind: state.selected_build,
+        label: state.selected_build.label().to_string(),
+        cost: state.selected_build.cost(),
+        can_build: false,
+        reason: Some("No game preview available".to_string()),
+        effects: Vec::new(),
+    };
+    let _ = render_screen(view, &inspect, &preview, &state, "");
 }
 
 fn render_screen(
     view: &GameView,
     inspect: &InspectView,
+    preview: &BuildPreviewView,
     state: &AsciiUiState,
     message: &str,
 ) -> io::Result<()> {
@@ -164,12 +176,29 @@ fn render_screen(
     render_map(&mut stdout, view, state)?;
     writeln!(stdout)?;
     writeln!(stdout, "Selected: {}", format_inspect(inspect))?;
+    render_build_preview(&mut stdout, preview)?;
     if !message.is_empty() {
         writeln!(stdout, "Message: {message}")?;
     }
     writeln!(stdout)?;
     render_controls(&mut stdout)?;
     stdout.flush()
+}
+
+fn render_build_preview(stdout: &mut impl Write, preview: &BuildPreviewView) -> io::Result<()> {
+    let result = if preview.can_build { "Yes" } else { "No" };
+    writeln!(
+        stdout,
+        "Build Preview: {} | Cost: {} | Can build: {}",
+        preview.label, preview.cost, result
+    )?;
+    if let Some(reason) = &preview.reason {
+        writeln!(stdout, "Reason: {reason}")?;
+    }
+    if !preview.effects.is_empty() {
+        writeln!(stdout, "Effects: {}", preview.effects.join("; "))?;
+    }
+    Ok(())
 }
 
 fn render_status(stdout: &mut impl Write, view: &GameView) -> io::Result<()> {
