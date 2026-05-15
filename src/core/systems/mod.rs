@@ -3,6 +3,7 @@ pub mod bulldoze;
 pub mod economy;
 pub mod entity_cleanup;
 pub mod happiness;
+pub mod placement;
 pub mod pollution;
 pub mod population;
 pub mod power;
