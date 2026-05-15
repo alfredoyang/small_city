@@ -150,6 +150,7 @@ pub fn render(view: &GameView) {
         in_bounds: false,
         cell: None,
         details: None,
+        explanations: Vec::new(),
     };
     let preview = BuildPreviewView {
         kind: state.selected_build,
@@ -186,6 +187,7 @@ fn render_screen(
     render_map(&mut stdout, view, state)?;
     writeln!(stdout)?;
     writeln!(stdout, "Selected: {}", format_inspect(inspect))?;
+    render_inspect_explanations(&mut stdout, inspect)?;
     render_build_preview(&mut stdout, preview)?;
     if !message.is_empty() {
         writeln!(stdout, "Message: {message}")?;
@@ -209,6 +211,13 @@ fn render_build_preview(stdout: &mut impl Write, preview: &BuildPreviewView) -> 
         writeln!(stdout, "Effects: {}", preview.effects.join("; "))?;
     }
     Ok(())
+}
+
+fn render_inspect_explanations(stdout: &mut impl Write, inspect: &InspectView) -> io::Result<()> {
+    if inspect.explanations.is_empty() {
+        return Ok(());
+    }
+    writeln!(stdout, "Inspect Notes: {}", inspect.explanations.join("; "))
 }
 
 fn render_status(stdout: &mut impl Write, view: &GameView) -> io::Result<()> {

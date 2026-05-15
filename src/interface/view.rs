@@ -97,6 +97,7 @@ pub struct InspectView {
     pub in_bounds: bool,
     pub cell: Option<CellView>,
     pub details: Option<InspectDetailsView>,
+    pub explanations: Vec<String>,
 }
 
 /// Type-specific details for the inspected coordinate.

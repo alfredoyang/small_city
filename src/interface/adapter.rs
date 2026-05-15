@@ -109,6 +109,9 @@ pub(crate) fn inspect_world(world: &World, x: usize, y: usize) -> InspectView {
         in_bounds,
         cell: in_bounds.then(|| cell_view(world, x, y)),
         details: in_bounds.then(|| inspect_details(world, x, y)),
+        explanations: in_bounds
+            .then(|| inspect_explanations(world, x, y))
+            .unwrap_or_default(),
     }
 }
 
@@ -181,6 +184,148 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 .unwrap_or(0),
         },
     }
+}
+
+fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
+    let Some(entity) = world.grid.get(x, y) else {
+        return vec!["Empty cells can be built on if the city has enough money.".to_string()];
+    };
+
+    let Some(building) = world.buildings.get(&entity) else {
+        return vec!["This cell has an unknown entity type.".to_string()];
+    };
+
+    let mut explanations = Vec::new();
+    let road_connected =
+        building.kind == BuildingKind::Road || road_connectivity::is_road_connected(world, entity);
+
+    match building.kind {
+        BuildingKind::Road => {
+            if power::is_powered_road(world, x, y) {
+                explanations.push("This road is part of a powered road network.".to_string());
+            } else {
+                explanations.push(
+                    "This road network needs an adjacent power plant to carry power.".to_string(),
+                );
+            }
+        }
+        BuildingKind::Residential => {
+            explain_road_and_power(world, entity, road_connected, &mut explanations);
+            let available_jobs = (world.stats.jobs - world.stats.population).max(0);
+            if available_jobs == 0 {
+                explanations.push(
+                    "Population growth is blocked because no jobs are available.".to_string(),
+                );
+            }
+            if let Some(population) = world.populations.get(&entity) {
+                if population.current >= population.max {
+                    explanations
+                        .push("This residential building is at max population.".to_string());
+                }
+            }
+            if world.stats.pollution > 0 {
+                explanations.push(format!(
+                    "City pollution is reducing happiness by {}.",
+                    world.stats.pollution
+                ));
+            }
+        }
+        BuildingKind::Commercial => {
+            explain_road_and_power(world, entity, road_connected, &mut explanations);
+            if road_connected && is_consumer_powered(world, entity) {
+                explanations.push("Provides 2 effective jobs and income.".to_string());
+            } else {
+                explanations.push(
+                    "Jobs and income are blocked until road and power requirements are met."
+                        .to_string(),
+                );
+            }
+        }
+        BuildingKind::Industrial => {
+            explain_road_and_power(world, entity, road_connected, &mut explanations);
+            if road_connected && is_consumer_powered(world, entity) {
+                explanations.push("Provides 3 effective jobs and income.".to_string());
+            } else {
+                explanations.push(
+                    "Jobs and income are blocked until road and power requirements are met."
+                        .to_string(),
+                );
+            }
+            if let Some(source) = world.pollution_sources.get(&entity) {
+                explanations.push(format!("Local effect: adds {} pollution.", source.amount));
+            }
+        }
+        BuildingKind::PowerPlant => {
+            if power::is_power_provider_connected(world, entity) {
+                explanations.push("Supplies capacity to adjacent road networks.".to_string());
+            } else {
+                explanations
+                    .push("Power output is blocked because no road is adjacent.".to_string());
+            }
+            if let Some(provider) = world.power_providers.get(&entity) {
+                explanations.push(format!("Provides {} power capacity.", provider.capacity));
+            }
+        }
+        BuildingKind::Park => {
+            if !road_connected {
+                explanations.push("This park is missing an adjacent road.".to_string());
+            }
+            if let Some(effect) = world.happiness_effects.get(&entity) {
+                explanations.push(format!("Local effect: adds +{} happiness.", effect.amount));
+            }
+        }
+    }
+
+    explanations
+}
+
+fn explain_road_and_power(
+    world: &World,
+    entity: crate::core::entity::Entity,
+    road_connected: bool,
+    explanations: &mut Vec<String>,
+) {
+    if !road_connected {
+        explanations.push("Blocked: no orthogonally adjacent road.".to_string());
+        return;
+    }
+
+    if is_consumer_powered(world, entity) {
+        explanations.push("Connected to a powered road network.".to_string());
+    } else if adjacent_powered_road_count(world, entity) > 0
+        && world.stats.power.total_power_shortage > 0
+    {
+        explanations.push("Blocked: connected power network lacks enough capacity.".to_string());
+    } else {
+        explanations.push("Blocked: adjacent road network is not powered.".to_string());
+    }
+}
+
+fn is_consumer_powered(world: &World, entity: crate::core::entity::Entity) -> bool {
+    world
+        .power_consumers
+        .get(&entity)
+        .is_some_and(|consumer| consumer.powered)
+}
+
+fn adjacent_powered_road_count(world: &World, entity: crate::core::entity::Entity) -> usize {
+    let Some(position) = world.positions.get(&entity) else {
+        return 0;
+    };
+    adjacent_coordinates(position.x, position.y)
+        .into_iter()
+        .flatten()
+        .filter(|(x, y)| world.grid.contains(*x, *y) && power::is_powered_road(world, *x, *y))
+        .count()
+}
+
+fn adjacent_coordinates(x: usize, y: usize) -> [Option<(usize, usize)>; 4] {
+    [
+        x.checked_sub(1).map(|left| (left, y)),
+        Some((x.saturating_add(1), y)),
+        y.checked_sub(1).map(|up| (x, up)),
+        Some((x, y.saturating_add(1))),
+    ]
 }
 
 /// Builds a cell view from ECS storage while keeping all World access inside the adapter.

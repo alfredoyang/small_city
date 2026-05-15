@@ -140,3 +140,93 @@ fn inspect_out_of_bounds_formats_without_cell_data() {
     assert_eq!(inspect.details, None);
     assert_eq!(format_inspect(&inspect), "(5, 5) is outside the map");
 }
+
+#[test]
+fn inspect_explains_missing_adjacent_road() {
+    let mut game = Game::new(3, 3);
+    assert!(game.build(1, 1, BuildingKind::Residential).success);
+
+    let inspect = game.inspect(1, 1);
+
+    assert!(
+        inspect
+            .explanations
+            .contains(&"Blocked: no orthogonally adjacent road.".to_string())
+    );
+}
+
+#[test]
+fn inspect_explains_unpowered_road_network() {
+    let mut game = Game::new(4, 4);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+
+    game.tick();
+    let inspect = game.inspect(1, 0);
+
+    assert!(
+        inspect
+            .explanations
+            .contains(&"Blocked: adjacent road network is not powered.".to_string())
+    );
+}
+
+#[test]
+fn inspect_explains_insufficient_power_capacity() {
+    let mut game = Game::new(8, 4);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    for x in 0..6 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+    for x in 1..5 {
+        assert!(game.build(x, 0, BuildingKind::Industrial).success);
+    }
+    assert!(game.build(5, 0, BuildingKind::Commercial).success);
+
+    game.tick();
+    let inspect = game.inspect(4, 0);
+
+    assert!(
+        inspect
+            .explanations
+            .contains(&"Blocked: connected power network lacks enough capacity.".to_string())
+    );
+}
+
+#[test]
+fn inspect_explains_no_available_jobs_for_residential_growth() {
+    let mut game = Game::new(4, 4);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(0, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+
+    game.tick();
+    let inspect = game.inspect(1, 0);
+
+    assert!(
+        inspect
+            .explanations
+            .contains(&"Population growth is blocked because no jobs are available.".to_string())
+    );
+}
+
+#[test]
+fn inspect_explains_local_pollution_and_happiness_effects() {
+    let mut game = Game::new(3, 3);
+    assert!(game.build(0, 0, BuildingKind::Industrial).success);
+    assert!(game.build(1, 0, BuildingKind::Park).success);
+
+    let industrial = game.inspect(0, 0);
+    let park = game.inspect(1, 0);
+
+    assert!(
+        industrial
+            .explanations
+            .contains(&"Local effect: adds 2 pollution.".to_string())
+    );
+    assert!(
+        park.explanations
+            .contains(&"Local effect: adds +3 happiness.".to_string())
+    );
+}

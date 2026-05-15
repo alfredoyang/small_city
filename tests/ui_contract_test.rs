@@ -173,3 +173,11 @@ fn ascii_ui_renders_demand_from_status_view() {
 
     assert!(source.contains("status.demand"));
 }
+
+#[test]
+fn ascii_ui_renders_inspect_explanations_from_inspect_view() {
+    let source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii ui source");
+
+    assert!(source.contains("inspect.explanations"));
+    assert!(source.contains("Inspect Notes:"));
+}
