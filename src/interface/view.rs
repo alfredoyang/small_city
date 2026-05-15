@@ -28,6 +28,7 @@ pub struct CellView {
     pub population: Option<i32>,
     pub max_population: Option<i32>,
     pub powered: Option<bool>,
+    pub power_demand: Option<i32>,
     pub road_connected: Option<bool>,
 }
 
@@ -42,6 +43,15 @@ pub struct CityStatusView {
     pub pollution: i32,
     pub happiness: i32,
     pub demand: CityDemand,
+    pub power: PowerStatusView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PowerStatusView {
+    pub total_capacity: i32,
+    pub total_demand: i32,
+    pub total_supplied: i32,
+    pub total_shortage: i32,
 }
 
 /// Simple zone demand levels derived from current city stats.
@@ -98,23 +108,27 @@ pub enum InspectDetailsView {
     Road,
     Residential {
         powered: bool,
+        power_demand: i32,
         road_connected: bool,
         population: i32,
         max_population: i32,
     },
     Commercial {
         powered: bool,
+        power_demand: i32,
         road_connected: bool,
         jobs: i32,
     },
     Industrial {
         powered: bool,
+        power_demand: i32,
         road_connected: bool,
         jobs: i32,
     },
     PowerPlant {
         road_connected: bool,
-        power_radius: usize,
+        connected_to_road_network: bool,
+        power_capacity: i32,
     },
     Park {
         road_connected: bool,

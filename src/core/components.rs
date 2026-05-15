@@ -21,12 +21,24 @@ pub struct Population {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PowerProvider {
-    pub radius: usize,
+    #[serde(default = "default_power_capacity", alias = "radius")]
+    pub capacity: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PowerConsumer {
+    #[serde(default)]
     pub powered: bool,
+    #[serde(default = "default_power_demand")]
+    pub demand: i32,
+}
+
+fn default_power_capacity() -> i32 {
+    10
+}
+
+fn default_power_demand() -> i32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

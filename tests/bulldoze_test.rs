@@ -50,6 +50,7 @@ fn bulldozing_a_road_can_affect_road_connectivity() {
     let mut game = Game::new(4, 4);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Industrial).success);
+    assert!(game.build(0, 1, BuildingKind::Road).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);
     game.tick();
     assert_eq!(game.view().status.jobs, 3);

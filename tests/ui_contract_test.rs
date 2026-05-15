@@ -28,18 +28,20 @@ fn map_overlays_return_width_times_height_cells() {
 }
 
 #[test]
-fn power_overlay_shows_power_plant_radius() {
+fn power_overlay_shows_powered_road_network() {
     let mut game = Game::new(7, 7);
     assert!(game.build(3, 3, BuildingKind::PowerPlant).success);
+    assert!(game.build(3, 2, BuildingKind::Road).success);
+    assert!(game.build(3, 1, BuildingKind::Road).success);
+    assert!(game.build(3, 0, BuildingKind::Residential).success);
 
     let view = game.view_with_overlay(MapOverlayInput::Power);
     let symbol_at = |x: usize, y: usize| view.map.cells[y * view.map.width + x].symbol;
 
     assert_eq!(symbol_at(3, 3), 'P');
-    assert_eq!(symbol_at(3, 0), '*');
-    assert_eq!(symbol_at(0, 3), '*');
-    assert_eq!(symbol_at(6, 3), '*');
-    assert_eq!(symbol_at(3, 6), '*');
+    assert_eq!(symbol_at(3, 2), '*');
+    assert_eq!(symbol_at(3, 1), '*');
+    assert_eq!(symbol_at(3, 0), '+');
     assert_eq!(symbol_at(0, 0), '.');
 }
 

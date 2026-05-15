@@ -26,19 +26,36 @@ pub(crate) fn build(world: &mut World, x: usize, y: usize, kind: BuildingKind) -
             world
                 .populations
                 .insert(entity, Population { current: 0, max: 5 });
-            world
-                .power_consumers
-                .insert(entity, PowerConsumer { powered: false });
+            world.power_consumers.insert(
+                entity,
+                PowerConsumer {
+                    powered: false,
+                    demand: 1,
+                },
+            );
         }
-        BuildingKind::Commercial | BuildingKind::Industrial => {
-            world
-                .power_consumers
-                .insert(entity, PowerConsumer { powered: false });
+        BuildingKind::Commercial => {
+            world.power_consumers.insert(
+                entity,
+                PowerConsumer {
+                    powered: false,
+                    demand: 2,
+                },
+            );
+        }
+        BuildingKind::Industrial => {
+            world.power_consumers.insert(
+                entity,
+                PowerConsumer {
+                    powered: false,
+                    demand: 3,
+                },
+            );
         }
         BuildingKind::PowerPlant => {
             world
                 .power_providers
-                .insert(entity, PowerProvider { radius: 3 });
+                .insert(entity, PowerProvider { capacity: 10 });
         }
         BuildingKind::Park => {
             world
@@ -120,7 +137,9 @@ fn build_effects(kind: BuildingKind) -> Vec<String> {
             "Provides 3 effective jobs when powered and road-connected".to_string(),
             "Creates 2 pollution".to_string(),
         ],
-        BuildingKind::PowerPlant => vec!["Powers consumers within radius 3".to_string()],
+        BuildingKind::PowerPlant => {
+            vec!["Adds 10 power capacity to adjacent road network".to_string()]
+        }
         BuildingKind::Park => vec!["Adds +3 happiness effect".to_string()],
     }
 }

@@ -33,7 +33,7 @@ fn save_load_roundtrip_restores_city_state_visible_through_game_view() {
         loaded_view.map.cells.len(),
         loaded_view.map.width * loaded_view.map.height
     );
-    assert_eq!(building_count(&loaded), 9);
+    assert_eq!(building_count(&loaded), 10);
     assert_eq!(loaded_view.status.population, 3);
     assert_eq!(loaded_view.status.pollution, 1);
     assert_eq!(loaded_view.status.happiness, 52);
@@ -131,6 +131,7 @@ fn full_city_game() -> Game {
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
     assert!(game.build(3, 0, BuildingKind::Industrial).success);
     assert!(game.build(4, 0, BuildingKind::Park).success);
+    assert!(game.build(0, 1, BuildingKind::Road).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);
     assert!(game.build(2, 1, BuildingKind::Road).success);
     assert!(game.build(3, 1, BuildingKind::Road).success);

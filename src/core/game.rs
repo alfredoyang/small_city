@@ -74,9 +74,7 @@ impl Game {
     pub fn build(&mut self, x: usize, y: usize, kind: BuildingKind) -> CommandResult {
         let result = build::build(&mut self.world, x, y, kind);
         // Build changes can affect derived city stats immediately, before the next turn.
-        stats::refresh_population_and_jobs(&mut self.world);
-        pollution::run(&mut self.world);
-        happiness::run(&mut self.world);
+        self.refresh_derived_state();
         result
     }
 

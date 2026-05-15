@@ -77,13 +77,13 @@ Power overlay symbols:
 
 ```text
 P power plant
-* inside power plant radius
+* powered road network
 + powered consumer
 - unpowered consumer
 . no power overlay data
 ```
 
-Status panels show turn, money, population, jobs, happiness, pollution, zone demand, current build tool and cost, current overlay, selected cell details, build preview explanations, and the latest command message.
+Status panels show turn, money, population, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, selected cell details, build preview explanations, and the latest command message.
 
 ## Save And Load
 
@@ -120,24 +120,31 @@ Tests cover core simulation rules, road connectivity, demand, bulldoze, build pr
 - Fixed-size grid with one entity per occupied cell.
 - Buildable road, residential, commercial, industrial, power plant, and park cells.
 - Building costs and money tracking.
-- Power plant radius using Manhattan distance.
-- Road connectivity requirement for residential growth and effective jobs.
-- Population growth when residential buildings are powered, road-connected, and jobs are available.
-- Commercial and industrial effective job counts and income when powered and road-connected.
-- Industrial pollution and park happiness effects.
-- Basic residential, commercial, and industrial demand levels.
 - Deterministic tick order and structured tick summary events.
+- Inspect output with building-specific details.
+
+## Current v0.2 Scope
+
 - Cursor-based ASCII UI using only `Game` and view models.
+- UI-local cursor, selected build tool, and current overlay state.
 - Bulldoze support with component cleanup and derived-state refresh.
 - Build preview explanations for selected cursor cell and build tool.
 - Prompted save/load filenames with default `city1`.
-- Inspect output with building-specific details.
+- Road connectivity requirement for residential growth and effective jobs.
+- Network-based power: roads form networks, power plants supply adjacent networks, and buildings draw power from adjacent powered roads.
+- Limited power capacity and consumer demand: power plants provide 10 capacity, residential uses 1, commercial uses 2, and industrial uses 3.
+- Deterministic power shortage handling by map position, y first then x.
+- Power status totals for capacity, demand, supplied power, and shortage.
+- Population growth only when residential buildings are powered, road-connected, and jobs are available.
+- Commercial and industrial effective job counts and income only when powered and road-connected.
+- Industrial pollution and park happiness effects.
+- Basic residential, commercial, and industrial demand levels.
 - Basic map overlays for normal, power, pollution, and population views.
 
-## Proposed v0.22 Roadmap
+## Proposed v0.2 Roadmap
 
-- Add richer overlay legends and demand explanations.
-- Add richer inspect details for nearby power coverage, road blockers, and local effects.
+- Add richer overlay legends and demand explanations in the ASCII UI.
+- Add richer inspect details for road blockers and local effects.
 - Add stronger demand-driven growth behavior.
 - Add replace/upgrade commands.
 - Add per-building maintenance costs and stronger economy balancing.

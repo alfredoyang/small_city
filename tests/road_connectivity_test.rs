@@ -21,8 +21,9 @@ fn residential_with_adjacent_road_grows() {
     let mut game = Game::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Road).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
     assert!(game.build(2, 0, BuildingKind::Residential).success);
-    assert!(game.build(1, 1, BuildingKind::Industrial).success);
+    assert!(game.build(2, 1, BuildingKind::Industrial).success);
 
     game.tick();
 
@@ -54,6 +55,8 @@ fn industrial_with_road_provides_effective_jobs() {
     let mut game = Game::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Industrial).success);
+    assert!(game.build(0, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
     assert!(game.build(2, 0, BuildingKind::Road).success);
 
     game.tick();

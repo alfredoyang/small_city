@@ -227,6 +227,14 @@ fn render_status(stdout: &mut impl Write, view: &GameView) -> io::Result<()> {
         demand_label(status.demand.residential),
         demand_label(status.demand.commercial),
         demand_label(status.demand.industrial)
+    )?;
+    writeln!(
+        stdout,
+        "Power: {}/{} supplied | Demand: {} | Shortage: {}",
+        status.power.total_supplied,
+        status.power.total_capacity,
+        status.power.total_demand,
+        status.power.total_shortage
     )
 }
 
@@ -362,51 +370,59 @@ pub fn format_inspect(inspect: &InspectView) -> String {
         InspectDetailsView::Road => format!("({}, {}) Road", inspect.x, inspect.y),
         InspectDetailsView::Residential {
             powered,
+            power_demand,
             road_connected,
             population,
             max_population,
         } => format!(
-            "({}, {}) Residential | Powered: {} | Road: {} | Population: {}/{}",
+            "({}, {}) Residential | Powered: {} | Demand: {} | Road: {} | Population: {}/{}",
             inspect.x,
             inspect.y,
             yes_no(*powered),
+            power_demand,
             yes_no(*road_connected),
             population,
             max_population
         ),
         InspectDetailsView::Commercial {
             powered,
+            power_demand,
             road_connected,
             jobs,
         } => format!(
-            "({}, {}) Commercial | Powered: {} | Road: {} | Jobs: {}",
+            "({}, {}) Commercial | Powered: {} | Demand: {} | Road: {} | Jobs: {}",
             inspect.x,
             inspect.y,
             yes_no(*powered),
+            power_demand,
             yes_no(*road_connected),
             jobs
         ),
         InspectDetailsView::Industrial {
             powered,
+            power_demand,
             road_connected,
             jobs,
         } => format!(
-            "({}, {}) Industrial | Powered: {} | Road: {} | Jobs: {}",
+            "({}, {}) Industrial | Powered: {} | Demand: {} | Road: {} | Jobs: {}",
             inspect.x,
             inspect.y,
             yes_no(*powered),
+            power_demand,
             yes_no(*road_connected),
             jobs
         ),
         InspectDetailsView::PowerPlant {
             road_connected,
-            power_radius,
+            connected_to_road_network,
+            power_capacity,
         } => format!(
-            "({}, {}) Power Plant | Road: {} | Power Radius: {}",
+            "({}, {}) Power Plant | Road: {} | Network: {} | Capacity: {}",
             inspect.x,
             inspect.y,
             yes_no(*road_connected),
-            power_radius
+            yes_no(*connected_to_road_network),
+            power_capacity
         ),
         InspectDetailsView::Park {
             road_connected,

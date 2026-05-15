@@ -1,9 +1,9 @@
-use crate::core::systems::road_connectivity;
+use crate::core::systems::{power, road_connectivity};
 use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
     BuildOptionView, CellView, CityDemand, CityStatusView, DemandLevel, GameView,
-    InspectDetailsView, InspectView, MapView,
+    InspectDetailsView, InspectView, MapView, PowerStatusView,
 };
 
 /// Converts the private ECS World into the only render model the UI may consume.
@@ -41,6 +41,12 @@ pub(crate) fn view_world_with_overlay(world: &World, overlay: MapOverlayInput) -
                 world.stats.pollution,
                 world.stats.happiness,
             ),
+            power: PowerStatusView {
+                total_capacity: world.stats.power.total_power_capacity,
+                total_demand: world.stats.power.total_power_demand,
+                total_supplied: world.stats.power.total_power_supplied,
+                total_shortage: world.stats.power.total_power_shortage,
+            },
         },
         build_options: [
             BuildingKind::Road,
@@ -120,12 +126,10 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
         BuildingKind::Road => InspectDetailsView::Road,
         BuildingKind::Residential => {
             let population = world.populations.get(&entity);
+            let consumer = world.power_consumers.get(&entity);
             InspectDetailsView::Residential {
-                powered: world
-                    .power_consumers
-                    .get(&entity)
-                    .map(|consumer| consumer.powered)
-                    .unwrap_or(false),
+                powered: consumer.map(|consumer| consumer.powered).unwrap_or(false),
+                power_demand: consumer.map(|consumer| consumer.demand).unwrap_or(0),
                 road_connected: road_connectivity::is_road_connected(world, entity),
                 population: population.map(|population| population.current).unwrap_or(0),
                 max_population: population.map(|population| population.max).unwrap_or(0),
@@ -137,6 +141,11 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 .get(&entity)
                 .map(|consumer| consumer.powered)
                 .unwrap_or(false),
+            power_demand: world
+                .power_consumers
+                .get(&entity)
+                .map(|consumer| consumer.demand)
+                .unwrap_or(0),
             road_connected: road_connectivity::is_road_connected(world, entity),
             jobs: effective_jobs(world, entity, building.kind),
         },
@@ -146,15 +155,21 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 .get(&entity)
                 .map(|consumer| consumer.powered)
                 .unwrap_or(false),
+            power_demand: world
+                .power_consumers
+                .get(&entity)
+                .map(|consumer| consumer.demand)
+                .unwrap_or(0),
             road_connected: road_connectivity::is_road_connected(world, entity),
             jobs: effective_jobs(world, entity, building.kind),
         },
         BuildingKind::PowerPlant => InspectDetailsView::PowerPlant {
             road_connected: road_connectivity::is_road_connected(world, entity),
-            power_radius: world
+            connected_to_road_network: power::is_power_provider_connected(world, entity),
+            power_capacity: world
                 .power_providers
                 .get(&entity)
-                .map(|provider| provider.radius)
+                .map(|provider| provider.capacity)
                 .unwrap_or(0),
         },
         BuildingKind::Park => InspectDetailsView::Park {
@@ -185,6 +200,7 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
             population: None,
             max_population: None,
             powered: None,
+            power_demand: None,
             road_connected: None,
         };
     };
@@ -195,6 +211,10 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
         .power_consumers
         .get(&entity)
         .map(|consumer| consumer.powered);
+    let power_demand = world
+        .power_consumers
+        .get(&entity)
+        .map(|consumer| consumer.demand);
     let normal_symbol = building.map_or('?', BuildingKind::symbol);
 
     CellView {
@@ -207,6 +227,7 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
         population: population.map(|population| population.current),
         max_population: population.map(|population| population.max),
         powered,
+        power_demand,
         road_connected: building.and_then(|kind| {
             (kind != BuildingKind::Road)
                 .then(|| road_connectivity::is_road_connected(world, entity))
@@ -239,12 +260,18 @@ fn overlay_symbol(
         MapOverlayInput::Power => {
             if world.power_providers.contains_key(&entity) {
                 'P'
+            } else if normal_symbol == '=' {
+                if power::is_powered_road(world, x, y) {
+                    '*'
+                } else {
+                    '='
+                }
             } else {
                 world
                     .power_consumers
                     .get(&entity)
                     .map(|consumer| if consumer.powered { '+' } else { '-' })
-                    .unwrap_or_else(|| power_coverage_symbol(world, x, y))
+                    .unwrap_or('.')
             }
         }
         MapOverlayInput::Pollution => world
@@ -262,25 +289,15 @@ fn overlay_symbol(
 
 fn empty_symbol(world: &World, x: usize, y: usize, overlay: MapOverlayInput) -> char {
     match overlay {
-        MapOverlayInput::Power => power_coverage_symbol(world, x, y),
+        MapOverlayInput::Power => {
+            if power::is_powered_road(world, x, y) {
+                '*'
+            } else {
+                '.'
+            }
+        }
         _ => '.',
     }
-}
-
-fn power_coverage_symbol(world: &World, x: usize, y: usize) -> char {
-    if is_power_covered(world, x, y) {
-        '*'
-    } else {
-        '.'
-    }
-}
-
-fn is_power_covered(world: &World, x: usize, y: usize) -> bool {
-    world.power_providers.iter().any(|(entity, provider)| {
-        world.positions.get(entity).is_some_and(|position| {
-            x.abs_diff(position.x) + y.abs_diff(position.y) <= provider.radius
-        })
-    })
 }
 
 fn digit_symbol(value: i32) -> char {
