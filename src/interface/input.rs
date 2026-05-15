@@ -42,6 +42,16 @@ impl BuildingKind {
         }
     }
 
+    /// Cost to upgrade one existing building of this type, if upgrades are supported.
+    pub fn upgrade_cost(self) -> Option<i32> {
+        match self {
+            Self::Residential => Some(10),
+            Self::PowerPlant => Some(15),
+            Self::Park => Some(8),
+            Self::Road | Self::Commercial | Self::Industrial => None,
+        }
+    }
+
     /// Jobs contributed to city statistics by workplace buildings.
     pub fn jobs(self) -> i32 {
         match self {

@@ -1,3 +1,4 @@
+use crate::core::systems::entity_cleanup;
 use crate::core::world::World;
 use crate::interface::events::{CommandResult, GameEventView};
 
@@ -23,14 +24,7 @@ pub(crate) fn bulldoze(world: &mut World, x: usize, y: usize) -> CommandResult {
     }
 
     world.resources.money -= BULLDOZE_COST;
-    world.grid.clear(x, y);
-    world.positions.remove(&entity);
-    world.buildings.remove(&entity);
-    world.populations.remove(&entity);
-    world.power_providers.remove(&entity);
-    world.power_consumers.remove(&entity);
-    world.pollution_sources.remove(&entity);
-    world.happiness_effects.remove(&entity);
+    entity_cleanup::remove_entity(world, entity, x, y);
 
     CommandResult::success(GameEventView::BuildingBulldozed { x, y })
 }

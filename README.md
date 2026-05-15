@@ -10,16 +10,16 @@ The project is split into three layers:
 - `interface`: UI-safe input types, events, view models, and adapters from ECS state to renderable data.
 - `ui`: cursor-based ASCII terminal UI.
 
-The main public API is `Game`, which owns the private ECS `World` and exposes operations such as `build`, `preview_build`, `bulldoze`, `tick`, `inspect`, `view`, `view_with_overlay`, `save_to_file`, and `load_from_file`.
+The main public API is `Game`, which owns the private ECS `World` and exposes operations such as `build`, `preview_build`, `replace`, `upgrade`, `bulldoze`, `tick`, `inspect`, `view`, `view_with_overlay`, `save_to_file`, and `load_from_file`.
 
 ## ECS Core
 
 The ECS is intentionally small:
 
 - `Entity`: stable ID for things placed in the city.
-- `Components`: plain data such as `Position`, `Building`, `Population`, `PowerProvider`, `PowerConsumer`, `PollutionSource`, and `HappinessEffect`.
+- `Components`: plain data such as `Position`, `Building` with level, `Population`, `PowerProvider`, `PowerConsumer`, `PollutionSource`, and `HappinessEffect`.
 - `World`: private storage for entities, components, grid, resources, and city stats.
-- `Systems`: deterministic functions that operate on `World`, including build, bulldoze, power, road connectivity, stats, population, economy, pollution, and happiness.
+- `Systems`: deterministic functions that operate on `World`, including build, replace, upgrade, bulldoze, power, road connectivity, stats, population, economy, pollution, and happiness.
 - `Grid`: stores entity IDs for occupied map cells.
 - `Resources`: global city state such as money, turn, population, jobs, pollution, unemployment, and happiness.
 
@@ -50,6 +50,8 @@ W/A/S/D or Arrow Keys  move cursor
 5                       select Power Plant
 6                       select Park
 B or Enter              build selected type at cursor
+R                       replace selected cell with selected build type
+U                       upgrade selected cell
 X                       bulldoze selected cell
 I                       inspect selected cell
 N                       next turn
@@ -128,6 +130,8 @@ Tests cover core simulation rules, road connectivity, demand, bulldoze, build pr
 - Cursor-based ASCII UI using only `Game` and view models.
 - UI-local cursor, selected build tool, and current overlay state.
 - Bulldoze support with component cleanup and derived-state refresh.
+- Replace support for swapping an occupied cell to the selected build type.
+- Upgrade support for residential, power plant, and park cells.
 - Build preview explanations for selected cursor cell and build tool.
 - Prompted save/load filenames with default `city1`.
 - Road connectivity requirement for residential growth and effective jobs.
@@ -143,8 +147,9 @@ Tests cover core simulation rules, road connectivity, demand, bulldoze, build pr
 - Basic map overlays for normal, power, pollution, and population views.
 - In-game overlay legends and short demand explanations in the ASCII UI.
 - Inspect notes explain blockers and local effects such as missing roads, unpowered networks, power shortage, no available jobs, pollution, and happiness.
+- Building levels start at 1 and currently max at 2.
+- Upgrade effects at level 2: residential max population increases from 5 to 8, power plant capacity increases from 10 to 15, and park happiness effect increases from +3 to +5.
 
 ## Proposed v0.2 Roadmap
 
-- Add replace/upgrade commands.
 - Add more scenario-style integration tests for longer simulations.

@@ -1,9 +1,12 @@
 pub mod build;
 pub mod bulldoze;
 pub mod economy;
+pub mod entity_cleanup;
 pub mod happiness;
 pub mod pollution;
 pub mod population;
 pub mod power;
+pub mod replace;
 pub mod road_connectivity;
 pub mod stats;
+pub mod upgrade;

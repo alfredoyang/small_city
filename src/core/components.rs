@@ -11,6 +11,13 @@ pub struct Position {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Building {
     pub kind: BuildingKind,
+    /// Player-facing building level. New buildings start at level 1; missing save data is treated as level 1.
+    #[serde(default = "default_building_level")]
+    pub level: u8,
+}
+
+fn default_building_level() -> u8 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

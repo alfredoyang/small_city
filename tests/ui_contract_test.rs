@@ -161,6 +161,20 @@ fn ascii_ui_save_load_uses_game_api_only() {
 }
 
 #[test]
+fn ascii_ui_replace_and_upgrade_use_game_api_only() {
+    let source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii ui source");
+
+    assert!(source.contains(".replace("));
+    assert!(source.contains("game.upgrade"));
+    for forbidden in ["crate::core::world", "crate::core::components", "world."] {
+        assert!(
+            !source.contains(forbidden),
+            "ASCII UI replace/upgrade must not use {forbidden} directly"
+        );
+    }
+}
+
+#[test]
 fn ascii_ui_renders_command_result_events() {
     let source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii ui source");
 

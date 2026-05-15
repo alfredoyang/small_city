@@ -18,7 +18,7 @@ pub(crate) fn build(world: &mut World, x: usize, y: usize, kind: BuildingKind) -
     world.resources.money -= cost;
     world.grid.set(x, y, entity);
     world.positions.insert(entity, Position { x, y });
-    world.buildings.insert(entity, Building { kind });
+    world.buildings.insert(entity, Building { kind, level: 1 });
 
     // Attach only the components that make this building participate in later systems.
     match kind {

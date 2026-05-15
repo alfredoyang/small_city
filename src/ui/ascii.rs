@@ -64,6 +64,8 @@ enum UiAction {
     MoveRight,
     SelectBuild(BuildingKind),
     Build,
+    Replace,
+    Upgrade,
     Bulldoze,
     Inspect,
     NextTurn,
@@ -101,6 +103,14 @@ pub fn run() -> io::Result<()> {
                 message = game
                     .build(state.cursor_x, state.cursor_y, state.selected_build)
                     .message();
+            }
+            UiAction::Replace => {
+                message = game
+                    .replace(state.cursor_x, state.cursor_y, state.selected_build)
+                    .message();
+            }
+            UiAction::Upgrade => {
+                message = game.upgrade(state.cursor_x, state.cursor_y).message();
             }
             UiAction::Bulldoze => {
                 message = game.bulldoze(state.cursor_x, state.cursor_y).message();
@@ -294,7 +304,11 @@ fn render_controls(stdout: &mut impl Write) -> io::Result<()> {
     writeln!(stdout, "B / Enter = Build selected type")?;
     writeln!(
         stdout,
-        "X = Bulldoze | I = Inspect | N = Next turn | V = Change overlay | S = Save | L = Load | Q = Quit"
+        "R = Replace with selected type | U = Upgrade | X = Bulldoze"
+    )?;
+    writeln!(
+        stdout,
+        "I = Inspect | N = Next turn | V = Change overlay | S = Save | L = Load | Q = Quit"
     )?;
     writeln!(
         stdout,
@@ -405,6 +419,8 @@ fn parse_key_sequence(bytes: &[u8]) -> UiAction {
         [b'5'] => UiAction::SelectBuild(BuildingKind::PowerPlant),
         [b'6'] => UiAction::SelectBuild(BuildingKind::Park),
         [b'b'] | [b'B'] | [b'\r'] | [b'\n'] => UiAction::Build,
+        [b'r'] | [b'R'] => UiAction::Replace,
+        [b'u'] | [b'U'] => UiAction::Upgrade,
         [b'x'] | [b'X'] => UiAction::Bulldoze,
         [b'i'] | [b'I'] => UiAction::Inspect,
         [b'n'] | [b'N'] => UiAction::NextTurn,
@@ -435,15 +451,17 @@ pub fn format_inspect(inspect: &InspectView) -> String {
             powered,
             power_demand,
             road_connected,
+            upgrade_level,
             population,
             max_population,
         } => format!(
-            "({}, {}) Residential | Powered: {} | Demand: {} | Road: {} | Population: {}/{}",
+            "({}, {}) Residential | Powered: {} | Demand: {} | Road: {} | Level: {} | Population: {}/{}",
             inspect.x,
             inspect.y,
             yes_no(*powered),
             power_demand,
             yes_no(*road_connected),
+            upgrade_level,
             population,
             max_population
         ),
@@ -478,23 +496,27 @@ pub fn format_inspect(inspect: &InspectView) -> String {
         InspectDetailsView::PowerPlant {
             road_connected,
             connected_to_road_network,
+            upgrade_level,
             power_capacity,
         } => format!(
-            "({}, {}) Power Plant | Road: {} | Network: {} | Capacity: {}",
+            "({}, {}) Power Plant | Road: {} | Network: {} | Level: {} | Capacity: {}",
             inspect.x,
             inspect.y,
             yes_no(*road_connected),
             yes_no(*connected_to_road_network),
+            upgrade_level,
             power_capacity
         ),
         InspectDetailsView::Park {
             road_connected,
+            upgrade_level,
             happiness_effect,
         } => format!(
-            "({}, {}) Park | Road: {} | Happiness: +{}",
+            "({}, {}) Park | Road: {} | Level: {} | Happiness: +{}",
             inspect.x,
             inspect.y,
             yes_no(*road_connected),
+            upgrade_level,
             happiness_effect
         ),
         InspectDetailsView::Unknown => format!("({}, {}) Unknown", inspect.x, inspect.y),
@@ -592,6 +614,8 @@ mod tests {
         );
         assert_eq!(parse_key_sequence(b"b"), UiAction::Build);
         assert_eq!(parse_key_sequence(b"\n"), UiAction::Build);
+        assert_eq!(parse_key_sequence(b"r"), UiAction::Replace);
+        assert_eq!(parse_key_sequence(b"u"), UiAction::Upgrade);
         assert_eq!(parse_key_sequence(b"x"), UiAction::Bulldoze);
         assert_eq!(parse_key_sequence(b"n"), UiAction::NextTurn);
         assert_eq!(parse_key_sequence(b"v"), UiAction::CycleOverlay);

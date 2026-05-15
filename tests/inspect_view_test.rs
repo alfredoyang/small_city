@@ -35,13 +35,14 @@ fn inspect_residential_shows_powered_state_and_population() {
             powered: true,
             power_demand: 1,
             road_connected: true,
+            upgrade_level: 1,
             population: 0,
             max_population: 5
         })
     );
     assert_eq!(
         format_inspect(&inspect),
-        "(1, 0) Residential | Powered: Yes | Demand: 1 | Road: Yes | Population: 0/5"
+        "(1, 0) Residential | Powered: Yes | Demand: 1 | Road: Yes | Level: 1 | Population: 0/5"
     );
 }
 
@@ -112,6 +113,7 @@ fn inspect_power_plant_and_park_show_special_effects() {
         Some(InspectDetailsView::PowerPlant {
             road_connected: false,
             connected_to_road_network: false,
+            upgrade_level: 1,
             power_capacity: 10
         })
     );
@@ -119,16 +121,17 @@ fn inspect_power_plant_and_park_show_special_effects() {
         park.details,
         Some(InspectDetailsView::Park {
             road_connected: false,
+            upgrade_level: 1,
             happiness_effect: 3
         })
     );
     assert_eq!(
         format_inspect(&power_plant),
-        "(0, 0) Power Plant | Road: No | Network: No | Capacity: 10"
+        "(0, 0) Power Plant | Road: No | Network: No | Level: 1 | Capacity: 10"
     );
     assert_eq!(
         format_inspect(&park),
-        "(1, 0) Park | Road: No | Happiness: +3"
+        "(1, 0) Park | Road: No | Level: 1 | Happiness: +3"
     );
 }
 

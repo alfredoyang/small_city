@@ -63,6 +63,14 @@ impl GameEventView {
                 format!("Bulldozed building at ({x}, {y})")
             }
             GameEventView::BulldozeFailed { reason } => reason.clone(),
+            GameEventView::BuildingReplaced { x, y, kind } => {
+                format!("Replaced building at ({x}, {y}) with {}", kind.label())
+            }
+            GameEventView::ReplaceFailed { reason } => reason.clone(),
+            GameEventView::BuildingUpgraded { x, y, kind, level } => {
+                format!("Upgraded {} at ({x}, {y}) to level {level}", kind.label())
+            }
+            GameEventView::UpgradeFailed { reason } => reason.clone(),
             GameEventView::TurnAdvanced { turn } => format!("Advanced to turn {turn}"),
             GameEventView::TickSummary {
                 turn,
@@ -107,6 +115,23 @@ pub enum GameEventView {
         y: usize,
     },
     BulldozeFailed {
+        reason: String,
+    },
+    BuildingReplaced {
+        x: usize,
+        y: usize,
+        kind: BuildingKind,
+    },
+    ReplaceFailed {
+        reason: String,
+    },
+    BuildingUpgraded {
+        x: usize,
+        y: usize,
+        kind: BuildingKind,
+        level: u8,
+    },
+    UpgradeFailed {
         reason: String,
     },
     TurnAdvanced {

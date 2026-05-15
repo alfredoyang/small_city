@@ -135,6 +135,7 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 powered: consumer.map(|consumer| consumer.powered).unwrap_or(false),
                 power_demand: consumer.map(|consumer| consumer.demand).unwrap_or(0),
                 road_connected: road_connectivity::is_road_connected(world, entity),
+                upgrade_level: building.level,
                 population: population.map(|population| population.current).unwrap_or(0),
                 max_population: population.map(|population| population.max).unwrap_or(0),
             }
@@ -170,6 +171,7 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
         BuildingKind::PowerPlant => InspectDetailsView::PowerPlant {
             road_connected: road_connectivity::is_road_connected(world, entity),
             connected_to_road_network: power::is_power_provider_connected(world, entity),
+            upgrade_level: building.level,
             power_capacity: world
                 .power_providers
                 .get(&entity)
@@ -178,6 +180,7 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
         },
         BuildingKind::Park => InspectDetailsView::Park {
             road_connected: road_connectivity::is_road_connected(world, entity),
+            upgrade_level: building.level,
             happiness_effect: world
                 .happiness_effects
                 .get(&entity)
@@ -277,6 +280,13 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
         }
     }
 
+    let level = building.level;
+    if level > 0 {
+        explanations.push(format!("Upgrade level: {level}."));
+    } else if let Some(cost) = building.kind.upgrade_cost() {
+        explanations.push(format!("Can be upgraded for {cost}."));
+    }
+
     explanations
 }
 
@@ -348,6 +358,7 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
             powered: None,
             power_demand: None,
             road_connected: None,
+            upgrade_level: None,
         };
     };
 
@@ -362,6 +373,7 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
         .get(&entity)
         .map(|consumer| consumer.demand);
     let normal_symbol = building.map_or('?', BuildingKind::symbol);
+    let upgrade_level = building.map_or(0, |building| building_level(world, entity, building));
 
     CellView {
         x,
@@ -378,7 +390,17 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
             (kind != BuildingKind::Road)
                 .then(|| road_connectivity::is_road_connected(world, entity))
         }),
+        upgrade_level: (upgrade_level > 0).then_some(upgrade_level),
     }
+}
+
+fn building_level(world: &World, entity: crate::core::entity::Entity, kind: BuildingKind) -> u8 {
+    world
+        .buildings
+        .get(&entity)
+        .filter(|building| building.kind == kind)
+        .map(|building| building.level)
+        .unwrap_or(0)
 }
 
 fn effective_jobs(world: &World, entity: crate::core::entity::Entity, kind: BuildingKind) -> i32 {
