@@ -34,7 +34,7 @@ fn save_load_roundtrip_restores_city_state_visible_through_game_view() {
         loaded_view.map.width * loaded_view.map.height
     );
     assert_eq!(building_count(&loaded), 10);
-    assert_eq!(loaded_view.status.population, 3);
+    assert_eq!(loaded_view.status.population, 5);
     assert_eq!(loaded_view.status.pollution, 1);
     assert_eq!(loaded_view.status.happiness, 52);
 
@@ -48,7 +48,7 @@ fn save_load_roundtrip_restores_city_state_visible_through_game_view() {
     let park = loaded.inspect(4, 0).cell.expect("park cell");
 
     assert_eq!(residential.building, Some(BuildingKind::Residential));
-    assert_eq!(residential.population, Some(3));
+    assert_eq!(residential.population, Some(5));
     assert_eq!(residential.powered, Some(true));
     assert_eq!(residential.road_connected, Some(true));
     assert_eq!(commercial.building, Some(BuildingKind::Commercial));

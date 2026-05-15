@@ -135,7 +135,7 @@ Tests cover core simulation rules, road connectivity, demand, bulldoze, build pr
 - Limited power capacity and consumer demand: power plants provide 10 capacity, residential uses 1, commercial uses 2, and industrial uses 3.
 - Deterministic power shortage handling by map position, y first then x.
 - Power status totals for capacity, demand, supplied power, and shortage.
-- Population growth only when residential buildings are powered, road-connected, and jobs are available.
+- Population growth only when residential buildings are powered, road-connected, and jobs are available; high residential demand can grow by 2 population per tick, medium demand grows by 1, and low demand does not grow.
 - Commercial and industrial effective job counts and income only when powered and road-connected.
 - Ongoing economy balance: commercial, industrial, power plant, and park buildings each cost 1 maintenance per turn; roads and residential buildings have no upkeep.
 - Industrial pollution and park happiness effects.
@@ -146,6 +146,5 @@ Tests cover core simulation rules, road connectivity, demand, bulldoze, build pr
 
 ## Proposed v0.2 Roadmap
 
-- Add stronger demand-driven growth behavior.
 - Add replace/upgrade commands.
 - Add more scenario-style integration tests for longer simulations.

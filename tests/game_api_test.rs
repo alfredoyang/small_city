@@ -67,11 +67,11 @@ fn tick_returns_structured_summary_events() {
             turn: 1,
             population: MetricChange {
                 before: 0,
-                after: 1
+                after: 2
             },
             money: MetricChange {
                 before: 47,
-                after: 49
+                after: 50
             },
             happiness: MetricChange {
                 before: 52,

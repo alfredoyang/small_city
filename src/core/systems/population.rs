@@ -27,9 +27,35 @@ pub(crate) fn run(world: &mut World) {
         let Some(population) = world.populations.get_mut(&entity) else {
             continue;
         };
-        if population.current < population.max {
-            population.current += 1;
-            available_jobs -= 1;
+        let growth = residential_growth_per_tick(available_jobs, world.stats.happiness)
+            .min(population.max - population.current)
+            .min(available_jobs);
+        if growth > 0 {
+            population.current += growth;
+            available_jobs -= growth;
         }
+    }
+}
+
+fn residential_growth_per_tick(available_jobs: i32, happiness: i32) -> i32 {
+    if available_jobs >= 3 && happiness >= 50 {
+        2
+    } else if available_jobs > 0 && happiness >= 35 {
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::residential_growth_per_tick;
+
+    #[test]
+    fn residential_growth_rate_follows_demand_thresholds() {
+        assert_eq!(residential_growth_per_tick(3, 50), 2);
+        assert_eq!(residential_growth_per_tick(1, 35), 1);
+        assert_eq!(residential_growth_per_tick(3, 34), 0);
+        assert_eq!(residential_growth_per_tick(0, 80), 0);
     }
 }
