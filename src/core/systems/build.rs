@@ -17,16 +17,14 @@ pub(crate) fn build(world: &mut World, x: usize, y: usize, kind: BuildingKind) -
     let entity = world.spawn();
     world.resources.money -= cost;
     world.grid.set(x, y, entity);
-    world.positions.insert(entity, Position { x, y });
-    world.buildings.insert(entity, Building { kind, level: 1 });
+    world.attach_position(entity, Position { x, y });
+    world.attach_building(entity, Building { kind, level: 1 });
 
     // Attach only the components that make this building participate in later systems.
     match kind {
         BuildingKind::Residential => {
-            world
-                .populations
-                .insert(entity, Population { current: 0, max: 5 });
-            world.power_consumers.insert(
+            world.attach_population(entity, Population { current: 0, max: 5 });
+            world.attach_power_consumer(
                 entity,
                 PowerConsumer {
                     powered: false,
@@ -35,7 +33,7 @@ pub(crate) fn build(world: &mut World, x: usize, y: usize, kind: BuildingKind) -
             );
         }
         BuildingKind::Commercial => {
-            world.power_consumers.insert(
+            world.attach_power_consumer(
                 entity,
                 PowerConsumer {
                     powered: false,
@@ -44,7 +42,7 @@ pub(crate) fn build(world: &mut World, x: usize, y: usize, kind: BuildingKind) -
             );
         }
         BuildingKind::Industrial => {
-            world.power_consumers.insert(
+            world.attach_power_consumer(
                 entity,
                 PowerConsumer {
                     powered: false,
@@ -53,23 +51,17 @@ pub(crate) fn build(world: &mut World, x: usize, y: usize, kind: BuildingKind) -
             );
         }
         BuildingKind::PowerPlant => {
-            world
-                .power_providers
-                .insert(entity, PowerProvider { capacity: 10 });
+            world.attach_power_provider(entity, PowerProvider { capacity: 10 });
         }
         BuildingKind::Park => {
-            world
-                .happiness_effects
-                .insert(entity, HappinessEffect { amount: 3 });
+            world.attach_happiness_effect(entity, HappinessEffect { amount: 3 });
         }
         BuildingKind::Road => {}
     }
 
     // Industrial buildings affect pollution but do not need a separate behavior component.
     if kind == BuildingKind::Industrial {
-        world
-            .pollution_sources
-            .insert(entity, PollutionSource { amount: 2 });
+        world.attach_pollution_source(entity, PollutionSource { amount: 2 });
     }
 
     CommandResult::success(GameEventView::Built { x, y, kind })

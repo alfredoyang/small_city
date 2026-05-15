@@ -152,6 +152,7 @@ impl Game {
         let mut game = Self {
             world: serde_json::from_reader(file)?,
         };
+        game.world.rebuild_entity_records();
         game.refresh_derived_state();
         Ok(game)
     }

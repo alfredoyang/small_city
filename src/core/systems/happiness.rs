@@ -26,8 +26,7 @@ mod tests {
 
         let mut high = World::new(1, 1);
         let entity = high.spawn();
-        high.happiness_effects
-            .insert(entity, HappinessEffect { amount: 90 });
+        high.attach_happiness_effect(entity, HappinessEffect { amount: 90 });
         happiness::run(&mut high);
         assert_eq!(high.stats.happiness, 100);
     }
