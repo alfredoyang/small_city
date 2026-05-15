@@ -7,7 +7,7 @@ use crate::core::systems::{
 };
 use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
-use crate::interface::events::{CommandResult, GameEventView, MetricChange};
+use crate::interface::events::{CommandResult, EconomyBreakdownView, GameEventView, MetricChange};
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{BuildPreviewView, GameView, InspectView};
 
@@ -116,7 +116,7 @@ impl Game {
         power::run(&mut self.world);
         stats::run(&mut self.world);
         population::run(&mut self.world);
-        economy::run(&mut self.world);
+        let economy = economy::run(&mut self.world);
         stats::refresh_population_and_jobs(&mut self.world);
         pollution::run(&mut self.world);
         happiness::run(&mut self.world);
@@ -131,6 +131,13 @@ impl Game {
             pollution: metric_change(before.pollution, after.pollution),
             unemployment: metric_change(before.unemployment, after.unemployment),
             powered_buildings: metric_change(before.powered_buildings, after.powered_buildings),
+            economy: EconomyBreakdownView {
+                population_income: economy.population_income,
+                commercial_income: economy.commercial_income,
+                industrial_income: economy.industrial_income,
+                maintenance_cost: economy.maintenance_cost,
+                net: economy.net,
+            },
         })
     }
 

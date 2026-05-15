@@ -1,5 +1,5 @@
 use small_city::core::game::Game;
-use small_city::interface::events::{GameEventView, MetricChange};
+use small_city::interface::events::{EconomyBreakdownView, GameEventView, MetricChange};
 use small_city::interface::input::BuildingKind;
 
 #[test]
@@ -89,6 +89,13 @@ fn tick_returns_structured_summary_events() {
                 before: 3,
                 after: 3
             },
+            economy: EconomyBreakdownView {
+                population_income: 2,
+                commercial_income: 2,
+                industrial_income: 3,
+                maintenance_cost: 4,
+                net: 3
+            },
         }
     );
 }
@@ -110,4 +117,9 @@ fn tick_summary_message_includes_metric_changes() {
     assert!(message.contains("population 1 (+1)"));
     assert!(message.contains("money 56 (+3)"));
     assert!(message.contains("powered buildings 3 (+0)"));
+    assert!(
+        message.contains(
+            "Economy: population +1, commercial +2, industrial +3, maintenance -3, net +3"
+        )
+    );
 }

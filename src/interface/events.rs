@@ -51,6 +51,15 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EconomyBreakdownView {
+    pub population_income: i32,
+    pub commercial_income: i32,
+    pub industrial_income: i32,
+    pub maintenance_cost: i32,
+    pub net: i32,
+}
+
 impl GameEventView {
     /// Converts one event into terminal-ready text without exposing ECS storage.
     pub fn message(&self) -> String {
@@ -80,8 +89,9 @@ impl GameEventView {
                 pollution,
                 unemployment,
                 powered_buildings,
+                economy,
             } => format!(
-                "Advanced to turn {turn}: population {} ({:+}), money {} ({:+}), happiness {} ({:+}), pollution {} ({:+}), unemployment {} ({:+}), powered buildings {} ({:+})",
+                "Advanced to turn {turn}: population {} ({:+}), money {} ({:+}), happiness {} ({:+}), pollution {} ({:+}), unemployment {} ({:+}), powered buildings {} ({:+})\nEconomy: population +{}, commercial +{}, industrial +{}, maintenance -{}, net {:+}",
                 population.after,
                 population.delta(),
                 money.after,
@@ -93,7 +103,12 @@ impl GameEventView {
                 unemployment.after,
                 unemployment.delta(),
                 powered_buildings.after,
-                powered_buildings.delta()
+                powered_buildings.delta(),
+                economy.population_income,
+                economy.commercial_income,
+                economy.industrial_income,
+                economy.maintenance_cost,
+                economy.net
             ),
         }
     }
@@ -145,5 +160,6 @@ pub enum GameEventView {
         pollution: MetricChange<i32>,
         unemployment: MetricChange<i32>,
         powered_buildings: MetricChange<i32>,
+        economy: EconomyBreakdownView,
     },
 }

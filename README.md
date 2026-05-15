@@ -127,7 +127,7 @@ Scenario-style integration tests cover longer multi-turn cities that combine pow
 - Deterministic tick order and structured tick summary events.
 - Inspect output with building-specific details.
 
-## Current v0.2 Scope
+## v0.2 Completed Scope
 
 - Cursor-based ASCII UI using only `Game` and view models.
 - UI-local cursor, selected build tool, and current overlay state.
@@ -143,7 +143,7 @@ Scenario-style integration tests cover longer multi-turn cities that combine pow
 - Power status totals for capacity, demand, supplied power, and shortage.
 - Population growth only when residential buildings are powered, road-connected, and jobs are available; high residential demand can grow by 2 population per tick, medium demand grows by 1, and low demand does not grow.
 - Commercial and industrial effective job counts and income only when powered and road-connected.
-- Ongoing economy balance: commercial, industrial, power plant, and park buildings each cost 1 maintenance per turn; roads and residential buildings have no upkeep.
+- Ongoing economy balance: commercial, industrial, power plant, and park buildings each cost 1 maintenance per turn; roads and residential buildings have no upkeep. Tick summaries include population income, commercial income, industrial income, maintenance, and net money change.
 - Industrial pollution and park happiness effects.
 - Basic residential, commercial, and industrial demand levels.
 - Basic map overlays for normal, power, pollution, and population views.
@@ -152,6 +152,9 @@ Scenario-style integration tests cover longer multi-turn cities that combine pow
 - Building levels start at 1 and currently max at 2.
 - Upgrade effects at level 2: residential max population increases from 5 to 8, power plant capacity increases from 10 to 15, and park happiness effect increases from +3 to +5.
 
-## Proposed Roadmap
-
-- Add new scenarios and balancing tests as gameplay systems grow.
+## v0.3 Scope
+- land value
+- desirability
+- local pollution pressure
+- land value overlay
+- desirability overlay
