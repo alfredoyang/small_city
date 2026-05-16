@@ -161,3 +161,82 @@ fn commercial_without_shoppers_pays_no_sales_tax() {
         }
     ));
 }
+
+#[test]
+fn disconnected_commercial_does_not_receive_shoppers_or_pay_sales_tax() {
+    let mut game = Game::new(10, 10);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(5, 0, BuildingKind::Industrial).success);
+    assert!(game.build(8, 0, BuildingKind::Commercial).success);
+    for x in 0..=5 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+
+    let result = game.tick();
+
+    let economy = tick_economy(&result.event);
+    assert!(economy.salaries_paid > 0);
+    assert!(economy.workplace_tax > 0);
+    assert!(economy.rent_income > 0);
+    assert_eq!(economy.commercial_sales_tax, 0);
+    assert_eq!(economy.shoppers_served, 0);
+    assert_eq!(economy.rent_failures, 0);
+    assert_eq!(economy.maintenance_cost, 3);
+}
+
+#[test]
+fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
+    let mut game = Game::new(10, 10);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(2, 0, BuildingKind::Commercial).success);
+    assert!(game.build(0, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
+
+    let first_tick = game.tick();
+    assert!(matches!(
+        first_tick.event,
+        GameEventView::TickSummary {
+            economy: EconomyBreakdownView {
+                salaries_paid: 3,
+                workplace_tax: 1,
+                rent_income: 1,
+                commercial_sales_tax: 1,
+                shoppers_served: 1,
+                rent_failures: 0,
+                maintenance_cost: 2,
+                net: 1,
+            },
+            ..
+        }
+    ));
+
+    assert!(game.bulldoze(2, 1).success);
+    let second_tick = game.tick();
+
+    assert!(matches!(
+        second_tick.event,
+        GameEventView::TickSummary {
+            economy: EconomyBreakdownView {
+                salaries_paid: 0,
+                workplace_tax: 0,
+                rent_income: 1,
+                commercial_sales_tax: 0,
+                shoppers_served: 0,
+                rent_failures: 0,
+                maintenance_cost: 2,
+                net: -1,
+            },
+            ..
+        }
+    ));
+}
+
+fn tick_economy(event: &GameEventView) -> EconomyBreakdownView {
+    match event {
+        GameEventView::TickSummary { economy, .. } => *economy,
+        other => panic!("expected tick summary event, got {other:?}"),
+    }
+}

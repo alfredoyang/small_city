@@ -152,8 +152,8 @@ Scenario-style integration tests cover longer multi-turn cities that combine pow
 - Power status totals for capacity, demand, supplied power, and shortage.
 - Population growth only when residential buildings are powered, road-connected, jobs are available, and desirability is not low; high desirability grows faster, medium desirability grows normally, and low desirability blocks growth.
 - Commercial and industrial effective job counts only when powered and road-connected.
-- Citizen economy foundation: citizens are assigned to effective commercial or industrial jobs, earn salary, pay rent when they can afford it, and spend money at commercial buildings for a happiness gain.
-- City income now comes from workplace tax, residential rent, and commercial sales tax. Commercial buildings pay sales tax only when citizens actually shop there.
+- Citizen economy foundation: citizens are assigned to powered, road-connected commercial or industrial jobs, earn salary, pay rent when they can afford it, and spend money at powered, road-connected commercial buildings for a happiness gain.
+- City income now comes from workplace tax, residential rent, and commercial sales tax. Commercial buildings pay sales tax only when citizens actually shop there, and disconnected shops receive no shoppers.
 - Ongoing economy balance: commercial, industrial, power plant, and park buildings each cost 1 maintenance per turn; roads and residential buildings have no upkeep. Tick summaries include salaries paid, workplace tax, rent, sales tax, shoppers served, rent failures, maintenance, and net money change.
 - Industrial pollution and park happiness effects.
 - Basic residential, commercial, and industrial demand levels.
