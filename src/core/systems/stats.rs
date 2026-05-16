@@ -1,3 +1,5 @@
+//! City statistics refresh system for population, effective jobs, and unemployment.
+
 use crate::core::systems::{citizens, road_connectivity};
 use crate::core::world::World;
 

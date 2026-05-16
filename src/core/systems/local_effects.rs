@@ -1,3 +1,5 @@
+//! Local effects system deriving land value, pollution pressure, accessibility, and desirability.
+
 use crate::core::resources::{LocalEffects, LocalEffectsMap};
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;

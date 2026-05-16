@@ -1,3 +1,5 @@
+//! Upgrade command handling for supported building types and their level-based effects.
+
 use crate::core::world::World;
 use crate::interface::events::{CommandResult, GameEventView};
 use crate::interface::input::BuildingKind;

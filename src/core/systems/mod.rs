@@ -1,3 +1,5 @@
+//! Collection of deterministic core systems that mutate or derive state from the ECS world.
+
 pub mod build;
 pub mod bulldoze;
 pub mod citizens;

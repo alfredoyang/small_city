@@ -1,3 +1,5 @@
+//! Shared building placement logic used by build and replace command systems.
+
 use crate::core::components::{
     Building, HappinessEffect, PollutionSource, Population, Position, PowerConsumer, PowerProvider,
 };

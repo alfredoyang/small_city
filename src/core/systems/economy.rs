@@ -1,3 +1,5 @@
+//! Economy system that applies income, maintenance, and a UI-safe money breakdown per tick.
+
 use crate::core::systems::{citizens, road_connectivity};
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;

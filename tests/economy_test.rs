@@ -1,3 +1,5 @@
+//! Integration tests for maintenance costs, income, and tick economy breakdowns.
+
 use small_city::core::game::Game;
 use small_city::interface::events::{EconomyBreakdownView, GameEventView, MetricChange};
 use small_city::interface::input::BuildingKind;

@@ -1,3 +1,5 @@
+//! Integration tests for local effects, desirability growth, overlays, and save/load refresh.
+
 use std::path::PathBuf;
 
 use small_city::core::game::Game;

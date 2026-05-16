@@ -1,3 +1,5 @@
+//! Public Game API that owns the private ECS world and exposes UI-safe operations.
+
 use std::fmt;
 use std::fs::File;
 use std::path::Path;

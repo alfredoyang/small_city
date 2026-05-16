@@ -1,3 +1,5 @@
+//! Global resources and derived city-wide data such as stats, power, and local effects.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

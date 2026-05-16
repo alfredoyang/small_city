@@ -1,3 +1,5 @@
+//! UI-safe view models used by renderers instead of exposing ECS internals.
+
 use crate::interface::input::BuildingKind;
 
 /// Complete read-only snapshot required to render the city UI.

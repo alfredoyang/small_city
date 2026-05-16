@@ -1,3 +1,5 @@
+//! UI-safe input enums and command parsing shared by frontends and tests.
+
 use serde::{Deserialize, Serialize};
 
 /// Building kind is shared by UI input, Game API calls, and core building components.

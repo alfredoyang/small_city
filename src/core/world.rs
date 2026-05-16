@@ -1,3 +1,5 @@
+//! Private ECS world storage for entities, component maps, grid, resources, and derived state.
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};

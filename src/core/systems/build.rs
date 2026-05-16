@@ -1,3 +1,5 @@
+//! Build command validation, mutation, and preview explanations for placing new buildings.
+
 use crate::core::systems::placement;
 use crate::core::world::World;
 use crate::interface::events::{CommandResult, GameEventView};

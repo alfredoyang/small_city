@@ -1,3 +1,5 @@
+//! UI-safe command result and event types returned by the public Game API.
+
 use crate::interface::input::BuildingKind;
 
 /// UI-safe result returned by Game API commands.

@@ -1,3 +1,5 @@
+//! Integration tests for road connectivity requirements on growth and effective jobs.
+
 use small_city::core::game::Game;
 use small_city::interface::input::BuildingKind;
 

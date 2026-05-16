@@ -1,3 +1,5 @@
+//! Population growth system that spawns citizen entities for qualifying residential buildings.
+
 use crate::core::systems::{
     citizens,
     local_effects::{self, DesirabilityLevel},

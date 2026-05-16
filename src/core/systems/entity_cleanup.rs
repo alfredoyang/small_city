@@ -1,3 +1,5 @@
+//! Entity cleanup helpers that remove all known components for a deleted building or citizen.
+
 use crate::core::entity::Entity;
 use crate::core::world::World;
 

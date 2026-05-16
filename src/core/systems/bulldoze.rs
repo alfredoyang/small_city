@@ -1,3 +1,5 @@
+//! Bulldoze command handling for removing occupied cells and charging demolition cost.
+
 use crate::core::systems::entity_cleanup;
 use crate::core::world::World;
 use crate::interface::events::{CommandResult, GameEventView};

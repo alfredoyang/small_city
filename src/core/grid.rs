@@ -1,3 +1,5 @@
+//! Fixed-size map grid that stores only cell-occupying building entity IDs.
+
 use serde::{Deserialize, Serialize};
 
 use crate::core::entity::Entity;

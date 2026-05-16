@@ -1,3 +1,5 @@
+//! UI boundary contract tests ensuring the ASCII UI uses public view models and Game APIs.
+
 use small_city::core::game::Game;
 use small_city::interface::input::{BuildingKind, MapOverlayInput, UiCommand, parse_command};
 use small_city::interface::view::GameView;

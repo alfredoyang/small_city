@@ -1,3 +1,5 @@
+//! Integration tests for off-grid citizen entities, home aggregates, and save/load behavior.
+
 use std::path::PathBuf;
 
 use small_city::core::game::Game;

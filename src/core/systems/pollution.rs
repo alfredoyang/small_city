@@ -1,3 +1,5 @@
+//! Pollution system calculating city pollution from industrial sources and park reduction.
+
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;
 

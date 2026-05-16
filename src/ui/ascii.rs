@@ -1,3 +1,5 @@
+//! Cursor-based ASCII terminal UI that renders only from GameView and InspectView data.
+
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::Command;
 

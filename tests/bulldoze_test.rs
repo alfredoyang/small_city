@@ -1,3 +1,5 @@
+//! Integration tests for bulldoze command behavior and derived-state refresh.
+
 use small_city::core::game::Game;
 use small_city::interface::input::BuildingKind;
 

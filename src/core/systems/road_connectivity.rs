@@ -1,3 +1,5 @@
+//! Road connectivity helper for determining whether buildings touch orthogonally adjacent roads.
+
 use crate::core::entity::Entity;
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;

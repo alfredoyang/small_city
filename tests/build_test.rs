@@ -1,3 +1,5 @@
+//! Integration tests for build validation, costs, and build preview explanations.
+
 use small_city::core::game::Game;
 use small_city::interface::input::BuildingKind;
 

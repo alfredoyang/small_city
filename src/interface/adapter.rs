@@ -1,3 +1,5 @@
+//! Adapter that converts private ECS world data into UI-safe view and inspect models.
+
 use crate::core::systems::{citizens, power, road_connectivity};
 use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};

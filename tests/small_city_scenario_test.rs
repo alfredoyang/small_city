@@ -1,3 +1,5 @@
+//! Longer scenario tests combining multiple systems over many deterministic turns.
+
 use small_city::core::game::Game;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -1,3 +1,5 @@
+//! ECS component data used by buildings, citizens, power, pollution, and happiness systems.
+
 use serde::{Deserialize, Serialize};
 
 use crate::interface::input::BuildingKind;

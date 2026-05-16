@@ -1,3 +1,5 @@
+//! Core simulation layer containing the custom ECS data model and deterministic systems.
+
 pub mod components;
 pub mod entity;
 pub mod game;

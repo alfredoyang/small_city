@@ -1,3 +1,5 @@
+//! Replace command handling for swapping an occupied cell to a different building type.
+
 use crate::core::systems::{entity_cleanup, placement};
 use crate::core::world::World;
 use crate::interface::events::{CommandResult, GameEventView};

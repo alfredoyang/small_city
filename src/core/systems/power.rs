@@ -1,3 +1,5 @@
+//! Road-network power system with plant capacity, consumer demand, and deterministic allocation.
+
 use std::collections::{HashSet, VecDeque};
 
 use crate::core::entity::Entity;

@@ -1,3 +1,5 @@
+//! Citizen entity support, including home links, happiness, and aggregate population sync.
+
 use crate::core::components::{Citizen, CitizenHappiness, Employment, Home};
 use crate::core::entity::Entity;
 use crate::core::systems::road_connectivity;

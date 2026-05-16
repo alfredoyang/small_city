@@ -1,3 +1,5 @@
+//! Integration tests for JSON save/load roundtrips and error handling.
+
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 

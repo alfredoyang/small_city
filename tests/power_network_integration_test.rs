@@ -1,3 +1,5 @@
+//! Integration tests for road-network power behavior across Game API and views.
+
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 

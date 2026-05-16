@@ -1,3 +1,5 @@
+//! Happiness system deriving city happiness from citizens when present, otherwise city effects.
+
 use crate::core::systems::citizens;
 use crate::core::world::World;
 

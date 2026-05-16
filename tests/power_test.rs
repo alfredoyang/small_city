@@ -1,3 +1,5 @@
+//! Integration tests for core power-network capacity, demand, and allocation rules.
+
 use small_city::core::game::Game;
 use small_city::interface::input::BuildingKind;
 
