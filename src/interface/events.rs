@@ -55,9 +55,12 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EconomyBreakdownView {
-    pub population_income: i32,
-    pub commercial_income: i32,
-    pub industrial_income: i32,
+    pub salaries_paid: i32,
+    pub workplace_tax: i32,
+    pub rent_income: i32,
+    pub commercial_sales_tax: i32,
+    pub shoppers_served: i32,
+    pub rent_failures: i32,
     pub maintenance_cost: i32,
     pub net: i32,
 }
@@ -93,7 +96,7 @@ impl GameEventView {
                 powered_buildings,
                 economy,
             } => format!(
-                "Advanced to turn {turn}: population {} ({:+}), money {} ({:+}), happiness {} ({:+}), pollution {} ({:+}), unemployment {} ({:+}), powered buildings {} ({:+})\nEconomy: population +{}, commercial +{}, industrial +{}, maintenance -{}, net {:+}",
+                "Advanced to turn {turn}: population {} ({:+}), money {} ({:+}), happiness {} ({:+}), pollution {} ({:+}), unemployment {} ({:+}), powered buildings {} ({:+})\nEconomy: salaries paid {}, workplace tax +{}, rent +{}, sales tax +{}, shoppers {}, rent failures {}, maintenance -{}, net {:+}",
                 population.after,
                 population.delta(),
                 money.after,
@@ -106,9 +109,12 @@ impl GameEventView {
                 unemployment.delta(),
                 powered_buildings.after,
                 powered_buildings.delta(),
-                economy.population_income,
-                economy.commercial_income,
-                economy.industrial_income,
+                economy.salaries_paid,
+                economy.workplace_tax,
+                economy.rent_income,
+                economy.commercial_sales_tax,
+                economy.shoppers_served,
+                economy.rent_failures,
                 economy.maintenance_cost,
                 economy.net
             ),

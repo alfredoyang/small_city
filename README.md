@@ -17,13 +17,13 @@ The main public API is `Game`, which owns the private ECS `World` and exposes op
 The ECS is intentionally small:
 
 - `Entity`: stable ID for things placed in the city.
-- `Components`: plain data such as `Position`, `Building` with level, `Population`, `Citizen`, `Home`, `Employment`, `CitizenHappiness`, `PowerProvider`, `PowerConsumer`, `PollutionSource`, and `HappinessEffect`.
+- `Components`: plain data such as `Position`, `Building` with level, `Population`, `Citizen`, `PowerProvider`, `PowerConsumer`, `PollutionSource`, and `HappinessEffect`.
 - `World`: private storage for entities, components, grid, resources, and city stats.
 - `Systems`: deterministic functions that operate on `World`, including build, replace, upgrade, bulldoze, power, road connectivity, citizens, local effects, stats, population, economy, pollution, and happiness.
 - `Grid`: stores entity IDs for occupied map cells.
 - `Resources`: global city state such as money, turn, population, jobs, pollution, unemployment, happiness, power stats, and derived local effects.
 
-Citizens are ECS entities, but they do not occupy grid cells. Buildings remain the only grid occupants. A citizen has a home residential building, optional employment, and individual happiness. Residential population is kept as a cache derived from citizens so existing views can stay simple while future behavior can become more individual.
+Citizens are ECS entities, but they do not occupy grid cells. Buildings remain the only grid occupants. A citizen has stable personal state: age, home residential building, optional workplace, happiness, and money. Residential population is kept as a cache derived from citizens so existing views can stay simple while future behavior can become more individual.
 
 ## UI Boundary
 
@@ -124,9 +124,9 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
-Tests cover core simulation rules, road connectivity, demand, bulldoze, build previews, save/load behavior, inspect output, map overlays, cursor/action parsing, and UI boundary contracts.
+Tests cover core simulation rules, citizen economy, road connectivity, demand, bulldoze, build previews, save/load behavior, inspect output, map overlays, cursor/action parsing, and UI boundary contracts.
 
-Scenario-style integration tests cover longer multi-turn cities that combine power networks, demand-driven growth, upgrades, replace, bulldoze, overlays, and save/load.
+Scenario-style integration tests cover longer multi-turn cities that combine power networks, demand-driven growth, citizen salary/rent/shopping economy, upgrades, replace, bulldoze, overlays, and save/load.
 
 ## v0.1 Completed Scope
 
@@ -151,8 +151,10 @@ Scenario-style integration tests cover longer multi-turn cities that combine pow
 - Deterministic power shortage handling by map position, y first then x.
 - Power status totals for capacity, demand, supplied power, and shortage.
 - Population growth only when residential buildings are powered, road-connected, jobs are available, and desirability is not low; high desirability grows faster, medium desirability grows normally, and low desirability blocks growth.
-- Commercial and industrial effective job counts and income only when powered and road-connected.
-- Ongoing economy balance: commercial, industrial, power plant, and park buildings each cost 1 maintenance per turn; roads and residential buildings have no upkeep. Tick summaries include population income, commercial income, industrial income, maintenance, and net money change.
+- Commercial and industrial effective job counts only when powered and road-connected.
+- Citizen economy foundation: citizens are assigned to effective commercial or industrial jobs, earn salary, pay rent when they can afford it, and spend money at commercial buildings for a happiness gain.
+- City income now comes from workplace tax, residential rent, and commercial sales tax. Commercial buildings pay sales tax only when citizens actually shop there.
+- Ongoing economy balance: commercial, industrial, power plant, and park buildings each cost 1 maintenance per turn; roads and residential buildings have no upkeep. Tick summaries include salaries paid, workplace tax, rent, sales tax, shoppers served, rent failures, maintenance, and net money change.
 - Industrial pollution and park happiness effects.
 - Basic residential, commercial, and industrial demand levels.
 - Basic map overlays for normal, power, pollution, population, land value, and desirability views.
@@ -177,4 +179,4 @@ Scenario-style integration tests cover longer multi-turn cities that combine pow
 - Happy or unhappy citizens can slightly affect nearby local effects.
 - Inspect and cell views expose local effects through UI-safe view models.
 - Land value and desirability map overlays.
-- Integration tests cover local effects, citizen spawning, citizen cleanup, growth behavior, overlays, and save/load refresh.
+- Integration tests cover local effects, citizen spawning, citizen cleanup, citizen economy behavior, growth behavior, overlays, and save/load refresh.

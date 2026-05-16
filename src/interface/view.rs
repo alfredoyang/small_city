@@ -56,6 +56,7 @@ pub struct CityStatusView {
     pub pollution: i32,
     pub happiness: i32,
     pub average_citizen_happiness: Option<i32>,
+    pub average_citizen_money: Option<i32>,
     pub demand: CityDemand,
     pub power: PowerStatusView,
 }
@@ -132,6 +133,7 @@ pub enum InspectDetailsView {
         max_population: i32,
         citizens: i32,
         average_happiness: Option<i32>,
+        average_money: Option<i32>,
     },
     Commercial {
         powered: bool,

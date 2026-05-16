@@ -59,6 +59,8 @@ pub struct Citizen {
     pub home: crate::core::entity::Entity,
     pub workplace: Option<crate::core::entity::Entity>,
     pub happiness: i32,
+    #[serde(default)]
+    pub money: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

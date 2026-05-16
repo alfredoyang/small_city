@@ -15,6 +15,7 @@ pub(crate) fn spawn_for_home(world: &mut World, residential: Entity, count: i32)
                 home: residential,
                 workplace: None,
                 happiness: 50,
+                money: 0,
             },
         );
     }
@@ -84,6 +85,30 @@ pub(crate) fn average_happiness(world: &World) -> Option<i32> {
         .values()
         .map(|citizen| citizen.happiness)
         .sum();
+    Some(total / count)
+}
+
+pub(crate) fn average_money_for_home(world: &World, residential: Entity) -> Option<i32> {
+    let mut total = 0;
+    let mut count = 0;
+    for citizen in world.citizens.values() {
+        if citizen.home != residential {
+            continue;
+        }
+        total += citizen.money;
+        count += 1;
+    }
+
+    if count > 0 { Some(total / count) } else { None }
+}
+
+pub(crate) fn average_money(world: &World) -> Option<i32> {
+    let count = world.citizens.len() as i32;
+    if count == 0 {
+        return None;
+    }
+
+    let total: i32 = world.citizens.values().map(|citizen| citizen.money).sum();
     Some(total / count)
 }
 

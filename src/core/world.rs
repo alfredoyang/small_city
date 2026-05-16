@@ -190,6 +190,7 @@ mod tests {
                 home: residential,
                 workplace: None,
                 happiness: 50,
+                money: 0,
             },
         );
 

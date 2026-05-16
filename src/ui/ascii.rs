@@ -479,8 +479,9 @@ pub fn format_inspect(inspect: &InspectView) -> String {
             max_population,
             citizens,
             average_happiness,
+            average_money,
         } => format!(
-            "({}, {}) Residential | Powered: {} | Demand: {} | Road: {} | Level: {} | Population: {}/{} | Citizens: {} | Avg Happiness: {}",
+            "({}, {}) Residential | Powered: {} | Demand: {} | Road: {} | Level: {} | Population: {}/{} | Citizens: {} | Avg Happiness: {} | Avg Money: {}",
             inspect.x,
             inspect.y,
             yes_no(*powered),
@@ -490,7 +491,8 @@ pub fn format_inspect(inspect: &InspectView) -> String {
             population,
             max_population,
             citizens,
-            optional_number(*average_happiness)
+            optional_number(*average_happiness),
+            optional_number(*average_money)
         ),
         InspectDetailsView::Commercial {
             powered,

@@ -5,7 +5,7 @@ use small_city::interface::events::{EconomyBreakdownView, GameEventView, MetricC
 use small_city::interface::input::BuildingKind;
 
 #[test]
-fn powered_industrial_income_is_reduced_by_maintenance() {
+fn workplace_without_citizen_workers_pays_no_tax_but_still_has_maintenance() {
     let mut game = Game::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Industrial).success);
@@ -15,7 +15,7 @@ fn powered_industrial_income_is_reduced_by_maintenance() {
 
     game.tick();
 
-    assert_eq!(game.view().status.money, 69);
+    assert_eq!(game.view().status.money, 66);
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn tick_event_exposes_economy_breakdown() {
             },
             money: MetricChange {
                 before: 68,
-                after: 69
+                after: 66
             },
             happiness: MetricChange {
                 before: 48,
@@ -89,12 +89,75 @@ fn tick_event_exposes_economy_breakdown() {
                 after: 1
             },
             economy: EconomyBreakdownView {
-                population_income: 0,
-                commercial_income: 0,
-                industrial_income: 3,
+                salaries_paid: 0,
+                workplace_tax: 0,
+                rent_income: 0,
+                commercial_sales_tax: 0,
+                shoppers_served: 0,
+                rent_failures: 0,
                 maintenance_cost: 2,
-                net: 1
+                net: -2
             },
         }
     );
+}
+
+#[test]
+fn citizen_salary_rent_and_shopping_create_city_tax_income() {
+    let mut game = Game::new(10, 10);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(2, 0, BuildingKind::Commercial).success);
+    assert!(game.build(0, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
+
+    let result = game.tick();
+
+    assert!(matches!(
+        result.event,
+        GameEventView::TickSummary {
+            economy: EconomyBreakdownView {
+                salaries_paid: 3,
+                workplace_tax: 1,
+                rent_income: 1,
+                commercial_sales_tax: 1,
+                shoppers_served: 1,
+                rent_failures: 0,
+                maintenance_cost: 2,
+                net: 1,
+            },
+            ..
+        }
+    ));
+    assert_eq!(game.view().status.citizens, 1);
+    assert_eq!(game.view().status.money, 65);
+}
+
+#[test]
+fn commercial_without_shoppers_pays_no_sales_tax() {
+    let mut game = Game::new(10, 10);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Commercial).success);
+    assert!(game.build(0, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+
+    let result = game.tick();
+
+    assert!(matches!(
+        result.event,
+        GameEventView::TickSummary {
+            economy: EconomyBreakdownView {
+                salaries_paid: 0,
+                workplace_tax: 0,
+                rent_income: 0,
+                commercial_sales_tax: 0,
+                shoppers_served: 0,
+                rent_failures: 0,
+                maintenance_cost: 2,
+                net: -2,
+            },
+            ..
+        }
+    ));
 }
