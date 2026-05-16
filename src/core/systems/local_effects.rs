@@ -44,11 +44,8 @@ pub(crate) fn run(world: &mut World) {
                 }
             }
 
-            for (citizen, home) in &world.homes {
-                let Some(happiness) = world.citizen_happiness.get(citizen) else {
-                    continue;
-                };
-                let Some(position) = world.positions.get(&home.residential) else {
+            for citizen in world.citizens.values() {
+                let Some(position) = world.positions.get(&citizen.home) else {
                     continue;
                 };
                 let distance = manhattan_distance(x, y, position.x, position.y);
@@ -56,9 +53,9 @@ pub(crate) fn run(world: &mut World) {
                     continue;
                 }
 
-                if happiness.value >= 60 {
+                if citizen.happiness >= 60 {
                     effects.land_value += 1;
-                } else if happiness.value < 40 {
+                } else if citizen.happiness < 40 {
                     effects.pollution_pressure += 1;
                     effects.land_value -= 1;
                 }

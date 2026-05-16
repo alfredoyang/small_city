@@ -1,6 +1,6 @@
 //! Citizen entity support, including home links, happiness, and aggregate population sync.
 
-use crate::core::components::{Citizen, CitizenHappiness, Employment, Home};
+use crate::core::components::Citizen;
 use crate::core::entity::Entity;
 use crate::core::systems::road_connectivity;
 use crate::core::world::World;
@@ -8,10 +8,15 @@ use crate::core::world::World;
 pub(crate) fn spawn_for_home(world: &mut World, residential: Entity, count: i32) {
     for _ in 0..count.max(0) {
         let citizen = world.spawn();
-        world.attach_citizen(citizen, Citizen { age: 0 });
-        world.attach_home(citizen, Home { residential });
-        world.attach_employment(citizen, Employment { workplace: None });
-        world.attach_citizen_happiness(citizen, CitizenHappiness { value: 50 });
+        world.attach_citizen(
+            citizen,
+            Citizen {
+                age: 0,
+                home: residential,
+                workplace: None,
+                happiness: 50,
+            },
+        );
     }
 }
 
@@ -36,7 +41,9 @@ pub(crate) fn update_happiness(world: &mut World) {
 
     for citizen in citizens {
         let happiness = citizen_happiness(world, citizen);
-        world.attach_citizen_happiness(citizen, CitizenHappiness { value: happiness });
+        if let Some(citizen) = world.citizens.get_mut(&citizen) {
+            citizen.happiness = happiness;
+        }
     }
 }
 
@@ -46,23 +53,20 @@ pub(crate) fn citizen_count(world: &World) -> i32 {
 
 pub(crate) fn citizen_count_for_home(world: &World, residential: Entity) -> i32 {
     world
-        .homes
+        .citizens
         .values()
-        .filter(|home| home.residential == residential)
+        .filter(|citizen| citizen.home == residential)
         .count() as i32
 }
 
 pub(crate) fn average_happiness_for_home(world: &World, residential: Entity) -> Option<i32> {
     let mut total = 0;
     let mut count = 0;
-    for (citizen, home) in &world.homes {
-        if home.residential != residential {
+    for citizen in world.citizens.values() {
+        if citizen.home != residential {
             continue;
         }
-        let Some(happiness) = world.citizen_happiness.get(citizen) else {
-            continue;
-        };
-        total += happiness.value;
+        total += citizen.happiness;
         count += 1;
     }
 
@@ -70,33 +74,33 @@ pub(crate) fn average_happiness_for_home(world: &World, residential: Entity) -> 
 }
 
 pub(crate) fn average_happiness(world: &World) -> Option<i32> {
-    let count = world.citizen_happiness.len() as i32;
+    let count = world.citizens.len() as i32;
     if count == 0 {
         return None;
     }
 
     let total: i32 = world
-        .citizen_happiness
+        .citizens
         .values()
-        .map(|happiness| happiness.value)
+        .map(|citizen| citizen.happiness)
         .sum();
     Some(total / count)
 }
 
 fn citizen_happiness(world: &World, citizen: Entity) -> i32 {
-    let Some(home) = world.homes.get(&citizen) else {
+    let Some(citizen) = world.citizens.get(&citizen) else {
         return 50;
     };
-    let Some(position) = world.positions.get(&home.residential) else {
+    let Some(position) = world.positions.get(&citizen.home) else {
         return 50;
     };
 
     let effects = world.local_effects.get(position.x, position.y);
     let powered = world
         .power_consumers
-        .get(&home.residential)
+        .get(&citizen.home)
         .is_some_and(|consumer| consumer.powered);
-    let road_connected = road_connectivity::is_road_connected(world, home.residential);
+    let road_connected = road_connectivity::is_road_connected(world, citizen.home);
 
     let mut happiness = 35 + effects.desirability * 6 + effects.accessibility;
     happiness -= effects.pollution_pressure * 3;

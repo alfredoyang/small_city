@@ -22,15 +22,6 @@ pub(crate) fn remove_entity(world: &mut World, entity: Entity, x: usize, y: usiz
     if record.has_citizen {
         world.citizens.remove(&entity);
     }
-    if record.has_home {
-        world.homes.remove(&entity);
-    }
-    if record.has_employment {
-        world.employments.remove(&entity);
-    }
-    if record.has_citizen_happiness {
-        world.citizen_happiness.remove(&entity);
-    }
     if record.has_power_provider {
         world.power_providers.remove(&entity);
     }
@@ -51,9 +42,6 @@ fn remove_from_all_component_maps(world: &mut World, entity: Entity) {
     world.buildings.remove(&entity);
     world.populations.remove(&entity);
     world.citizens.remove(&entity);
-    world.homes.remove(&entity);
-    world.employments.remove(&entity);
-    world.citizen_happiness.remove(&entity);
     world.power_providers.remove(&entity);
     world.power_consumers.remove(&entity);
     world.pollution_sources.remove(&entity);
@@ -63,16 +51,13 @@ fn remove_from_all_component_maps(world: &mut World, entity: Entity) {
 
 fn remove_citizens_for_home(world: &mut World, residential: Entity) {
     let citizens: Vec<_> = world
-        .homes
+        .citizens
         .iter()
-        .filter_map(|(citizen, home)| (home.residential == residential).then_some(*citizen))
+        .filter_map(|(entity, citizen)| (citizen.home == residential).then_some(*entity))
         .collect();
 
     for citizen in citizens {
         world.entities.remove(&citizen);
         world.citizens.remove(&citizen);
-        world.homes.remove(&citizen);
-        world.employments.remove(&citizen);
-        world.citizen_happiness.remove(&citizen);
     }
 }
