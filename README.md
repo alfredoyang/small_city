@@ -8,7 +8,7 @@ The project is split into three layers:
 
 - `core`: ECS data, resources, systems, grid, and the public `Game` API.
 - `interface`: UI-safe input types, events, view models, and adapters from ECS state to renderable data.
-- `ui`: cursor-based ASCII terminal UI.
+- `ui`: terminal frontends, including the ratatui TUI and cursor-based ASCII fallback UI.
 
 The main public API is `Game`, which owns the private ECS `World` and exposes operations such as `build`, `preview_build`, `replace`, `upgrade`, `bulldoze`, `tick`, `inspect`, `view`, `view_with_overlay`, `save_to_file`, and `load_from_file`.
 
@@ -31,15 +31,24 @@ UI code must not access ECS internals. It must use the public `Game` API and ren
 
 The adapter in `src/interface/adapter.rs` is the boundary where private ECS data becomes UI-safe view data. Map overlays, demand, road-connected status, local effects, build previews, and inspect details are generated before the ASCII UI renders them.
 
-## ASCII UI
+## Terminal UI
 
-Run the terminal UI with:
+Run the richer panel-based TUI with:
 
 ```sh
 cargo run
 ```
 
-The UI keeps cursor state locally. The cursor is not stored in the ECS core.
+You can choose a frontend explicitly:
+
+```sh
+cargo run -- tui
+cargo run -- ascii
+```
+
+The TUI uses `ratatui` and `crossterm` for panels, styling, alternate-screen rendering, keyboard input, and raw terminal mode. The older ASCII UI remains available as a fallback/debug frontend.
+
+Both UIs keep cursor state locally. The cursor is not stored in the ECS core.
 
 Controls:
 
@@ -58,6 +67,8 @@ X                       bulldoze selected cell
 I                       inspect selected cell
 N                       next turn
 V                       cycle overlay
+O                       open overlay selector in TUI
+H                       open help screen in TUI
 S                       prompt for save filename
 L                       prompt for load filename
 Q                       quit
@@ -94,7 +105,7 @@ land value      0-9, higher means parks and commercial activity improved nearby 
 desirability    0-9, combines land value, pollution pressure, and road accessibility
 ```
 
-Status panels show turn, money, population, citizen count, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, overlay legend, demand notes, selected cell details, inspect notes, build preview explanations, and the latest command message.
+The TUI presents the same view data in panels: city map, selected cell, city status, build preview/actions, and messages/tick summary. Status panels show turn, money, population, citizen count, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, overlay legend, demand notes, selected cell details, inspect notes, build preview explanations, and the latest command message.
 
 ## Save And Load
 
@@ -124,7 +135,7 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
-Tests cover core simulation rules, citizen economy, road connectivity, demand, bulldoze, build previews, save/load behavior, inspect output, map overlays, cursor/action parsing, and UI boundary contracts.
+Tests cover core simulation rules, citizen economy, road connectivity, demand, bulldoze, build previews, save/load behavior, inspect output, map overlays, cursor/action parsing, TUI key mapping, and UI boundary contracts.
 
 Scenario-style integration tests cover longer multi-turn cities that combine power networks, demand-driven growth, citizen salary/rent/shopping economy, upgrades, replace, bulldoze, overlays, and save/load.
 
@@ -139,6 +150,7 @@ Scenario-style integration tests cover longer multi-turn cities that combine pow
 ## v0.2 Completed Scope
 
 - Cursor-based ASCII UI using only `Game` and view models.
+- Panel-based ratatui TUI using only `Game` and view models, with ASCII UI preserved as fallback.
 - UI-local cursor, selected build tool, and current overlay state.
 - Bulldoze support with component cleanup and derived-state refresh.
 - Replace support for swapping an occupied cell to the selected build type.
@@ -180,3 +192,4 @@ Scenario-style integration tests cover longer multi-turn cities that combine pow
 - Inspect and cell views expose local effects through UI-safe view models.
 - Land value and desirability map overlays.
 - Integration tests cover local effects, citizen spawning, citizen cleanup, citizen economy behavior, growth behavior, overlays, and save/load refresh.
+- Implemented the new TUI panel-based terminal with ratatui + crossterm.

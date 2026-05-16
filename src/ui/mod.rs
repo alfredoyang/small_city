@@ -1,3 +1,5 @@
-//! User-interface layer containing the ASCII terminal frontend.
+//! User-interface layer containing terminal frontends for the game.
 
 pub mod ascii;
+pub mod tui;
+pub(crate) mod tui_input;

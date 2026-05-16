@@ -1,5 +1,12 @@
-//! Binary entry point that launches the cursor-based ASCII terminal UI.
+//! Binary entry point that selects between the TUI and fallback ASCII frontends.
 
 fn main() -> std::io::Result<()> {
-    small_city::ui::ascii::run()
+    match std::env::args().nth(1).as_deref() {
+        Some("ascii") => small_city::ui::ascii::run(),
+        Some("tui") | None => small_city::ui::tui::run(),
+        Some(other) => {
+            eprintln!("Unknown frontend '{other}'. Use 'ascii' or 'tui'.");
+            Ok(())
+        }
+    }
 }

@@ -160,6 +160,24 @@ fn ascii_ui_does_not_import_ecs_internals() {
 }
 
 #[test]
+fn tui_does_not_import_ecs_internals() {
+    let source = std::fs::read_to_string("src/ui/tui.rs").expect("tui source");
+
+    for forbidden_import in [
+        "crate::core::world",
+        "crate::core::components",
+        "crate::core::systems",
+        "crate::core::resources",
+        "crate::core::grid",
+    ] {
+        assert!(
+            !source.contains(forbidden_import),
+            "TUI must not import ECS internals via {forbidden_import}"
+        );
+    }
+}
+
+#[test]
 fn ascii_ui_save_load_uses_game_api_only() {
     let source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii ui source");
 
