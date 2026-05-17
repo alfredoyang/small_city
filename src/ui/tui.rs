@@ -26,6 +26,8 @@ use crate::ui::tui_input::{TuiAction, map_key_event};
 const DEFAULT_SAVE_FILE: &str = "city1";
 const AUTO_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const PAUSED_POLL_TIMEOUT: Duration = Duration::from_secs(3600);
+const MIN_TUI_WIDTH: u16 = 100;
+const MIN_TUI_HEIGHT: u16 = 30;
 
 /// Local frontend state that is intentionally not stored in the simulation.
 ///
@@ -366,6 +368,11 @@ fn render(
     state: &TuiState,
 ) {
     let root = frame.area();
+    if terminal_is_too_small(root) {
+        render_too_small(frame, root);
+        return;
+    }
+
     // The screen is split into three horizontal bands. Each band is then split into panels.
     // `Constraint::Min` gives the map the flexible space; fixed-height lower panels stay readable.
     let vertical = Layout::default()
@@ -399,6 +406,39 @@ fn render(
     if let Some(prompt) = &state.prompt {
         render_prompt(frame, root, prompt);
     }
+}
+
+fn terminal_is_too_small(area: Rect) -> bool {
+    area.width < MIN_TUI_WIDTH || area.height < MIN_TUI_HEIGHT
+}
+
+fn render_too_small(frame: &mut Frame<'_>, area: Rect) {
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Terminal too small",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "Need at least {}x{}",
+            MIN_TUI_WIDTH, MIN_TUI_HEIGHT
+        )),
+        Line::from(format!("Current: {}x{}", area.width, area.height)),
+        Line::from(""),
+        Line::from("Resize the terminal or run: cargo run -- ascii"),
+        Line::from("Press Q to quit"),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().title("Small City").borders(Borders::ALL))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 fn render_map(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &TuiState) {
@@ -1073,6 +1113,20 @@ mod tests {
     }
 
     #[test]
+    fn small_terminal_renders_resize_warning() {
+        let game = Game::new(10, 10);
+        let output = render_test_screen_with_size(&game, TuiState::default(), 80, 24);
+
+        assert!(output.contains("Small City"));
+        assert!(output.contains("Terminal too small"));
+        assert!(output.contains("Need at least 100x30"));
+        assert!(output.contains("Current: 80x24"));
+        assert!(output.contains("cargo run -- ascii"));
+        assert!(output.contains("Press Q to quit"));
+        assert!(!output.contains("City Map"));
+    }
+
+    #[test]
     fn help_panel_contains_overlay_order_and_legends() {
         let game = Game::new(10, 10);
         let state = TuiState {
@@ -1121,17 +1175,35 @@ mod tests {
     }
 
     fn render_test_screen(game: &Game, state: TuiState) -> String {
-        let terminal = render_test_terminal(game, state);
+        render_test_screen_with_size(game, state, 120, 36)
+    }
+
+    fn render_test_screen_with_size(
+        game: &Game,
+        state: TuiState,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let terminal = render_test_terminal_with_size(game, state, width, height);
         buffer_text(terminal.backend().buffer())
     }
 
-    fn render_test_terminal(game: &Game, mut state: TuiState) -> Terminal<TestBackend> {
+    fn render_test_terminal(game: &Game, state: TuiState) -> Terminal<TestBackend> {
+        render_test_terminal_with_size(game, state, 120, 36)
+    }
+
+    fn render_test_terminal_with_size(
+        game: &Game,
+        mut state: TuiState,
+        width: u16,
+        height: u16,
+    ) -> Terminal<TestBackend> {
         let view = game.view_with_overlay(state.current_overlay);
         state.clamp_cursor(&view);
         let inspect = game.inspect(state.cursor_x, state.cursor_y);
         let preview = game.preview_build(state.cursor_x, state.cursor_y, state.selected_build);
 
-        let backend = TestBackend::new(120, 36);
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| render(frame, &view, &inspect, &preview, &state))

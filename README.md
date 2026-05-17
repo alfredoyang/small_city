@@ -108,6 +108,8 @@ desirability    0-9, combines land value, pollution pressure, and road accessibi
 
 The TUI presents the same view data in panels: city map, selected cell, city status, build preview/actions, and messages/tick summary. Status panels show turn, money, population, citizen count, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, overlay legend, demand notes, selected cell details, inspect notes, build preview explanations, run/pause state, and the latest command message. New and loaded TUI games start paused; pressing Space resumes automatic one-second ticks.
 
+The TUI needs at least a 100x30 terminal. Smaller terminals show a resize warning and suggest `cargo run -- ascii`.
+
 ## Save And Load
 
 Save the current city from the ASCII UI:
