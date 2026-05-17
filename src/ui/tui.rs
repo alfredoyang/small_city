@@ -113,115 +113,241 @@ enum PromptKind {
     Load,
 }
 
-/// Runs the ratatui frontend while preserving the public Game API boundary.
-pub fn run() -> io::Result<()> {
-    let mut terminal = TerminalGuard::enter()?;
-    let mut game = Game::default();
-    let mut state = TuiState::default();
-    let mut next_auto_tick = Instant::now() + AUTO_TICK_INTERVAL;
-    let mut dirty = true;
+struct TuiRuntime {
+    game: Game,
+    state: TuiState,
+    next_auto_tick: Instant,
+    dirty: bool,
+}
 
-    loop {
-        if state.is_running && Instant::now() >= next_auto_tick {
-            state.message = game.tick().message();
-            next_auto_tick = Instant::now() + AUTO_TICK_INTERVAL;
-            dirty = true;
+impl TuiRuntime {
+    fn new(now: Instant) -> Self {
+        Self {
+            game: Game::default(),
+            state: TuiState::default(),
+            next_auto_tick: now + AUTO_TICK_INTERVAL,
+            dirty: true,
         }
+    }
 
-        if dirty {
-            // Pull all render data through the public API only when the screen needs repainting.
-            // This keeps the TUI from caching or reaching into ECS internals while avoiding idle
-            // redraw work.
-            let view = game.view_with_overlay(state.current_overlay);
-            state.clamp_cursor(&view);
-            let inspect = game.inspect(state.cursor_x, state.cursor_y);
-            let preview = game.preview_build(state.cursor_x, state.cursor_y, state.selected_build);
-
-            // ratatui redraws the whole frame into an off-screen buffer and then flushes the diff
-            // to the terminal. The closure receives a `Frame` that all render functions write into.
-            terminal.draw(|frame| render(frame, &view, &inspect, &preview, &state))?;
-            dirty = false;
+    fn apply_due_auto_tick(&mut self, now: Instant) {
+        if self.state.is_running && now >= self.next_auto_tick {
+            self.state.message = self.game.tick().message();
+            self.next_auto_tick = now + AUTO_TICK_INTERVAL;
+            self.dirty = true;
         }
+    }
 
-        // Sleep until input arrives or, in running mode, until the next scheduled auto tick is due.
-        if !event::poll(poll_timeout(
-            state.is_running,
-            next_auto_tick,
-            Instant::now(),
-        ))? {
-            continue;
-        }
+    fn poll_timeout(&self, now: Instant) -> Duration {
+        poll_timeout(self.state.is_running, self.next_auto_tick, now)
+    }
 
-        // Crossterm can report mouse, resize, and paste events too. Resize changes should repaint.
-        let Event::Key(key) = event::read()? else {
-            dirty = true;
-            continue;
+    fn mark_clean(&mut self) {
+        self.dirty = false;
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn handle_prompt_key(&mut self, key: KeyEvent) -> io::Result<bool> {
+        let Some(prompt) = self.state.prompt.as_mut() else {
+            return Ok(false);
         };
 
-        // Prompts are modal: while entering a filename, normal gameplay hotkeys are ignored.
-        if handle_prompt_key(key, &mut game, &mut state)? {
-            dirty = true;
-            continue;
+        // Returning `true` means the key was consumed by the prompt and should not also trigger a
+        // normal gameplay action.
+        match key.code {
+            KeyCode::Esc => {
+                self.state.prompt = None;
+                self.state.message = "Cancelled prompt".to_string();
+            }
+            KeyCode::Backspace => {
+                prompt.input.pop();
+            }
+            KeyCode::Enter => {
+                let prompt = self.state.prompt.take().expect("prompt exists");
+                let filename = if prompt.input.trim().is_empty() {
+                    DEFAULT_SAVE_FILE.to_string()
+                } else {
+                    prompt.input.trim().to_string()
+                };
+
+                match prompt.kind {
+                    PromptKind::Save => {
+                        self.state.message = match self.game.save_to_file(&filename) {
+                            Ok(()) => format!("Saved {filename}"),
+                            Err(error) => error.to_string(),
+                        };
+                    }
+                    PromptKind::Load => {
+                        self.state.message = match Game::load_from_file(&filename) {
+                            Ok(loaded_game) => {
+                                self.game = loaded_game;
+                                self.state.is_running = false;
+                                // Loading swaps in a new game state, so the cursor is reset and then
+                                // clamped against the loaded map dimensions.
+                                self.state.reset_cursor();
+                                let view = self.game.view_with_overlay(self.state.current_overlay);
+                                self.state.clamp_cursor(&view);
+                                format!("Loaded {filename}; simulation paused")
+                            }
+                            Err(error) => error.to_string(),
+                        };
+                    }
+                }
+            }
+            KeyCode::Char(value) => prompt.input.push(value),
+            _ => {}
         }
 
-        // Non-modal keys are normalized into actions before mutating UI state or calling Game APIs.
-        let action = map_key_event(key);
+        self.dirty = true;
+        Ok(true)
+    }
+
+    fn apply_action(&mut self, action: TuiAction, now: Instant) -> TuiFlow {
         match action {
-            TuiAction::MoveUp => move_cursor_with_current_view(&game, &mut state, 0, -1),
-            TuiAction::MoveDown => move_cursor_with_current_view(&game, &mut state, 0, 1),
-            TuiAction::MoveLeft => move_cursor_with_current_view(&game, &mut state, -1, 0),
-            TuiAction::MoveRight => move_cursor_with_current_view(&game, &mut state, 1, 0),
+            TuiAction::MoveUp => self.move_cursor(0, -1),
+            TuiAction::MoveDown => self.move_cursor(0, 1),
+            TuiAction::MoveLeft => self.move_cursor(-1, 0),
+            TuiAction::MoveRight => self.move_cursor(1, 0),
             TuiAction::SelectBuild(kind) => {
-                state.selected_build = kind;
-                state.message = format!("Selected {}", kind.label());
+                self.state.selected_build = kind;
+                self.state.message = format!("Selected {}", kind.label());
             }
             TuiAction::Build => {
-                state.message = game
-                    .build(state.cursor_x, state.cursor_y, state.selected_build)
+                self.state.message = self
+                    .game
+                    .build(
+                        self.state.cursor_x,
+                        self.state.cursor_y,
+                        self.state.selected_build,
+                    )
                     .message();
             }
             TuiAction::Replace => {
-                state.message = game
-                    .replace(state.cursor_x, state.cursor_y, state.selected_build)
+                self.state.message = self
+                    .game
+                    .replace(
+                        self.state.cursor_x,
+                        self.state.cursor_y,
+                        self.state.selected_build,
+                    )
                     .message();
             }
             TuiAction::Upgrade => {
-                state.message = game.upgrade(state.cursor_x, state.cursor_y).message();
+                self.state.message = self
+                    .game
+                    .upgrade(self.state.cursor_x, self.state.cursor_y)
+                    .message();
             }
             TuiAction::Bulldoze => {
-                state.message = game.bulldoze(state.cursor_x, state.cursor_y).message();
+                self.state.message = self
+                    .game
+                    .bulldoze(self.state.cursor_x, self.state.cursor_y)
+                    .message();
             }
-            TuiAction::Tick => {
-                manual_tick(&mut game, &mut state);
-            }
+            TuiAction::Tick => self.manual_tick(),
             TuiAction::Save => {
-                state.prompt = Some(PromptState {
+                self.state.prompt = Some(PromptState {
                     kind: PromptKind::Save,
                     input: String::new(),
                 });
             }
             TuiAction::Load => {
-                state.prompt = Some(PromptState {
+                self.state.prompt = Some(PromptState {
                     kind: PromptKind::Load,
                     input: String::new(),
                 });
             }
-            TuiAction::ToggleHelp => state.show_help = !state.show_help,
-            TuiAction::CycleOverlay => state.cycle_overlay(),
+            TuiAction::ToggleHelp => self.state.show_help = !self.state.show_help,
+            TuiAction::CycleOverlay => self.state.cycle_overlay(),
             TuiAction::ToggleRun => {
-                state.toggle_run();
-                next_auto_tick = Instant::now() + AUTO_TICK_INTERVAL;
+                self.state.toggle_run();
+                self.next_auto_tick = now + AUTO_TICK_INTERVAL;
             }
-            TuiAction::Quit => return Ok(()),
-            TuiAction::None => continue,
+            TuiAction::Quit => return TuiFlow::Quit,
+            TuiAction::None => return TuiFlow::Continue,
         }
-        dirty = true;
+
+        self.dirty = true;
+        TuiFlow::Continue
+    }
+
+    fn move_cursor(&mut self, dx: isize, dy: isize) {
+        let view = self.game.view_with_overlay(self.state.current_overlay);
+        self.state.move_cursor(dx, dy, &view);
+    }
+
+    fn manual_tick(&mut self) {
+        if self.state.is_running {
+            self.state.message = "Pause before using manual next turn".to_string();
+            return;
+        }
+
+        self.state.message = self.game.tick().message();
     }
 }
 
-fn move_cursor_with_current_view(game: &Game, state: &mut TuiState, dx: isize, dy: isize) {
-    let view = game.view_with_overlay(state.current_overlay);
-    state.move_cursor(dx, dy, &view);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiFlow {
+    Continue,
+    Quit,
+}
+
+/// Runs the ratatui frontend while preserving the public Game API boundary.
+pub fn run() -> io::Result<()> {
+    let mut terminal = TerminalGuard::enter()?;
+    let mut runtime = TuiRuntime::new(Instant::now());
+
+    loop {
+        runtime.apply_due_auto_tick(Instant::now());
+
+        if runtime.dirty {
+            // Pull all render data through the public API only when the screen needs repainting.
+            // This keeps the TUI from caching or reaching into ECS internals while avoiding idle
+            // redraw work.
+            let view = runtime
+                .game
+                .view_with_overlay(runtime.state.current_overlay);
+            runtime.state.clamp_cursor(&view);
+            let inspect = runtime
+                .game
+                .inspect(runtime.state.cursor_x, runtime.state.cursor_y);
+            let preview = runtime.game.preview_build(
+                runtime.state.cursor_x,
+                runtime.state.cursor_y,
+                runtime.state.selected_build,
+            );
+
+            // ratatui redraws the whole frame into an off-screen buffer and then flushes the diff
+            // to the terminal. The closure receives a `Frame` that all render functions write into.
+            terminal.draw(|frame| render(frame, &view, &inspect, &preview, &runtime.state))?;
+            runtime.mark_clean();
+        }
+
+        // Sleep until input arrives or, in running mode, until the next scheduled auto tick is due.
+        if !event::poll(runtime.poll_timeout(Instant::now()))? {
+            continue;
+        }
+
+        // Crossterm can report mouse, resize, and paste events too. Resize changes should repaint.
+        let Event::Key(key) = event::read()? else {
+            runtime.mark_dirty();
+            continue;
+        };
+
+        // Prompts are modal: while entering a filename, normal gameplay hotkeys are ignored.
+        if runtime.handle_prompt_key(key)? {
+            continue;
+        }
+
+        // Non-modal keys are normalized into actions before mutating UI state or calling Game APIs.
+        let action = map_key_event(key);
+        if runtime.apply_action(action, Instant::now()) == TuiFlow::Quit {
+            return Ok(());
+        }
+    }
 }
 
 fn poll_timeout(is_running: bool, next_auto_tick: Instant, now: Instant) -> Duration {
@@ -230,69 +356,6 @@ fn poll_timeout(is_running: bool, next_auto_tick: Instant, now: Instant) -> Dura
     } else {
         PAUSED_POLL_TIMEOUT
     }
-}
-
-fn manual_tick(game: &mut Game, state: &mut TuiState) {
-    if state.is_running {
-        state.message = "Pause before using manual next turn".to_string();
-        return;
-    }
-
-    state.message = game.tick().message();
-}
-
-fn handle_prompt_key(key: KeyEvent, game: &mut Game, state: &mut TuiState) -> io::Result<bool> {
-    let Some(prompt) = state.prompt.as_mut() else {
-        return Ok(false);
-    };
-
-    // Returning `true` means the key was consumed by the prompt and should not also trigger a
-    // normal gameplay action.
-    match key.code {
-        KeyCode::Esc => {
-            state.prompt = None;
-            state.message = "Cancelled prompt".to_string();
-        }
-        KeyCode::Backspace => {
-            prompt.input.pop();
-        }
-        KeyCode::Enter => {
-            let prompt = state.prompt.take().expect("prompt exists");
-            let filename = if prompt.input.trim().is_empty() {
-                DEFAULT_SAVE_FILE.to_string()
-            } else {
-                prompt.input.trim().to_string()
-            };
-
-            match prompt.kind {
-                PromptKind::Save => {
-                    state.message = match game.save_to_file(&filename) {
-                        Ok(()) => format!("Saved {filename}"),
-                        Err(error) => error.to_string(),
-                    };
-                }
-                PromptKind::Load => {
-                    state.message = match Game::load_from_file(&filename) {
-                        Ok(loaded_game) => {
-                            *game = loaded_game;
-                            state.is_running = false;
-                            // Loading swaps in a new game state, so the cursor is reset and then
-                            // clamped against the loaded map dimensions.
-                            state.reset_cursor();
-                            let view = game.view_with_overlay(state.current_overlay);
-                            state.clamp_cursor(&view);
-                            format!("Loaded {filename}; simulation paused")
-                        }
-                        Err(error) => error.to_string(),
-                    };
-                }
-            }
-        }
-        KeyCode::Char(value) => prompt.input.push(value),
-        _ => {}
-    }
-
-    Ok(true)
 }
 
 fn render(
@@ -823,6 +886,7 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
 
     #[test]
@@ -863,27 +927,102 @@ mod tests {
 
     #[test]
     fn manual_tick_advances_only_when_paused() {
-        let mut game = Game::new(10, 10);
-        let mut state = TuiState::default();
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.game = Game::new(10, 10);
 
-        manual_tick(&mut game, &mut state);
+        assert_eq!(
+            runtime.apply_action(TuiAction::Tick, now),
+            TuiFlow::Continue
+        );
 
-        assert_eq!(game.view().status.turn, 1);
-        assert!(state.message.contains("Advanced to turn 1"));
+        assert_eq!(runtime.game.view().status.turn, 1);
+        assert!(runtime.state.message.contains("Advanced to turn 1"));
+        assert!(runtime.dirty);
     }
 
     #[test]
     fn manual_tick_is_blocked_while_running() {
-        let mut game = Game::new(10, 10);
-        let mut state = TuiState {
-            is_running: true,
-            ..TuiState::default()
-        };
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.game = Game::new(10, 10);
+        runtime.state.is_running = true;
 
-        manual_tick(&mut game, &mut state);
+        assert_eq!(
+            runtime.apply_action(TuiAction::Tick, now),
+            TuiFlow::Continue
+        );
 
-        assert_eq!(game.view().status.turn, 0);
-        assert_eq!(state.message, "Pause before using manual next turn");
+        assert_eq!(runtime.game.view().status.turn, 0);
+        assert_eq!(runtime.state.message, "Pause before using manual next turn");
+        assert!(runtime.dirty);
+    }
+
+    #[test]
+    fn apply_action_updates_build_tool_and_cursor() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.game = Game::new(3, 3);
+        runtime.mark_clean();
+
+        assert_eq!(
+            runtime.apply_action(TuiAction::SelectBuild(BuildingKind::Road), now),
+            TuiFlow::Continue
+        );
+        assert_eq!(runtime.state.selected_build, BuildingKind::Road);
+        assert_eq!(runtime.state.message, "Selected Road");
+        assert!(runtime.dirty);
+
+        runtime.mark_clean();
+        assert_eq!(
+            runtime.apply_action(TuiAction::MoveRight, now),
+            TuiFlow::Continue
+        );
+        assert_eq!((runtime.state.cursor_x, runtime.state.cursor_y), (1, 0));
+        assert!(runtime.dirty);
+    }
+
+    #[test]
+    fn runtime_applies_due_auto_tick_when_running() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.game = Game::new(10, 10);
+        runtime.state.is_running = true;
+        runtime.next_auto_tick = now;
+        runtime.mark_clean();
+
+        runtime.apply_due_auto_tick(now);
+
+        assert_eq!(runtime.game.view().status.turn, 1);
+        assert_eq!(runtime.next_auto_tick, now + AUTO_TICK_INTERVAL);
+        assert!(runtime.dirty);
+    }
+
+    #[test]
+    fn prompt_input_and_cancel_are_runtime_state_only() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.apply_action(TuiAction::Save, now);
+        runtime.mark_clean();
+
+        assert!(
+            runtime
+                .handle_prompt_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+                .expect("prompt char handled")
+        );
+        assert_eq!(runtime.state.prompt.as_ref().expect("prompt").input, "a");
+        assert!(runtime.dirty);
+
+        runtime
+            .handle_prompt_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .expect("prompt backspace handled");
+        assert_eq!(runtime.state.prompt.as_ref().expect("prompt").input, "");
+
+        runtime
+            .handle_prompt_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("prompt escape handled");
+        assert!(runtime.state.prompt.is_none());
+        assert_eq!(runtime.state.message, "Cancelled prompt");
     }
 
     #[test]
