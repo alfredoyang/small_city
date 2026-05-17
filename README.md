@@ -66,8 +66,8 @@ U                       upgrade selected cell
 X                       bulldoze selected cell
 I                       inspect selected cell
 N                       next turn
-V                       cycle overlay
-O                       open overlay selector in TUI
+V                       cycle overlay in ASCII UI
+O                       cycle overlay in TUI
 H                       open help screen in TUI
 S                       prompt for save filename
 L                       prompt for load filename

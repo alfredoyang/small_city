@@ -37,7 +37,6 @@ struct TuiState {
     current_overlay: MapOverlayInput,
     message: String,
     show_help: bool,
-    show_overlay_menu: bool,
     prompt: Option<PromptState>,
 }
 
@@ -50,7 +49,6 @@ impl Default for TuiState {
             current_overlay: MapOverlayInput::Normal,
             message: "Tiny City Builder".to_string(),
             show_help: false,
-            show_overlay_menu: false,
             prompt: None,
         }
     }
@@ -74,6 +72,18 @@ impl TuiState {
     fn reset_cursor(&mut self) {
         self.cursor_x = 0;
         self.cursor_y = 0;
+    }
+
+    fn cycle_overlay(&mut self) {
+        self.current_overlay = match self.current_overlay {
+            MapOverlayInput::Normal => MapOverlayInput::Power,
+            MapOverlayInput::Power => MapOverlayInput::Pollution,
+            MapOverlayInput::Pollution => MapOverlayInput::Population,
+            MapOverlayInput::Population => MapOverlayInput::LandValue,
+            MapOverlayInput::LandValue => MapOverlayInput::Desirability,
+            MapOverlayInput::Desirability => MapOverlayInput::Normal,
+        };
+        self.message = format!("Overlay: {}", overlay_label(self.current_overlay));
     }
 }
 
@@ -124,11 +134,6 @@ pub fn run() -> io::Result<()> {
             continue;
         }
 
-        // The overlay selector is also modal, but only for keys it understands.
-        if state.show_overlay_menu && handle_overlay_menu_key(key, &mut state) {
-            continue;
-        }
-
         // Non-modal keys are normalized into actions before mutating UI state or calling Game APIs.
         let action = map_key_event(key);
         match action {
@@ -172,7 +177,7 @@ pub fn run() -> io::Result<()> {
                 });
             }
             TuiAction::ToggleHelp => state.show_help = !state.show_help,
-            TuiAction::ToggleOverlayMenu => state.show_overlay_menu = !state.show_overlay_menu,
+            TuiAction::CycleOverlay => state.cycle_overlay(),
             TuiAction::Quit => return Ok(()),
             TuiAction::None => {}
         }
@@ -232,31 +237,6 @@ fn handle_prompt_key(key: KeyEvent, game: &mut Game, state: &mut TuiState) -> io
     Ok(true)
 }
 
-fn handle_overlay_menu_key(key: KeyEvent, state: &mut TuiState) -> bool {
-    // The overlay menu uses number keys for overlay choices. It consumes only those keys plus
-    // close keys; other keys fall through to normal action handling.
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('O') => {
-            state.show_overlay_menu = false;
-            true
-        }
-        KeyCode::Char('1') => select_overlay(state, MapOverlayInput::Normal),
-        KeyCode::Char('2') => select_overlay(state, MapOverlayInput::Power),
-        KeyCode::Char('3') => select_overlay(state, MapOverlayInput::Pollution),
-        KeyCode::Char('4') => select_overlay(state, MapOverlayInput::Population),
-        KeyCode::Char('5') => select_overlay(state, MapOverlayInput::LandValue),
-        KeyCode::Char('6') => select_overlay(state, MapOverlayInput::Desirability),
-        _ => false,
-    }
-}
-
-fn select_overlay(state: &mut TuiState, overlay: MapOverlayInput) -> bool {
-    state.current_overlay = overlay;
-    state.show_overlay_menu = false;
-    state.message = format!("Overlay: {}", overlay_label(overlay));
-    true
-}
-
 fn render(
     frame: &mut Frame<'_>,
     view: &GameView,
@@ -294,9 +274,6 @@ fn render(
     // modal renderers blanks the covered area before drawing the popup border and text.
     if state.show_help {
         render_help(frame, root);
-    }
-    if state.show_overlay_menu {
-        render_overlay_menu(frame, root, state.current_overlay);
     }
     if let Some(prompt) = &state.prompt {
         render_prompt(frame, root, prompt);
@@ -479,7 +456,7 @@ fn render_build_preview(
 fn render_messages(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let lines = vec![
         Line::from(state.message.as_str()),
-        Line::from("WASD/Arrows move | 1-6 tools | N next | O overlays | H help | Q quit"),
+        Line::from("WASD/Arrows move | 1-6 tools | N next | O cycle overlay | H help | Q quit"),
     ];
 
     frame.render_widget(
@@ -503,50 +480,37 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ),
         Line::from("Actions: B/Enter Build | R Replace | U Upgrade | X Bulldoze | N Next Turn"),
         Line::from("Files: S Save | L Load | Enter at prompt uses city1"),
-        Line::from("Views: O Overlay Menu | H Close Help | Q Quit"),
+        Line::from("Views: O Cycle Overlay | H Close Help | Q Quit"),
+        Line::from(
+            "Overlay order: Normal -> Power -> Pollution -> Population -> Land Value -> Desirability",
+        ),
+        Line::from(format!(
+            "Normal: {}",
+            overlay_legend(MapOverlayInput::Normal)
+        )),
+        Line::from(format!("Power: {}", overlay_legend(MapOverlayInput::Power))),
+        Line::from(format!(
+            "Pollution: {}",
+            overlay_legend(MapOverlayInput::Pollution)
+        )),
+        Line::from(format!(
+            "Population: {}",
+            overlay_legend(MapOverlayInput::Population)
+        )),
+        Line::from(format!(
+            "Land Value: {}",
+            overlay_legend(MapOverlayInput::LandValue)
+        )),
+        Line::from(format!(
+            "Desirability: {}",
+            overlay_legend(MapOverlayInput::Desirability)
+        )),
         Line::from("The TUI renders only GameView, InspectView, and BuildPreviewView data."),
     ];
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().title("Help").borders(Borders::ALL))
-            .wrap(Wrap { trim: true }),
-        popup,
-    );
-}
-
-fn render_overlay_menu(frame: &mut Frame<'_>, area: Rect, current: MapOverlayInput) {
-    let popup = centered_rect(50, 45, area);
-    let lines = [
-        MapOverlayInput::Normal,
-        MapOverlayInput::Power,
-        MapOverlayInput::Pollution,
-        MapOverlayInput::Population,
-        MapOverlayInput::LandValue,
-        MapOverlayInput::Desirability,
-    ]
-    .iter()
-    .enumerate()
-    .map(|(index, overlay)| {
-        let marker = if *overlay == current { "*" } else { " " };
-        Line::from(format!(
-            "{} {}. {} - {}",
-            marker,
-            index + 1,
-            overlay_label(*overlay),
-            overlay_legend(*overlay)
-        ))
-    })
-    .collect::<Vec<_>>();
-
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title("Overlay Selector")
-                    .borders(Borders::ALL),
-            )
             .wrap(Wrap { trim: true }),
         popup,
     );
