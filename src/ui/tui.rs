@@ -433,7 +433,13 @@ fn render_build_preview(
 ) {
     let can_build = if preview.can_build { "Yes" } else { "No" };
     let mut lines = vec![
-        Line::from(format!("Tool: {}", state.selected_build.label())),
+        Line::from(vec![
+            Span::raw("Tool: "),
+            Span::styled(
+                state.selected_build.label(),
+                building_style(state.selected_build).add_modifier(Modifier::BOLD),
+            ),
+        ]),
         Line::from(format!(
             "Cost: ${} | Upkeep: ${}",
             selected_build_cost(view, state.selected_build),
@@ -601,8 +607,8 @@ fn cell_style(symbol: char, overlay: MapOverlayInput) -> Style {
             '=' => Style::default().fg(Color::Gray),
             'R' => Style::default().fg(Color::Green),
             'C' => Style::default().fg(Color::Blue),
-            'I' => Style::default().fg(Color::Red),
-            'T' => Style::default().fg(Color::Yellow),
+            'I' => Style::default().fg(Color::Yellow),
+            'T' => Style::default().fg(Color::Red),
             'P' => Style::default().fg(Color::LightGreen),
             _ => Style::default(),
         },
@@ -615,6 +621,17 @@ fn cell_style(symbol: char, overlay: MapOverlayInput) -> Style {
         MapOverlayInput::Population => Style::default().fg(Color::Green),
         MapOverlayInput::LandValue => Style::default().fg(Color::Cyan),
         MapOverlayInput::Desirability => Style::default().fg(Color::Magenta),
+    }
+}
+
+fn building_style(kind: BuildingKind) -> Style {
+    match kind {
+        BuildingKind::Road => Style::default().fg(Color::Gray),
+        BuildingKind::Residential => Style::default().fg(Color::Green),
+        BuildingKind::Commercial => Style::default().fg(Color::Blue),
+        BuildingKind::Industrial => Style::default().fg(Color::Yellow),
+        BuildingKind::PowerPlant => Style::default().fg(Color::Red),
+        BuildingKind::Park => Style::default().fg(Color::LightGreen),
     }
 }
 
