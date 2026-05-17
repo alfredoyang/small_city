@@ -25,7 +25,7 @@ use crate::ui::tui_input::{TuiAction, map_key_event};
 
 const DEFAULT_SAVE_FILE: &str = "city1";
 const AUTO_TICK_INTERVAL: Duration = Duration::from_secs(1);
-const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PAUSED_POLL_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Local frontend state that is intentionally not stored in the simulation.
 ///
@@ -118,48 +118,59 @@ pub fn run() -> io::Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let mut game = Game::default();
     let mut state = TuiState::default();
-    let mut last_auto_tick = Instant::now();
+    let mut next_auto_tick = Instant::now() + AUTO_TICK_INTERVAL;
+    let mut dirty = true;
 
     loop {
-        if state.is_running && last_auto_tick.elapsed() >= AUTO_TICK_INTERVAL {
+        if state.is_running && Instant::now() >= next_auto_tick {
             state.message = game.tick().message();
-            last_auto_tick = Instant::now();
+            next_auto_tick = Instant::now() + AUTO_TICK_INTERVAL;
+            dirty = true;
         }
 
-        // Pull all render data through the public API on each frame. This keeps the TUI from
-        // caching or reaching into ECS internals.
-        let view = game.view_with_overlay(state.current_overlay);
-        state.clamp_cursor(&view);
-        let inspect = game.inspect(state.cursor_x, state.cursor_y);
-        let preview = game.preview_build(state.cursor_x, state.cursor_y, state.selected_build);
+        if dirty {
+            // Pull all render data through the public API only when the screen needs repainting.
+            // This keeps the TUI from caching or reaching into ECS internals while avoiding idle
+            // redraw work.
+            let view = game.view_with_overlay(state.current_overlay);
+            state.clamp_cursor(&view);
+            let inspect = game.inspect(state.cursor_x, state.cursor_y);
+            let preview = game.preview_build(state.cursor_x, state.cursor_y, state.selected_build);
 
-        // ratatui redraws the whole frame into an off-screen buffer and then flushes the diff to
-        // the terminal. The closure receives a `Frame` that all render functions write into.
-        terminal.draw(|frame| render(frame, &view, &inspect, &preview, &state))?;
+            // ratatui redraws the whole frame into an off-screen buffer and then flushes the diff
+            // to the terminal. The closure receives a `Frame` that all render functions write into.
+            terminal.draw(|frame| render(frame, &view, &inspect, &preview, &state))?;
+            dirty = false;
+        }
 
-        // Polling with a timeout lets the UI refresh even when no key is pressed, while avoiding a
-        // busy loop that would burn CPU.
-        if !event::poll(INPUT_POLL_INTERVAL)? {
+        // Sleep until input arrives or, in running mode, until the next scheduled auto tick is due.
+        if !event::poll(poll_timeout(
+            state.is_running,
+            next_auto_tick,
+            Instant::now(),
+        ))? {
             continue;
         }
 
-        // Crossterm can report mouse, resize, and paste events too. This UI only handles keys.
+        // Crossterm can report mouse, resize, and paste events too. Resize changes should repaint.
         let Event::Key(key) = event::read()? else {
+            dirty = true;
             continue;
         };
 
         // Prompts are modal: while entering a filename, normal gameplay hotkeys are ignored.
         if handle_prompt_key(key, &mut game, &mut state)? {
+            dirty = true;
             continue;
         }
 
         // Non-modal keys are normalized into actions before mutating UI state or calling Game APIs.
         let action = map_key_event(key);
         match action {
-            TuiAction::MoveUp => state.move_cursor(0, -1, &view),
-            TuiAction::MoveDown => state.move_cursor(0, 1, &view),
-            TuiAction::MoveLeft => state.move_cursor(-1, 0, &view),
-            TuiAction::MoveRight => state.move_cursor(1, 0, &view),
+            TuiAction::MoveUp => move_cursor_with_current_view(&game, &mut state, 0, -1),
+            TuiAction::MoveDown => move_cursor_with_current_view(&game, &mut state, 0, 1),
+            TuiAction::MoveLeft => move_cursor_with_current_view(&game, &mut state, -1, 0),
+            TuiAction::MoveRight => move_cursor_with_current_view(&game, &mut state, 1, 0),
             TuiAction::SelectBuild(kind) => {
                 state.selected_build = kind;
                 state.message = format!("Selected {}", kind.label());
@@ -199,11 +210,25 @@ pub fn run() -> io::Result<()> {
             TuiAction::CycleOverlay => state.cycle_overlay(),
             TuiAction::ToggleRun => {
                 state.toggle_run();
-                last_auto_tick = Instant::now();
+                next_auto_tick = Instant::now() + AUTO_TICK_INTERVAL;
             }
             TuiAction::Quit => return Ok(()),
-            TuiAction::None => {}
+            TuiAction::None => continue,
         }
+        dirty = true;
+    }
+}
+
+fn move_cursor_with_current_view(game: &Game, state: &mut TuiState, dx: isize, dy: isize) {
+    let view = game.view_with_overlay(state.current_overlay);
+    state.move_cursor(dx, dy, &view);
+}
+
+fn poll_timeout(is_running: bool, next_auto_tick: Instant, now: Instant) -> Duration {
+    if is_running {
+        next_auto_tick.saturating_duration_since(now)
+    } else {
+        PAUSED_POLL_TIMEOUT
     }
 }
 
@@ -859,6 +884,30 @@ mod tests {
 
         assert_eq!(game.view().status.turn, 0);
         assert_eq!(state.message, "Pause before using manual next turn");
+    }
+
+    #[test]
+    fn paused_mode_uses_long_poll_timeout() {
+        let now = Instant::now();
+
+        assert_eq!(
+            poll_timeout(false, now + AUTO_TICK_INTERVAL, now),
+            PAUSED_POLL_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn running_mode_polls_until_next_tick_deadline() {
+        let now = Instant::now();
+
+        assert_eq!(
+            poll_timeout(true, now + Duration::from_millis(250), now),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            poll_timeout(true, now - Duration::from_millis(1), now),
+            Duration::ZERO
+        );
     }
 
     #[test]
