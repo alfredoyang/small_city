@@ -712,3 +712,138 @@ impl Drop for TerminalGuard {
         let _ = self.terminal.show_cursor();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn overlay_cycles_in_display_order() {
+        let mut state = TuiState::default();
+
+        state.cycle_overlay();
+        assert_eq!(state.current_overlay, MapOverlayInput::Power);
+        assert_eq!(state.message, "Overlay: Power");
+
+        state.cycle_overlay();
+        assert_eq!(state.current_overlay, MapOverlayInput::Pollution);
+        state.cycle_overlay();
+        assert_eq!(state.current_overlay, MapOverlayInput::Population);
+        state.cycle_overlay();
+        assert_eq!(state.current_overlay, MapOverlayInput::LandValue);
+        state.cycle_overlay();
+        assert_eq!(state.current_overlay, MapOverlayInput::Desirability);
+        state.cycle_overlay();
+        assert_eq!(state.current_overlay, MapOverlayInput::Normal);
+    }
+
+    #[test]
+    fn render_draws_expected_main_panels() {
+        let game = Game::new(10, 10);
+        let output = render_test_screen(&game, TuiState::default());
+
+        for expected in [
+            "City Map",
+            "Selected Cell",
+            "Status",
+            "Build / Actions",
+            "Messages / Tick Summary",
+            "Overlay: Normal",
+            "Tool: Residential",
+        ] {
+            assert!(
+                output.contains(expected),
+                "expected TUI output to contain {expected:?}\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_panel_contains_overlay_order_and_legends() {
+        let game = Game::new(10, 10);
+        let state = TuiState {
+            show_help: true,
+            ..TuiState::default()
+        };
+
+        let output = render_test_screen(&game, state);
+
+        assert!(output.contains("Help"));
+        assert!(output.contains("O Cycle Overlay"));
+        assert!(output.contains("Overlay order: Normal -> Power -> Pollution"));
+        assert!(output.contains("Normal: . empty"));
+        assert!(output.contains("Desirability: 0-9 desirability"));
+    }
+
+    #[test]
+    fn selected_build_tool_uses_building_color() {
+        let game = Game::new(10, 10);
+        let state = TuiState {
+            selected_build: BuildingKind::Industrial,
+            ..TuiState::default()
+        };
+
+        let terminal = render_test_terminal(&game, state);
+        let buffer = terminal.backend().buffer();
+        let cell = find_first_text_cell(buffer, "Industrial").expect("styled Industrial text");
+
+        assert_eq!(cell.fg, Color::Yellow);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    fn render_test_screen(game: &Game, state: TuiState) -> String {
+        let terminal = render_test_terminal(game, state);
+        buffer_text(terminal.backend().buffer())
+    }
+
+    fn render_test_terminal(game: &Game, mut state: TuiState) -> Terminal<TestBackend> {
+        let view = game.view_with_overlay(state.current_overlay);
+        state.clamp_cursor(&view);
+        let inspect = game.inspect(state.cursor_x, state.cursor_y);
+        let preview = game.preview_build(state.cursor_x, state.cursor_y, state.selected_build);
+
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &view, &inspect, &preview, &state))
+            .expect("render TUI frame");
+        terminal
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = buffer.area();
+        let width = area.width as usize;
+        let mut text = String::new();
+
+        for row in buffer.content().chunks(width) {
+            for cell in row {
+                text.push_str(cell.symbol());
+            }
+            text.push('\n');
+        }
+
+        text
+    }
+
+    fn find_first_text_cell<'a>(
+        buffer: &'a ratatui::buffer::Buffer,
+        needle: &str,
+    ) -> Option<&'a ratatui::buffer::Cell> {
+        let area = buffer.area();
+        let width = area.width as usize;
+
+        for row in buffer.content().chunks(width) {
+            let mut line = String::new();
+            for cell in row {
+                line.push_str(cell.symbol());
+            }
+
+            if let Some(x) = line.find(needle) {
+                return row.get(x);
+            }
+        }
+
+        None
+    }
+}
