@@ -472,15 +472,31 @@ fn render_messages(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered_rect(70, 70, area);
+    let popup = centered_rect(82, 100, area);
     let lines = vec![
-        Line::from("Movement: WASD or arrow keys"),
-        Line::from(
-            "Build tools: 1 Road | 2 Residential | 3 Commercial | 4 Industrial | 5 Power | 6 Park",
-        ),
-        Line::from("Actions: B/Enter Build | R Replace | U Upgrade | X Bulldoze | N Next Turn"),
-        Line::from("Files: S Save | L Load | Enter at prompt uses city1"),
-        Line::from("Views: O Cycle Overlay | H Close Help | Q Quit"),
+        help_section("Movement"),
+        Line::from("  WASD / Arrow Keys    Move cursor"),
+        Line::from(""),
+        help_section("Build Tools"),
+        Line::from("  1 Road        2 Residential     3 Commercial"),
+        Line::from("  4 Industrial  5 Power Plant     6 Park"),
+        Line::from(""),
+        help_section("Actions"),
+        Line::from("  B / Enter     Build selected tool"),
+        Line::from("  R             Replace selected cell with selected tool"),
+        Line::from("  U             Upgrade selected cell"),
+        Line::from("  X             Bulldoze selected cell"),
+        Line::from("  N             Next turn"),
+        Line::from(""),
+        help_section("Files And UI"),
+        Line::from("  S             Save city"),
+        Line::from("  L             Load city"),
+        Line::from("  H             Close Help"),
+        Line::from("  Q             Quit"),
+        Line::from("  Enter at save/load prompt uses city1"),
+        Line::from(""),
+        help_section("Overlays"),
+        Line::from("  O Cycle Overlay"),
         Line::from(
             "Overlay order: Normal -> Power -> Pollution -> Population -> Land Value -> Desirability",
         ),
@@ -505,6 +521,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             "Desirability: {}",
             overlay_legend(MapOverlayInput::Desirability)
         )),
+        Line::from(""),
+        help_section("Boundary"),
         Line::from("The TUI renders only GameView, InspectView, and BuildPreviewView data."),
     ];
     frame.render_widget(Clear, popup);
@@ -514,6 +532,15 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             .wrap(Wrap { trim: true }),
         popup,
     );
+}
+
+fn help_section(label: &'static str) -> Line<'static> {
+    Line::from(Span::styled(
+        label,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))
 }
 
 fn render_prompt(frame: &mut Frame<'_>, area: Rect, prompt: &PromptState) {
