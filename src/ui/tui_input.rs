@@ -24,6 +24,7 @@ pub(crate) enum TuiAction {
     Load,
     ToggleHelp,
     CycleOverlay,
+    ToggleRun,
     Quit,
     None,
 }
@@ -63,6 +64,7 @@ pub(crate) fn map_key_event(event: KeyEvent) -> TuiAction {
         KeyCode::Char('l') | KeyCode::Char('L') => TuiAction::Load,
         KeyCode::Char('h') | KeyCode::Char('H') => TuiAction::ToggleHelp,
         KeyCode::Char('o') | KeyCode::Char('O') => TuiAction::CycleOverlay,
+        KeyCode::Char(' ') => TuiAction::ToggleRun,
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => TuiAction::Quit,
         _ => TuiAction::None,
     }
@@ -135,6 +137,7 @@ mod tests {
             map_key_event(key(KeyCode::Char('O'))),
             TuiAction::CycleOverlay
         );
+        assert_eq!(map_key_event(key(KeyCode::Char(' '))), TuiAction::ToggleRun);
         assert_eq!(map_key_event(key(KeyCode::Char('Q'))), TuiAction::Quit);
     }
 }

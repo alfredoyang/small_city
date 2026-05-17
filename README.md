@@ -65,7 +65,8 @@ R                       replace selected cell with selected build type
 U                       upgrade selected cell
 X                       bulldoze selected cell
 I                       inspect selected cell
-N                       next turn
+N                       next turn when paused
+Space                   pause/resume automatic ticks in TUI
 V                       cycle overlay in ASCII UI
 O                       cycle overlay in TUI
 H                       open help screen in TUI
@@ -105,7 +106,7 @@ land value      0-9, higher means parks and commercial activity improved nearby 
 desirability    0-9, combines land value, pollution pressure, and road accessibility
 ```
 
-The TUI presents the same view data in panels: city map, selected cell, city status, build preview/actions, and messages/tick summary. Status panels show turn, money, population, citizen count, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, overlay legend, demand notes, selected cell details, inspect notes, build preview explanations, and the latest command message.
+The TUI presents the same view data in panels: city map, selected cell, city status, build preview/actions, and messages/tick summary. Status panels show turn, money, population, citizen count, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, overlay legend, demand notes, selected cell details, inspect notes, build preview explanations, run/pause state, and the latest command message. New and loaded TUI games start paused; pressing Space resumes automatic one-second ticks.
 
 ## Save And Load
 

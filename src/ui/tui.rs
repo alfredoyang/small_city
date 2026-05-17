@@ -1,7 +1,7 @@
 //! Panel-based ratatui terminal frontend built only from Game API view models.
 
 use std::io::{self, Stdout};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use crossterm::execute;
@@ -24,6 +24,8 @@ use crate::ui::ascii;
 use crate::ui::tui_input::{TuiAction, map_key_event};
 
 const DEFAULT_SAVE_FILE: &str = "city1";
+const AUTO_TICK_INTERVAL: Duration = Duration::from_secs(1);
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Local frontend state that is intentionally not stored in the simulation.
 ///
@@ -36,6 +38,7 @@ struct TuiState {
     selected_build: BuildingKind,
     current_overlay: MapOverlayInput,
     message: String,
+    is_running: bool,
     show_help: bool,
     prompt: Option<PromptState>,
 }
@@ -48,6 +51,7 @@ impl Default for TuiState {
             selected_build: BuildingKind::Residential,
             current_overlay: MapOverlayInput::Normal,
             message: "Tiny City Builder".to_string(),
+            is_running: false,
             show_help: false,
             prompt: None,
         }
@@ -85,6 +89,15 @@ impl TuiState {
         };
         self.message = format!("Overlay: {}", overlay_label(self.current_overlay));
     }
+
+    fn toggle_run(&mut self) {
+        self.is_running = !self.is_running;
+        self.message = if self.is_running {
+            "Simulation running: auto tick every 1 second".to_string()
+        } else {
+            "Simulation paused".to_string()
+        };
+    }
 }
 
 /// Temporary text-entry state for save/load filename prompts.
@@ -105,8 +118,14 @@ pub fn run() -> io::Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let mut game = Game::default();
     let mut state = TuiState::default();
+    let mut last_auto_tick = Instant::now();
 
     loop {
+        if state.is_running && last_auto_tick.elapsed() >= AUTO_TICK_INTERVAL {
+            state.message = game.tick().message();
+            last_auto_tick = Instant::now();
+        }
+
         // Pull all render data through the public API on each frame. This keeps the TUI from
         // caching or reaching into ECS internals.
         let view = game.view_with_overlay(state.current_overlay);
@@ -120,7 +139,7 @@ pub fn run() -> io::Result<()> {
 
         // Polling with a timeout lets the UI refresh even when no key is pressed, while avoiding a
         // busy loop that would burn CPU.
-        if !event::poll(Duration::from_millis(250))? {
+        if !event::poll(INPUT_POLL_INTERVAL)? {
             continue;
         }
 
@@ -162,7 +181,7 @@ pub fn run() -> io::Result<()> {
                 state.message = game.bulldoze(state.cursor_x, state.cursor_y).message();
             }
             TuiAction::Tick => {
-                state.message = game.tick().message();
+                manual_tick(&mut game, &mut state);
             }
             TuiAction::Save => {
                 state.prompt = Some(PromptState {
@@ -178,10 +197,23 @@ pub fn run() -> io::Result<()> {
             }
             TuiAction::ToggleHelp => state.show_help = !state.show_help,
             TuiAction::CycleOverlay => state.cycle_overlay(),
+            TuiAction::ToggleRun => {
+                state.toggle_run();
+                last_auto_tick = Instant::now();
+            }
             TuiAction::Quit => return Ok(()),
             TuiAction::None => {}
         }
     }
+}
+
+fn manual_tick(game: &mut Game, state: &mut TuiState) {
+    if state.is_running {
+        state.message = "Pause before using manual next turn".to_string();
+        return;
+    }
+
+    state.message = game.tick().message();
 }
 
 fn handle_prompt_key(key: KeyEvent, game: &mut Game, state: &mut TuiState) -> io::Result<bool> {
@@ -218,12 +250,13 @@ fn handle_prompt_key(key: KeyEvent, game: &mut Game, state: &mut TuiState) -> io
                     state.message = match Game::load_from_file(&filename) {
                         Ok(loaded_game) => {
                             *game = loaded_game;
+                            state.is_running = false;
                             // Loading swaps in a new game state, so the cursor is reset and then
                             // clamped against the loaded map dimensions.
                             state.reset_cursor();
                             let view = game.view_with_overlay(state.current_overlay);
                             state.clamp_cursor(&view);
-                            format!("Loaded {filename}")
+                            format!("Loaded {filename}; simulation paused")
                         }
                         Err(error) => error.to_string(),
                     };
@@ -266,7 +299,7 @@ fn render(
 
     render_map(frame, top[0], view, state);
     render_selected_cell(frame, top[1], inspect);
-    render_status(frame, middle[0], view);
+    render_status(frame, middle[0], view, state);
     render_build_preview(frame, middle[1], view, preview, state);
     render_messages(frame, vertical[2], state);
 
@@ -361,9 +394,10 @@ fn render_selected_cell(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView
     );
 }
 
-fn render_status(frame: &mut Frame<'_>, area: Rect, view: &GameView) {
+fn render_status(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &TuiState) {
     let status = &view.status;
     let lines = vec![
+        simulation_status_line(state.is_running),
         Line::from(format!(
             "Turn: {} | Money: ${} | Pop: {} | Citizens: {}",
             status.turn, status.money, status.population, status.citizens
@@ -455,8 +489,11 @@ fn render_build_preview(
 
 fn render_messages(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let lines = vec![
+        simulation_status_line(state.is_running),
         Line::from(state.message.as_str()),
-        Line::from("WASD/Arrows move | 1-6 tools | N next | O cycle overlay | H help | Q quit"),
+        Line::from(
+            "Space pause/resume | WASD/Arrows move | 1-6 tools | N next | O overlay | H help | Q quit",
+        ),
     ];
 
     frame.render_widget(
@@ -482,6 +519,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  4 Industrial  5 Power Plant     6 Park"),
         Line::from(""),
         help_section("Actions"),
+        Line::from("  Space         Pause / resume automatic ticks"),
         Line::from("  B / Enter     Build selected tool"),
         Line::from("  R             Replace selected cell with selected tool"),
         Line::from("  U             Upgrade selected cell"),
@@ -541,6 +579,23 @@ fn help_section(label: &'static str) -> Line<'static> {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     ))
+}
+
+fn simulation_status_line(is_running: bool) -> Line<'static> {
+    let (label, color, detail) = if is_running {
+        ("RUNNING", Color::Green, "auto tick every 1 second")
+    } else {
+        ("PAUSED", Color::Yellow, "press Space to resume")
+    };
+
+    Line::from(vec![
+        Span::raw("Simulation: "),
+        Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(" | {detail}")),
+    ])
 }
 
 fn render_prompt(frame: &mut Frame<'_>, area: Rect, prompt: &PromptState) {
@@ -766,6 +821,47 @@ mod tests {
     }
 
     #[test]
+    fn run_state_defaults_to_paused_and_toggles() {
+        let mut state = TuiState::default();
+
+        assert!(!state.is_running);
+        state.toggle_run();
+        assert!(state.is_running);
+        assert_eq!(
+            state.message,
+            "Simulation running: auto tick every 1 second"
+        );
+        state.toggle_run();
+        assert!(!state.is_running);
+        assert_eq!(state.message, "Simulation paused");
+    }
+
+    #[test]
+    fn manual_tick_advances_only_when_paused() {
+        let mut game = Game::new(10, 10);
+        let mut state = TuiState::default();
+
+        manual_tick(&mut game, &mut state);
+
+        assert_eq!(game.view().status.turn, 1);
+        assert!(state.message.contains("Advanced to turn 1"));
+    }
+
+    #[test]
+    fn manual_tick_is_blocked_while_running() {
+        let mut game = Game::new(10, 10);
+        let mut state = TuiState {
+            is_running: true,
+            ..TuiState::default()
+        };
+
+        manual_tick(&mut game, &mut state);
+
+        assert_eq!(game.view().status.turn, 0);
+        assert_eq!(state.message, "Pause before using manual next turn");
+    }
+
+    #[test]
     fn render_draws_expected_main_panels() {
         let game = Game::new(10, 10);
         let output = render_test_screen(&game, TuiState::default());
@@ -778,6 +874,8 @@ mod tests {
             "Messages / Tick Summary",
             "Overlay: Normal",
             "Tool: Residential",
+            "Simulation: PAUSED",
+            "press Space to resume",
         ] {
             assert!(
                 output.contains(expected),
@@ -797,10 +895,25 @@ mod tests {
         let output = render_test_screen(&game, state);
 
         assert!(output.contains("Help"));
+        assert!(output.contains("Space         Pause / resume automatic ticks"));
         assert!(output.contains("O Cycle Overlay"));
         assert!(output.contains("Overlay order: Normal -> Power -> Pollution"));
         assert!(output.contains("Normal: . empty"));
         assert!(output.contains("Desirability: 0-9 desirability"));
+    }
+
+    #[test]
+    fn render_shows_running_status_when_auto_tick_is_enabled() {
+        let game = Game::new(10, 10);
+        let state = TuiState {
+            is_running: true,
+            ..TuiState::default()
+        };
+
+        let output = render_test_screen(&game, state);
+
+        assert!(output.contains("Simulation: RUNNING"));
+        assert!(output.contains("auto tick every 1 second"));
     }
 
     #[test]
