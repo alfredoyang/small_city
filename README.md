@@ -77,7 +77,7 @@ Q                       quit
 
 Note: lowercase `s` moves down; uppercase `S` saves.
 
-Normal map symbols:
+ASCII fallback map symbols:
 
 ```text
 . empty
@@ -89,24 +89,45 @@ T power plant
 P park
 ```
 
+Ratatui TUI map tiles use an ASCII-2 theme by default. Every map cell is a fixed two-character tile:
+
+```text
+.. empty
+== road
+R1 residential level 1
+R2 residential level 2
+C1 commercial level 1
+I1 industrial level 1
+T1 power plant level 1
+P1 park level 1
+R- unpowered residential
+R! blocked residential
+```
+
 Power overlay symbols:
 
 ```text
-P power plant
-* powered road network
-+ powered consumer
-- unpowered consumer
-. no power overlay data
+T* active power plant
+=* powered road network
+R+ powered residential
+R- unpowered residential
+C+ powered commercial
+C- unpowered commercial
+I+ powered industrial
+I- unpowered industrial
+.. no power overlay data
 ```
 
 Local overlays:
 
 ```text
-land value      0-9, higher means parks and commercial activity improved nearby land
-desirability    0-9, combines land value, pollution pressure, and road accessibility
+pollution       .. clean | -- low | ++ medium | ** high | ## severe
+land value      .. none  | -- low | ++ medium | ** high | ## very high
+desirability    !! bad   | -- low | ++ medium | ** good | ## excellent
+population      R0-R9 for residential population where available
 ```
 
-The TUI presents the same view data in panels: city map, selected cell, city status, build preview/actions, and messages/tick summary. Status panels show turn, money, population, citizen count, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, overlay legend, demand notes, selected cell details, inspect notes, build preview explanations, run/pause state, and the latest command message. New and loaded TUI games start paused; pressing Space resumes automatic one-second ticks.
+The TUI presents the same view data in panels: city map, selected cell, city status, build preview/actions, and messages/tick summary. Status panels show turn, money, population, citizen count, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, overlay legend, demand notes, selected cell details, inspect notes, build preview explanations, run/pause state, and the latest command message. TUI messages use `OK:`, `WARN:`, `ERR:`, or `INFO:` prefixes. New and loaded TUI games start paused; pressing Space resumes automatic one-second ticks.
 
 The TUI needs at least a 100x30 terminal. Smaller terminals show a resize warning and suggest `cargo run -- ascii`.
 

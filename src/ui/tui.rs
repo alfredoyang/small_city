@@ -18,7 +18,7 @@ use ratatui::{Frame, Terminal};
 use crate::core::game::Game;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
-    BuildPreviewView, DemandLevel, GameView, InspectDetailsView, InspectView,
+    BuildPreviewView, CellView, DemandLevel, GameView, InspectDetailsView, InspectView,
 };
 use crate::ui::ascii;
 use crate::ui::tui_input::{TuiAction, map_key_event};
@@ -39,6 +39,7 @@ struct TuiState {
     cursor_y: usize,
     selected_build: BuildingKind,
     current_overlay: MapOverlayInput,
+    tile_theme: TileTheme,
     message: String,
     is_running: bool,
     show_help: bool,
@@ -52,12 +53,173 @@ impl Default for TuiState {
             cursor_y: 0,
             selected_build: BuildingKind::Residential,
             current_overlay: MapOverlayInput::Normal,
+            tile_theme: TileTheme::AsciiDetailed,
             message: "Tiny City Builder".to_string(),
             is_running: false,
             show_help: false,
             prompt: None,
         }
     }
+}
+
+/// UI-only map theme. It converts safe interface view models into fixed-width terminal tiles.
+///
+/// `AsciiDetailed` is the default because every tile is exactly two ASCII characters, which keeps
+/// map rows aligned across terminals. `AsciiCompact` preserves the older one-character language
+/// inside a two-character tile. `Unicode` remains optional and is not the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TileTheme {
+    AsciiCompact,
+    AsciiDetailed,
+    Unicode,
+}
+
+impl TileTheme {
+    fn tile_for_cell(
+        self,
+        cell: &CellView,
+        overlay: MapOverlayInput,
+        is_cursor: bool,
+        preview_state: PreviewState,
+    ) -> TileGlyph {
+        let mut glyph = match overlay {
+            MapOverlayInput::Normal => self.normal_tile(cell),
+            MapOverlayInput::Power => self.power_tile(cell),
+            MapOverlayInput::Pollution => self.intensity_tile(
+                cell.local_effects.pollution_pressure,
+                IntensityKind::Pollution,
+            ),
+            MapOverlayInput::Population => self.population_tile(cell),
+            MapOverlayInput::LandValue => {
+                self.intensity_tile(cell.local_effects.land_value, IntensityKind::LandValue)
+            }
+            MapOverlayInput::Desirability => {
+                self.intensity_tile(cell.local_effects.desirability, IntensityKind::Desirability)
+            }
+        };
+
+        if preview_state != PreviewState::None {
+            glyph.style = match preview_state {
+                PreviewState::Valid => glyph.style.fg(Color::Green),
+                PreviewState::Invalid => glyph.style.fg(Color::Red),
+                PreviewState::None => glyph.style,
+            }
+            .add_modifier(Modifier::BOLD);
+        }
+
+        if is_cursor {
+            glyph.style = glyph
+                .style
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD);
+        }
+
+        glyph
+    }
+
+    fn normal_tile(self, cell: &CellView) -> TileGlyph {
+        let tile = match self {
+            TileTheme::AsciiCompact => format!("{}.", cell.symbol),
+            TileTheme::AsciiDetailed => ascii_detailed_normal_tile(cell),
+            TileTheme::Unicode => unicode_normal_tile(cell),
+        };
+        TileGlyph {
+            tile,
+            style: cell_base_style(cell),
+        }
+    }
+
+    fn power_tile(self, cell: &CellView) -> TileGlyph {
+        let tile = match cell.symbol {
+            'P' => "T*".to_string(),
+            '*' => "=*".to_string(),
+            '+' => format!("{}+", tile_type(cell)),
+            '-' => format!("{}-", tile_type(cell)),
+            _ => "..".to_string(),
+        };
+        let style = match cell.symbol {
+            'P' | '*' | '+' => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            '-' => problem_style(),
+            _ => empty_style(),
+        };
+
+        match self {
+            TileTheme::Unicode => TileGlyph {
+                tile: tile.replace('T', "ϟ"),
+                style,
+            },
+            TileTheme::AsciiCompact | TileTheme::AsciiDetailed => TileGlyph { tile, style },
+        }
+    }
+
+    fn intensity_tile(self, value: i32, kind: IntensityKind) -> TileGlyph {
+        let marker = intensity_marker(value, kind);
+        let tile = match self {
+            TileTheme::AsciiCompact | TileTheme::AsciiDetailed => format!("{marker}{marker}"),
+            TileTheme::Unicode => unicode_intensity_tile(value, kind).to_string(),
+        };
+        TileGlyph {
+            tile,
+            style: intensity_style(value, kind),
+        }
+    }
+
+    fn population_tile(self, cell: &CellView) -> TileGlyph {
+        if let Some(population) = cell.population {
+            let marker = population.clamp(0, 9);
+            return TileGlyph {
+                tile: format!("{}{}", tile_type(cell), marker),
+                style: Style::default().fg(Color::Green),
+            };
+        }
+
+        self.intensity_tile(0, IntensityKind::Population)
+    }
+
+    fn legend(self, overlay: MapOverlayInput) -> &'static str {
+        match overlay {
+            MapOverlayInput::Normal => {
+                ".. Empty | == Road | R1/R2 Residential | C1 Commercial | I1 Industrial | T1 Power | P1 Park"
+            }
+            MapOverlayInput::Power => {
+                "T* Plant | =* Powered road | R+ Powered | R- Unpowered | C+/C- Commercial | I+/I- Industrial"
+            }
+            MapOverlayInput::Pollution => ". Clean | - Low | + Medium | * High | # Severe",
+            MapOverlayInput::Population => ".. None | R0-R9 Residential population",
+            MapOverlayInput::LandValue => ". None | - Low | + Medium | * High | # Very High",
+            MapOverlayInput::Desirability => "! Bad | - Low | + Medium | * Good | # Excellent",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            TileTheme::AsciiCompact => "ASCII Compact",
+            TileTheme::AsciiDetailed => "ASCII-2",
+            TileTheme::Unicode => "Unicode",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TileGlyph {
+    pub tile: String,
+    pub style: Style,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewState {
+    None,
+    Valid,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntensityKind {
+    Pollution,
+    Population,
+    LandValue,
+    Desirability,
 }
 
 impl TuiState {
@@ -392,7 +554,7 @@ fn render(
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(vertical[1]);
 
-    render_map(frame, top[0], view, state);
+    render_map(frame, top[0], view, preview, state);
     render_selected_cell(frame, top[1], inspect);
     render_status(frame, middle[0], view, state);
     render_build_preview(frame, middle[1], view, preview, state);
@@ -441,17 +603,26 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_map(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &TuiState) {
+fn render_map(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &GameView,
+    preview: &BuildPreviewView,
+    state: &TuiState,
+) {
     let mut lines = Vec::new();
     lines.push(Line::from(format!(
-        "Overlay: {} | {}",
+        "Overlay: {} | Theme: {} | {}",
         overlay_label(state.current_overlay),
-        overlay_legend(state.current_overlay)
+        state.tile_theme.label(),
+        state.tile_theme.legend(state.current_overlay)
     )));
 
+    let gap = map_cell_gap(area, view);
+    let cell_width = 2 + gap.len();
     let mut header = vec![Span::raw("   ")];
     for x in 0..view.map.width {
-        header.push(Span::raw(format!("{x:^3}")));
+        header.push(Span::raw(format!("{x:^cell_width$}")));
     }
     lines.push(Line::from(header));
 
@@ -459,18 +630,21 @@ fn render_map(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &TuiSta
         let mut row = vec![Span::raw(format!("{y:>2} "))];
         for x in 0..view.map.width {
             let index = y * view.map.width + x;
-            let symbol = view.map.cells[index].symbol;
-            // The cursor is styling, not extra text. Every cell stays exactly three characters
-            // wide, so moving the cursor cannot shift map columns.
-            let style = if x == state.cursor_x && y == state.cursor_y {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                cell_style(symbol, state.current_overlay)
-            };
-            row.push(Span::styled(format!(" {symbol} "), style));
+            let cell = &view.map.cells[index];
+            let is_cursor = x == state.cursor_x && y == state.cursor_y;
+            let preview_state = preview_state_for_cell(x, y, preview, state);
+            let glyph = state.tile_theme.tile_for_cell(
+                cell,
+                state.current_overlay,
+                is_cursor,
+                preview_state,
+            );
+            // Each tile is exactly two ASCII characters. The optional gap is outside the styled
+            // tile so cursor highlighting never changes map width.
+            row.push(Span::styled(glyph.tile, glyph.style));
+            if !gap.is_empty() {
+                row.push(Span::raw(gap));
+            }
         }
         lines.push(Line::from(row));
     }
@@ -571,6 +745,13 @@ fn render_build_preview(
     state: &TuiState,
 ) {
     let can_build = if preview.can_build { "Yes" } else { "No" };
+    let preview_style = if preview.can_build {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    };
     let mut lines = vec![
         Line::from(vec![
             Span::raw("Tool: "),
@@ -584,7 +765,10 @@ fn render_build_preview(
             selected_build_cost(view, state.selected_build),
             selected_build_maintenance_cost(view, state.selected_build)
         )),
-        Line::from(format!("Can Build: {can_build}")),
+        Line::from(vec![
+            Span::raw("Can Build: "),
+            Span::styled(can_build, preview_style),
+        ]),
     ];
 
     if let Some(reason) = &preview.reason {
@@ -618,7 +802,7 @@ fn render_build_preview(
 fn render_messages(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let lines = vec![
         simulation_status_line(state.is_running),
-        Line::from(state.message.as_str()),
+        Line::from(format_message(&state.message)),
         Line::from(
             "Space pause/resume | WASD/Arrows move | 1-6 tools | N next | O overlay | H help | Q quit",
         ),
@@ -660,6 +844,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  H             Close Help"),
         Line::from("  Q             Quit"),
         Line::from("  Enter at save/load prompt uses city1"),
+        Line::from(format!("  Tile themes   {}", tile_theme_labels())),
         Line::from(""),
         help_section("Overlays"),
         Line::from("  O Cycle Overlay"),
@@ -668,24 +853,27 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ),
         Line::from(format!(
             "Normal: {}",
-            overlay_legend(MapOverlayInput::Normal)
+            TileTheme::AsciiDetailed.legend(MapOverlayInput::Normal)
         )),
-        Line::from(format!("Power: {}", overlay_legend(MapOverlayInput::Power))),
+        Line::from(format!(
+            "Power: {}",
+            TileTheme::AsciiDetailed.legend(MapOverlayInput::Power)
+        )),
         Line::from(format!(
             "Pollution: {}",
-            overlay_legend(MapOverlayInput::Pollution)
+            TileTheme::AsciiDetailed.legend(MapOverlayInput::Pollution)
         )),
         Line::from(format!(
             "Population: {}",
-            overlay_legend(MapOverlayInput::Population)
+            TileTheme::AsciiDetailed.legend(MapOverlayInput::Population)
         )),
         Line::from(format!(
             "Land Value: {}",
-            overlay_legend(MapOverlayInput::LandValue)
+            TileTheme::AsciiDetailed.legend(MapOverlayInput::LandValue)
         )),
         Line::from(format!(
             "Desirability: {}",
-            overlay_legend(MapOverlayInput::Desirability)
+            TileTheme::AsciiDetailed.legend(MapOverlayInput::Desirability)
         )),
         Line::from(""),
         help_section("Boundary"),
@@ -707,6 +895,18 @@ fn help_section(label: &'static str) -> Line<'static> {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     ))
+}
+
+fn tile_theme_labels() -> String {
+    [
+        TileTheme::AsciiDetailed,
+        TileTheme::AsciiCompact,
+        TileTheme::Unicode,
+    ]
+    .iter()
+    .map(|theme| theme.label())
+    .collect::<Vec<_>>()
+    .join(" / ")
 }
 
 fn simulation_status_line(is_running: bool) -> Line<'static> {
@@ -773,39 +973,162 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn cell_style(symbol: char, overlay: MapOverlayInput) -> Style {
-    // Color is purely presentation. The meaning still comes from GameView cell symbols and overlay
-    // data generated by the interface adapter.
-    match overlay {
-        MapOverlayInput::Normal => match symbol {
-            '=' => Style::default().fg(Color::Gray),
-            'R' => Style::default().fg(Color::Green),
-            'C' => Style::default().fg(Color::Blue),
-            'I' => Style::default().fg(Color::Yellow),
-            'T' => Style::default().fg(Color::Red),
-            'P' => Style::default().fg(Color::LightGreen),
-            _ => Style::default(),
-        },
-        MapOverlayInput::Power => match symbol {
-            '*' | '+' | 'P' => Style::default().fg(Color::Yellow),
-            '-' => Style::default().fg(Color::Red),
-            _ => Style::default(),
-        },
-        MapOverlayInput::Pollution => Style::default().fg(Color::Red),
-        MapOverlayInput::Population => Style::default().fg(Color::Green),
-        MapOverlayInput::LandValue => Style::default().fg(Color::Cyan),
-        MapOverlayInput::Desirability => Style::default().fg(Color::Magenta),
+fn map_cell_gap(area: Rect, view: &GameView) -> &'static str {
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let width_with_gaps = 3 + view.map.width * 3;
+    if width_with_gaps <= inner_width {
+        " "
+    } else {
+        ""
     }
+}
+
+fn preview_state_for_cell(
+    x: usize,
+    y: usize,
+    preview: &BuildPreviewView,
+    state: &TuiState,
+) -> PreviewState {
+    if x != state.cursor_x || y != state.cursor_y {
+        return PreviewState::None;
+    }
+
+    if preview.can_build {
+        PreviewState::Valid
+    } else {
+        PreviewState::Invalid
+    }
+}
+
+fn ascii_detailed_normal_tile(cell: &CellView) -> String {
+    let Some(kind) = cell.building else {
+        return "..".to_string();
+    };
+
+    if matches!(cell.road_connected, Some(false)) {
+        return format!("{}!", tile_type(cell));
+    }
+    if matches!(cell.powered, Some(false)) && cell.power_demand.unwrap_or_default() > 0 {
+        return format!("{}-", tile_type(cell));
+    }
+
+    match kind {
+        BuildingKind::Road => "==".to_string(),
+        BuildingKind::Residential
+        | BuildingKind::Commercial
+        | BuildingKind::Industrial
+        | BuildingKind::PowerPlant
+        | BuildingKind::Park => format!("{}{}", tile_type(cell), tile_level(cell)),
+    }
+}
+
+fn unicode_normal_tile(cell: &CellView) -> String {
+    match ascii_detailed_normal_tile(cell).as_str() {
+        ".." => "..".to_string(),
+        "==" => "==".to_string(),
+        tile => tile.to_string(),
+    }
+}
+
+fn tile_type(cell: &CellView) -> char {
+    match cell.building {
+        Some(BuildingKind::Road) => '=',
+        Some(BuildingKind::Residential) => 'R',
+        Some(BuildingKind::Commercial) => 'C',
+        Some(BuildingKind::Industrial) => 'I',
+        Some(BuildingKind::PowerPlant) => 'T',
+        Some(BuildingKind::Park) => 'P',
+        None => '.',
+    }
+}
+
+fn tile_level(cell: &CellView) -> char {
+    char::from_digit(u32::from(cell.upgrade_level.unwrap_or(1).min(9)), 10).unwrap_or('1')
+}
+
+fn intensity_marker(value: i32, kind: IntensityKind) -> char {
+    match kind {
+        IntensityKind::Desirability => match value {
+            i32::MIN..=0 => '!',
+            1..=3 => '-',
+            4..=6 => '+',
+            7..=8 => '*',
+            _ => '#',
+        },
+        _ => match value {
+            i32::MIN..=0 => '.',
+            1..=2 => '-',
+            3..=5 => '+',
+            6..=8 => '*',
+            _ => '#',
+        },
+    }
+}
+
+fn unicode_intensity_tile(value: i32, kind: IntensityKind) -> &'static str {
+    match intensity_marker(value, kind) {
+        '!' => "!!",
+        '.' => "..",
+        '-' => "--",
+        '+' => "++",
+        '*' => "**",
+        '#' => "##",
+        _ => "..",
+    }
+}
+
+fn intensity_style(value: i32, kind: IntensityKind) -> Style {
+    match kind {
+        IntensityKind::Pollution => match value {
+            i32::MIN..=0 => empty_style(),
+            1..=5 => Style::default().fg(Color::Yellow),
+            _ => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        },
+        IntensityKind::Population => Style::default().fg(Color::Green),
+        IntensityKind::LandValue => Style::default().fg(Color::Cyan),
+        IntensityKind::Desirability => match value {
+            i32::MIN..=3 => Style::default().fg(Color::Red),
+            4..=6 => Style::default().fg(Color::Yellow),
+            _ => Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        },
+    }
+}
+
+fn cell_base_style(cell: &CellView) -> Style {
+    let mut style = match cell.building {
+        Some(kind) => building_style(kind),
+        None => empty_style(),
+    };
+
+    if matches!(cell.road_connected, Some(false))
+        || (matches!(cell.powered, Some(false)) && cell.power_demand.unwrap_or_default() > 0)
+    {
+        style = problem_style();
+    }
+
+    style
+}
+
+fn empty_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn problem_style() -> Style {
+    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
 }
 
 fn building_style(kind: BuildingKind) -> Style {
     match kind {
         BuildingKind::Road => Style::default().fg(Color::Gray),
         BuildingKind::Residential => Style::default().fg(Color::Green),
-        BuildingKind::Commercial => Style::default().fg(Color::Blue),
-        BuildingKind::Industrial => Style::default().fg(Color::Yellow),
-        BuildingKind::PowerPlant => Style::default().fg(Color::Red),
-        BuildingKind::Park => Style::default().fg(Color::LightGreen),
+        BuildingKind::Commercial => Style::default().fg(Color::Yellow),
+        BuildingKind::Industrial => Style::default().fg(Color::Magenta),
+        BuildingKind::PowerPlant => Style::default().fg(Color::Cyan),
+        BuildingKind::Park => Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD),
     }
 }
 
@@ -825,19 +1148,31 @@ fn selected_build_maintenance_cost(view: &GameView, selected_build: BuildingKind
         .unwrap_or_else(|| selected_build.maintenance_cost())
 }
 
-fn overlay_legend(overlay: MapOverlayInput) -> &'static str {
-    match overlay {
-        MapOverlayInput::Normal => {
-            ". empty | = road | R residential | C commercial | I industrial | T power | P park"
-        }
-        MapOverlayInput::Power => {
-            "P plant | * powered road | + powered building | - unpowered building | . none"
-        }
-        MapOverlayInput::Pollution => "0-9 pollution level | . none",
-        MapOverlayInput::Population => "0-9 population | . none",
-        MapOverlayInput::LandValue => "0-9 land value | higher is better",
-        MapOverlayInput::Desirability => "0-9 desirability | high grows faster, low blocks growth",
+fn format_message(message: &str) -> String {
+    if message.starts_with("OK:")
+        || message.starts_with("WARN:")
+        || message.starts_with("ERR:")
+        || message.starts_with("INFO:")
+    {
+        return message.to_string();
     }
+
+    let prefix = if message.contains("Cannot")
+        || message.contains("Failed")
+        || message.contains("not")
+        || message.contains("Invalid")
+        || message.contains("error")
+    {
+        "ERR"
+    } else if message.contains("Shortage") || message.contains("unpowered") {
+        "WARN"
+    } else if message.contains("Advanced to turn") {
+        "INFO"
+    } else {
+        "OK"
+    };
+
+    format!("{prefix}: {message}")
 }
 
 fn overlay_label(overlay: MapOverlayInput) -> &'static str {
@@ -954,6 +1289,7 @@ mod tests {
         let mut state = TuiState::default();
 
         assert!(!state.is_running);
+        assert_eq!(state.tile_theme, TileTheme::AsciiDetailed);
         state.toggle_run();
         assert!(state.is_running);
         assert_eq!(
@@ -963,6 +1299,125 @@ mod tests {
         state.toggle_run();
         assert!(!state.is_running);
         assert_eq!(state.message, "Simulation paused");
+    }
+
+    #[test]
+    fn ascii_detailed_theme_maps_normal_tiles() {
+        let residential = themed_cell(Some(BuildingKind::Residential), 'R', Some(2), None, None, 0);
+        let road = themed_cell(Some(BuildingKind::Road), '=', None, None, None, 0);
+        let empty = themed_cell(None, '.', None, None, None, 0);
+
+        assert_eq!(
+            TileTheme::AsciiDetailed
+                .tile_for_cell(
+                    &residential,
+                    MapOverlayInput::Normal,
+                    false,
+                    PreviewState::None
+                )
+                .tile,
+            "R2"
+        );
+        assert_eq!(
+            TileTheme::AsciiDetailed
+                .tile_for_cell(&road, MapOverlayInput::Normal, false, PreviewState::None)
+                .tile,
+            "=="
+        );
+        assert_eq!(
+            TileTheme::AsciiDetailed
+                .tile_for_cell(&empty, MapOverlayInput::Normal, false, PreviewState::None)
+                .tile,
+            ".."
+        );
+    }
+
+    #[test]
+    fn ascii_detailed_power_overlay_uses_fixed_width_tiles() {
+        let cases = [
+            (
+                themed_cell(Some(BuildingKind::PowerPlant), 'P', Some(1), None, None, 0),
+                "T*",
+            ),
+            (
+                themed_cell(Some(BuildingKind::Road), '*', None, None, None, 0),
+                "=*",
+            ),
+            (
+                themed_cell(
+                    Some(BuildingKind::Residential),
+                    '+',
+                    Some(1),
+                    Some(true),
+                    None,
+                    0,
+                ),
+                "R+",
+            ),
+            (
+                themed_cell(
+                    Some(BuildingKind::Commercial),
+                    '-',
+                    Some(1),
+                    Some(false),
+                    None,
+                    0,
+                ),
+                "C-",
+            ),
+            (themed_cell(None, '.', None, None, None, 0), ".."),
+        ];
+
+        for (cell, expected) in cases {
+            let glyph = TileTheme::AsciiDetailed.tile_for_cell(
+                &cell,
+                MapOverlayInput::Power,
+                false,
+                PreviewState::None,
+            );
+            assert_eq!(glyph.tile, expected);
+            assert_eq!(glyph.tile.len(), 2);
+            assert!(glyph.tile.is_ascii());
+        }
+    }
+
+    #[test]
+    fn ascii_detailed_overlays_return_fixed_width_ascii_tiles() {
+        let cell = themed_cell(Some(BuildingKind::Industrial), 'I', Some(1), None, None, 9);
+
+        for overlay in [
+            MapOverlayInput::Pollution,
+            MapOverlayInput::LandValue,
+            MapOverlayInput::Desirability,
+            MapOverlayInput::Population,
+        ] {
+            let glyph =
+                TileTheme::AsciiDetailed.tile_for_cell(&cell, overlay, false, PreviewState::None);
+            assert_eq!(glyph.tile.len(), 2);
+            assert!(glyph.tile.is_ascii());
+        }
+    }
+
+    #[test]
+    fn tile_theme_styles_cursor_and_build_preview() {
+        let cell = themed_cell(None, '.', None, None, None, 0);
+
+        let valid = TileTheme::AsciiDetailed.tile_for_cell(
+            &cell,
+            MapOverlayInput::Normal,
+            true,
+            PreviewState::Valid,
+        );
+        let invalid = TileTheme::AsciiDetailed.tile_for_cell(
+            &cell,
+            MapOverlayInput::Normal,
+            false,
+            PreviewState::Invalid,
+        );
+
+        assert!(valid.style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(invalid.style.fg, Some(Color::Red));
+        assert!(invalid.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -1140,8 +1595,8 @@ mod tests {
         assert!(output.contains("Space         Pause / resume automatic ticks"));
         assert!(output.contains("O Cycle Overlay"));
         assert!(output.contains("Overlay order: Normal -> Power -> Pollution"));
-        assert!(output.contains("Normal: . empty"));
-        assert!(output.contains("Desirability: 0-9 desirability"));
+        assert!(output.contains("Normal: .. Empty"));
+        assert!(output.contains("Desirability: ! Bad"));
     }
 
     #[test]
@@ -1168,10 +1623,47 @@ mod tests {
 
         let terminal = render_test_terminal(&game, state);
         let buffer = terminal.backend().buffer();
-        let cell = find_first_text_cell(buffer, "Industrial").expect("styled Industrial text");
+        let cell = find_text_cell_after_prefix(buffer, "Tool: ", "Industrial")
+            .expect("styled Industrial tool text");
 
-        assert_eq!(cell.fg, Color::Yellow);
+        assert_eq!(cell.fg, Color::Magenta);
         assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    fn themed_cell(
+        building: Option<BuildingKind>,
+        symbol: char,
+        upgrade_level: Option<u8>,
+        powered: Option<bool>,
+        road_connected: Option<bool>,
+        effect_value: i32,
+    ) -> CellView {
+        CellView {
+            x: 0,
+            y: 0,
+            symbol,
+            building,
+            label: building
+                .map(|kind| kind.label().to_string())
+                .unwrap_or_else(|| "Empty Land".to_string()),
+            buildable: building.is_none(),
+            population: if matches!(building, Some(BuildingKind::Residential)) {
+                Some(effect_value)
+            } else {
+                None
+            },
+            max_population: None,
+            powered,
+            power_demand: powered.map(|_| 1),
+            road_connected,
+            upgrade_level,
+            local_effects: crate::interface::view::LocalEffectsView {
+                land_value: effect_value,
+                pollution_pressure: effect_value,
+                accessibility: 0,
+                desirability: effect_value,
+            },
+        }
     }
 
     fn render_test_screen(game: &Game, state: TuiState) -> String {
@@ -1226,12 +1718,14 @@ mod tests {
         text
     }
 
-    fn find_first_text_cell<'a>(
+    fn find_text_cell_after_prefix<'a>(
         buffer: &'a ratatui::buffer::Buffer,
+        prefix: &str,
         needle: &str,
     ) -> Option<&'a ratatui::buffer::Cell> {
         let area = buffer.area();
         let width = area.width as usize;
+        let full_needle = format!("{prefix}{needle}");
 
         for row in buffer.content().chunks(width) {
             let mut line = String::new();
@@ -1239,8 +1733,14 @@ mod tests {
                 line.push_str(cell.symbol());
             }
 
-            if let Some(x) = line.find(needle) {
-                return row.get(x);
+            if let Some(byte_x) = line.find(&full_needle) {
+                let prefix_byte_x = byte_x + prefix.len();
+                let cell_x = line[..prefix_byte_x].chars().count();
+                let width = needle.chars().count();
+                return row
+                    .get(cell_x..cell_x + width)
+                    .and_then(|cells| cells.iter().find(|cell| cell.fg != Color::Reset))
+                    .or_else(|| row.get(cell_x));
             }
         }
 
