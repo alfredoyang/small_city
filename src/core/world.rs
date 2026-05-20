@@ -11,6 +11,7 @@ use crate::core::components::{
 use crate::core::entity::Entity;
 use crate::core::grid::Grid;
 use crate::core::resources::{CityResources, CityStats, LocalEffectsMap};
+use crate::core::systems::road_network_analysis::RoadNetworkAnalysis;
 use crate::interface::input::BuildingKind;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -24,6 +25,8 @@ pub(crate) struct World {
     pub stats: CityStats,
     #[serde(default)]
     pub local_effects: LocalEffectsMap,
+    #[serde(skip, default)]
+    pub road_analysis: RoadNetworkAnalysis,
     pub positions: HashMap<Entity, Position>,
     pub buildings: HashMap<Entity, Building>,
     pub populations: HashMap<Entity, Population>,
@@ -57,6 +60,7 @@ impl World {
             resources: CityResources::default(),
             stats: CityStats::default(),
             local_effects: LocalEffectsMap::new(width, height),
+            road_analysis: RoadNetworkAnalysis::default(),
             positions: HashMap::new(),
             buildings: HashMap::new(),
             populations: HashMap::new(),

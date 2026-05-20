@@ -1,6 +1,6 @@
 //! Adapter that converts private ECS world data into UI-safe view and inspect models.
 
-use crate::core::systems::{citizens, economy, power, road_connectivity};
+use crate::core::systems::{citizens, economy, power, road_connectivity, road_network_analysis};
 use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
@@ -234,6 +234,7 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
         }
         BuildingKind::Residential => {
             explain_road_and_power(world, entity, road_connected, &mut explanations);
+            explain_road_access(world, entity, building.kind, &mut explanations);
             let available_jobs = (world.stats.jobs - world.stats.population).max(0);
             if available_jobs == 0 {
                 explanations.push(
@@ -270,6 +271,7 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
         }
         BuildingKind::Commercial => {
             explain_road_and_power(world, entity, road_connected, &mut explanations);
+            explain_road_access(world, entity, building.kind, &mut explanations);
             if road_connected && is_consumer_powered(world, entity) {
                 explanations.push("Provides 2 effective jobs and income.".to_string());
                 explanations.push(format!(
@@ -290,6 +292,7 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
         }
         BuildingKind::Industrial => {
             explain_road_and_power(world, entity, road_connected, &mut explanations);
+            explain_road_access(world, entity, building.kind, &mut explanations);
             if road_connected && is_consumer_powered(world, entity) {
                 explanations.push("Provides 3 effective jobs and income.".to_string());
                 explanations.push(format!(
@@ -345,6 +348,54 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
     ));
 
     explanations
+}
+
+fn explain_road_access(
+    world: &World,
+    entity: crate::core::entity::Entity,
+    kind: BuildingKind,
+    explanations: &mut Vec<String>,
+) {
+    let access = road_network_analysis::access_for(world, entity);
+    match kind {
+        BuildingKind::Residential => {
+            explanations.push(format!(
+                "Commute: nearest workplace is {}.",
+                distance_note(access.commute_distance)
+            ));
+            explanations.push(format!(
+                "Shopping: nearest commercial is {}.",
+                distance_note(access.nearest_shop_distance)
+            ));
+        }
+        BuildingKind::Commercial => {
+            explanations.push(format!(
+                "Goods: nearest industrial route is {}.",
+                distance_note(access.goods_route_distance)
+            ));
+            explanations.push(format!(
+                "Trade: edge access is {}.",
+                distance_note(access.import_export_distance)
+            ));
+        }
+        BuildingKind::Industrial => {
+            explanations.push(format!(
+                "Goods: nearest commercial route is {}.",
+                distance_note(access.goods_route_distance)
+            ));
+            explanations.push(format!(
+                "Trade: edge access is {}.",
+                distance_note(access.import_export_distance)
+            ));
+        }
+        _ => {}
+    }
+}
+
+fn distance_note(distance: Option<u32>) -> String {
+    distance
+        .map(|distance| format!("{distance} road tiles away"))
+        .unwrap_or_else(|| "unreachable by road".to_string())
 }
 
 fn explain_road_and_power(

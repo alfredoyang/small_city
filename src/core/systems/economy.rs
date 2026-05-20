@@ -7,7 +7,7 @@
 //! ECS internals.
 
 use crate::core::components::BuildingData;
-use crate::core::systems::road_connectivity;
+use crate::core::systems::{road_connectivity, road_network_analysis};
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;
 
@@ -101,7 +101,17 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
             .get(&citizen_entity)
             .map(|citizen| rent_per_citizen(world, citizen.home))
             .unwrap_or(1);
-        let shopping = next_shopping_offer(world, &shopping_slots);
+        let shopping = world
+            .citizens
+            .get(&citizen_entity)
+            .map(|citizen| next_shopping_offer(world, citizen.home, &shopping_slots))
+            .unwrap_or_else(|| {
+                next_shopping_offer(
+                    world,
+                    crate::core::entity::Entity(u32::MAX),
+                    &shopping_slots,
+                )
+            });
 
         let mut sold_local_good_from = None;
         {
@@ -134,7 +144,9 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
             // A shopping slot is consumed only when the citizen can actually buy,
             // so poor citizens do not block later citizens from shopping.
             if citizen.money >= shopping.cost && shopping.sales_tax > 0 {
-                shopping_slots.remove(0);
+                if let Some(slot_index) = shopping.slot_index {
+                    shopping_slots.remove(slot_index);
+                }
                 citizen.money -= shopping.cost;
                 commercial_sales_tax += shopping.sales_tax;
                 shoppers_served += 1;
@@ -159,8 +171,8 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
     // City money changes only through tax/rent income minus public maintenance.
     // Salaries and shopping costs are tracked on citizens but are not direct
     // expenses for the city budget in this simplified model.
-    let manufacturing_tax = goods_flow.local_goods_produced * MANUFACTURING_TAX_PER_GOOD;
-    let export_tax = goods_flow.exported_goods * EXPORT_TAX_PER_GOOD;
+    let manufacturing_tax = goods_flow.manufacturing_tax;
+    let export_tax = goods_flow.export_tax;
     let net = workplace_tax + rent_income + commercial_sales_tax + manufacturing_tax + export_tax
         - maintenance_cost;
     world.resources.money += net;
@@ -189,6 +201,8 @@ struct GoodsFlow {
     local_goods_produced: i32,
     local_goods_stored: i32,
     exported_goods: i32,
+    manufacturing_tax: i32,
+    export_tax: i32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -198,6 +212,7 @@ struct ShoppingOffer {
     sales_tax: i32,
     happiness_bonus: i32,
     local_goods: bool,
+    slot_index: Option<usize>,
 }
 
 fn assign_workplaces(world: &mut World) {
@@ -215,10 +230,15 @@ fn assign_workplaces(world: &mut World) {
     let mut citizen_entities: Vec<_> = world.citizens.keys().copied().collect();
     citizen_entities.sort_by_key(|citizen| citizen.0);
 
-    // Citizens take one slot each. Extra citizens become unemployed; extra slots
-    // remain vacant and therefore pay no salary or workplace tax.
-    for (index, citizen_entity) in citizen_entities.into_iter().enumerate() {
-        let workplace = workplaces.get(index).copied();
+    // Citizens take the nearest reachable job slot. Ties use map order through
+    // the pre-sorted slot list, keeping assignment deterministic.
+    for citizen_entity in citizen_entities {
+        let home = world
+            .citizens
+            .get(&citizen_entity)
+            .map(|citizen| citizen.home);
+        let workplace_index = home.and_then(|home| nearest_slot_index(world, home, &workplaces));
+        let workplace = workplace_index.map(|index| workplaces.remove(index));
         if let Some(citizen) = world.citizens.get_mut(&citizen_entity) {
             citizen.workplace = workplace;
         }
@@ -268,30 +288,53 @@ fn commercial_shopping_slot_entities(world: &World) -> Vec<crate::core::entity::
 }
 
 fn distribute_local_goods(world: &mut World) -> GoodsFlow {
-    let local_goods_produced = productive_industrials(world)
-        .into_iter()
-        .map(|industrial| industrial_goods_production(world, industrial))
-        .sum();
-    let mut remaining_goods = local_goods_produced;
+    let mut local_goods_produced = 0;
     let mut local_goods_stored = 0;
+    let mut exported_goods = 0;
+    let mut manufacturing_tax = 0;
+    let mut export_tax = 0;
+    let commercials = productive_commercials(world);
 
-    for commercial in productive_commercials(world) {
-        let capacity = commercial_goods_capacity_for_entity(world, commercial);
-        let stored = commercial_goods_stored(world, commercial);
-        let free_capacity = (capacity - stored).max(0);
-        let supplied = free_capacity.min(remaining_goods);
-        add_commercial_goods(world, commercial, supplied);
-        remaining_goods -= supplied;
-        local_goods_stored += supplied;
-        if remaining_goods == 0 {
-            break;
+    for industrial in productive_industrials(world) {
+        let produced = industrial_goods_production(world, industrial);
+        local_goods_produced += produced;
+        let mut remaining_goods = produced;
+
+        for commercial in nearest_commercials_for_goods(world, industrial, &commercials) {
+            let capacity = commercial_goods_capacity_for_entity(world, commercial);
+            let stored = commercial_goods_stored(world, commercial);
+            let free_capacity = (capacity - stored).max(0);
+            let supplied = free_capacity.min(remaining_goods);
+            if supplied <= 0 {
+                continue;
+            }
+            add_commercial_goods(world, commercial, supplied);
+            remaining_goods -= supplied;
+            local_goods_stored += supplied;
+            let distance =
+                road_network_analysis::distance_between_buildings(world, industrial, commercial);
+            manufacturing_tax += supplied * margin_per_good(MANUFACTURING_TAX_PER_GOOD, distance);
+            if remaining_goods == 0 {
+                break;
+            }
+        }
+
+        if remaining_goods > 0 {
+            exported_goods += remaining_goods;
+            let distance =
+                road_network_analysis::access_for(world, industrial).import_export_distance;
+            export_tax += remaining_goods * margin_per_good(EXPORT_TAX_PER_GOOD, distance);
+            manufacturing_tax +=
+                remaining_goods * margin_per_good(MANUFACTURING_TAX_PER_GOOD, distance);
         }
     }
 
     GoodsFlow {
         local_goods_produced,
         local_goods_stored,
-        exported_goods: remaining_goods.max(0),
+        exported_goods,
+        manufacturing_tax,
+        export_tax,
     }
 }
 
@@ -439,9 +482,11 @@ pub(crate) fn commercial_goods_capacity_for_entity(
 
 fn next_shopping_offer(
     world: &World,
+    home: crate::core::entity::Entity,
     shopping_slots: &[crate::core::entity::Entity],
 ) -> ShoppingOffer {
-    let commercial = shopping_slots.first().copied();
+    let slot_index = nearest_slot_index(world, home, shopping_slots);
+    let commercial = slot_index.and_then(|index| shopping_slots.get(index).copied());
     let Some(commercial) = commercial else {
         return ShoppingOffer {
             commercial: crate::core::entity::Entity(u32::MAX),
@@ -449,9 +494,11 @@ fn next_shopping_offer(
             sales_tax: 0,
             happiness_bonus: 0,
             local_goods: false,
+            slot_index: None,
         };
     };
     let local_goods = commercial_goods_stored(world, commercial) > 0;
+    let distance = road_network_analysis::distance_between_buildings(world, home, commercial);
 
     ShoppingOffer {
         commercial,
@@ -461,13 +508,62 @@ fn next_shopping_offer(
             IMPORTED_SHOPPING_COST
         },
         sales_tax: commercial_sales_tax_for_purchase(world, commercial),
-        happiness_bonus: if local_goods {
+        happiness_bonus: (if local_goods {
             LOCAL_SHOPPING_HAPPINESS_BONUS
         } else {
             IMPORTED_SHOPPING_HAPPINESS_BONUS
-        },
+        } + road_network_analysis::shopping_happiness_modifier(distance))
+        .max(0),
         local_goods,
+        slot_index,
     }
+}
+
+fn nearest_slot_index(
+    world: &World,
+    from: crate::core::entity::Entity,
+    slots: &[crate::core::entity::Entity],
+) -> Option<usize> {
+    slots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            road_network_analysis::distance_between_buildings(world, from, *slot)
+                .map(|distance| (index, distance))
+        })
+        .min_by_key(|(index, distance)| (*distance, *index))
+        .map(|(index, _distance)| index)
+}
+
+fn nearest_commercials_for_goods(
+    world: &World,
+    industrial: crate::core::entity::Entity,
+    commercials: &[crate::core::entity::Entity],
+) -> Vec<crate::core::entity::Entity> {
+    let mut ordered: Vec<_> = commercials
+        .iter()
+        .copied()
+        .filter_map(|commercial| {
+            road_network_analysis::distance_between_buildings(world, industrial, commercial)
+                .map(|distance| (commercial, distance))
+        })
+        .collect();
+    ordered.sort_by_key(|(commercial, distance)| {
+        let position_key = world
+            .positions
+            .get(commercial)
+            .map(|position| (position.y, position.x, commercial.0))
+            .unwrap_or((usize::MAX, usize::MAX, commercial.0));
+        (*distance, position_key)
+    });
+    ordered
+        .into_iter()
+        .map(|(commercial, _distance)| commercial)
+        .collect()
+}
+
+fn margin_per_good(base: i32, distance: Option<u32>) -> i32 {
+    (base - road_network_analysis::route_margin_penalty(distance)).max(0)
 }
 
 fn consume_local_good(world: &mut World, commercial: crate::core::entity::Entity) {

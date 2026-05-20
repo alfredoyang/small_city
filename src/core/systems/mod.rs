@@ -13,5 +13,6 @@ pub mod population;
 pub mod power;
 pub mod replace;
 pub mod road_connectivity;
+pub mod road_network_analysis;
 pub mod stats;
 pub mod upgrade;

@@ -77,7 +77,7 @@ fn tick_returns_structured_summary_events() {
             },
             happiness: MetricChange {
                 before: 52,
-                after: 55
+                after: 56
             },
             pollution: MetricChange {
                 before: 1,

@@ -237,6 +237,29 @@ fn inspect_explains_no_available_jobs_for_residential_growth() {
 }
 
 #[test]
+fn inspect_exposes_road_network_distance_notes() {
+    let mut game = Game::new(6, 4);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(4, 0, BuildingKind::Commercial).success);
+    for x in 1..=4 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+
+    let inspect = game.inspect(1, 0);
+
+    assert!(
+        inspect
+            .explanations
+            .contains(&"Commute: nearest workplace is 3 road tiles away.".to_string())
+    );
+    assert!(
+        inspect
+            .explanations
+            .contains(&"Shopping: nearest commercial is 3 road tiles away.".to_string())
+    );
+}
+
+#[test]
 fn inspect_explains_local_pollution_and_happiness_effects() {
     let mut game = Game::new(3, 3);
     assert!(game.build(0, 0, BuildingKind::Industrial).success);

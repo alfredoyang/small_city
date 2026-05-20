@@ -375,6 +375,51 @@ fn commercial_imports_goods_when_local_storage_is_empty() {
 }
 
 #[test]
+fn citizens_prefer_nearby_reachable_jobs() {
+    let mut game = Game::new(8, 4);
+    assert!(game.build(7, 1, BuildingKind::PowerPlant).success);
+    assert!(game.build(0, 0, BuildingKind::Industrial).success);
+    assert!(game.build(5, 0, BuildingKind::Commercial).success);
+    assert!(game.build(6, 0, BuildingKind::Residential).success);
+    for x in 0..=6 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+
+    let economy = tick_economy(&game.tick().event);
+
+    assert_eq!(economy.salaries_paid, 3);
+    assert_eq!(economy.workplace_tax, 1);
+}
+
+#[test]
+fn nearby_commercial_gives_better_shopping_happiness_than_far_commercial() {
+    let nearby = shopping_happiness_city(3);
+    let far = shopping_happiness_city(14);
+
+    assert!(
+        nearby > far,
+        "nearby shop happiness {nearby} should beat far shop happiness {far}"
+    );
+}
+
+#[test]
+fn far_export_access_lowers_export_and_manufacturing_margin() {
+    let mut game = Game::new(14, 4);
+    assert!(game.build(11, 2, BuildingKind::PowerPlant).success);
+    assert!(game.build(10, 1, BuildingKind::Industrial).success);
+    for x in 0..=10 {
+        assert!(game.build(x, 2, BuildingKind::Road).success);
+    }
+
+    let economy = tick_economy(&game.tick().event);
+
+    assert_eq!(economy.local_goods_produced, 4);
+    assert_eq!(economy.exported_goods, 4);
+    assert_eq!(economy.manufacturing_tax, 0);
+    assert_eq!(economy.export_tax, 0);
+}
+
+#[test]
 fn save_load_preserves_land_value_rent_behavior() {
     let path = std::env::temp_dir().join("small_city_v04_economy_roundtrip.json");
     let game = powered_residential_city(true);
@@ -419,6 +464,23 @@ fn commercial_tax_city(with_park: bool) -> EconomyBreakdownView {
     }
 
     tick_economy(&game.tick().event)
+}
+
+fn shopping_happiness_city(commercial_x: usize) -> i32 {
+    let mut game = Game::new(20, 4);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(
+        game.build(commercial_x, 0, BuildingKind::Commercial)
+            .success
+    );
+    assert!(game.build(18, 0, BuildingKind::Industrial).success);
+    for x in 0..=18 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+
+    assert!(game.tick().success);
+    residential_average_happiness(&game, 1, 0).expect("resident happiness")
 }
 
 fn residential_rent(game: &Game, x: usize, y: usize) -> i32 {

@@ -2,7 +2,7 @@
 
 use crate::core::components::Citizen;
 use crate::core::entity::Entity;
-use crate::core::systems::road_connectivity;
+use crate::core::systems::{road_connectivity, road_network_analysis};
 use crate::core::world::World;
 
 pub(crate) fn spawn_for_home(world: &mut World, residential: Entity, count: i32) {
@@ -132,6 +132,11 @@ fn citizen_happiness(world: &World, citizen: Entity) -> i32 {
     happiness -= effects.pollution_pressure * 3;
     if citizen.workplace.is_none() {
         happiness -= 10;
+    }
+    let road_access = road_network_analysis::access_for(world, citizen.home);
+    happiness -= road_network_analysis::commute_penalty(road_access.commute_distance);
+    if road_access.nearest_shop_distance.is_none() {
+        happiness -= 2;
     }
     happiness -= citizen.rent_stress * 10;
     if !powered {
