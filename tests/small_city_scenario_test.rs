@@ -248,6 +248,13 @@ fn connected_economy_loop_runs_over_many_turns_after_upgrade_and_save_load() {
     assert!(total_economy.rent_income > 0);
     assert!(total_economy.commercial_sales_tax > 0);
     assert!(total_economy.shoppers_served > 0);
+    // The long scenario now also proves the added goods economy remains active
+    // across upgrades and save/load: factories produce local goods, commercial
+    // buildings store/sell them, and manufacturing tax contributes to the budget.
+    assert!(total_economy.local_goods_produced > 0);
+    assert!(total_economy.local_goods_stored > 0);
+    assert!(total_economy.local_goods_sold > 0);
+    assert!(total_economy.manufacturing_tax > 0);
     assert!(total_economy.maintenance_cost > 0);
     assert!(
         total_economy.rent_failures < total_economy.rent_income,
@@ -263,6 +270,13 @@ struct EconomyTotals {
     rent_income: i32,
     commercial_sales_tax: i32,
     shoppers_served: i32,
+    local_goods_produced: i32,
+    local_goods_stored: i32,
+    local_goods_sold: i32,
+    imported_goods_sold: i32,
+    exported_goods: i32,
+    manufacturing_tax: i32,
+    export_tax: i32,
     rent_failures: i32,
     maintenance_cost: i32,
     net: i32,
@@ -275,6 +289,13 @@ impl EconomyTotals {
         self.rent_income += breakdown.rent_income;
         self.commercial_sales_tax += breakdown.commercial_sales_tax;
         self.shoppers_served += breakdown.shoppers_served;
+        self.local_goods_produced += breakdown.local_goods_produced;
+        self.local_goods_stored += breakdown.local_goods_stored;
+        self.local_goods_sold += breakdown.local_goods_sold;
+        self.imported_goods_sold += breakdown.imported_goods_sold;
+        self.exported_goods += breakdown.exported_goods;
+        self.manufacturing_tax += breakdown.manufacturing_tax;
+        self.export_tax += breakdown.export_tax;
         self.rent_failures += breakdown.rent_failures;
         self.maintenance_cost += breakdown.maintenance_cost;
         self.net += breakdown.net;
@@ -287,6 +308,13 @@ impl EconomyTotals {
             rent_income: self.rent_income + other.rent_income,
             commercial_sales_tax: self.commercial_sales_tax + other.commercial_sales_tax,
             shoppers_served: self.shoppers_served + other.shoppers_served,
+            local_goods_produced: self.local_goods_produced + other.local_goods_produced,
+            local_goods_stored: self.local_goods_stored + other.local_goods_stored,
+            local_goods_sold: self.local_goods_sold + other.local_goods_sold,
+            imported_goods_sold: self.imported_goods_sold + other.imported_goods_sold,
+            exported_goods: self.exported_goods + other.exported_goods,
+            manufacturing_tax: self.manufacturing_tax + other.manufacturing_tax,
+            export_tax: self.export_tax + other.export_tax,
             rent_failures: self.rent_failures + other.rent_failures,
             maintenance_cost: self.maintenance_cost + other.maintenance_cost,
             net: self.net + other.net,

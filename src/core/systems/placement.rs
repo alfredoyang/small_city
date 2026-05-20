@@ -1,7 +1,8 @@
 //! Shared building placement logic used by build and replace command systems.
 
 use crate::core::components::{
-    Building, HappinessEffect, PollutionSource, Population, Position, PowerConsumer, PowerProvider,
+    Building, BuildingData, HappinessEffect, PollutionSource, Population, Position, PowerConsumer,
+    PowerProvider,
 };
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;
@@ -11,7 +12,14 @@ pub(crate) fn place_building(world: &mut World, x: usize, y: usize, kind: Buildi
     world.resources.money -= kind.cost();
     world.grid.set(x, y, entity);
     world.attach_position(entity, Position { x, y });
-    world.attach_building(entity, Building { kind, level: 1 });
+    world.attach_building(
+        entity,
+        Building {
+            kind,
+            level: 1,
+            data: building_data_for_kind(kind),
+        },
+    );
 
     attach_building_components(world, entity, kind);
 }
@@ -58,5 +66,18 @@ fn attach_building_components(
             world.attach_happiness_effect(entity, HappinessEffect { amount: 3 });
         }
         BuildingKind::Road => {}
+    }
+}
+
+fn building_data_for_kind(kind: BuildingKind) -> BuildingData {
+    match kind {
+        BuildingKind::Commercial => BuildingData::Commercial {
+            local_goods_stored: 0,
+        },
+        BuildingKind::Road
+        | BuildingKind::Residential
+        | BuildingKind::Industrial
+        | BuildingKind::PowerPlant
+        | BuildingKind::Park => BuildingData::None,
     }
 }

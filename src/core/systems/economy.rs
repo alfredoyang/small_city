@@ -6,6 +6,7 @@
 //! `EconomyBreakdown` so UI layers can explain the money change without reading
 //! ECS internals.
 
+use crate::core::components::BuildingData;
 use crate::core::systems::road_connectivity;
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;
@@ -13,10 +14,18 @@ use crate::interface::input::BuildingKind;
 const COMMERCIAL_SHOPPER_CAPACITY: i32 = 4;
 const COMMERCIAL_SALARY: i32 = 3;
 const INDUSTRIAL_SALARY: i32 = 4;
-const SHOPPING_COST: i32 = 1;
-const SHOPPING_HAPPINESS_BONUS: i32 = 3;
+const LOCAL_SHOPPING_COST: i32 = 1;
+const IMPORTED_SHOPPING_COST: i32 = 2;
+const LOCAL_SHOPPING_HAPPINESS_BONUS: i32 = 3;
+const IMPORTED_SHOPPING_HAPPINESS_BONUS: i32 = 1;
 const MISSED_RENT_HAPPINESS_PENALTY: i32 = 5;
 const MISSED_SHOPPING_HAPPINESS_PENALTY: i32 = 1;
+const INDUSTRIAL_GOODS_PRODUCTION: i32 = 4;
+const INDUSTRIAL_GOODS_PRODUCTION_PER_EXTRA_LEVEL: i32 = 2;
+const COMMERCIAL_GOODS_STORAGE: i32 = 8;
+const COMMERCIAL_GOODS_STORAGE_PER_EXTRA_LEVEL: i32 = 4;
+const MANUFACTURING_TAX_PER_GOOD: i32 = 1;
+const EXPORT_TAX_PER_GOOD: i32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EconomyBreakdown {
@@ -25,6 +34,13 @@ pub(crate) struct EconomyBreakdown {
     pub rent_income: i32,
     pub commercial_sales_tax: i32,
     pub shoppers_served: i32,
+    pub local_goods_produced: i32,
+    pub local_goods_stored: i32,
+    pub local_goods_sold: i32,
+    pub imported_goods_sold: i32,
+    pub exported_goods: i32,
+    pub manufacturing_tax: i32,
+    pub export_tax: i32,
     pub rent_failures: i32,
     pub maintenance_cost: i32,
     pub net: i32,
@@ -38,7 +54,20 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
     // Workplaces and shops are recalculated every tick from powered,
     // road-connected buildings. This keeps employment and shopping deterministic
     // after build, bulldoze, replace, upgrade, save, or load.
+    ensure_commercial_building_data(world);
     assign_workplaces(world);
+
+    // Industry flow:
+    // 1. Productive industrial buildings create local goods.
+    // 2. Local goods fill productive commercial storage in map order.
+    // 3. Surplus local goods are exported for export tax.
+    // 4. Citizens shopping later consume stored local goods first; empty shops
+    //    import goods at a higher citizen price and lower happiness gain.
+    //
+    // This encourages local production without introducing individual cargo
+    // entities or pathfinding. Existing powered + road-connected rules decide
+    // which industrial and commercial buildings can participate.
+    let goods_flow = distribute_local_goods(world);
 
     let mut shopping_slots = commercial_shopping_slot_entities(world);
     let mut salaries_paid = 0;
@@ -46,6 +75,8 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
     let mut rent_income = 0;
     let mut commercial_sales_tax = 0;
     let mut shoppers_served = 0;
+    let mut local_goods_sold = 0;
+    let mut imported_goods_sold = 0;
     let mut rent_failures = 0;
 
     let mut citizen_entities: Vec<_> = world.citizens.keys().copied().collect();
@@ -70,53 +101,68 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
             .get(&citizen_entity)
             .map(|citizen| rent_per_citizen(world, citizen.home))
             .unwrap_or(1);
-        let shopping_tax = next_commercial_sales_tax(world, &shopping_slots);
+        let shopping = next_shopping_offer(world, &shopping_slots);
 
-        let Some(citizen) = world.citizens.get_mut(&citizen_entity) else {
-            continue;
-        };
+        let mut sold_local_good_from = None;
+        {
+            let Some(citizen) = world.citizens.get_mut(&citizen_entity) else {
+                continue;
+            };
 
-        // Salary is private citizen money. Workplace tax is the city's income
-        // from that productive job. Industrial jobs intentionally pay more tax
-        // than commercial jobs.
-        if salary.0 > 0 {
-            citizen.money += salary.0;
-            salaries_paid += salary.0;
-            workplace_tax += salary.1;
+            // Salary is private citizen money. Workplace tax is the city's income
+            // from that productive job. Industrial jobs intentionally pay more tax
+            // than commercial jobs.
+            if salary.0 > 0 {
+                citizen.money += salary.0;
+                salaries_paid += salary.0;
+                workplace_tax += salary.1;
+            }
+
+            // Rent is paid per citizen. Failure does not remove the citizen, but it
+            // records rent stress so the happiness system can lower future morale.
+            if citizen.money >= rent {
+                citizen.money -= rent;
+                rent_income += rent;
+                citizen.rent_stress = 0;
+            } else {
+                rent_failures += 1;
+                citizen.rent_stress = 1;
+                citizen.happiness -= MISSED_RENT_HAPPINESS_PENALTY;
+            }
+
+            // Shopping is optional and capacity-limited by commercial buildings.
+            // A shopping slot is consumed only when the citizen can actually buy,
+            // so poor citizens do not block later citizens from shopping.
+            if citizen.money >= shopping.cost && shopping.sales_tax > 0 {
+                shopping_slots.remove(0);
+                citizen.money -= shopping.cost;
+                commercial_sales_tax += shopping.sales_tax;
+                shoppers_served += 1;
+                citizen.happiness += shopping.happiness_bonus;
+                if shopping.local_goods {
+                    local_goods_sold += 1;
+                    sold_local_good_from = Some(shopping.commercial);
+                } else {
+                    imported_goods_sold += 1;
+                }
+            } else {
+                citizen.happiness -= MISSED_SHOPPING_HAPPINESS_PENALTY;
+            }
+
+            citizen.happiness = citizen.happiness.clamp(0, 100);
         }
-
-        // Rent is paid per citizen. Failure does not remove the citizen, but it
-        // records rent stress so the happiness system can lower future morale.
-        if citizen.money >= rent {
-            citizen.money -= rent;
-            rent_income += rent;
-            citizen.rent_stress = 0;
-        } else {
-            rent_failures += 1;
-            citizen.rent_stress = 1;
-            citizen.happiness -= MISSED_RENT_HAPPINESS_PENALTY;
+        if let Some(commercial) = sold_local_good_from {
+            consume_local_good(world, commercial);
         }
-
-        // Shopping is optional and capacity-limited by commercial buildings.
-        // A shopping slot is consumed only when the citizen can actually buy,
-        // so poor citizens do not block later citizens from shopping.
-        if citizen.money >= SHOPPING_COST && shopping_tax > 0 {
-            shopping_slots.remove(0);
-            citizen.money -= SHOPPING_COST;
-            commercial_sales_tax += shopping_tax;
-            shoppers_served += 1;
-            citizen.happiness += SHOPPING_HAPPINESS_BONUS;
-        } else {
-            citizen.happiness -= MISSED_SHOPPING_HAPPINESS_PENALTY;
-        }
-
-        citizen.happiness = citizen.happiness.clamp(0, 100);
     }
 
     // City money changes only through tax/rent income minus public maintenance.
     // Salaries and shopping costs are tracked on citizens but are not direct
     // expenses for the city budget in this simplified model.
-    let net = workplace_tax + rent_income + commercial_sales_tax - maintenance_cost;
+    let manufacturing_tax = goods_flow.local_goods_produced * MANUFACTURING_TAX_PER_GOOD;
+    let export_tax = goods_flow.exported_goods * EXPORT_TAX_PER_GOOD;
+    let net = workplace_tax + rent_income + commercial_sales_tax + manufacturing_tax + export_tax
+        - maintenance_cost;
     world.resources.money += net;
 
     EconomyBreakdown {
@@ -125,10 +171,33 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
         rent_income,
         commercial_sales_tax,
         shoppers_served,
+        local_goods_produced: goods_flow.local_goods_produced,
+        local_goods_stored: goods_flow.local_goods_stored,
+        local_goods_sold,
+        imported_goods_sold,
+        exported_goods: goods_flow.exported_goods,
+        manufacturing_tax,
+        export_tax,
         rent_failures,
         maintenance_cost,
         net,
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GoodsFlow {
+    local_goods_produced: i32,
+    local_goods_stored: i32,
+    exported_goods: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShoppingOffer {
+    commercial: crate::core::entity::Entity,
+    cost: i32,
+    sales_tax: i32,
+    happiness_bonus: i32,
+    local_goods: bool,
 }
 
 fn assign_workplaces(world: &mut World) {
@@ -198,6 +267,70 @@ fn commercial_shopping_slot_entities(world: &World) -> Vec<crate::core::entity::
     slots
 }
 
+fn distribute_local_goods(world: &mut World) -> GoodsFlow {
+    let local_goods_produced = productive_industrials(world)
+        .into_iter()
+        .map(|industrial| industrial_goods_production(world, industrial))
+        .sum();
+    let mut remaining_goods = local_goods_produced;
+    let mut local_goods_stored = 0;
+
+    for commercial in productive_commercials(world) {
+        let capacity = commercial_goods_capacity_for_entity(world, commercial);
+        let stored = commercial_goods_stored(world, commercial);
+        let free_capacity = (capacity - stored).max(0);
+        let supplied = free_capacity.min(remaining_goods);
+        add_commercial_goods(world, commercial, supplied);
+        remaining_goods -= supplied;
+        local_goods_stored += supplied;
+        if remaining_goods == 0 {
+            break;
+        }
+    }
+
+    GoodsFlow {
+        local_goods_produced,
+        local_goods_stored,
+        exported_goods: remaining_goods.max(0),
+    }
+}
+
+fn productive_industrials(world: &World) -> Vec<crate::core::entity::Entity> {
+    let mut industrials: Vec<_> = world
+        .buildings
+        .iter()
+        .filter(|(entity, building)| {
+            building.kind == BuildingKind::Industrial && is_effective_workplace(world, **entity)
+        })
+        .map(|(entity, _)| *entity)
+        .collect();
+    sort_entities_by_position(world, &mut industrials);
+    industrials
+}
+
+fn productive_commercials(world: &World) -> Vec<crate::core::entity::Entity> {
+    let mut commercials: Vec<_> = world
+        .buildings
+        .iter()
+        .filter(|(entity, building)| {
+            building.kind == BuildingKind::Commercial && is_effective_workplace(world, **entity)
+        })
+        .map(|(entity, _)| *entity)
+        .collect();
+    sort_entities_by_position(world, &mut commercials);
+    commercials
+}
+
+fn sort_entities_by_position(world: &World, entities: &mut [crate::core::entity::Entity]) {
+    entities.sort_by_key(|entity| {
+        world
+            .positions
+            .get(entity)
+            .map(|position| (position.y, position.x, entity.0))
+            .unwrap_or((usize::MAX, usize::MAX, entity.0))
+    });
+}
+
 fn salary_for_workplace(world: &World, workplace: crate::core::entity::Entity) -> Option<i32> {
     let building = world.buildings.get(&workplace)?;
     if !is_effective_workplace(world, workplace) {
@@ -240,13 +373,6 @@ pub(crate) fn rent_per_citizen(world: &World, home: crate::core::entity::Entity)
     1 + land_value / 4 + (level - 1)
 }
 
-fn next_commercial_sales_tax(world: &World, shopping_slots: &[crate::core::entity::Entity]) -> i32 {
-    shopping_slots
-        .first()
-        .map(|commercial| commercial_sales_tax_for_purchase(world, *commercial))
-        .unwrap_or(0)
-}
-
 pub(crate) fn commercial_sales_tax_for_purchase(
     world: &World,
     commercial: crate::core::entity::Entity,
@@ -264,6 +390,132 @@ pub(crate) fn commercial_sales_tax_for_purchase(
     // Better commercial locations and upgraded commercial buildings collect a
     // little more tax per shopper.
     1 + land_value / 4 + (level - 1)
+}
+
+pub(crate) fn industrial_goods_production(
+    world: &World,
+    industrial: crate::core::entity::Entity,
+) -> i32 {
+    let Some(building) = world.buildings.get(&industrial) else {
+        return 0;
+    };
+    if building.kind != BuildingKind::Industrial {
+        return 0;
+    }
+
+    INDUSTRIAL_GOODS_PRODUCTION
+        + (i32::from(building.level.max(1)) - 1) * INDUSTRIAL_GOODS_PRODUCTION_PER_EXTRA_LEVEL
+}
+
+pub(crate) fn commercial_goods_capacity(level: u8) -> i32 {
+    COMMERCIAL_GOODS_STORAGE
+        + (i32::from(level.max(1)) - 1) * COMMERCIAL_GOODS_STORAGE_PER_EXTRA_LEVEL
+}
+
+pub(crate) fn commercial_goods_stored(
+    world: &World,
+    commercial: crate::core::entity::Entity,
+) -> i32 {
+    world
+        .buildings
+        .get(&commercial)
+        .and_then(|building| match building.data {
+            BuildingData::Commercial { local_goods_stored } => Some(local_goods_stored),
+            BuildingData::None => None,
+        })
+        .unwrap_or(0)
+}
+
+pub(crate) fn commercial_goods_capacity_for_entity(
+    world: &World,
+    commercial: crate::core::entity::Entity,
+) -> i32 {
+    world
+        .buildings
+        .get(&commercial)
+        .map(|building| commercial_goods_capacity(building.level))
+        .unwrap_or(0)
+}
+
+fn next_shopping_offer(
+    world: &World,
+    shopping_slots: &[crate::core::entity::Entity],
+) -> ShoppingOffer {
+    let commercial = shopping_slots.first().copied();
+    let Some(commercial) = commercial else {
+        return ShoppingOffer {
+            commercial: crate::core::entity::Entity(u32::MAX),
+            cost: 0,
+            sales_tax: 0,
+            happiness_bonus: 0,
+            local_goods: false,
+        };
+    };
+    let local_goods = commercial_goods_stored(world, commercial) > 0;
+
+    ShoppingOffer {
+        commercial,
+        cost: if local_goods {
+            LOCAL_SHOPPING_COST
+        } else {
+            IMPORTED_SHOPPING_COST
+        },
+        sales_tax: commercial_sales_tax_for_purchase(world, commercial),
+        happiness_bonus: if local_goods {
+            LOCAL_SHOPPING_HAPPINESS_BONUS
+        } else {
+            IMPORTED_SHOPPING_HAPPINESS_BONUS
+        },
+        local_goods,
+    }
+}
+
+fn consume_local_good(world: &mut World, commercial: crate::core::entity::Entity) {
+    if let Some(building) = world.buildings.get_mut(&commercial) {
+        if let BuildingData::Commercial { local_goods_stored } = &mut building.data {
+            if *local_goods_stored > 0 {
+                *local_goods_stored -= 1;
+            }
+        }
+    }
+}
+
+fn add_commercial_goods(world: &mut World, commercial: crate::core::entity::Entity, amount: i32) {
+    if amount <= 0 {
+        return;
+    }
+    if let Some(building) = world.buildings.get_mut(&commercial) {
+        let capacity = commercial_goods_capacity(building.level);
+        if let BuildingData::Commercial { local_goods_stored } = &mut building.data {
+            *local_goods_stored = (*local_goods_stored + amount).clamp(0, capacity);
+        }
+    }
+}
+
+fn ensure_commercial_building_data(world: &mut World) {
+    let commercials: Vec<_> = world
+        .buildings
+        .iter()
+        .filter_map(|(entity, building)| {
+            (building.kind == BuildingKind::Commercial).then_some((*entity, building.level))
+        })
+        .collect();
+
+    for (commercial, level) in commercials {
+        let capacity = commercial_goods_capacity(level);
+        if let Some(building) = world.buildings.get_mut(&commercial) {
+            match &mut building.data {
+                BuildingData::Commercial { local_goods_stored } => {
+                    *local_goods_stored = (*local_goods_stored).clamp(0, capacity);
+                }
+                BuildingData::None => {
+                    building.data = BuildingData::Commercial {
+                        local_goods_stored: 0,
+                    };
+                }
+            }
+        }
+    }
 }
 
 fn is_effective_workplace(world: &World, entity: crate::core::entity::Entity) -> bool {

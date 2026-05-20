@@ -69,32 +69,42 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
 
     assert_eq!(
         commercial.details,
+        // Commercial inspect now includes local goods inventory through the
+        // view model, because storage lives on the commercial building and must
+        // be visible without exposing ECS internals.
         Some(InspectDetailsView::Commercial {
             powered: true,
             power_demand: 2,
             road_connected: true,
             maintenance_cost: 1,
             sales_tax_per_shopper: 1,
+            goods_stored: 4,
+            goods_capacity: 8,
             jobs: 2
         })
     );
     assert_eq!(
         industrial.details,
+        // Industrial inspect now includes goods production so players can see
+        // how much local supply the factory contributes to nearby commercial.
         Some(InspectDetailsView::Industrial {
             powered: true,
             power_demand: 3,
             road_connected: true,
             maintenance_cost: 1,
+            goods_production: 4,
             jobs: 3
         })
     );
     assert_eq!(
         format_inspect(&commercial),
-        "(1, 0) Commercial | Powered: Yes | Demand: 2 | Road: Yes | Maintenance: 1 | Sales Tax: 1 | Jobs: 2"
+        // ASCII formatting changed only because it renders the new InspectView
+        // fields; the UI still does not read core storage directly.
+        "(1, 0) Commercial | Powered: Yes | Demand: 2 | Road: Yes | Maintenance: 1 | Sales Tax: 1 | Goods: 4/8 | Jobs: 2"
     );
     assert_eq!(
         format_inspect(&industrial),
-        "(2, 0) Industrial | Powered: Yes | Demand: 3 | Road: Yes | Maintenance: 1 | Jobs: 3"
+        "(2, 0) Industrial | Powered: Yes | Demand: 3 | Road: Yes | Maintenance: 1 | Goods: 4 | Jobs: 3"
     );
 }
 

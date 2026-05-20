@@ -189,8 +189,8 @@ Scenario-style integration tests cover longer multi-turn cities that combine pow
 - Population growth only when residential buildings are powered, road-connected, jobs are available, and desirability is not low; high desirability grows faster, medium desirability grows normally, and low desirability blocks growth.
 - Commercial and industrial effective job counts only when powered and road-connected.
 - Citizen economy foundation: citizens are assigned to powered, road-connected commercial or industrial jobs, earn salary, pay rent when they can afford it, and spend money at powered, road-connected commercial buildings for a happiness gain.
-- City income now comes from workplace tax, residential rent, and commercial sales tax. Commercial buildings pay sales tax only when citizens actually shop there, and disconnected shops receive no shoppers.
-- Ongoing economy balance: commercial, industrial, power plant, and park buildings each cost 1 maintenance per turn; roads and residential buildings have no upkeep. Tick summaries include salaries paid, workplace tax, rent, sales tax, shoppers served, rent failures, maintenance, and net money change.
+- City income now comes from workplace tax, residential rent, commercial sales tax, manufacturing tax, and export tax. Commercial buildings pay sales tax only when citizens actually shop there, and disconnected shops receive no shoppers.
+- Ongoing economy balance: commercial, industrial, power plant, and park buildings each cost 1 maintenance per turn; roads and residential buildings have no upkeep. Tick summaries include salaries paid, workplace tax, rent, sales tax, goods produced/stored/sold/imported/exported, manufacturing tax, export tax, shoppers served, rent failures, maintenance, and net money change.
 - Industrial pollution and park happiness effects.
 - Basic residential, commercial, and industrial demand levels.
 - Basic map overlays for normal, power, pollution, population, land value, and desirability views.
@@ -225,8 +225,12 @@ Scenario-style integration tests cover longer multi-turn cities that combine pow
 - Citizens who cannot afford rent receive rent stress, which lowers future happiness.
 - Commercial and industrial workplaces pay level-based tax, with industrial paying more.
 - Commercial sales tax now increases with local land value and building level.
+- Industrial buildings produce local goods when powered and road-connected.
+- Productive commercial buildings store local goods up to capacity and sell local goods before importing.
+- Surplus industrial goods are exported for export tax.
+- Local goods give citizens cheaper shopping and better happiness than imported goods.
 - Building maintenance increases with building level.
 - Citizen happiness considers home desirability, pollution pressure, unemployment, and rent stress.
 - Residential growth is blocked by low average happiness and gets a small bonus from high average happiness.
-- Inspect output exposes UI-safe economy details such as rent per citizen, maintenance, sales tax per shopper, power demand, level, local effects, and happiness blockers.
-- Tick summaries include rent collected, rent failures, commercial sales tax, maintenance, and net money change.
+- Inspect output exposes UI-safe economy details such as rent per citizen, maintenance, sales tax per shopper, commercial goods storage, industrial goods production, power demand, level, local effects, and happiness blockers.
+- Tick summaries include rent collected, rent failures, commercial sales tax, local goods flow, manufacturing tax, export tax, maintenance, and net money change.

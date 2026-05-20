@@ -504,9 +504,11 @@ pub fn format_inspect(inspect: &InspectView) -> String {
             road_connected,
             maintenance_cost,
             sales_tax_per_shopper,
+            goods_stored,
+            goods_capacity,
             jobs,
         } => format!(
-            "({}, {}) Commercial | Powered: {} | Demand: {} | Road: {} | Maintenance: {} | Sales Tax: {} | Jobs: {}",
+            "({}, {}) Commercial | Powered: {} | Demand: {} | Road: {} | Maintenance: {} | Sales Tax: {} | Goods: {}/{} | Jobs: {}",
             inspect.x,
             inspect.y,
             yes_no(*powered),
@@ -514,6 +516,8 @@ pub fn format_inspect(inspect: &InspectView) -> String {
             yes_no(*road_connected),
             maintenance_cost,
             sales_tax_per_shopper,
+            goods_stored,
+            goods_capacity,
             jobs
         ),
         InspectDetailsView::Industrial {
@@ -521,15 +525,17 @@ pub fn format_inspect(inspect: &InspectView) -> String {
             power_demand,
             road_connected,
             maintenance_cost,
+            goods_production,
             jobs,
         } => format!(
-            "({}, {}) Industrial | Powered: {} | Demand: {} | Road: {} | Maintenance: {} | Jobs: {}",
+            "({}, {}) Industrial | Powered: {} | Demand: {} | Road: {} | Maintenance: {} | Goods: {} | Jobs: {}",
             inspect.x,
             inspect.y,
             yes_no(*powered),
             power_demand,
             yes_no(*road_connected),
             maintenance_cost,
+            goods_production,
             jobs
         ),
         InspectDetailsView::PowerPlant {

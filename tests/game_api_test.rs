@@ -73,7 +73,7 @@ fn tick_returns_structured_summary_events() {
             },
             money: MetricChange {
                 before: 47,
-                after: 53
+                after: 57
             },
             happiness: MetricChange {
                 before: 52,
@@ -91,15 +91,25 @@ fn tick_returns_structured_summary_events() {
                 before: 3,
                 after: 3
             },
+            // Tick summaries now expose the goods supply chain. These values
+            // verify that local industrial output reaches commercial storage and
+            // contributes manufacturing tax to the same public event the UI uses.
             economy: EconomyBreakdownView {
                 salaries_paid: 6,
                 workplace_tax: 2,
                 rent_income: 4,
                 commercial_sales_tax: 4,
                 shoppers_served: 2,
+                local_goods_produced: 4,
+                local_goods_stored: 4,
+                local_goods_sold: 2,
+                imported_goods_sold: 0,
+                exported_goods: 0,
+                manufacturing_tax: 4,
+                export_tax: 0,
                 rent_failures: 0,
                 maintenance_cost: 4,
-                net: 6
+                net: 10
             },
         }
     );
@@ -120,11 +130,13 @@ fn tick_summary_message_includes_metric_changes() {
     let message = game.tick().message();
 
     assert!(message.contains("population 1 (+1)"));
-    assert!(message.contains("money 54 (+1)"));
+    assert!(message.contains("money 58 (+5)"));
     assert!(message.contains("powered buildings 3 (+0)"));
+    // The message expectation changed because tick feedback now explains goods
+    // production, local/imported sales, export flow, and related taxes.
     assert!(
         message.contains(
-            "Economy: salaries paid 3, workplace tax +1, rent +2, sales tax +1, shoppers 1, rent failures 0, maintenance -3, net +1"
+            "Economy: salaries paid 3, workplace tax +1, rent +2, sales tax +1, shoppers 1, local goods produced 4, stored 4, sold 1, imported 0, exported 0, manufacturing tax +4, export tax +0, rent failures 0, maintenance -3, net +5"
         )
     );
 }

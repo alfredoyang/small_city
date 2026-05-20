@@ -27,10 +27,37 @@ pub struct Building {
     /// Player-facing building level. New buildings start at level 1; missing save data is treated as level 1.
     #[serde(default = "default_building_level")]
     pub level: u8,
+    /// Kind-specific building state. Most buildings have no extra data; commercial buildings
+    /// keep durable local goods inventory here so it stays attached to the building itself.
+    #[serde(default)]
+    pub data: BuildingData,
 }
 
 fn default_building_level() -> u8 {
     1
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Kind-specific state stored directly on the owning building.
+///
+/// This avoids a separate component map for state that only makes sense for one building kind,
+/// while leaving room for later variants such as warehouse, office, or civic building data.
+pub enum BuildingData {
+    None,
+    /// Commercial inventory for goods made by local industrial buildings.
+    ///
+    /// Imported goods are not stored here yet. They are an on-demand fallback used by the economy
+    /// system when a customer shops and this local inventory is empty. If imports later become
+    /// delayed, limited, or trucked, this variant can grow an `imported_goods_stored` field.
+    Commercial {
+        local_goods_stored: i32,
+    },
+}
+
+impl Default for BuildingData {
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -165,6 +165,8 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
             road_connected: road_connectivity::is_road_connected(world, entity),
             maintenance_cost: economy::maintenance_for_building(building.kind, building.level),
             sales_tax_per_shopper: economy::commercial_sales_tax_for_purchase(world, entity),
+            goods_stored: economy::commercial_goods_stored(world, entity),
+            goods_capacity: economy::commercial_goods_capacity_for_entity(world, entity),
             jobs: effective_jobs(world, entity, building.kind),
         },
         BuildingKind::Industrial => InspectDetailsView::Industrial {
@@ -180,6 +182,7 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 .unwrap_or(0),
             road_connected: road_connectivity::is_road_connected(world, entity),
             maintenance_cost: economy::maintenance_for_building(building.kind, building.level),
+            goods_production: economy::industrial_goods_production(world, entity),
             jobs: effective_jobs(world, entity, building.kind),
         },
         BuildingKind::PowerPlant => InspectDetailsView::PowerPlant {
@@ -273,6 +276,11 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
                     "Economy: sales tax is {} per shopper.",
                     economy::commercial_sales_tax_for_purchase(world, entity)
                 ));
+                explanations.push(format!(
+                    "Goods: {}/{} local goods stored; imports are used when storage is empty.",
+                    economy::commercial_goods_stored(world, entity),
+                    economy::commercial_goods_capacity_for_entity(world, entity)
+                ));
             } else {
                 explanations.push(
                     "Jobs and income are blocked until road and power requirements are met."
@@ -284,6 +292,10 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
             explain_road_and_power(world, entity, road_connected, &mut explanations);
             if road_connected && is_consumer_powered(world, entity) {
                 explanations.push("Provides 3 effective jobs and income.".to_string());
+                explanations.push(format!(
+                    "Goods: produces {} local goods per turn for commercial storage or export.",
+                    economy::industrial_goods_production(world, entity)
+                ));
             } else {
                 explanations.push(
                     "Jobs and income are blocked until road and power requirements are met."

@@ -151,7 +151,7 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::World;
-    use crate::core::components::{Building, Citizen, Population, Position};
+    use crate::core::components::{Building, BuildingData, Citizen, Population, Position};
     use crate::interface::input::BuildingKind;
 
     #[test]
@@ -165,6 +165,7 @@ mod tests {
             Building {
                 kind: BuildingKind::Residential,
                 level: 1,
+                data: BuildingData::None,
             },
         );
         world.attach_population(entity, Population { current: 0, max: 5 });
@@ -211,6 +212,7 @@ mod tests {
             Building {
                 kind: BuildingKind::Park,
                 level: 1,
+                data: BuildingData::None,
             },
         );
         world.entities.clear();

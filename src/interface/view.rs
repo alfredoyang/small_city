@@ -143,6 +143,8 @@ pub enum InspectDetailsView {
         road_connected: bool,
         maintenance_cost: i32,
         sales_tax_per_shopper: i32,
+        goods_stored: i32,
+        goods_capacity: i32,
         jobs: i32,
     },
     Industrial {
@@ -150,6 +152,7 @@ pub enum InspectDetailsView {
         power_demand: i32,
         road_connected: bool,
         maintenance_cost: i32,
+        goods_production: i32,
         jobs: i32,
     },
     PowerPlant {

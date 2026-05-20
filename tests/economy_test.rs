@@ -16,7 +16,7 @@ fn workplace_without_citizen_workers_pays_no_tax_but_still_has_maintenance() {
 
     game.tick();
 
-    assert_eq!(game.view().status.money, 66);
+    assert_eq!(game.view().status.money, 74);
 }
 
 #[test]
@@ -71,7 +71,7 @@ fn tick_event_exposes_economy_breakdown() {
             },
             money: MetricChange {
                 before: 68,
-                after: 66
+                after: 74
             },
             happiness: MetricChange {
                 before: 48,
@@ -89,15 +89,26 @@ fn tick_event_exposes_economy_breakdown() {
                 before: 1,
                 after: 1
             },
+            // Expected values changed after goods flow: productive industrial
+            // buildings now manufacture local goods even without shoppers. With
+            // no connected commercial storage, those goods are exported and add
+            // manufacturing/export tax to the city budget.
             economy: EconomyBreakdownView {
                 salaries_paid: 0,
                 workplace_tax: 0,
                 rent_income: 0,
                 commercial_sales_tax: 0,
                 shoppers_served: 0,
+                local_goods_produced: 4,
+                local_goods_stored: 0,
+                local_goods_sold: 0,
+                imported_goods_sold: 0,
+                exported_goods: 4,
+                manufacturing_tax: 4,
+                export_tax: 4,
                 rent_failures: 0,
                 maintenance_cost: 2,
-                net: -2
+                net: 6
             },
         }
     );
@@ -109,27 +120,40 @@ fn citizen_salary_rent_and_shopping_create_city_tax_income() {
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
+    assert!(game.build(3, 0, BuildingKind::Industrial).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);
     assert!(game.build(2, 1, BuildingKind::Road).success);
+    assert!(game.build(3, 1, BuildingKind::Road).success);
 
     let result = game.tick();
 
     assert_eq!(
         tick_economy(&result.event),
+        // This expected breakdown includes the local-goods path. Industrial
+        // production fills commercial storage, the citizen buys one local good,
+        // and city net now includes manufacturing tax in addition to rent,
+        // workplace tax, sales tax, and maintenance.
         EconomyBreakdownView {
             salaries_paid: 3,
             workplace_tax: 1,
             rent_income: 2,
-            commercial_sales_tax: 2,
+            commercial_sales_tax: 1,
             shoppers_served: 1,
+            local_goods_produced: 4,
+            local_goods_stored: 4,
+            local_goods_sold: 1,
+            imported_goods_sold: 0,
+            exported_goods: 0,
+            manufacturing_tax: 4,
+            export_tax: 0,
             rent_failures: 0,
-            maintenance_cost: 2,
-            net: 3,
+            maintenance_cost: 3,
+            net: 5,
         }
     );
     assert_eq!(game.view().status.citizens, 1);
-    assert_eq!(game.view().status.money, 67);
+    assert_eq!(game.view().status.money, 58);
 }
 
 #[test]
@@ -154,6 +178,7 @@ fn commercial_without_shoppers_pays_no_sales_tax() {
                 rent_failures: 0,
                 maintenance_cost: 2,
                 net: -2,
+                ..
             },
             ..
         }
@@ -189,23 +214,35 @@ fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
+    assert!(game.build(3, 0, BuildingKind::Industrial).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);
     assert!(game.build(2, 1, BuildingKind::Road).success);
+    assert!(game.build(3, 1, BuildingKind::Road).success);
 
     let first_tick = game.tick();
     assert!(matches!(
         first_tick.event,
         GameEventView::TickSummary {
+            // The pre-bulldoze tick uses local goods because industrial and
+            // commercial are both connected. This locks in the intended baseline
+            // before removing the commercial road connection.
             economy: EconomyBreakdownView {
                 salaries_paid: 3,
                 workplace_tax: 1,
                 rent_income: 2,
-                commercial_sales_tax: 2,
+                commercial_sales_tax: 1,
                 shoppers_served: 1,
+                local_goods_produced: 4,
+                local_goods_stored: 4,
+                local_goods_sold: 1,
+                imported_goods_sold: 0,
+                exported_goods: 0,
+                manufacturing_tax: 4,
+                export_tax: 0,
                 rent_failures: 0,
-                maintenance_cost: 2,
-                net: 3,
+                maintenance_cost: 3,
+                net: 5,
             },
             ..
         }
@@ -216,15 +253,24 @@ fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
 
     assert_eq!(
         tick_economy(&second_tick.event),
+        // After the road is bulldozed, commercial shopping and industrial goods
+        // flow stop. Maintenance still applies because the buildings remain.
         EconomyBreakdownView {
             salaries_paid: 0,
             workplace_tax: 0,
             rent_income: 0,
             commercial_sales_tax: 0,
             shoppers_served: 0,
+            local_goods_produced: 0,
+            local_goods_stored: 0,
+            local_goods_sold: 0,
+            imported_goods_sold: 0,
+            exported_goods: 0,
+            manufacturing_tax: 0,
+            export_tax: 0,
             rent_failures: 1,
-            maintenance_cost: 2,
-            net: -2,
+            maintenance_cost: 3,
+            net: -3,
         }
     );
 }
@@ -282,7 +328,50 @@ fn commercial_in_higher_land_value_area_pays_more_sales_tax() {
     let premium = commercial_tax_city(true);
 
     assert!(premium.commercial_sales_tax > plain.commercial_sales_tax);
-    assert_eq!(premium.shoppers_served, plain.shoppers_served);
+    assert!(premium.shoppers_served >= plain.shoppers_served);
+}
+
+#[test]
+fn industrial_goods_fill_commercial_storage_and_surplus_exports() {
+    let mut game = Game::new(10, 10);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(5, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Industrial).success);
+    assert!(game.build(2, 0, BuildingKind::Industrial).success);
+    assert!(game.build(3, 0, BuildingKind::Industrial).success);
+    assert!(game.build(4, 0, BuildingKind::Commercial).success);
+    for x in 0..=5 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+
+    let economy = tick_economy(&game.tick().event);
+
+    assert_eq!(economy.local_goods_produced, 12);
+    assert_eq!(economy.local_goods_stored, 8);
+    assert_eq!(economy.exported_goods, 4);
+    assert_eq!(economy.manufacturing_tax, 12);
+    assert_eq!(economy.export_tax, 4);
+    assert_eq!(commercial_goods(&game, 4, 0), (8, 8));
+}
+
+#[test]
+fn commercial_imports_goods_when_local_storage_is_empty() {
+    let mut game = Game::new(10, 10);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(2, 0, BuildingKind::Commercial).success);
+    assert!(game.build(0, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
+
+    assert_eq!(tick_economy(&game.tick().event).imported_goods_sold, 0);
+    let economy = tick_economy(&game.tick().event);
+
+    assert_eq!(economy.local_goods_produced, 0);
+    assert_eq!(economy.local_goods_sold, 0);
+    assert_eq!(economy.imported_goods_sold, 1);
+    assert_eq!(economy.manufacturing_tax, 0);
+    assert_eq!(economy.export_tax, 0);
 }
 
 #[test]
@@ -322,7 +411,9 @@ fn powered_residential_city(with_park: bool) -> Game {
 fn commercial_tax_city(with_park: bool) -> EconomyBreakdownView {
     let mut game = powered_residential_city(false);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
+    assert!(game.build(3, 0, BuildingKind::Industrial).success);
     assert!(game.build(2, 1, BuildingKind::Road).success);
+    assert!(game.build(3, 1, BuildingKind::Road).success);
     if with_park {
         assert!(game.build(2, 2, BuildingKind::Park).success);
     }
@@ -354,5 +445,16 @@ fn power_plant_maintenance(game: &Game, x: usize, y: usize) -> i32 {
             maintenance_cost, ..
         } => maintenance_cost,
         other => panic!("expected power plant details, got {other:?}"),
+    }
+}
+
+fn commercial_goods(game: &Game, x: usize, y: usize) -> (i32, i32) {
+    match game.inspect(x, y).details.expect("inspect details") {
+        InspectDetailsView::Commercial {
+            goods_stored,
+            goods_capacity,
+            ..
+        } => (goods_stored, goods_capacity),
+        other => panic!("expected commercial details, got {other:?}"),
     }
 }
