@@ -499,13 +499,15 @@ fn next_shopping_offer(
     };
     let local_goods = commercial_goods_stored(world, commercial) > 0;
     let distance = road_network_analysis::distance_between_buildings(world, home, commercial);
+    let import_distance =
+        road_network_analysis::access_for(world, commercial).import_export_distance;
 
     ShoppingOffer {
         commercial,
         cost: if local_goods {
             LOCAL_SHOPPING_COST
         } else {
-            IMPORTED_SHOPPING_COST
+            IMPORTED_SHOPPING_COST + road_network_analysis::import_cost_penalty(import_distance)
         },
         sales_tax: commercial_sales_tax_for_purchase(world, commercial),
         happiness_bonus: (if local_goods {

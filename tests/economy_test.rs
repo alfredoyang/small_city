@@ -420,6 +420,15 @@ fn far_export_access_lowers_export_and_manufacturing_margin() {
 }
 
 #[test]
+fn far_import_access_raises_import_cost_for_shoppers() {
+    let near = imported_goods_sold_after_two_ticks(false);
+    let far = imported_goods_sold_after_two_ticks(true);
+
+    assert_eq!(near, 1);
+    assert_eq!(far, 0);
+}
+
+#[test]
 fn save_load_preserves_land_value_rent_behavior() {
     let path = std::env::temp_dir().join("small_city_v04_economy_roundtrip.json");
     let game = powered_residential_city(true);
@@ -481,6 +490,27 @@ fn shopping_happiness_city(commercial_x: usize) -> i32 {
 
     assert!(game.tick().success);
     residential_average_happiness(&game, 1, 0).expect("resident happiness")
+}
+
+fn imported_goods_sold_after_two_ticks(far_from_edge: bool) -> i32 {
+    let mut game = Game::new(20, 4);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    if far_from_edge {
+        assert!(game.build(10, 0, BuildingKind::Commercial).success);
+        assert!(game.build(11, 0, BuildingKind::Residential).success);
+        for x in 0..=11 {
+            assert!(game.build(x, 1, BuildingKind::Road).success);
+        }
+    } else {
+        assert!(game.build(1, 0, BuildingKind::Commercial).success);
+        assert!(game.build(2, 0, BuildingKind::Residential).success);
+        for x in 0..=2 {
+            assert!(game.build(x, 1, BuildingKind::Road).success);
+        }
+    }
+
+    assert!(game.tick().success);
+    tick_economy(&game.tick().event).imported_goods_sold
 }
 
 fn residential_rent(game: &Game, x: usize, y: usize) -> i32 {

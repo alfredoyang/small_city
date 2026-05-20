@@ -57,6 +57,10 @@ pub(crate) fn route_margin_penalty(distance: Option<u32>) -> i32 {
     distance.map(|distance| (distance / 8) as i32).unwrap_or(0)
 }
 
+pub(crate) fn import_cost_penalty(distance: Option<u32>) -> i32 {
+    distance.map(|distance| (distance / 8) as i32).unwrap_or(0)
+}
+
 pub(crate) fn distance_between_buildings(world: &World, from: Entity, to: Entity) -> Option<u32> {
     let from_access = access_for(world, from);
     let to_access = access_for(world, to);
