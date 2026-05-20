@@ -1,6 +1,7 @@
 //! UI-safe command result and event types returned by the public Game API.
 
 use crate::interface::input::BuildingKind;
+use crate::interface::view::GameTimeView;
 
 /// UI-safe result returned by Game API commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +96,7 @@ impl GameEventView {
             GameEventView::TurnAdvanced { turn } => format!("Advanced to turn {turn}"),
             GameEventView::TickSummary {
                 turn,
+                time,
                 population,
                 money,
                 happiness,
@@ -103,7 +105,8 @@ impl GameEventView {
                 powered_buildings,
                 economy,
             } => format!(
-                "Advanced to turn {turn}: population {} ({:+}), money {} ({:+}), happiness {} ({:+}), pollution {} ({:+}), unemployment {} ({:+}), powered buildings {} ({:+})\nEconomy: salaries paid {}, workplace tax +{}, rent +{}, sales tax +{}, shoppers {}, local goods produced {}, stored {}, sold {}, imported {}, exported {}, manufacturing tax +{}, export tax +{}, rent failures {}, maintenance -{}, net {:+}",
+                "Advanced to turn {turn} ({}): population {} ({:+}), money {} ({:+}), happiness {} ({:+}), pollution {} ({:+}), unemployment {} ({:+}), powered buildings {} ({:+})\nEconomy: salaries paid {}, workplace tax +{}, rent +{}, sales tax +{}, shoppers {}, local goods produced {}, stored {}, sold {}, imported {}, exported {}, manufacturing tax +{}, export tax +{}, rent failures {}, maintenance -{}, net {:+}",
+                time.label,
                 population.after,
                 population.delta(),
                 money.after,
@@ -176,6 +179,7 @@ pub enum GameEventView {
     },
     TickSummary {
         turn: u32,
+        time: GameTimeView,
         population: MetricChange<i32>,
         money: MetricChange<i32>,
         happiness: MetricChange<i32>,

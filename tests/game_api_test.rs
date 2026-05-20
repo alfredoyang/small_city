@@ -1,8 +1,10 @@
 //! Integration tests for public Game API tick events and basic simulation effects.
 
 use small_city::core::game::Game;
+use small_city::core::resources::GameTime;
 use small_city::interface::events::{EconomyBreakdownView, GameEventView, MetricChange};
 use small_city::interface::input::BuildingKind;
+use small_city::interface::view::GameTimeView;
 
 #[test]
 fn default_game_uses_larger_distance_friendly_map() {
@@ -52,6 +54,11 @@ fn tick_advances_turn_deterministically() {
     game.tick();
 
     assert_eq!(game.view().status.turn, 2);
+    assert_eq!(game.view().status.time.total_hours, 2);
+    assert_eq!(
+        game.view().status.time.label,
+        "Year 1, Month 1, Week 1, Day 1, 02:00"
+    );
 }
 
 #[test]
@@ -67,7 +74,7 @@ fn tick_returns_structured_summary_events() {
     assert!(game.build(2, 1, BuildingKind::Road).success);
     assert!(game.build(3, 1, BuildingKind::Road).success);
 
-    let result = game.tick();
+    let result = advance_one_week(&mut game);
 
     assert!(result.success);
     assert_eq!(result.events.len(), 1);
@@ -75,14 +82,15 @@ fn tick_returns_structured_summary_events() {
     assert_eq!(
         result.events[0],
         GameEventView::TickSummary {
-            turn: 1,
+            turn: 168,
+            time: expected_time(168),
             population: MetricChange {
                 before: 0,
                 after: 2
             },
             money: MetricChange {
-                before: 47,
-                after: 57
+                before: 63,
+                after: 77
             },
             happiness: MetricChange {
                 before: 52,
@@ -110,15 +118,15 @@ fn tick_returns_structured_summary_events() {
                 commercial_sales_tax: 4,
                 shoppers_served: 2,
                 local_goods_produced: 4,
-                local_goods_stored: 4,
+                local_goods_stored: 0,
                 local_goods_sold: 2,
                 imported_goods_sold: 0,
-                exported_goods: 0,
+                exported_goods: 4,
                 manufacturing_tax: 4,
-                export_tax: 0,
+                export_tax: 4,
                 rent_failures: 0,
                 maintenance_cost: 4,
-                net: 10
+                net: 14
             },
         }
     );
@@ -136,16 +144,39 @@ fn tick_summary_message_includes_metric_changes() {
     assert!(game.build(2, 1, BuildingKind::Road).success);
     assert!(game.build(3, 1, BuildingKind::Road).success);
 
-    let message = game.tick().message();
+    let message = advance_one_week(&mut game).message();
 
     assert!(message.contains("population 1 (+1)"));
-    assert!(message.contains("money 58 (+5)"));
+    assert!(message.contains("Year 1, Month 1, Week 2, Day 1, 00:00"));
+    assert!(message.contains("money 84 (+9)"));
     assert!(message.contains("powered buildings 3 (+0)"));
     // The message expectation changed because tick feedback now explains goods
     // production, local/imported sales, export flow, and related taxes.
     assert!(
         message.contains(
-            "Economy: salaries paid 3, workplace tax +1, rent +2, sales tax +1, shoppers 1, local goods produced 4, stored 4, sold 1, imported 0, exported 0, manufacturing tax +4, export tax +0, rent failures 0, maintenance -3, net +5"
+            "Economy: salaries paid 3, workplace tax +1, rent +2, sales tax +1, shoppers 1, local goods produced 4, stored 0, sold 1, imported 0, exported 4, manufacturing tax +4, export tax +4, rent failures 0, maintenance -3, net +9"
         )
     );
+}
+
+fn expected_time(total_hours: u64) -> GameTimeView {
+    let time = GameTime { total_hours };
+    GameTimeView {
+        total_hours,
+        year: time.year(),
+        month: time.month(),
+        week: time.week_of_month(),
+        day: time.day_of_week(),
+        hour: time.hour_of_day(),
+        label: time.label(),
+    }
+}
+
+fn advance_one_week(game: &mut Game) -> small_city::interface::events::CommandResult {
+    // Phase A time cadence moved population growth from every tick to the weekly boundary.
+    let mut result = game.tick();
+    for _ in 1..24 * 7 {
+        result = game.tick();
+    }
+    result
 }

@@ -1,11 +1,18 @@
-//! Global resources and derived city-wide data such as stats, power, and local effects.
+//! Global resources and derived city-wide data such as time, stats, power, and local effects.
 
 use serde::{Deserialize, Serialize};
+
+pub const HOURS_PER_DAY: u64 = 24;
+pub const DAYS_PER_WEEK: u64 = 7;
+pub const WEEKS_PER_MONTH: u64 = 4;
+pub const MONTHS_PER_YEAR: u64 = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CityResources {
     pub money: i32,
     pub turn: u32,
+    #[serde(default)]
+    pub time: GameTime,
 }
 
 impl Default for CityResources {
@@ -13,8 +20,76 @@ impl Default for CityResources {
         Self {
             money: 100,
             turn: 0,
+            time: GameTime::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Simulation calendar stored as total elapsed hours.
+///
+/// Calendar fields are derived instead of stored separately so save files cannot
+/// drift into invalid dates. The game uses a simple city-builder calendar:
+/// 24 hours per day, 7 days per week, 4 weeks per month, and 12 months per year.
+pub struct GameTime {
+    pub total_hours: u64,
+}
+
+impl GameTime {
+    pub fn advance_hours(&mut self, hours: u64) {
+        self.total_hours = self.total_hours.saturating_add(hours);
+    }
+
+    pub fn hour_of_day(self) -> u8 {
+        (self.total_hours % HOURS_PER_DAY) as u8
+    }
+
+    pub fn day_of_week(self) -> u8 {
+        ((self.total_hours / HOURS_PER_DAY) % DAYS_PER_WEEK) as u8 + 1
+    }
+
+    pub fn week_of_month(self) -> u8 {
+        ((self.total_hours / (HOURS_PER_DAY * DAYS_PER_WEEK)) % WEEKS_PER_MONTH) as u8 + 1
+    }
+
+    pub fn month(self) -> u8 {
+        ((self.total_hours / (HOURS_PER_DAY * DAYS_PER_WEEK * WEEKS_PER_MONTH)) % MONTHS_PER_YEAR)
+            as u8
+            + 1
+    }
+
+    pub fn year(self) -> u32 {
+        (self.total_hours / (HOURS_PER_DAY * DAYS_PER_WEEK * WEEKS_PER_MONTH * MONTHS_PER_YEAR))
+            as u32
+            + 1
+    }
+
+    pub fn label(self) -> String {
+        format!(
+            "Year {}, Month {}, Week {}, Day {}, {:02}:00",
+            self.year(),
+            self.month(),
+            self.week_of_month(),
+            self.day_of_week(),
+            self.hour_of_day()
+        )
+    }
+}
+
+pub fn is_new_day(before: GameTime, after: GameTime) -> bool {
+    crossed_period(before.total_hours, after.total_hours, HOURS_PER_DAY)
+}
+
+pub fn is_new_week(before: GameTime, after: GameTime) -> bool {
+    crossed_period(
+        before.total_hours,
+        after.total_hours,
+        HOURS_PER_DAY * DAYS_PER_WEEK,
+    )
+}
+
+fn crossed_period(before: u64, after: u64, period: u64) -> bool {
+    before / period < after / period
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +101,45 @@ pub struct CityStats {
     pub happiness: i32,
     #[serde(default)]
     pub power: PowerStats,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GameTime, is_new_day, is_new_week};
+
+    #[test]
+    fn game_time_derives_calendar_fields_from_total_hours() {
+        let time = GameTime {
+            total_hours: 24 * 8,
+        };
+
+        assert_eq!(time.hour_of_day(), 0);
+        assert_eq!(time.day_of_week(), 2);
+        assert_eq!(time.week_of_month(), 2);
+        assert_eq!(time.month(), 1);
+        assert_eq!(time.year(), 1);
+        assert_eq!(time.label(), "Year 1, Month 1, Week 2, Day 2, 00:00");
+    }
+
+    #[test]
+    fn cadence_helpers_detect_day_and_week_boundaries() {
+        assert!(!is_new_day(
+            GameTime { total_hours: 22 },
+            GameTime { total_hours: 23 }
+        ));
+        assert!(is_new_day(
+            GameTime { total_hours: 23 },
+            GameTime { total_hours: 24 }
+        ));
+        assert!(is_new_week(
+            GameTime {
+                total_hours: 24 * 7 - 1
+            },
+            GameTime {
+                total_hours: 24 * 7
+            }
+        ));
+    }
 }
 
 impl Default for CityStats {

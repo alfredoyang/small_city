@@ -3,6 +3,14 @@
 use small_city::core::game::Game;
 use small_city::interface::input::BuildingKind;
 
+fn advance_one_week(game: &mut Game) {
+    // Phase A moved population growth to weekly boundaries, so population tests
+    // advance through one in-game week before asserting growth.
+    for _ in 0..24 * 7 {
+        game.tick();
+    }
+}
+
 #[test]
 fn residential_next_to_powered_road_network_becomes_powered() {
     let mut game = Game::new(5, 5);
@@ -138,7 +146,7 @@ fn population_only_grows_when_powered_by_network() {
     assert!(game.build(2, 1, BuildingKind::Road).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
 
-    game.tick();
+    advance_one_week(&mut game);
 
     assert_eq!(
         game.inspect(1, 0)

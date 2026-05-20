@@ -253,7 +253,8 @@ fn render_status(stdout: &mut impl Write, view: &GameView) -> io::Result<()> {
     let status = &view.status;
     writeln!(
         stdout,
-        "Turn: {} | Money: ${} | Pop: {} | Citizens: {} | Jobs: {} | Happiness: {} | Pollution: {}",
+        "{} | Turn: {} | Money: ${} | Pop: {} | Citizens: {} | Jobs: {} | Happiness: {} | Pollution: {}",
+        status.time.label,
         status.turn,
         status.money,
         status.population,

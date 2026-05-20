@@ -27,7 +27,7 @@ const COMMERCIAL_GOODS_STORAGE_PER_EXTRA_LEVEL: i32 = 4;
 const MANUFACTURING_TAX_PER_GOOD: i32 = 1;
 const EXPORT_TAX_PER_GOOD: i32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct EconomyBreakdown {
     pub salaries_paid: i32,
     pub workplace_tax: i32,

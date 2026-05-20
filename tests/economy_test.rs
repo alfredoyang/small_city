@@ -1,9 +1,10 @@
 //! Integration tests for maintenance costs, income, and tick economy breakdowns.
 
 use small_city::core::game::Game;
+use small_city::core::resources::GameTime;
 use small_city::interface::events::{EconomyBreakdownView, GameEventView, MetricChange};
 use small_city::interface::input::BuildingKind;
-use small_city::interface::view::InspectDetailsView;
+use small_city::interface::view::{GameTimeView, InspectDetailsView};
 
 #[test]
 fn workplace_without_citizen_workers_pays_no_tax_but_still_has_maintenance() {
@@ -14,7 +15,7 @@ fn workplace_without_citizen_workers_pays_no_tax_but_still_has_maintenance() {
     assert!(game.build(1, 1, BuildingKind::Road).success);
     assert_eq!(game.view().status.money, 68);
 
-    game.tick();
+    advance_one_day(&mut game);
 
     assert_eq!(game.view().status.money, 74);
 }
@@ -26,7 +27,7 @@ fn unproductive_buildings_still_have_maintenance_costs() {
     assert!(game.build(1, 0, BuildingKind::Park).success);
     assert_eq!(game.view().status.money, 74);
 
-    game.tick();
+    advance_one_day(&mut game);
 
     assert_eq!(game.view().status.money, 72);
 }
@@ -59,12 +60,13 @@ fn tick_event_exposes_economy_breakdown() {
     assert!(game.build(0, 1, BuildingKind::Road).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);
 
-    let result = game.tick();
+    let result = advance_one_day(&mut game);
 
     assert_eq!(
         result.event,
         GameEventView::TickSummary {
-            turn: 1,
+            turn: 24,
+            time: expected_time(24),
             population: MetricChange {
                 before: 0,
                 after: 0
@@ -126,7 +128,7 @@ fn citizen_salary_rent_and_shopping_create_city_tax_income() {
     assert!(game.build(2, 1, BuildingKind::Road).success);
     assert!(game.build(3, 1, BuildingKind::Road).success);
 
-    let result = game.tick();
+    let result = advance_one_week(&mut game);
 
     assert_eq!(
         tick_economy(&result.event),
@@ -141,19 +143,19 @@ fn citizen_salary_rent_and_shopping_create_city_tax_income() {
             commercial_sales_tax: 1,
             shoppers_served: 1,
             local_goods_produced: 4,
-            local_goods_stored: 4,
+            local_goods_stored: 0,
             local_goods_sold: 1,
             imported_goods_sold: 0,
-            exported_goods: 0,
+            exported_goods: 4,
             manufacturing_tax: 4,
-            export_tax: 0,
+            export_tax: 4,
             rent_failures: 0,
             maintenance_cost: 3,
-            net: 5,
+            net: 9,
         }
     );
     assert_eq!(game.view().status.citizens, 1);
-    assert_eq!(game.view().status.money, 58);
+    assert_eq!(game.view().status.money, 84);
 }
 
 #[test]
@@ -164,7 +166,7 @@ fn commercial_without_shoppers_pays_no_sales_tax() {
     assert!(game.build(0, 1, BuildingKind::Road).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);
 
-    let result = game.tick();
+    let result = advance_one_day(&mut game);
 
     assert!(matches!(
         result.event,
@@ -196,7 +198,7 @@ fn disconnected_commercial_does_not_receive_shoppers_or_pay_sales_tax() {
         assert!(game.build(x, 1, BuildingKind::Road).success);
     }
 
-    let result = game.tick();
+    let result = advance_one_week(&mut game);
 
     let economy = tick_economy(&result.event);
     assert!(economy.salaries_paid > 0);
@@ -220,7 +222,7 @@ fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
     assert!(game.build(2, 1, BuildingKind::Road).success);
     assert!(game.build(3, 1, BuildingKind::Road).success);
 
-    let first_tick = game.tick();
+    let first_tick = advance_one_week(&mut game);
     assert!(matches!(
         first_tick.event,
         GameEventView::TickSummary {
@@ -234,22 +236,22 @@ fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
                 commercial_sales_tax: 1,
                 shoppers_served: 1,
                 local_goods_produced: 4,
-                local_goods_stored: 4,
+                local_goods_stored: 0,
                 local_goods_sold: 1,
                 imported_goods_sold: 0,
-                exported_goods: 0,
+                exported_goods: 4,
                 manufacturing_tax: 4,
-                export_tax: 0,
+                export_tax: 4,
                 rent_failures: 0,
                 maintenance_cost: 3,
-                net: 5,
+                net: 9,
             },
             ..
         }
     ));
 
     assert!(game.bulldoze(2, 1).success);
-    let second_tick = game.tick();
+    let second_tick = advance_one_day(&mut game);
 
     assert_eq!(
         tick_economy(&second_tick.event),
@@ -293,12 +295,12 @@ fn citizen_unable_to_pay_rent_gets_lower_happiness() {
     assert!(game.build(2, 1, BuildingKind::Road).success);
     assert!(game.build(3, 1, BuildingKind::Road).success);
 
-    assert!(game.tick().success);
+    advance_one_week(&mut game);
     let before = residential_average_happiness(&game, 1, 0).expect("resident happiness");
 
     assert!(game.bulldoze(3, 1).success);
-    let failed_rent_tick = game.tick();
-    assert!(game.tick().success);
+    let failed_rent_tick = advance_one_day(&mut game);
+    advance_one_week(&mut game);
     let after = residential_average_happiness(&game, 1, 0).expect("resident happiness after rent");
 
     assert!(
@@ -344,7 +346,7 @@ fn industrial_goods_fill_commercial_storage_and_surplus_exports() {
         assert!(game.build(x, 1, BuildingKind::Road).success);
     }
 
-    let economy = tick_economy(&game.tick().event);
+    let economy = tick_economy(&advance_one_day(&mut game).event);
 
     assert_eq!(economy.local_goods_produced, 12);
     assert_eq!(economy.local_goods_stored, 8);
@@ -364,8 +366,11 @@ fn commercial_imports_goods_when_local_storage_is_empty() {
     assert!(game.build(1, 1, BuildingKind::Road).success);
     assert!(game.build(2, 1, BuildingKind::Road).success);
 
-    assert_eq!(tick_economy(&game.tick().event).imported_goods_sold, 0);
-    let economy = tick_economy(&game.tick().event);
+    assert_eq!(
+        tick_economy(&advance_one_week(&mut game).event).imported_goods_sold,
+        0
+    );
+    let economy = tick_economy(&advance_one_day(&mut game).event);
 
     assert_eq!(economy.local_goods_produced, 0);
     assert_eq!(economy.local_goods_sold, 0);
@@ -385,7 +390,7 @@ fn citizens_prefer_nearby_reachable_jobs() {
         assert!(game.build(x, 1, BuildingKind::Road).success);
     }
 
-    let economy = tick_economy(&game.tick().event);
+    let economy = tick_economy(&advance_one_week(&mut game).event);
 
     assert_eq!(economy.salaries_paid, 3);
     assert_eq!(economy.workplace_tax, 1);
@@ -411,7 +416,7 @@ fn far_export_access_lowers_export_and_manufacturing_margin() {
         assert!(game.build(x, 2, BuildingKind::Road).success);
     }
 
-    let economy = tick_economy(&game.tick().event);
+    let economy = tick_economy(&advance_one_day(&mut game).event);
 
     assert_eq!(economy.local_goods_produced, 4);
     assert_eq!(economy.exported_goods, 4);
@@ -450,6 +455,37 @@ fn tick_economy(event: &GameEventView) -> EconomyBreakdownView {
     }
 }
 
+fn expected_time(total_hours: u64) -> GameTimeView {
+    let time = GameTime { total_hours };
+    GameTimeView {
+        total_hours,
+        year: time.year(),
+        month: time.month(),
+        week: time.week_of_month(),
+        day: time.day_of_week(),
+        hour: time.hour_of_day(),
+        label: time.label(),
+    }
+}
+
+fn advance_one_day(game: &mut Game) -> small_city::interface::events::CommandResult {
+    // Phase A time cadence moved economy from every tick to the daily boundary.
+    let mut result = game.tick();
+    for _ in 1..24 {
+        result = game.tick();
+    }
+    result
+}
+
+fn advance_one_week(game: &mut Game) -> small_city::interface::events::CommandResult {
+    // Phase A time cadence moved population growth from every tick to the weekly boundary.
+    let mut result = game.tick();
+    for _ in 1..24 * 7 {
+        result = game.tick();
+    }
+    result
+}
+
 fn powered_residential_city(with_park: bool) -> Game {
     let mut game = Game::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
@@ -472,7 +508,7 @@ fn commercial_tax_city(with_park: bool) -> EconomyBreakdownView {
         assert!(game.build(2, 2, BuildingKind::Park).success);
     }
 
-    tick_economy(&game.tick().event)
+    tick_economy(&advance_one_week(&mut game).event)
 }
 
 fn shopping_happiness_city(commercial_x: usize) -> i32 {
@@ -488,7 +524,7 @@ fn shopping_happiness_city(commercial_x: usize) -> i32 {
         assert!(game.build(x, 1, BuildingKind::Road).success);
     }
 
-    assert!(game.tick().success);
+    advance_one_week(&mut game);
     residential_average_happiness(&game, 1, 0).expect("resident happiness")
 }
 
@@ -509,8 +545,8 @@ fn imported_goods_sold_after_two_ticks(far_from_edge: bool) -> i32 {
         }
     }
 
-    assert!(game.tick().success);
-    tick_economy(&game.tick().event).imported_goods_sold
+    advance_one_week(&mut game);
+    tick_economy(&advance_one_day(&mut game).event).imported_goods_sold
 }
 
 fn residential_rent(game: &Game, x: usize, y: usize) -> i32 {

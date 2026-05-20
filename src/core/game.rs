@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs::File;
 use std::path::Path;
 
+use crate::core::resources::{is_new_day, is_new_week};
 use crate::core::systems::{
     build, bulldoze, citizens, economy, happiness, local_effects, pollution, population, power,
     replace, road_network_analysis, stats, upgrade,
@@ -12,7 +13,7 @@ use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
 use crate::interface::events::{CommandResult, EconomyBreakdownView, GameEventView, MetricChange};
 use crate::interface::input::{BuildingKind, MapOverlayInput};
-use crate::interface::view::{BuildPreviewView, GameView, InspectView};
+use crate::interface::view::{BuildPreviewView, GameTimeView, GameView, InspectView};
 
 const DEFAULT_MAP_WIDTH: usize = 20;
 const DEFAULT_MAP_HEIGHT: usize = 15;
@@ -116,16 +117,25 @@ impl Game {
         result
     }
 
-    /// Advances the simulation by one deterministic turn.
+    /// Advances the simulation by one deterministic hour.
     pub fn tick(&mut self) -> CommandResult {
         let before = TickSummarySnapshot::from_world(&self.world);
+        let before_time = self.world.resources.time;
+        self.world.resources.time.advance_hours(1);
+        let after_time = self.world.resources.time;
         power::run(&mut self.world);
         stats::run(&mut self.world);
         local_effects::run(&mut self.world);
-        population::run(&mut self.world);
+        if is_new_week(before_time, after_time) {
+            population::run(&mut self.world);
+        }
         citizens::update_happiness(&mut self.world);
         local_effects::run(&mut self.world);
-        let economy = economy::run(&mut self.world);
+        let economy = if is_new_day(before_time, after_time) {
+            economy::run(&mut self.world)
+        } else {
+            economy::EconomyBreakdown::default()
+        };
         stats::refresh_population_and_jobs(&mut self.world);
         pollution::run(&mut self.world);
         happiness::run(&mut self.world);
@@ -134,6 +144,7 @@ impl Game {
 
         CommandResult::success(GameEventView::TickSummary {
             turn: self.world.resources.turn,
+            time: game_time_view(self.world.resources.time),
             population: metric_change(before.population, after.population),
             money: metric_change(before.money, after.money),
             happiness: metric_change(before.happiness, after.happiness),
@@ -229,4 +240,16 @@ impl TickSummarySnapshot {
 
 fn metric_change<T>(before: T, after: T) -> MetricChange<T> {
     MetricChange { before, after }
+}
+
+fn game_time_view(time: crate::core::resources::GameTime) -> GameTimeView {
+    GameTimeView {
+        total_hours: time.total_hours,
+        year: time.year(),
+        month: time.month(),
+        week: time.week_of_month(),
+        day: time.day_of_week(),
+        hour: time.hour_of_day(),
+        label: time.label(),
+    }
 }

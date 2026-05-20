@@ -49,6 +49,7 @@ pub struct LocalEffectsView {
 pub struct CityStatusView {
     pub money: i32,
     pub turn: u32,
+    pub time: GameTimeView,
     pub population: i32,
     pub citizens: i32,
     pub jobs: i32,
@@ -59,6 +60,17 @@ pub struct CityStatusView {
     pub average_citizen_money: Option<i32>,
     pub demand: CityDemand,
     pub power: PowerStatusView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameTimeView {
+    pub total_hours: u64,
+    pub year: u32,
+    pub month: u8,
+    pub week: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

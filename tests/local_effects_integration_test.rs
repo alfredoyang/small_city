@@ -44,8 +44,8 @@ fn residential_near_park_grows_better_than_residential_near_industrial() {
             .success
     );
 
-    assert!(park_city.tick().success);
-    assert!(industrial_city.tick().success);
+    advance_one_week(&mut park_city);
+    advance_one_week(&mut industrial_city);
 
     let park_population = park_city
         .inspect(3, 0)
@@ -87,7 +87,7 @@ fn save_load_preserves_behavior_after_derived_effects_are_refreshed() {
     let mut game = Game::new(10, 10);
     build_powered_high_job_city(&mut game, 3, 0);
     assert!(game.build(3, 2, BuildingKind::Park).success);
-    assert!(game.tick().success);
+    advance_one_week(&mut game);
     game.save_to_file(&path).expect("save city");
 
     let mut loaded = Game::load_from_file(&path).expect("load city");
@@ -122,9 +122,7 @@ fn long_city_growth_favors_high_desirability_residential_over_low_desirability()
     assert!(park_side.land_value > industrial_side.land_value);
     assert!(industrial_side.pollution_pressure > park_side.pollution_pressure);
 
-    for _ in 0..12 {
-        assert!(game.tick().success);
-    }
+    advance_weeks(&mut game, 2);
 
     let view = game.view();
     let land_overlay = game.view_with_overlay(MapOverlayInput::LandValue);
@@ -142,7 +140,7 @@ fn long_city_growth_favors_high_desirability_residential_over_low_desirability()
         .population
         .expect("industrial-side population");
 
-    assert_eq!(view.status.turn, 12);
+    assert_eq!(view.status.turn, 24 * 7 * 2);
     assert!(park_population > industrial_population);
     assert!(park_population > 0);
     assert_eq!(industrial_population, 0);
@@ -166,9 +164,7 @@ fn long_layout_mutations_refresh_local_effects_and_continue_after_save_load() {
         .inspect(2, 0)
         .local_effects
         .expect("blocked local effects");
-    for _ in 0..4 {
-        assert!(game.tick().success);
-    }
+    advance_one_week(&mut game);
     assert_eq!(
         game.inspect(2, 0)
             .cell
@@ -198,9 +194,7 @@ fn long_layout_mutations_refresh_local_effects_and_continue_after_save_load() {
         .expect("loaded local effects");
     assert_eq!(loaded_effects, improved_effects);
 
-    for _ in 0..8 {
-        assert!(loaded.tick().success);
-    }
+    advance_one_week(&mut loaded);
 
     let residential = loaded.inspect(2, 0).cell.expect("residential after load");
     let desirability_overlay = loaded.view_with_overlay(MapOverlayInput::Desirability);
@@ -223,6 +217,18 @@ fn build_powered_high_job_city(game: &mut Game, residential_x: usize, residentia
 
     for x in 0..=6 {
         assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+}
+
+fn advance_one_week(game: &mut Game) {
+    advance_weeks(game, 1);
+}
+
+fn advance_weeks(game: &mut Game, weeks: usize) {
+    // Phase A time cadence moved population growth from every tick to the
+    // weekly boundary, so growth assertions advance by explicit weeks.
+    for _ in 0..24 * 7 * weeks {
+        assert!(game.tick().success);
     }
 }
 

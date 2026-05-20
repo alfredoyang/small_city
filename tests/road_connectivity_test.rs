@@ -3,6 +3,14 @@
 use small_city::core::game::Game;
 use small_city::interface::input::BuildingKind;
 
+fn advance_one_week(game: &mut Game) {
+    // Phase A moved population growth to weekly boundaries, so growth tests
+    // advance through one in-game week before asserting population changes.
+    for _ in 0..24 * 7 {
+        game.tick();
+    }
+}
+
 #[test]
 fn residential_without_adjacent_road_does_not_grow() {
     let mut game = Game::new(5, 5);
@@ -27,7 +35,7 @@ fn residential_with_adjacent_road_grows() {
     assert!(game.build(2, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 1, BuildingKind::Commercial).success);
 
-    game.tick();
+    advance_one_week(&mut game);
 
     let cell = game.inspect(2, 0).cell.expect("residential cell");
     assert_eq!(cell.population, Some(1));

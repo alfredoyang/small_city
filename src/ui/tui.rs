@@ -700,6 +700,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &Tui
     let status = &view.status;
     let lines = vec![
         simulation_status_line(state.is_running),
+        Line::from(status.time.label.clone()),
         Line::from(format!(
             "Turn: {} | Money: ${} | Pop: {} | Citizens: {}",
             status.turn, status.money, status.population, status.citizens

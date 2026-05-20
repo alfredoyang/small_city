@@ -27,14 +27,12 @@ fn connected_road_network_powers_consumers() {
     assert_eq!(cell(&power_overlay, 1, 0).symbol, '+');
     assert_eq!(cell(&power_overlay, 2, 0).symbol, '+');
 
-    for _ in 0..3 {
-        game.tick();
-    }
+    advance_one_week(&mut game);
 
     let residential = game.inspect(1, 0);
     assert_eq!(
         residential.cell.expect("residential cell").population,
-        Some(2)
+        Some(1)
     );
     assert!(game.view().status.population > 0);
 }
@@ -137,7 +135,7 @@ fn save_load_preserves_power_network_behavior() {
     game.save_to_file(&path).expect("save succeeds");
 
     let mut loaded = Game::load_from_file(&path).expect("load succeeds");
-    loaded.tick();
+    advance_one_week(&mut loaded);
 
     let view = loaded.view();
     assert_eq!(view.map.cells.len(), view.map.width * view.map.height);
@@ -152,7 +150,7 @@ fn save_load_preserves_power_network_behavior() {
             .cell
             .expect("residential cell")
             .population,
-        Some(2)
+        Some(1)
     );
 
     std::fs::remove_file(path).expect("remove save file");
@@ -177,6 +175,13 @@ fn all_consumers_powered(view: &GameView) -> bool {
         .iter()
         .filter_map(|cell| cell.powered)
         .all(|powered| powered)
+}
+
+fn advance_one_week(game: &mut Game) {
+    // Phase A time cadence moved population growth from every tick to the weekly boundary.
+    for _ in 0..24 * 7 {
+        assert!(game.tick().success);
+    }
 }
 
 fn save_path(name: &str) -> PathBuf {

@@ -62,7 +62,10 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
     assert!(game.build(0, 1, BuildingKind::Road).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);
     assert!(game.build(2, 1, BuildingKind::Road).success);
-    game.tick();
+    // Phase A time cadence moved goods flow from every tick to the daily boundary.
+    for _ in 0..24 {
+        assert!(game.tick().success);
+    }
 
     let commercial = game.inspect(1, 0);
     let industrial = game.inspect(2, 0);

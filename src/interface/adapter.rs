@@ -4,7 +4,7 @@ use crate::core::systems::{citizens, economy, power, road_connectivity, road_net
 use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
-    BuildOptionView, CellView, CityDemand, CityStatusView, DemandLevel, GameView,
+    BuildOptionView, CellView, CityDemand, CityStatusView, DemandLevel, GameTimeView, GameView,
     InspectDetailsView, InspectView, LocalEffectsView, MapView, PowerStatusView,
 };
 
@@ -31,6 +31,7 @@ pub(crate) fn view_world_with_overlay(world: &World, overlay: MapOverlayInput) -
         status: CityStatusView {
             money: world.resources.money,
             turn: world.resources.turn,
+            time: game_time_view(world.resources.time),
             population: world.stats.population,
             citizens: citizens::citizen_count(world),
             jobs: world.stats.jobs,
@@ -69,6 +70,18 @@ pub(crate) fn view_world_with_overlay(world: &World, overlay: MapOverlayInput) -
             maintenance_cost: kind.maintenance_cost(),
         })
         .collect(),
+    }
+}
+
+fn game_time_view(time: crate::core::resources::GameTime) -> GameTimeView {
+    GameTimeView {
+        total_hours: time.total_hours,
+        year: time.year(),
+        month: time.month(),
+        week: time.week_of_month(),
+        day: time.day_of_week(),
+        hour: time.hour_of_day(),
+        label: time.label(),
     }
 }
 
