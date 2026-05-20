@@ -14,6 +14,9 @@ use crate::interface::events::{CommandResult, EconomyBreakdownView, GameEventVie
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{BuildPreviewView, GameView, InspectView};
 
+const DEFAULT_MAP_WIDTH: usize = 20;
+const DEFAULT_MAP_HEIGHT: usize = 15;
+
 #[derive(Debug)]
 pub struct Game {
     world: World,
@@ -193,7 +196,7 @@ impl Game {
 
 impl Default for Game {
     fn default() -> Self {
-        Self::new(10, 10)
+        Self::new(DEFAULT_MAP_WIDTH, DEFAULT_MAP_HEIGHT)
     }
 }
 

@@ -5,6 +5,15 @@ use small_city::interface::events::{EconomyBreakdownView, GameEventView, MetricC
 use small_city::interface::input::BuildingKind;
 
 #[test]
+fn default_game_uses_larger_distance_friendly_map() {
+    let view = Game::default().view();
+
+    assert_eq!(view.map.width, 20);
+    assert_eq!(view.map.height, 15);
+    assert_eq!(view.map.cells.len(), view.map.width * view.map.height);
+}
+
+#[test]
 fn industrial_creates_pollution() {
     let mut game = Game::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::Industrial).success);
