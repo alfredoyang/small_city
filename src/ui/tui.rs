@@ -700,7 +700,6 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &Tui
     let status = &view.status;
     let lines = vec![
         simulation_status_line(state.is_running),
-        Line::from(status.time.label.clone()),
         Line::from(format!(
             "Turn: {} | Money: ${} | Pop: {} | Citizens: {}",
             status.turn, status.money, status.population, status.citizens
@@ -732,10 +731,35 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &Tui
 
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().title("Status").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title("Status")
+                    .title(status_time_title(view))
+                    .borders(Borders::ALL),
+            )
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn status_time_title(view: &GameView) -> Line<'static> {
+    let status = &view.status;
+    Line::from(Span::styled(
+        format!("Time: {} {}", time_spinner(status.turn), status.time.label),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))
+    .right_aligned()
+}
+
+fn time_spinner(turn: u32) -> char {
+    match turn % 4 {
+        0 => '|',
+        1 => '/',
+        2 => '-',
+        _ => '\\',
+    }
 }
 
 fn render_build_preview(
@@ -1560,12 +1584,43 @@ mod tests {
             "Tool: Residential",
             "Simulation: PAUSED",
             "press Space to resume",
+            "Time: | Year 1, Month 1, Week 1, Day 1, 00:00",
         ] {
             assert!(
                 output.contains(expected),
                 "expected TUI output to contain {expected:?}\n{output}"
             );
         }
+    }
+
+    #[test]
+    fn status_time_renders_in_panel_header() {
+        let game = Game::new(10, 10);
+        let output = render_test_screen(&game, TuiState::default());
+        let header = output
+            .lines()
+            .find(|line| line.contains("Status"))
+            .expect("status panel header");
+
+        assert!(header.contains("Time: | Year 1, Month 1, Week 1, Day 1, 00:00"));
+    }
+
+    #[test]
+    fn status_time_spinner_advances_with_turns() {
+        let mut game = Game::new(10, 10);
+        game.tick();
+        let output = render_test_screen(&game, TuiState::default());
+
+        assert!(output.contains("Time: / Year 1, Month 1, Week 1, Day 1, 01:00"));
+    }
+
+    #[test]
+    fn time_spinner_cycles_by_turn() {
+        assert_eq!(time_spinner(0), '|');
+        assert_eq!(time_spinner(1), '/');
+        assert_eq!(time_spinner(2), '-');
+        assert_eq!(time_spinner(3), '\\');
+        assert_eq!(time_spinner(4), '|');
     }
 
     #[test]

@@ -253,15 +253,16 @@ fn render_status(stdout: &mut impl Write, view: &GameView) -> io::Result<()> {
     let status = &view.status;
     writeln!(
         stdout,
-        "{} | Turn: {} | Money: ${} | Pop: {} | Citizens: {} | Jobs: {} | Happiness: {} | Pollution: {}",
-        status.time.label,
+        "Turn: {} | Money: ${} | Pop: {} | Citizens: {} | Jobs: {} | Happiness: {} | Pollution: {} | Time: {} {}",
         status.turn,
         status.money,
         status.population,
         status.citizens,
         status.jobs,
         status.happiness,
-        status.pollution
+        status.pollution,
+        time_spinner(status.turn),
+        status.time.label
     )?;
     writeln!(
         stdout,
@@ -278,6 +279,15 @@ fn render_status(stdout: &mut impl Write, view: &GameView) -> io::Result<()> {
         status.power.total_demand,
         status.power.total_shortage
     )
+}
+
+fn time_spinner(turn: u32) -> char {
+    match turn % 4 {
+        0 => '|',
+        1 => '/',
+        2 => '-',
+        _ => '\\',
+    }
 }
 
 fn render_map(stdout: &mut impl Write, view: &GameView, state: &AsciiUiState) -> io::Result<()> {
@@ -653,7 +663,10 @@ impl Drop for KeyModeRestore {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsciiUiState, UiAction, demand_note, overlay_legend, parse_key_sequence};
+    use super::{
+        AsciiUiState, UiAction, demand_note, overlay_legend, parse_key_sequence, render_status,
+        time_spinner,
+    };
     use crate::core::game::Game;
     use crate::interface::input::{BuildingKind, MapOverlayInput};
     use crate::interface::view::DemandLevel;
@@ -748,5 +761,30 @@ mod tests {
         assert!(demand_note(BuildingKind::Residential, DemandLevel::High).contains("jobs"));
         assert!(demand_note(BuildingKind::Commercial, DemandLevel::Low).contains("population"));
         assert!(demand_note(BuildingKind::Industrial, DemandLevel::High).contains("jobs"));
+    }
+
+    #[test]
+    fn status_renders_clear_time_with_spinner() {
+        let mut game = Game::new(3, 3);
+        let mut output = Vec::new();
+
+        render_status(&mut output, &game.view()).expect("render status");
+        let first = String::from_utf8(output).expect("status is utf8");
+        assert!(first.contains("Pollution: 0 | Time: | Year 1, Month 1, Week 1, Day 1, 00:00"));
+
+        game.tick();
+        let mut output = Vec::new();
+        render_status(&mut output, &game.view()).expect("render status after tick");
+        let second = String::from_utf8(output).expect("status is utf8");
+        assert!(second.contains("Pollution: 0 | Time: / Year 1, Month 1, Week 1, Day 1, 01:00"));
+    }
+
+    #[test]
+    fn time_spinner_cycles_by_turn() {
+        assert_eq!(time_spinner(0), '|');
+        assert_eq!(time_spinner(1), '/');
+        assert_eq!(time_spinner(2), '-');
+        assert_eq!(time_spinner(3), '\\');
+        assert_eq!(time_spinner(4), '|');
     }
 }
