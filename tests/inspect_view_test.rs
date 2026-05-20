@@ -38,6 +38,8 @@ fn inspect_residential_shows_powered_state_and_population() {
             power_demand: 1,
             road_connected: true,
             upgrade_level: 1,
+            maintenance_cost: 0,
+            rent_per_citizen: 2,
             population: 0,
             max_population: 5,
             citizens: 0,
@@ -47,7 +49,7 @@ fn inspect_residential_shows_powered_state_and_population() {
     );
     assert_eq!(
         format_inspect(&inspect),
-        "(1, 0) Residential | Powered: Yes | Demand: 1 | Road: Yes | Level: 1 | Population: 0/5 | Citizens: 0 | Avg Happiness: None | Avg Money: None"
+        "(1, 0) Residential | Powered: Yes | Demand: 1 | Road: Yes | Level: 1 | Maintenance: 0 | Rent: 2 | Population: 0/5 | Citizens: 0 | Avg Happiness: None | Avg Money: None"
     );
 }
 
@@ -71,6 +73,8 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
             powered: true,
             power_demand: 2,
             road_connected: true,
+            maintenance_cost: 1,
+            sales_tax_per_shopper: 1,
             jobs: 2
         })
     );
@@ -80,16 +84,17 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
             powered: true,
             power_demand: 3,
             road_connected: true,
+            maintenance_cost: 1,
             jobs: 3
         })
     );
     assert_eq!(
         format_inspect(&commercial),
-        "(1, 0) Commercial | Powered: Yes | Demand: 2 | Road: Yes | Jobs: 2"
+        "(1, 0) Commercial | Powered: Yes | Demand: 2 | Road: Yes | Maintenance: 1 | Sales Tax: 1 | Jobs: 2"
     );
     assert_eq!(
         format_inspect(&industrial),
-        "(2, 0) Industrial | Powered: Yes | Demand: 3 | Road: Yes | Jobs: 3"
+        "(2, 0) Industrial | Powered: Yes | Demand: 3 | Road: Yes | Maintenance: 1 | Jobs: 3"
     );
 }
 
@@ -119,6 +124,7 @@ fn inspect_power_plant_and_park_show_special_effects() {
             road_connected: false,
             connected_to_road_network: false,
             upgrade_level: 1,
+            maintenance_cost: 1,
             power_capacity: 10
         })
     );
@@ -127,16 +133,17 @@ fn inspect_power_plant_and_park_show_special_effects() {
         Some(InspectDetailsView::Park {
             road_connected: false,
             upgrade_level: 1,
+            maintenance_cost: 1,
             happiness_effect: 3
         })
     );
     assert_eq!(
         format_inspect(&power_plant),
-        "(0, 0) Power Plant | Road: No | Network: No | Level: 1 | Capacity: 10"
+        "(0, 0) Power Plant | Road: No | Network: No | Level: 1 | Maintenance: 1 | Capacity: 10"
     );
     assert_eq!(
         format_inspect(&park),
-        "(1, 0) Park | Road: No | Level: 1 | Happiness: +3"
+        "(1, 0) Park | Road: No | Level: 1 | Maintenance: 1 | Happiness: +3"
     );
 }
 

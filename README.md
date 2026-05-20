@@ -161,7 +161,7 @@ cargo clippy -- -D warnings
 
 Tests cover core simulation rules, citizen economy, road connectivity, demand, bulldoze, build previews, save/load behavior, inspect output, map overlays, cursor/action parsing, TUI key mapping, and UI boundary contracts.
 
-Scenario-style integration tests cover longer multi-turn cities that combine power networks, demand-driven growth, citizen salary/rent/shopping economy, upgrades, replace, bulldoze, overlays, and save/load.
+Scenario-style integration tests cover longer multi-turn cities that combine power networks, demand-driven growth, citizen salary/rent/shopping economy, land-value effects, upgrades, replace, bulldoze, overlays, and save/load.
 
 ## v0.1 Completed Scope
 
@@ -217,3 +217,16 @@ Scenario-style integration tests cover longer multi-turn cities that combine pow
 - Land value and desirability map overlays.
 - Integration tests cover local effects, citizen spawning, citizen cleanup, citizen economy behavior, growth behavior, overlays, and save/load refresh.
 - Implemented the new TUI panel-based terminal with ratatui + crossterm.
+
+## v0.4 Completed Scope
+
+- Connected economy, happiness, land value, and building level into one deterministic loop.
+- Residential rent now depends on local land value and building level.
+- Citizens who cannot afford rent receive rent stress, which lowers future happiness.
+- Commercial and industrial workplaces pay level-based tax, with industrial paying more.
+- Commercial sales tax now increases with local land value and building level.
+- Building maintenance increases with building level.
+- Citizen happiness considers home desirability, pollution pressure, unemployment, and rent stress.
+- Residential growth is blocked by low average happiness and gets a small bonus from high average happiness.
+- Inspect output exposes UI-safe economy details such as rent per citizen, maintenance, sales tax per shopper, power demand, level, local effects, and happiness blockers.
+- Tick summaries include rent collected, rent failures, commercial sales tax, maintenance, and net money change.

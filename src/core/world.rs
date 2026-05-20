@@ -191,6 +191,7 @@ mod tests {
                 workplace: None,
                 happiness: 50,
                 money: 0,
+                rent_stress: 0,
             },
         );
 

@@ -61,6 +61,9 @@ pub struct Citizen {
     pub happiness: i32,
     #[serde(default)]
     pub money: i32,
+    /// Set by the economy system when rent cannot be paid; happiness reads it as rent stress.
+    #[serde(default)]
+    pub rent_stress: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

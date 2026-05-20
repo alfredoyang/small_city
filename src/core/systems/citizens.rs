@@ -16,6 +16,7 @@ pub(crate) fn spawn_for_home(world: &mut World, residential: Entity, count: i32)
                 workplace: None,
                 happiness: 50,
                 money: 0,
+                rent_stress: 0,
             },
         );
     }
@@ -129,6 +130,10 @@ fn citizen_happiness(world: &World, citizen: Entity) -> i32 {
 
     let mut happiness = 35 + effects.desirability * 6 + effects.accessibility;
     happiness -= effects.pollution_pressure * 3;
+    if citizen.workplace.is_none() {
+        happiness -= 10;
+    }
+    happiness -= citizen.rent_stress * 10;
     if !powered {
         happiness -= 15;
     }

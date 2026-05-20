@@ -2,6 +2,7 @@
 
 use small_city::core::game::Game;
 use small_city::interface::events::{EconomyBreakdownView, GameEventView};
+use small_city::interface::view::InspectDetailsView;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -160,7 +161,102 @@ fn replace_bulldoze_save_load_scenario_continues_for_twenty_ticks() {
     assert!((0..=100).contains(&view.status.happiness));
 }
 
-#[derive(Default)]
+#[test]
+fn connected_economy_loop_runs_over_many_turns_after_upgrade_and_save_load() {
+    let path = save_path("long-economy-loop");
+    let mut game = Game::new(12, 12);
+
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    for x in 0..=6 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(2, 0, BuildingKind::Residential).success);
+    assert!(game.build(3, 0, BuildingKind::Commercial).success);
+    assert!(game.build(4, 0, BuildingKind::Industrial).success);
+    assert!(game.build(5, 0, BuildingKind::Park).success);
+
+    let starting_rent = residential_rent(&game, 1, 0);
+    let starting_power_maintenance = building_maintenance(&game, 0, 0);
+    let starting_population = game.view().status.population;
+
+    for _ in 0..8 {
+        assert!(game.tick().success);
+    }
+
+    assert!(
+        game.view().status.population > starting_population,
+        "the connected city should grow before upgrades"
+    );
+
+    assert!(game.upgrade(0, 0).success);
+    assert!(game.upgrade(1, 0).success);
+    assert!(game.upgrade(5, 0).success);
+
+    let upgraded_rent = residential_rent(&game, 1, 0);
+    let upgraded_power_maintenance = building_maintenance(&game, 0, 0);
+    assert!(
+        upgraded_rent > starting_rent,
+        "residential upgrade should increase rent from {starting_rent}, got {upgraded_rent}"
+    );
+    assert!(
+        upgraded_power_maintenance > starting_power_maintenance,
+        "power plant upgrade should increase maintenance"
+    );
+
+    let money_before_save = game.view().status.money;
+    let mut pre_save_economy = EconomyTotals::default();
+    for _ in 0..10 {
+        let result = game.tick();
+        assert!(result.success);
+        pre_save_economy.add(tick_economy(&result.event));
+    }
+    assert_eq!(
+        game.view().status.money,
+        money_before_save + pre_save_economy.net
+    );
+
+    game.save_to_file(&path)
+        .expect("save long economy scenario");
+    let mut loaded = Game::load_from_file(&path).expect("load long economy scenario");
+    std::fs::remove_file(&path).expect("remove long economy save");
+
+    let loaded_starting_money = loaded.view().status.money;
+    let mut post_load_economy = EconomyTotals::default();
+    for _ in 0..12 {
+        let result = loaded.tick();
+        assert!(result.success);
+        post_load_economy.add(tick_economy(&result.event));
+    }
+
+    let view = loaded.view();
+    let total_economy = pre_save_economy.plus(post_load_economy);
+    let upgraded_home = loaded.inspect(1, 0).cell.expect("upgraded home cell");
+    let commercial_tax = commercial_sales_tax(&loaded, 3, 0);
+
+    assert_eq!(view.status.turn, 30);
+    assert_eq!(
+        view.status.money,
+        loaded_starting_money + post_load_economy.net
+    );
+    assert_eq!(view.map.cells.len(), view.map.width * view.map.height);
+    assert_eq!(upgraded_home.upgrade_level, Some(2));
+    assert!(residential_rent(&loaded, 1, 0) >= upgraded_rent);
+    assert!(commercial_tax > 1);
+    assert!(total_economy.salaries_paid > 0);
+    assert!(total_economy.workplace_tax > 0);
+    assert!(total_economy.rent_income > 0);
+    assert!(total_economy.commercial_sales_tax > 0);
+    assert!(total_economy.shoppers_served > 0);
+    assert!(total_economy.maintenance_cost > 0);
+    assert!(
+        total_economy.rent_failures < total_economy.rent_income,
+        "the long economy should mostly sustain rent payments"
+    );
+    assert!((0..=100).contains(&view.status.happiness));
+}
+
+#[derive(Clone, Copy, Default)]
 struct EconomyTotals {
     salaries_paid: i32,
     workplace_tax: i32,
@@ -183,6 +279,19 @@ impl EconomyTotals {
         self.maintenance_cost += breakdown.maintenance_cost;
         self.net += breakdown.net;
     }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            salaries_paid: self.salaries_paid + other.salaries_paid,
+            workplace_tax: self.workplace_tax + other.workplace_tax,
+            rent_income: self.rent_income + other.rent_income,
+            commercial_sales_tax: self.commercial_sales_tax + other.commercial_sales_tax,
+            shoppers_served: self.shoppers_served + other.shoppers_served,
+            rent_failures: self.rent_failures + other.rent_failures,
+            maintenance_cost: self.maintenance_cost + other.maintenance_cost,
+            net: self.net + other.net,
+        }
+    }
 }
 
 fn tick_economy(event: &GameEventView) -> EconomyBreakdownView {
@@ -202,4 +311,44 @@ fn save_path(name: &str) -> PathBuf {
         std::process::id(),
         unique
     ))
+}
+
+fn residential_rent(game: &Game, x: usize, y: usize) -> i32 {
+    match game.inspect(x, y).details.expect("inspect details") {
+        InspectDetailsView::Residential {
+            rent_per_citizen, ..
+        } => rent_per_citizen,
+        other => panic!("expected residential details, got {other:?}"),
+    }
+}
+
+fn commercial_sales_tax(game: &Game, x: usize, y: usize) -> i32 {
+    match game.inspect(x, y).details.expect("inspect details") {
+        InspectDetailsView::Commercial {
+            sales_tax_per_shopper,
+            ..
+        } => sales_tax_per_shopper,
+        other => panic!("expected commercial details, got {other:?}"),
+    }
+}
+
+fn building_maintenance(game: &Game, x: usize, y: usize) -> i32 {
+    match game.inspect(x, y).details.expect("inspect details") {
+        InspectDetailsView::Residential {
+            maintenance_cost, ..
+        }
+        | InspectDetailsView::Commercial {
+            maintenance_cost, ..
+        }
+        | InspectDetailsView::Industrial {
+            maintenance_cost, ..
+        }
+        | InspectDetailsView::PowerPlant {
+            maintenance_cost, ..
+        }
+        | InspectDetailsView::Park {
+            maintenance_cost, ..
+        } => maintenance_cost,
+        other => panic!("expected building maintenance details, got {other:?}"),
+    }
 }

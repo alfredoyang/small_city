@@ -1,6 +1,6 @@
 //! Adapter that converts private ECS world data into UI-safe view and inspect models.
 
-use crate::core::systems::{citizens, power, road_connectivity};
+use crate::core::systems::{citizens, economy, power, road_connectivity};
 use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
@@ -142,6 +142,8 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 power_demand: consumer.map(|consumer| consumer.demand).unwrap_or(0),
                 road_connected: road_connectivity::is_road_connected(world, entity),
                 upgrade_level: building.level,
+                maintenance_cost: economy::maintenance_for_building(building.kind, building.level),
+                rent_per_citizen: economy::rent_per_citizen(world, entity),
                 population: population.map(|population| population.current).unwrap_or(0),
                 max_population: population.map(|population| population.max).unwrap_or(0),
                 citizens: citizens::citizen_count_for_home(world, entity),
@@ -161,6 +163,8 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 .map(|consumer| consumer.demand)
                 .unwrap_or(0),
             road_connected: road_connectivity::is_road_connected(world, entity),
+            maintenance_cost: economy::maintenance_for_building(building.kind, building.level),
+            sales_tax_per_shopper: economy::commercial_sales_tax_for_purchase(world, entity),
             jobs: effective_jobs(world, entity, building.kind),
         },
         BuildingKind::Industrial => InspectDetailsView::Industrial {
@@ -175,12 +179,14 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 .map(|consumer| consumer.demand)
                 .unwrap_or(0),
             road_connected: road_connectivity::is_road_connected(world, entity),
+            maintenance_cost: economy::maintenance_for_building(building.kind, building.level),
             jobs: effective_jobs(world, entity, building.kind),
         },
         BuildingKind::PowerPlant => InspectDetailsView::PowerPlant {
             road_connected: road_connectivity::is_road_connected(world, entity),
             connected_to_road_network: power::is_power_provider_connected(world, entity),
             upgrade_level: building.level,
+            maintenance_cost: economy::maintenance_for_building(building.kind, building.level),
             power_capacity: world
                 .power_providers
                 .get(&entity)
@@ -190,6 +196,7 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
         BuildingKind::Park => InspectDetailsView::Park {
             road_connected: road_connectivity::is_road_connected(world, entity),
             upgrade_level: building.level,
+            maintenance_cost: economy::maintenance_for_building(building.kind, building.level),
             happiness_effect: world
                 .happiness_effects
                 .get(&entity)
@@ -242,11 +249,30 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
                     world.stats.pollution
                 ));
             }
+            let rent = economy::rent_per_citizen(world, entity);
+            explanations.push(format!("Economy: rent is {rent} per citizen."));
+            if let Some(average_happiness) = citizens::average_happiness_for_home(world, entity) {
+                if average_happiness < 40 {
+                    explanations.push(
+                        "Happiness blocker: average resident happiness below 40 blocks growth."
+                            .to_string(),
+                    );
+                } else if average_happiness >= 70 {
+                    explanations.push(
+                        "Happiness bonus: average resident happiness at least 70 improves growth."
+                            .to_string(),
+                    );
+                }
+            }
         }
         BuildingKind::Commercial => {
             explain_road_and_power(world, entity, road_connected, &mut explanations);
             if road_connected && is_consumer_powered(world, entity) {
                 explanations.push("Provides 2 effective jobs and income.".to_string());
+                explanations.push(format!(
+                    "Economy: sales tax is {} per shopper.",
+                    economy::commercial_sales_tax_for_purchase(world, entity)
+                ));
             } else {
                 explanations.push(
                     "Jobs and income are blocked until road and power requirements are met."
@@ -295,6 +321,10 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
     } else if let Some(cost) = building.kind.upgrade_cost() {
         explanations.push(format!("Can be upgraded for {cost}."));
     }
+    explanations.push(format!(
+        "Maintenance: {} per turn.",
+        economy::maintenance_for_building(building.kind, building.level)
+    ));
 
     let effects = world.local_effects.get(x, y);
     explanations.push(format!(

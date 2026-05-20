@@ -40,10 +40,11 @@ pub(crate) fn run(world: &mut World) {
             continue;
         };
         let current_population = citizens::citizen_count_for_home(world, entity);
-        let growth =
-            residential_growth_per_tick(available_jobs, world.stats.happiness, desirability)
-                .min(population.max - current_population)
-                .min(available_jobs);
+        let growth_happiness =
+            citizens::average_happiness_for_home(world, entity).unwrap_or(world.stats.happiness);
+        let growth = residential_growth_per_tick(available_jobs, growth_happiness, desirability)
+            .min(population.max - current_population)
+            .min(available_jobs);
         if growth > 0 {
             citizens::spawn_for_home(world, entity, growth);
             available_jobs -= growth;
@@ -58,17 +59,22 @@ fn residential_growth_per_tick(
     happiness: i32,
     desirability: DesirabilityLevel,
 ) -> i32 {
+    if happiness < 40 {
+        return 0;
+    }
+
     let demand_growth = if available_jobs >= 3 && happiness >= 50 {
         2
-    } else if available_jobs > 0 && happiness >= 35 {
+    } else if available_jobs > 0 {
         1
     } else {
         return 0;
     };
+    let happiness_bonus = if happiness >= 70 { 1 } else { 0 };
 
     match desirability {
-        DesirabilityLevel::High => demand_growth + 1,
-        DesirabilityLevel::Medium => demand_growth,
+        DesirabilityLevel::High => demand_growth + 1 + happiness_bonus,
+        DesirabilityLevel::Medium => demand_growth + happiness_bonus,
         DesirabilityLevel::Low => 0,
     }
 }
@@ -85,11 +91,11 @@ mod tests {
             2
         );
         assert_eq!(
-            residential_growth_per_tick(1, 35, DesirabilityLevel::Medium),
+            residential_growth_per_tick(1, 40, DesirabilityLevel::Medium),
             1
         );
         assert_eq!(
-            residential_growth_per_tick(3, 34, DesirabilityLevel::Medium),
+            residential_growth_per_tick(3, 39, DesirabilityLevel::Medium),
             0
         );
         assert_eq!(
@@ -111,6 +117,18 @@ mod tests {
         assert_eq!(
             residential_growth_per_tick(3, 50, DesirabilityLevel::Low),
             0
+        );
+    }
+
+    #[test]
+    fn residential_growth_rate_uses_happiness_thresholds() {
+        assert_eq!(
+            residential_growth_per_tick(3, 39, DesirabilityLevel::Medium),
+            0
+        );
+        assert_eq!(
+            residential_growth_per_tick(3, 70, DesirabilityLevel::Medium),
+            3
         );
     }
 }

@@ -3,6 +3,7 @@
 use small_city::core::game::Game;
 use small_city::interface::events::{EconomyBreakdownView, GameEventView, MetricChange};
 use small_city::interface::input::BuildingKind;
+use small_city::interface::view::InspectDetailsView;
 
 #[test]
 fn workplace_without_citizen_workers_pays_no_tax_but_still_has_maintenance() {
@@ -114,24 +115,21 @@ fn citizen_salary_rent_and_shopping_create_city_tax_income() {
 
     let result = game.tick();
 
-    assert!(matches!(
-        result.event,
-        GameEventView::TickSummary {
-            economy: EconomyBreakdownView {
-                salaries_paid: 3,
-                workplace_tax: 1,
-                rent_income: 1,
-                commercial_sales_tax: 1,
-                shoppers_served: 1,
-                rent_failures: 0,
-                maintenance_cost: 2,
-                net: 1,
-            },
-            ..
+    assert_eq!(
+        tick_economy(&result.event),
+        EconomyBreakdownView {
+            salaries_paid: 3,
+            workplace_tax: 1,
+            rent_income: 2,
+            commercial_sales_tax: 2,
+            shoppers_served: 1,
+            rent_failures: 0,
+            maintenance_cost: 2,
+            net: 3,
         }
-    ));
+    );
     assert_eq!(game.view().status.citizens, 1);
-    assert_eq!(game.view().status.money, 65);
+    assert_eq!(game.view().status.money, 67);
 }
 
 #[test]
@@ -202,12 +200,12 @@ fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
             economy: EconomyBreakdownView {
                 salaries_paid: 3,
                 workplace_tax: 1,
-                rent_income: 1,
-                commercial_sales_tax: 1,
+                rent_income: 2,
+                commercial_sales_tax: 2,
                 shoppers_served: 1,
                 rent_failures: 0,
                 maintenance_cost: 2,
-                net: 1,
+                net: 3,
             },
             ..
         }
@@ -216,27 +214,145 @@ fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
     assert!(game.bulldoze(2, 1).success);
     let second_tick = game.tick();
 
-    assert!(matches!(
-        second_tick.event,
-        GameEventView::TickSummary {
-            economy: EconomyBreakdownView {
-                salaries_paid: 0,
-                workplace_tax: 0,
-                rent_income: 1,
-                commercial_sales_tax: 0,
-                shoppers_served: 0,
-                rent_failures: 0,
-                maintenance_cost: 2,
-                net: -1,
-            },
-            ..
+    assert_eq!(
+        tick_economy(&second_tick.event),
+        EconomyBreakdownView {
+            salaries_paid: 0,
+            workplace_tax: 0,
+            rent_income: 0,
+            commercial_sales_tax: 0,
+            shoppers_served: 0,
+            rent_failures: 1,
+            maintenance_cost: 2,
+            net: -2,
         }
-    ));
+    );
+}
+
+#[test]
+fn residential_in_higher_land_value_area_charges_higher_rent() {
+    let plain = powered_residential_city(false);
+    let premium = powered_residential_city(true);
+
+    assert!(
+        residential_rent(&premium, 1, 0) > residential_rent(&plain, 1, 0),
+        "park-driven land value should increase rent"
+    );
+}
+
+#[test]
+fn citizen_unable_to_pay_rent_gets_lower_happiness() {
+    let mut game = powered_residential_city(true);
+    assert!(game.build(3, 0, BuildingKind::Commercial).success);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
+    assert!(game.build(3, 1, BuildingKind::Road).success);
+
+    assert!(game.tick().success);
+    let before = residential_average_happiness(&game, 1, 0).expect("resident happiness");
+
+    assert!(game.bulldoze(3, 1).success);
+    let failed_rent_tick = game.tick();
+    assert!(game.tick().success);
+    let after = residential_average_happiness(&game, 1, 0).expect("resident happiness after rent");
+
+    assert!(
+        after < before,
+        "expected happiness to drop from {before} to below it, got {after}"
+    );
+    assert!(tick_economy(&failed_rent_tick.event).rent_failures > 0);
+}
+
+#[test]
+fn level_two_building_has_higher_maintenance_than_level_one() {
+    let mut game = Game::new(5, 5);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+
+    let level_one = power_plant_maintenance(&game, 0, 0);
+    assert!(game.upgrade(0, 0).success);
+    let level_two = power_plant_maintenance(&game, 0, 0);
+
+    assert_eq!(level_one, 1);
+    assert_eq!(level_two, 2);
+    assert!(level_two > level_one);
+}
+
+#[test]
+fn commercial_in_higher_land_value_area_pays_more_sales_tax() {
+    let plain = commercial_tax_city(false);
+    let premium = commercial_tax_city(true);
+
+    assert!(premium.commercial_sales_tax > plain.commercial_sales_tax);
+    assert_eq!(premium.shoppers_served, plain.shoppers_served);
+}
+
+#[test]
+fn save_load_preserves_land_value_rent_behavior() {
+    let path = std::env::temp_dir().join("small_city_v04_economy_roundtrip.json");
+    let game = powered_residential_city(true);
+    let before = residential_rent(&game, 1, 0);
+    game.save_to_file(&path).expect("save city");
+
+    let mut loaded = Game::load_from_file(&path).expect("load city");
+    let _ = std::fs::remove_file(&path);
+    let after = residential_rent(&loaded, 1, 0);
+
+    assert_eq!(after, before);
+    assert!(loaded.tick().success);
 }
 
 fn tick_economy(event: &GameEventView) -> EconomyBreakdownView {
     match event {
         GameEventView::TickSummary { economy, .. } => *economy,
         other => panic!("expected tick summary event, got {other:?}"),
+    }
+}
+
+fn powered_residential_city(with_park: bool) -> Game {
+    let mut game = Game::new(10, 10);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(0, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    if with_park {
+        assert!(game.build(2, 0, BuildingKind::Park).success);
+    }
+    game
+}
+
+fn commercial_tax_city(with_park: bool) -> EconomyBreakdownView {
+    let mut game = powered_residential_city(false);
+    assert!(game.build(2, 0, BuildingKind::Commercial).success);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
+    if with_park {
+        assert!(game.build(2, 2, BuildingKind::Park).success);
+    }
+
+    tick_economy(&game.tick().event)
+}
+
+fn residential_rent(game: &Game, x: usize, y: usize) -> i32 {
+    match game.inspect(x, y).details.expect("inspect details") {
+        InspectDetailsView::Residential {
+            rent_per_citizen, ..
+        } => rent_per_citizen,
+        other => panic!("expected residential details, got {other:?}"),
+    }
+}
+
+fn residential_average_happiness(game: &Game, x: usize, y: usize) -> Option<i32> {
+    match game.inspect(x, y).details.expect("inspect details") {
+        InspectDetailsView::Residential {
+            average_happiness, ..
+        } => average_happiness,
+        other => panic!("expected residential details, got {other:?}"),
+    }
+}
+
+fn power_plant_maintenance(game: &Game, x: usize, y: usize) -> i32 {
+    match game.inspect(x, y).details.expect("inspect details") {
+        InspectDetailsView::PowerPlant {
+            maintenance_cost, ..
+        } => maintenance_cost,
+        other => panic!("expected power plant details, got {other:?}"),
     }
 }

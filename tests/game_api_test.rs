@@ -73,11 +73,11 @@ fn tick_returns_structured_summary_events() {
             },
             money: MetricChange {
                 before: 47,
-                after: 49
+                after: 53
             },
             happiness: MetricChange {
                 before: 52,
-                after: 65
+                after: 55
             },
             pollution: MetricChange {
                 before: 1,
@@ -94,12 +94,12 @@ fn tick_returns_structured_summary_events() {
             economy: EconomyBreakdownView {
                 salaries_paid: 6,
                 workplace_tax: 2,
-                rent_income: 2,
-                commercial_sales_tax: 2,
+                rent_income: 4,
+                commercial_sales_tax: 4,
                 shoppers_served: 2,
                 rent_failures: 0,
                 maintenance_cost: 4,
-                net: 2
+                net: 6
             },
         }
     );
@@ -120,11 +120,11 @@ fn tick_summary_message_includes_metric_changes() {
     let message = game.tick().message();
 
     assert!(message.contains("population 1 (+1)"));
-    assert!(message.contains("money 53 (+0)"));
+    assert!(message.contains("money 54 (+1)"));
     assert!(message.contains("powered buildings 3 (+0)"));
     assert!(
         message.contains(
-            "Economy: salaries paid 3, workplace tax +1, rent +1, sales tax +1, shoppers 1, rent failures 0, maintenance -3, net +0"
+            "Economy: salaries paid 3, workplace tax +1, rent +2, sales tax +1, shoppers 1, rent failures 0, maintenance -3, net +1"
         )
     );
 }
