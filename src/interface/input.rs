@@ -48,11 +48,16 @@ impl BuildingKind {
 
     /// Cost to upgrade one existing building of this type, if upgrades are supported.
     pub fn upgrade_cost(self) -> Option<i32> {
+        self.upgrade_cost_for_level(2)
+    }
+
+    /// Cost to upgrade this building type into a specific target level.
+    pub fn upgrade_cost_for_level(self, target_level: u8) -> Option<i32> {
         match self {
-            Self::Residential => Some(10),
-            Self::PowerPlant => Some(15),
-            Self::Park => Some(8),
-            Self::Road | Self::Commercial | Self::Industrial => None,
+            Self::Residential if target_level == 2 => Some(10),
+            Self::PowerPlant if target_level == 2 => Some(15),
+            Self::Park if target_level == 2 => Some(8),
+            _ => None,
         }
     }
 

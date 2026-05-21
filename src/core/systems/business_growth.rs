@@ -38,7 +38,7 @@ pub(crate) fn run(world: &mut World) -> BusinessGrowthSummary {
         if let Some(building) = world.buildings.get_mut(&candidate.entity) {
             building.level = candidate.next_level;
         }
-        economy::spend_business_cash(world, candidate.entity, candidate.threshold);
+        economy::spend_business_cash(world, candidate.entity, candidate.cost);
         apply_business_upgrade_effect(
             world,
             candidate.entity,
@@ -101,7 +101,7 @@ struct ReinvestmentCandidate {
     entity: Entity,
     kind: BuildingKind,
     next_level: u8,
-    threshold: i32,
+    cost: i32,
 }
 
 fn business_candidates(world: &World) -> Vec<Entity> {
@@ -136,7 +136,8 @@ fn evaluate_reinvestment(
         return None;
     }
     let kind = building.kind;
-    let threshold = reinvestment_threshold(kind)?;
+    let next_level = building.level + 1;
+    let cost = reinvestment_upgrade_cost(kind, next_level)?;
     let powered = world
         .power_consumers
         .get(&entity)
@@ -149,14 +150,22 @@ fn evaluate_reinvestment(
     }
 
     let finance = economy::business_finance(world, entity)?;
-    (finance.business_cash >= threshold && finance.last_period_profit > 0).then_some(
+    (finance.business_cash >= cost && finance.last_period_profit > 0).then_some(
         ReinvestmentCandidate {
             entity,
             kind,
-            next_level: building.level + 1,
-            threshold,
+            next_level,
+            cost,
         },
     )
+}
+
+pub(crate) fn reinvestment_upgrade_cost(kind: BuildingKind, target_level: u8) -> Option<i32> {
+    match (kind, target_level) {
+        (BuildingKind::Commercial, 2 | 3) => Some(COMMERCIAL_REINVESTMENT_THRESHOLD),
+        (BuildingKind::Industrial, 2 | 3) => Some(INDUSTRIAL_REINVESTMENT_THRESHOLD),
+        _ => None,
+    }
 }
 
 fn demand_allows_reinvestment_with_context(
@@ -183,7 +192,7 @@ fn apply_business_upgrade_effect(world: &mut World, entity: Entity, kind: Buildi
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::{reinvestment_upgrade_cost, run};
     use crate::core::components::{BuildingData, BusinessFinance};
     use crate::core::systems::{citizens, placement};
     use crate::core::world::World;
@@ -228,6 +237,30 @@ mod tests {
         assert_eq!(business_cash(&world, commercial), 2);
         assert_eq!(business_cash(&world, industrial), 6);
         assert_eq!(world.pollution_sources.get(&industrial).unwrap().amount, 3);
+    }
+
+    #[test]
+    fn run_does_not_upgrade_when_business_cash_cannot_cover_cost() {
+        let mut world = World::new(4, 3);
+        placement::place_building(&mut world, 0, 0, BuildingKind::Residential);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Commercial);
+        for x in 0..=1 {
+            placement::place_building(&mut world, x, 1, BuildingKind::Road);
+        }
+
+        let residential = world.grid.get(0, 0).expect("residential entity");
+        let commercial = world.grid.get(1, 0).expect("commercial entity");
+        citizens::spawn_for_home(&mut world, residential, 1);
+        world.power_consumers.get_mut(&commercial).unwrap().powered = true;
+        let cost = reinvestment_upgrade_cost(BuildingKind::Commercial, 2).expect("upgrade cost");
+        set_business_finance(&mut world, commercial, cost - 1, 3);
+
+        let summary = run(&mut world);
+
+        assert_eq!(summary.commercial_upgrades, 0);
+        assert!(summary.upgrades.is_empty());
+        assert_eq!(world.buildings.get(&commercial).unwrap().level, 1);
+        assert_eq!(business_cash(&world, commercial), cost - 1);
     }
 
     fn set_business_finance(

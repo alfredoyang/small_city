@@ -26,17 +26,18 @@ pub(crate) fn upgrade(world: &mut World, x: usize, y: usize) -> CommandResult {
         });
     };
 
-    let Some(cost) = building.kind.upgrade_cost() else {
-        return CommandResult::failure(GameEventView::UpgradeFailed {
-            reason: format!("{} cannot be upgraded", building.kind.label()),
-        });
-    };
-
     if building.level >= MAX_UPGRADE_LEVEL {
         return CommandResult::failure(GameEventView::UpgradeFailed {
             reason: "Building is already fully upgraded".to_string(),
         });
     }
+
+    let next_level = building.level + 1;
+    let Some(cost) = building.kind.upgrade_cost_for_level(next_level) else {
+        return CommandResult::failure(GameEventView::UpgradeFailed {
+            reason: format!("{} cannot be upgraded", building.kind.label()),
+        });
+    };
 
     if world.resources.money < cost {
         return CommandResult::failure(GameEventView::UpgradeFailed {
@@ -45,7 +46,6 @@ pub(crate) fn upgrade(world: &mut World, x: usize, y: usize) -> CommandResult {
     }
 
     world.resources.money -= cost;
-    let next_level = building.level + 1;
     if let Some(building) = world.buildings.get_mut(&entity) {
         building.level = next_level;
     }

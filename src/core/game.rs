@@ -126,6 +126,9 @@ impl Game {
         power::run(&mut self.world);
         stats::run(&mut self.world);
         local_effects::run(&mut self.world);
+        if is_new_day(before_time, after_time) {
+            citizens::apply_daily_happiness_decay(&mut self.world);
+        }
         if is_new_week(before_time, after_time) {
             population::run(&mut self.world);
         }
@@ -267,5 +270,50 @@ fn game_time_view(time: crate::core::resources::GameTime) -> GameTimeView {
         day: time.day_of_week(),
         hour: time.hour_of_day(),
         label: time.label(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Game;
+    use crate::core::systems::citizens;
+
+    #[test]
+    fn citizen_happiness_decay_happens_on_daily_boundary_not_hourly() {
+        let (mut game, residential) = game_with_one_citizen();
+
+        for _ in 0..23 {
+            assert!(game.tick().success);
+        }
+        assert_eq!(citizen_happiness_decay(&game), 0);
+        assert_eq!(
+            citizens::average_happiness_for_home(&game.world, residential),
+            Some(50)
+        );
+
+        assert!(game.tick().success);
+
+        let average_happiness =
+            citizens::average_happiness_for_home(&game.world, residential).expect("happiness");
+        assert_eq!(citizen_happiness_decay(&game), 1);
+        assert!(average_happiness < 50);
+        assert!(game.view().status.happiness < 50);
+    }
+
+    fn game_with_one_citizen() -> (Game, crate::core::entity::Entity) {
+        let mut game = Game::new(1, 1);
+        let residential = game.world.spawn();
+        citizens::spawn_for_home(&mut game.world, residential, 1);
+        game.refresh_derived_state();
+        (game, residential)
+    }
+
+    fn citizen_happiness_decay(game: &Game) -> i32 {
+        game.world
+            .citizens
+            .values()
+            .next()
+            .expect("citizen")
+            .happiness_decay
     }
 }

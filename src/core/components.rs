@@ -100,7 +100,8 @@ pub struct Population {
 ///
 /// Citizens do not occupy map cells. Stable citizen-only state is grouped here to keep the custom
 /// ECS simple: `home` links to a residential building, `workplace` may later link to a commercial
-/// or industrial job site, and `happiness` is updated by the citizen system from home conditions.
+/// or industrial job site, and `happiness` is updated by the citizen system from home conditions
+/// plus persistent morale changes such as daily decay.
 /// Future movement/pathfinding state should remain in separate reusable components instead of
 /// growing this record.
 pub struct Citizen {
@@ -109,6 +110,8 @@ pub struct Citizen {
     pub home: crate::core::entity::Entity,
     pub workplace: Option<crate::core::entity::Entity>,
     pub happiness: i32,
+    #[serde(default)]
+    pub happiness_decay: i32,
     #[serde(default)]
     pub money: i32,
     /// Set by the economy system when rent cannot be paid; happiness reads it as rent stress.

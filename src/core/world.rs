@@ -195,6 +195,7 @@ mod tests {
                 home: residential,
                 workplace: None,
                 happiness: 50,
+                happiness_decay: 0,
                 money: 0,
                 rent_stress: 0,
             },

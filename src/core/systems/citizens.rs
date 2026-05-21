@@ -5,6 +5,8 @@ use crate::core::entity::Entity;
 use crate::core::systems::{road_connectivity, road_network_analysis};
 use crate::core::world::World;
 
+const DAILY_HAPPINESS_DECAY: i32 = 1;
+
 pub(crate) fn spawn_for_home(world: &mut World, residential: Entity, count: i32) {
     for _ in 0..count.max(0) {
         let citizen = world.spawn();
@@ -15,6 +17,7 @@ pub(crate) fn spawn_for_home(world: &mut World, residential: Entity, count: i32)
                 home: residential,
                 workplace: None,
                 happiness: 50,
+                happiness_decay: 0,
                 money: 0,
                 rent_stress: 0,
             },
@@ -33,6 +36,17 @@ pub(crate) fn sync_population_from_citizens(world: &mut World) {
     for (residential, count) in counts {
         if let Some(population) = world.populations.get_mut(&residential) {
             population.current = count.min(population.max);
+        }
+    }
+}
+
+pub(crate) fn apply_daily_happiness_decay(world: &mut World) {
+    let mut citizens: Vec<_> = world.citizens.keys().copied().collect();
+    citizens.sort_by_key(|citizen| citizen.0);
+
+    for citizen in citizens {
+        if let Some(citizen) = world.citizens.get_mut(&citizen) {
+            citizen.happiness_decay = (citizen.happiness_decay + DAILY_HAPPINESS_DECAY).min(100);
         }
     }
 }
@@ -118,7 +132,7 @@ fn citizen_happiness(world: &World, citizen: Entity) -> i32 {
         return 50;
     };
     let Some(position) = world.positions.get(&citizen.home) else {
-        return 50;
+        return (50 - citizen.happiness_decay).clamp(0, 100);
     };
 
     let effects = world.local_effects.get(position.x, position.y);
@@ -145,13 +159,17 @@ fn citizen_happiness(world: &World, citizen: Entity) -> i32 {
     if !road_connected {
         happiness -= 10;
     }
+    happiness -= citizen.happiness_decay;
 
     happiness.clamp(0, 100)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{average_happiness_for_home, citizen_count_for_home, spawn_for_home};
+    use super::{
+        apply_daily_happiness_decay, average_happiness_for_home, citizen_count_for_home,
+        spawn_for_home, update_happiness,
+    };
     use crate::core::world::World;
 
     #[test]
@@ -164,5 +182,31 @@ mod tests {
         assert_eq!(world.citizens.len(), 3);
         assert_eq!(citizen_count_for_home(&world, residential), 3);
         assert_eq!(average_happiness_for_home(&world, residential), Some(50));
+    }
+
+    #[test]
+    fn daily_happiness_decay_lowers_citizens_by_one() {
+        let mut world = World::new(2, 2);
+        let residential = world.spawn();
+        spawn_for_home(&mut world, residential, 1);
+
+        apply_daily_happiness_decay(&mut world);
+        update_happiness(&mut world);
+
+        assert_eq!(average_happiness_for_home(&world, residential), Some(49));
+    }
+
+    #[test]
+    fn daily_happiness_decay_keeps_citizens_clamped_at_zero() {
+        let mut world = World::new(2, 2);
+        let residential = world.spawn();
+        spawn_for_home(&mut world, residential, 1);
+
+        for _ in 0..150 {
+            apply_daily_happiness_decay(&mut world);
+            update_happiness(&mut world);
+        }
+
+        assert_eq!(average_happiness_for_home(&world, residential), Some(0));
     }
 }
