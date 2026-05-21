@@ -228,16 +228,156 @@ fn connected_economy_loop_runs_over_many_turns_after_upgrade_and_save_load() {
     assert!((0..=100).contains(&view.status.happiness));
 }
 
+#[test]
+fn stable_starter_city_stays_in_sane_ranges_over_three_weeks() {
+    let mut game = Game::new(12, 12);
+
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    for x in 0..=7 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+    for x in 1..=3 {
+        assert!(game.build(x, 0, BuildingKind::Residential).success);
+    }
+    assert!(game.build(4, 0, BuildingKind::Commercial).success);
+    assert!(game.build(5, 0, BuildingKind::Industrial).success);
+    assert!(game.build(6, 0, BuildingKind::Park).success);
+
+    let starting_money = game.view().status.money;
+    let economy = advance_weeks(&mut game, 3);
+    let view = game.view();
+
+    assert_eq!(view.status.turn, 24 * 7 * 3);
+    assert_eq!(view.status.money, starting_money + economy.net);
+    // Current v0.4 goods export and manufacturing taxes make even a compact
+    // starter city strongly profitable, so this uses a deliberately broad cap.
+    assert_in_range("money", view.status.money, 20, 1_000);
+    assert_in_range("population", view.status.population, 3, 20);
+    assert_in_range("jobs", view.status.jobs, 5, 12);
+    assert_in_range("unemployment", view.status.unemployment, 0, 5);
+    assert_in_range("happiness", view.status.happiness, 35, 100);
+    assert_in_range("pollution", view.status.pollution, 0, 6);
+    assert_eq!(view.status.power.total_shortage, 0);
+    assert_eq!(
+        view.status.power.total_supplied,
+        view.status.power.total_demand
+    );
+    assert!(economy.net > 0);
+    assert!(economy.rent_failures < economy.rent_income);
+    assert!(economy.local_goods_produced > 0);
+}
+
+#[test]
+fn overbuilt_maintenance_pressure_city_loses_money_but_keeps_running() {
+    let mut game = Game::new(12, 12);
+
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    for x in 0..=7 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+    for x in 1..=4 {
+        assert!(game.build(x, 0, BuildingKind::Commercial).success);
+    }
+    assert!(game.build(5, 0, BuildingKind::Park).success);
+    assert!(game.build(6, 0, BuildingKind::Park).success);
+
+    let starting_money = game.view().status.money;
+    let economy = advance_weeks(&mut game, 2);
+    let view = game.view();
+
+    assert_eq!(view.status.turn, 24 * 7 * 2);
+    assert_eq!(view.status.money, starting_money + economy.net);
+    assert_eq!(view.status.population, 0);
+    assert_eq!(view.status.unemployment, 0);
+    assert_eq!(view.status.power.total_shortage, 0);
+    assert!(economy.maintenance_cost > 0);
+    assert_eq!(economy.rent_income, 0);
+    assert_eq!(economy.commercial_sales_tax, 0);
+    assert!(
+        economy.net < 0,
+        "overbuilt shops and parks without population should create budget pressure"
+    );
+    assert!(
+        view.status.money < starting_money,
+        "money should fall from {starting_money}, got {}",
+        view.status.money
+    );
+    assert!(
+        view.status.money <= 0,
+        "current v0.4 allows money to go negative instead of blocking maintenance; got {}",
+        view.status.money
+    );
+    assert!((0..=100).contains(&view.status.happiness));
+}
+
+#[test]
+fn polluted_industrial_city_limits_growth_and_happiness_over_four_weeks() {
+    let mut game = Game::new(12, 12);
+
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    for x in 0..=8 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+    for x in 1..=4 {
+        assert!(game.build(x, 0, BuildingKind::Residential).success);
+    }
+    assert!(game.build(5, 0, BuildingKind::Industrial).success);
+    assert!(game.build(6, 0, BuildingKind::Industrial).success);
+
+    let economy = advance_weeks(&mut game, 4);
+    let view = game.view();
+    let polluted_home = game.inspect(4, 0).cell.expect("polluted home cell");
+    let edge_home = game.inspect(1, 0).cell.expect("edge home cell");
+
+    assert_eq!(view.status.turn, 24 * 7 * 4);
+    assert_in_range("population", view.status.population, 1, 16);
+    assert!(
+        view.status.population < 20,
+        "pollution pressure should keep the four homes below full capacity"
+    );
+    assert!(
+        view.status.pollution >= 3,
+        "industrial-heavy layout should keep visible pollution pressure"
+    );
+    assert!(
+        polluted_home.local_effects.pollution_pressure > edge_home.local_effects.pollution_pressure,
+        "home next to industry should show stronger local pollution pressure"
+    );
+    assert!(
+        polluted_home.local_effects.desirability < edge_home.local_effects.desirability,
+        "local pollution should reduce nearby residential desirability"
+    );
+    assert!(
+        residential_average_happiness(&game, 4, 0) <= residential_average_happiness(&game, 1, 0),
+        "residents closest to industry should not be happier than residents farther away"
+    );
+    assert!((0..=100).contains(&view.status.happiness));
+    assert_eq!(view.status.power.total_shortage, 0);
+    assert!(economy.local_goods_produced > 0);
+    assert!(economy.manufacturing_tax > 0);
+}
+
 fn advance_one_week(game: &mut Game) -> EconomyTotals {
     // Phase A moved population to weekly boundaries and economy to daily
     // boundaries, so scenario tests collect a full week of hourly ticks.
+    advance_weeks(game, 1)
+}
+
+fn advance_weeks(game: &mut Game, weeks: u32) -> EconomyTotals {
     let mut economy_total = EconomyTotals::default();
-    for _ in 0..24 * 7 {
+    for _ in 0..24 * 7 * weeks {
         let result = game.tick();
         assert!(result.success);
         economy_total.add(tick_economy(&result.event));
     }
     economy_total
+}
+
+fn assert_in_range(name: &str, value: i32, min: i32, max: i32) {
+    assert!(
+        (min..=max).contains(&value),
+        "{name} should be in {min}..={max}, got {value}"
+    );
 }
 
 #[derive(Clone, Copy, Default)]
@@ -334,6 +474,15 @@ fn commercial_sales_tax(game: &Game, x: usize, y: usize) -> i32 {
             ..
         } => sales_tax_per_shopper,
         other => panic!("expected commercial details, got {other:?}"),
+    }
+}
+
+fn residential_average_happiness(game: &Game, x: usize, y: usize) -> Option<i32> {
+    match game.inspect(x, y).details.expect("inspect details") {
+        InspectDetailsView::Residential {
+            average_happiness, ..
+        } => average_happiness,
+        other => panic!("expected residential details, got {other:?}"),
     }
 }
 
