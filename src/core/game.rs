@@ -136,16 +136,18 @@ impl Game {
         } else {
             economy::EconomyBreakdown::default()
         };
-        if is_new_week(before_time, after_time) {
-            business_growth::run(&mut self.world);
-        }
+        let business_upgrades = if is_new_week(before_time, after_time) {
+            business_growth::run(&mut self.world).upgrades
+        } else {
+            Vec::new()
+        };
         stats::refresh_population_and_jobs(&mut self.world);
         pollution::run(&mut self.world);
         happiness::run(&mut self.world);
         self.world.resources.turn += 1;
         let after = TickSummarySnapshot::from_world(&self.world);
 
-        CommandResult::success(GameEventView::TickSummary {
+        let tick_summary = GameEventView::TickSummary {
             turn: self.world.resources.turn,
             time: game_time_view(self.world.resources.time),
             population: metric_change(before.population, after.population),
@@ -171,7 +173,18 @@ impl Game {
                 maintenance_cost: economy.maintenance_cost,
                 net: economy.net,
             },
-        })
+        };
+        let mut events = vec![tick_summary];
+        events.extend(business_upgrades.into_iter().map(|upgrade| {
+            GameEventView::BusinessAutoUpgraded {
+                x: upgrade.x,
+                y: upgrade.y,
+                kind: upgrade.kind,
+                level: upgrade.level,
+            }
+        }));
+
+        CommandResult::success_events(events)
     }
 
     /// Returns a UI-safe view of one map coordinate without exposing ECS storage.

@@ -4,7 +4,7 @@ use small_city::core::game::Game;
 use small_city::core::resources::GameTime;
 use small_city::interface::events::{EconomyBreakdownView, GameEventView, MetricChange};
 use small_city::interface::input::BuildingKind;
-use small_city::interface::view::GameTimeView;
+use small_city::interface::view::{GameTimeView, InspectDetailsView};
 
 #[test]
 fn default_game_uses_larger_distance_friendly_map() {
@@ -77,7 +77,7 @@ fn tick_returns_structured_summary_events() {
     let result = advance_one_week(&mut game);
 
     assert!(result.success);
-    assert_eq!(result.events.len(), 1);
+    assert_eq!(result.events.len(), 2);
     assert_eq!(result.event, result.events[0]);
     assert_eq!(
         result.events[0],
@@ -132,6 +132,15 @@ fn tick_returns_structured_summary_events() {
             },
         }
     );
+    assert_eq!(
+        result.events[1],
+        GameEventView::BusinessAutoUpgraded {
+            x: 3,
+            y: 0,
+            kind: BuildingKind::Industrial,
+            level: 2
+        }
+    );
 }
 
 #[test]
@@ -159,6 +168,58 @@ fn tick_summary_message_includes_metric_changes() {
             "Economy: salaries paid 3, workplace tax +1, rent +2, sales tax +1, shoppers 1, local goods produced 4, stored 0, sold 1, imported 0, exported 4, manufacturing tax +4, export tax +4, rent failures 0, maintenance -3, net +9"
         )
     );
+    assert!(message.contains("Industrial at (3, 0) upgraded to level 2 from reinvestment"));
+}
+
+#[test]
+fn business_reinvestment_can_raise_industrial_to_level_three_and_emit_event() {
+    let mut game = Game::new(10, 10);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Industrial).success);
+    for x in 2..=5 {
+        assert!(game.build(x, 0, BuildingKind::Residential).success);
+    }
+    for x in 0..=5 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+
+    let first_week = advance_one_week(&mut game);
+    let second_week = advance_one_week(&mut game);
+
+    assert_eq!(
+        first_week.events[1],
+        GameEventView::BusinessAutoUpgraded {
+            x: 1,
+            y: 0,
+            kind: BuildingKind::Industrial,
+            level: 2
+        }
+    );
+    assert_eq!(
+        second_week.events[1],
+        GameEventView::BusinessAutoUpgraded {
+            x: 1,
+            y: 0,
+            kind: BuildingKind::Industrial,
+            level: 3
+        }
+    );
+    match game.inspect(1, 0).details.expect("industrial details") {
+        InspectDetailsView::Industrial {
+            upgrade_level,
+            maintenance_cost,
+            goods_production,
+            jobs,
+            ..
+        } => {
+            assert_eq!(upgrade_level, 3);
+            assert_eq!(maintenance_cost, 3);
+            assert_eq!(goods_production, 8);
+            assert_eq!(jobs, 5);
+        }
+        other => panic!("expected industrial details, got {other:?}"),
+    }
+    assert_eq!(game.view().status.pollution, 4);
 }
 
 fn expected_time(total_hours: u64) -> GameTimeView {

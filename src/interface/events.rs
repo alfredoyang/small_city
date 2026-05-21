@@ -20,6 +20,18 @@ impl CommandResult {
         }
     }
 
+    pub fn success_events(events: Vec<GameEventView>) -> Self {
+        let event = events
+            .first()
+            .cloned()
+            .unwrap_or(GameEventView::TurnAdvanced { turn: 0 });
+        Self {
+            success: true,
+            event,
+            events,
+        }
+    }
+
     pub fn failure(event: GameEventView) -> Self {
         Self {
             success: false,
@@ -91,6 +103,12 @@ impl GameEventView {
             GameEventView::ReplaceFailed { reason } => reason.clone(),
             GameEventView::BuildingUpgraded { x, y, kind, level } => {
                 format!("Upgraded {} at ({x}, {y}) to level {level}", kind.label())
+            }
+            GameEventView::BusinessAutoUpgraded { x, y, kind, level } => {
+                format!(
+                    "{} at ({x}, {y}) upgraded to level {level} from reinvestment",
+                    kind.label()
+                )
             }
             GameEventView::UpgradeFailed { reason } => reason.clone(),
             GameEventView::TurnAdvanced { turn } => format!("Advanced to turn {turn}"),
@@ -166,6 +184,12 @@ pub enum GameEventView {
         reason: String,
     },
     BuildingUpgraded {
+        x: usize,
+        y: usize,
+        kind: BuildingKind,
+        level: u8,
+    },
+    BusinessAutoUpgraded {
         x: usize,
         y: usize,
         kind: BuildingKind,

@@ -292,4 +292,4 @@ Implementation status:
 
 - Phase A: Done. Commercial and industrial business cash/profit are tracked and exposed through inspect notes.
 - Phase B: Done. Profitable commercial and industrial buildings can auto-upgrade from level 1 to 2 at weekly boundaries.
-- Phase C: Remaining. Add level 3, stronger effects, and tick events such as `Commercial upgraded from reinvestment`.
+- Phase C: Done. Business reinvestment can raise commercial and industrial buildings to level 3, level 3 strengthens level-based effects, and tick results include auto-upgrade events such as `Commercial upgraded from reinvestment`.

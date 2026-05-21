@@ -435,7 +435,7 @@ fn explain_business_reinvestment(
     let Some(building) = world.buildings.get(&entity) else {
         return;
     };
-    if building.level >= crate::core::systems::upgrade::MAX_UPGRADE_LEVEL {
+    if building.level >= business_growth::MAX_REINVESTMENT_LEVEL {
         explanations.push("Business: already fully upgraded.".to_string());
     } else if business_growth::can_reinvest(world, entity, kind) {
         explanations.push("Business: upgrade ready from reinvestment.".to_string());

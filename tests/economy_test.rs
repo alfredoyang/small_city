@@ -201,7 +201,8 @@ fn profitable_industrial_auto_upgrades_from_business_cash() {
 
     advance_one_week(&mut game);
 
-    match game.inspect(1, 0).details.expect("industrial details") {
+    let inspect = game.inspect(1, 0);
+    match inspect.details.expect("industrial details") {
         InspectDetailsView::Industrial {
             upgrade_level,
             maintenance_cost,
@@ -217,11 +218,23 @@ fn profitable_industrial_auto_upgrades_from_business_cash() {
             assert_eq!(goods_production, 6);
             assert!(business_cash >= 14);
             assert!(recent_profit > 0);
-            assert!(!upgrade_ready);
+            assert!(upgrade_ready);
             assert_eq!(jobs, 4);
         }
         other => panic!("expected industrial details, got {other:?}"),
     }
+    assert!(
+        inspect
+            .explanations
+            .iter()
+            .any(|note| note.contains("upgrade ready from reinvestment"))
+    );
+    assert!(
+        inspect
+            .explanations
+            .iter()
+            .all(|note| !note.contains("already fully upgraded"))
+    );
 }
 
 #[test]
@@ -258,7 +271,7 @@ fn profitable_commercial_auto_upgrades_from_shopping_profit() {
             assert!(business_cash >= 0);
             assert_eq!(upgrade_threshold, Some(8));
             assert!(recent_profit > 0);
-            assert!(!upgrade_ready);
+            assert!(upgrade_ready);
             assert_eq!(jobs, 3);
         }
         other => panic!("expected commercial details, got {other:?}"),
