@@ -229,7 +229,7 @@ fn connected_economy_loop_runs_over_many_turns_after_upgrade_and_save_load() {
 }
 
 #[test]
-fn stable_starter_city_stays_in_sane_ranges_over_three_weeks() {
+fn stable_starter_city_stays_in_sane_ranges_and_locks_reinvestment_pacing() {
     let mut game = Game::new(12, 12);
 
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
@@ -244,7 +244,36 @@ fn stable_starter_city_stays_in_sane_ranges_over_three_weeks() {
     assert!(game.build(6, 0, BuildingKind::Park).success);
 
     let starting_money = game.view().status.money;
-    let economy = advance_weeks(&mut game, 3);
+    let first_week = advance_one_week(&mut game);
+    assert_eq!(
+        building_upgrade_level(&game, 4, 0),
+        1,
+        "commercial should not auto-upgrade in the first starter-city week"
+    );
+    assert_eq!(
+        building_upgrade_level(&game, 5, 0),
+        2,
+        "industrial should reach level 2 after one profitable starter-city week"
+    );
+    let second_week = advance_one_week(&mut game);
+    assert_eq!(
+        building_upgrade_level(&game, 4, 0),
+        2,
+        "commercial should reach level 2 after demand and shopping cash build up"
+    );
+    assert_eq!(
+        building_upgrade_level(&game, 5, 0),
+        3,
+        "industrial should reach the current reinvestment cap after two profitable weeks"
+    );
+    let third_week = advance_one_week(&mut game);
+    assert_eq!(
+        building_upgrade_level(&game, 4, 0),
+        3,
+        "commercial should reach the current reinvestment cap after three starter-city weeks"
+    );
+    assert_eq!(building_upgrade_level(&game, 5, 0), 3);
+    let economy = first_week.plus(second_week).plus(third_week);
     let view = game.view();
 
     assert_eq!(view.status.turn, 24 * 7 * 3);
@@ -268,7 +297,7 @@ fn stable_starter_city_stays_in_sane_ranges_over_three_weeks() {
 }
 
 #[test]
-fn overbuilt_maintenance_pressure_city_loses_money_but_keeps_running() {
+fn overbuilt_maintenance_pressure_city_blocks_reinvestment_without_demand() {
     let mut game = Game::new(12, 12);
 
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
@@ -282,7 +311,23 @@ fn overbuilt_maintenance_pressure_city_loses_money_but_keeps_running() {
     assert!(game.build(6, 0, BuildingKind::Park).success);
 
     let starting_money = game.view().status.money;
-    let economy = advance_weeks(&mut game, 2);
+    let first_week = advance_one_week(&mut game);
+    for x in 1..=4 {
+        assert_eq!(
+            building_upgrade_level(&game, x, 0),
+            1,
+            "commercial at ({x}, 0) should not auto-upgrade without population demand"
+        );
+    }
+    let second_week = advance_one_week(&mut game);
+    for x in 1..=4 {
+        assert_eq!(
+            building_upgrade_level(&game, x, 0),
+            1,
+            "commercial at ({x}, 0) should stay level 1 under overbuilt no-demand pressure"
+        );
+    }
+    let economy = first_week.plus(second_week);
     let view = game.view();
 
     assert_eq!(view.status.turn, 24 * 7 * 2);
@@ -311,7 +356,7 @@ fn overbuilt_maintenance_pressure_city_loses_money_but_keeps_running() {
 }
 
 #[test]
-fn polluted_industrial_city_limits_growth_and_happiness_over_four_weeks() {
+fn polluted_industrial_city_locks_fast_industrial_reinvestment_pacing() {
     let mut game = Game::new(12, 12);
 
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
@@ -324,7 +369,32 @@ fn polluted_industrial_city_limits_growth_and_happiness_over_four_weeks() {
     assert!(game.build(5, 0, BuildingKind::Industrial).success);
     assert!(game.build(6, 0, BuildingKind::Industrial).success);
 
-    let economy = advance_weeks(&mut game, 4);
+    let first_week = advance_one_week(&mut game);
+    assert_eq!(
+        building_upgrade_level(&game, 5, 0),
+        2,
+        "first industrial should upgrade after one profitable polluted-city week"
+    );
+    assert_eq!(
+        building_upgrade_level(&game, 6, 0),
+        2,
+        "second industrial should upgrade after one profitable polluted-city week"
+    );
+    let second_week = advance_one_week(&mut game);
+    assert_eq!(building_upgrade_level(&game, 5, 0), 3);
+    assert_eq!(building_upgrade_level(&game, 6, 0), 3);
+    let third_week = advance_one_week(&mut game);
+    let fourth_week = advance_one_week(&mut game);
+    assert_eq!(
+        building_upgrade_level(&game, 5, 0),
+        3,
+        "industrial should stay capped at level 3 after additional profitable weeks"
+    );
+    assert_eq!(building_upgrade_level(&game, 6, 0), 3);
+    let economy = first_week
+        .plus(second_week)
+        .plus(third_week)
+        .plus(fourth_week);
     let view = game.view();
     let polluted_home = game.inspect(4, 0).cell.expect("polluted home cell");
     let edge_home = game.inspect(1, 0).cell.expect("edge home cell");
@@ -483,6 +553,17 @@ fn residential_average_happiness(game: &Game, x: usize, y: usize) -> Option<i32>
             average_happiness, ..
         } => average_happiness,
         other => panic!("expected residential details, got {other:?}"),
+    }
+}
+
+fn building_upgrade_level(game: &Game, x: usize, y: usize) -> u8 {
+    match game.inspect(x, y).details.expect("inspect details") {
+        InspectDetailsView::Residential { upgrade_level, .. }
+        | InspectDetailsView::Commercial { upgrade_level, .. }
+        | InspectDetailsView::Industrial { upgrade_level, .. }
+        | InspectDetailsView::PowerPlant { upgrade_level, .. }
+        | InspectDetailsView::Park { upgrade_level, .. } => upgrade_level,
+        other => panic!("expected upgradeable building details, got {other:?}"),
     }
 }
 
