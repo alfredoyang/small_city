@@ -67,6 +67,8 @@ X                       bulldoze selected cell
 I                       inspect selected cell
 N                       next turn when paused
 Space                   pause/resume automatic ticks in TUI
++ or =                  increase TUI run speed up to 4x
+-                       decrease TUI run speed down to 1x
 V                       cycle overlay in ASCII UI
 O                       cycle overlay in TUI
 H                       open help screen in TUI
@@ -127,7 +129,7 @@ desirability    !! bad   | -- low | ++ medium | ** good | ## excellent
 population      R0-R9 for residential population where available
 ```
 
-The TUI presents the same view data in panels: city map, selected cell, city status, build preview/actions, and messages/tick summary. Status panels show turn, money, population, citizen count, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, overlay legend, demand notes, selected cell details, inspect notes, build preview explanations, run/pause state, and the latest command message. TUI messages use `OK:`, `WARN:`, `ERR:`, or `INFO:` prefixes. New and loaded TUI games start paused; pressing Space resumes automatic one-second ticks.
+The TUI presents the same view data in panels: city map, selected cell, city status, build preview/actions, and messages/tick summary. Status panels show turn, money, population, citizen count, jobs, happiness, pollution, power capacity/supply/shortage, zone demand, current build tool and cost, current overlay, overlay legend, demand notes, selected cell details, inspect notes, build preview explanations, run/pause state, run speed, and the latest command message. TUI messages use `OK:`, `WARN:`, `ERR:`, or `INFO:` prefixes. New and loaded TUI games start paused; pressing Space resumes automatic ticks at the selected 1x, 2x, or 4x speed.
 
 The TUI needs at least a 100x30 terminal. Smaller terminals show a resize warning and suggest `cargo run -- ascii`.
 

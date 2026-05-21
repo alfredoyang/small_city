@@ -42,6 +42,7 @@ struct TuiState {
     tile_theme: TileTheme,
     message: String,
     is_running: bool,
+    run_speed: RunSpeed,
     show_help: bool,
     prompt: Option<PromptState>,
 }
@@ -56,8 +57,49 @@ impl Default for TuiState {
             tile_theme: TileTheme::AsciiDetailed,
             message: "Tiny City Builder".to_string(),
             is_running: false,
+            run_speed: RunSpeed::One,
             show_help: false,
             prompt: None,
+        }
+    }
+}
+
+/// UI-only fast-forward speed. The core simulation still advances by repeated `Game::tick()` calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunSpeed {
+    One,
+    Two,
+    Four,
+}
+
+impl RunSpeed {
+    fn label(self) -> &'static str {
+        match self {
+            Self::One => "1x",
+            Self::Two => "2x",
+            Self::Four => "4x",
+        }
+    }
+
+    fn interval(self) -> Duration {
+        match self {
+            Self::One => AUTO_TICK_INTERVAL,
+            Self::Two => Duration::from_millis(500),
+            Self::Four => Duration::from_millis(250),
+        }
+    }
+
+    fn faster(self) -> Self {
+        match self {
+            Self::One => Self::Two,
+            Self::Two | Self::Four => Self::Four,
+        }
+    }
+
+    fn slower(self) -> Self {
+        match self {
+            Self::One | Self::Two => Self::One,
+            Self::Four => Self::Two,
         }
     }
 }
@@ -257,10 +299,24 @@ impl TuiState {
     fn toggle_run(&mut self) {
         self.is_running = !self.is_running;
         self.message = if self.is_running {
-            "Simulation running: auto tick every 1 second".to_string()
+            format!(
+                "Simulation running at {}: auto tick every {}",
+                self.run_speed.label(),
+                speed_interval_label(self.run_speed)
+            )
         } else {
             "Simulation paused".to_string()
         };
+    }
+
+    fn increase_speed(&mut self) {
+        self.run_speed = self.run_speed.faster();
+        self.message = format!("Simulation speed: {}", self.run_speed.label());
+    }
+
+    fn decrease_speed(&mut self) {
+        self.run_speed = self.run_speed.slower();
+        self.message = format!("Simulation speed: {}", self.run_speed.label());
     }
 }
 
@@ -289,7 +345,7 @@ impl TuiRuntime {
         Self {
             game: Game::default(),
             state: TuiState::default(),
-            next_auto_tick: now + AUTO_TICK_INTERVAL,
+            next_auto_tick: now + RunSpeed::One.interval(),
             dirty: true,
         }
     }
@@ -297,7 +353,7 @@ impl TuiRuntime {
     fn apply_due_auto_tick(&mut self, now: Instant) {
         if self.state.is_running && now >= self.next_auto_tick {
             self.state.message = self.game.tick().message();
-            self.next_auto_tick = now + AUTO_TICK_INTERVAL;
+            self.next_auto_tick = now + self.state.run_speed.interval();
             self.dirty = true;
         }
     }
@@ -428,7 +484,15 @@ impl TuiRuntime {
             TuiAction::CycleOverlay => self.state.cycle_overlay(),
             TuiAction::ToggleRun => {
                 self.state.toggle_run();
-                self.next_auto_tick = now + AUTO_TICK_INTERVAL;
+                self.next_auto_tick = now + self.state.run_speed.interval();
+            }
+            TuiAction::IncreaseSpeed => {
+                self.state.increase_speed();
+                self.next_auto_tick = now + self.state.run_speed.interval();
+            }
+            TuiAction::DecreaseSpeed => {
+                self.state.decrease_speed();
+                self.next_auto_tick = now + self.state.run_speed.interval();
             }
             TuiAction::Quit => return TuiFlow::Quit,
             TuiAction::None => return TuiFlow::Continue,
@@ -699,7 +763,7 @@ fn render_selected_cell(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView
 fn render_status(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &TuiState) {
     let status = &view.status;
     let lines = vec![
-        simulation_status_line(state.is_running),
+        simulation_status_line(state),
         Line::from(format!(
             "Turn: {} | Money: ${} | Pop: {} | Citizens: {}",
             status.turn, status.money, status.population, status.citizens
@@ -826,10 +890,10 @@ fn render_build_preview(
 
 fn render_messages(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let lines = vec![
-        simulation_status_line(state.is_running),
+        simulation_status_line(state),
         Line::from(format_message(&state.message)),
         Line::from(
-            "Space pause/resume | WASD/Arrows move | 1-6 tools | N next | O overlay | H help | Q quit",
+            "Space pause/resume | +/- speed | WASD/Arrows move | 1-6 tools | N next | O overlay | H help | Q quit",
         ),
     ];
 
@@ -856,7 +920,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  4 Industrial  5 Power Plant     6 Park"),
         Line::from(""),
         help_section("Actions"),
-        Line::from("  Space         Pause / resume automatic ticks"),
+        Line::from("  Space         Pause / resume automatic ticks | +/- speed"),
         Line::from("  B / Enter     Build selected tool"),
         Line::from("  R             Replace selected cell with selected tool"),
         Line::from("  U             Upgrade selected cell"),
@@ -934,11 +998,23 @@ fn tile_theme_labels() -> String {
     .join(" / ")
 }
 
-fn simulation_status_line(is_running: bool) -> Line<'static> {
-    let (label, color, detail) = if is_running {
-        ("RUNNING", Color::Green, "auto tick every 1 second")
+fn simulation_status_line(state: &TuiState) -> Line<'static> {
+    let (label, color, detail) = if state.is_running {
+        (
+            "RUNNING",
+            Color::Green,
+            format!(
+                "{} | auto tick every {}",
+                state.run_speed.label(),
+                speed_interval_label(state.run_speed)
+            ),
+        )
     } else {
-        ("PAUSED", Color::Yellow, "press Space to resume")
+        (
+            "PAUSED",
+            Color::Yellow,
+            format!("{} | press Space to resume", state.run_speed.label()),
+        )
     };
 
     Line::from(vec![
@@ -949,6 +1025,14 @@ fn simulation_status_line(is_running: bool) -> Line<'static> {
         ),
         Span::raw(format!(" | {detail}")),
     ])
+}
+
+fn speed_interval_label(speed: RunSpeed) -> &'static str {
+    match speed {
+        RunSpeed::One => "1 second",
+        RunSpeed::Two => "500ms",
+        RunSpeed::Four => "250ms",
+    }
 }
 
 fn render_prompt(frame: &mut Frame<'_>, area: Rect, prompt: &PromptState) {
@@ -1315,15 +1399,57 @@ mod tests {
 
         assert!(!state.is_running);
         assert_eq!(state.tile_theme, TileTheme::AsciiDetailed);
+        assert_eq!(state.run_speed, RunSpeed::One);
         state.toggle_run();
         assert!(state.is_running);
         assert_eq!(
             state.message,
-            "Simulation running: auto tick every 1 second"
+            "Simulation running at 1x: auto tick every 1 second"
         );
         state.toggle_run();
         assert!(!state.is_running);
         assert_eq!(state.message, "Simulation paused");
+    }
+
+    #[test]
+    fn run_speed_increase_and_decrease_are_clamped() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+
+        assert_eq!(runtime.state.run_speed, RunSpeed::One);
+        assert_eq!(
+            runtime.apply_action(TuiAction::IncreaseSpeed, now),
+            TuiFlow::Continue
+        );
+        assert_eq!(runtime.state.run_speed, RunSpeed::Two);
+        assert_eq!(runtime.next_auto_tick, now + Duration::from_millis(500));
+        assert_eq!(
+            runtime.apply_action(TuiAction::IncreaseSpeed, now),
+            TuiFlow::Continue
+        );
+        assert_eq!(runtime.state.run_speed, RunSpeed::Four);
+        assert_eq!(runtime.next_auto_tick, now + Duration::from_millis(250));
+        assert_eq!(
+            runtime.apply_action(TuiAction::IncreaseSpeed, now),
+            TuiFlow::Continue
+        );
+        assert_eq!(runtime.state.run_speed, RunSpeed::Four);
+
+        assert_eq!(
+            runtime.apply_action(TuiAction::DecreaseSpeed, now),
+            TuiFlow::Continue
+        );
+        assert_eq!(runtime.state.run_speed, RunSpeed::Two);
+        assert_eq!(
+            runtime.apply_action(TuiAction::DecreaseSpeed, now),
+            TuiFlow::Continue
+        );
+        assert_eq!(runtime.state.run_speed, RunSpeed::One);
+        assert_eq!(
+            runtime.apply_action(TuiAction::DecreaseSpeed, now),
+            TuiFlow::Continue
+        );
+        assert_eq!(runtime.state.run_speed, RunSpeed::One);
     }
 
     #[test]
@@ -1450,6 +1576,7 @@ mod tests {
         let now = Instant::now();
         let mut runtime = TuiRuntime::new(now);
         runtime.game = Game::new(10, 10);
+        runtime.state.run_speed = RunSpeed::Four;
 
         assert_eq!(
             runtime.apply_action(TuiAction::Tick, now),
@@ -1467,6 +1594,7 @@ mod tests {
         let mut runtime = TuiRuntime::new(now);
         runtime.game = Game::new(10, 10);
         runtime.state.is_running = true;
+        runtime.state.run_speed = RunSpeed::Four;
 
         assert_eq!(
             runtime.apply_action(TuiAction::Tick, now),
@@ -1516,6 +1644,21 @@ mod tests {
         assert_eq!(runtime.game.view().status.turn, 1);
         assert_eq!(runtime.next_auto_tick, now + AUTO_TICK_INTERVAL);
         assert!(runtime.dirty);
+    }
+
+    #[test]
+    fn runtime_applies_due_auto_tick_using_current_speed_interval() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.game = Game::new(10, 10);
+        runtime.state.is_running = true;
+        runtime.state.run_speed = RunSpeed::Four;
+        runtime.next_auto_tick = now;
+
+        runtime.apply_due_auto_tick(now);
+
+        assert_eq!(runtime.game.view().status.turn, 1);
+        assert_eq!(runtime.next_auto_tick, now + Duration::from_millis(250));
     }
 
     #[test]
@@ -1570,6 +1713,13 @@ mod tests {
     }
 
     #[test]
+    fn running_next_tick_interval_follows_speed() {
+        assert_eq!(RunSpeed::One.interval(), Duration::from_secs(1));
+        assert_eq!(RunSpeed::Two.interval(), Duration::from_millis(500));
+        assert_eq!(RunSpeed::Four.interval(), Duration::from_millis(250));
+    }
+
+    #[test]
     fn render_draws_expected_main_panels() {
         let game = Game::new(10, 10);
         let output = render_test_screen(&game, TuiState::default());
@@ -1583,7 +1733,7 @@ mod tests {
             "Overlay: Normal",
             "Tool: Residential",
             "Simulation: PAUSED",
-            "press Space to resume",
+            "1x | press Space to resume",
             "Time: | Year 1, Month 1, Week 1, Day 1, 00:00",
         ] {
             assert!(
@@ -1648,7 +1798,7 @@ mod tests {
         let output = render_test_screen(&game, state);
 
         assert!(output.contains("Help"));
-        assert!(output.contains("Space         Pause / resume automatic ticks"));
+        assert!(output.contains("Space         Pause / resume automatic ticks | +/- speed"));
         assert!(output.contains("O Cycle Overlay"));
         assert!(output.contains("Overlay order: Normal -> Power -> Pollution"));
         assert!(output.contains("Normal: .. Empty"));
@@ -1666,7 +1816,7 @@ mod tests {
         let output = render_test_screen(&game, state);
 
         assert!(output.contains("Simulation: RUNNING"));
-        assert!(output.contains("auto tick every 1 second"));
+        assert!(output.contains("1x | auto tick every 1 second"));
     }
 
     #[test]

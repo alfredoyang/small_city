@@ -25,6 +25,8 @@ pub(crate) enum TuiAction {
     ToggleHelp,
     CycleOverlay,
     ToggleRun,
+    IncreaseSpeed,
+    DecreaseSpeed,
     Quit,
     None,
 }
@@ -65,6 +67,8 @@ pub(crate) fn map_key_event(event: KeyEvent) -> TuiAction {
         KeyCode::Char('h') | KeyCode::Char('H') => TuiAction::ToggleHelp,
         KeyCode::Char('o') | KeyCode::Char('O') => TuiAction::CycleOverlay,
         KeyCode::Char(' ') => TuiAction::ToggleRun,
+        KeyCode::Char('+') | KeyCode::Char('=') => TuiAction::IncreaseSpeed,
+        KeyCode::Char('-') => TuiAction::DecreaseSpeed,
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => TuiAction::Quit,
         _ => TuiAction::None,
     }
@@ -139,5 +143,21 @@ mod tests {
         );
         assert_eq!(map_key_event(key(KeyCode::Char(' '))), TuiAction::ToggleRun);
         assert_eq!(map_key_event(key(KeyCode::Char('Q'))), TuiAction::Quit);
+    }
+
+    #[test]
+    fn maps_speed_keys() {
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('+'))),
+            TuiAction::IncreaseSpeed
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('='))),
+            TuiAction::IncreaseSpeed
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('-'))),
+            TuiAction::DecreaseSpeed
+        );
     }
 }
