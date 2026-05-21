@@ -5,7 +5,7 @@ use crate::interface::events::{CommandResult, GameEventView};
 use crate::interface::input::BuildingKind;
 
 // v0.2 supports one upgrade step: base buildings start at level 1 and cap at level 2.
-const MAX_UPGRADE_LEVEL: u8 = 2;
+pub(crate) const MAX_UPGRADE_LEVEL: u8 = 2;
 
 pub(crate) fn upgrade(world: &mut World, x: usize, y: usize) -> CommandResult {
     if !world.grid.contains(x, y) {
@@ -59,7 +59,7 @@ pub(crate) fn upgrade(world: &mut World, x: usize, y: usize) -> CommandResult {
     })
 }
 
-fn apply_upgrade_effect(
+pub(crate) fn apply_upgrade_effect(
     world: &mut World,
     entity: crate::core::entity::Entity,
     kind: BuildingKind,
@@ -80,6 +80,11 @@ fn apply_upgrade_effect(
                 effect.amount = 5;
             }
         }
-        BuildingKind::Road | BuildingKind::Commercial | BuildingKind::Industrial => {}
+        BuildingKind::Industrial => {
+            if let Some(source) = world.pollution_sources.get_mut(&entity) {
+                source.amount = 3;
+            }
+        }
+        BuildingKind::Road | BuildingKind::Commercial => {}
     }
 }

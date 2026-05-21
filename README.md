@@ -234,3 +234,62 @@ Scenario-style integration tests cover longer multi-turn cities that combine pow
 - Residential growth is blocked by low average happiness and gets a small bonus from high average happiness.
 - Inspect output exposes UI-safe economy details such as rent per citizen, maintenance, sales tax per shopper, commercial goods storage, industrial goods production, power demand, level, local effects, and happiness blockers.
 - Tick summaries include rent collected, rent failures, commercial sales tax, local goods flow, manufacturing tax, export tax, maintenance, and net money change.
+
+## V0.4 Business Reinvestment Scope
+
+Commercial and industrial buildings can level up automatically when they earn enough money. This uses building-level business profit, not city money, so successful districts grow from their own performance.
+
+Implemented business state:
+
+- `business_cash`
+- `lifetime_profit`
+- `days_profitable`
+- `last_period_profit`
+
+Profit comes from the existing economy loop:
+
+- Commercial earns from shoppers and sales.
+- Industrial earns from local goods sold, manufacturing value, and exports.
+- Maintenance, import cost, export distance cost, and route distance penalties reduce profit.
+
+Upgrade checks run weekly after daily economy has accumulated profit:
+
+- Level 1 to 2 requires enough `business_cash`.
+- Building must be powered.
+- Building must be road-connected.
+- Recent demand should not be low.
+- Commercial should have customers or goods flow.
+- Industrial should have workers, production, or export flow.
+
+Implemented commercial upgrade effects:
+
+- More jobs.
+- More shopper capacity.
+- More goods storage.
+- Higher sales tax potential.
+- Higher maintenance.
+
+Implemented industrial upgrade effects:
+
+- More jobs.
+- More goods production.
+- Better export potential.
+- Higher manufacturing tax potential.
+- Higher maintenance.
+- Higher pollution pressure.
+
+Inspect output exposes UI-safe business notes:
+
+- Business cash progress toward upgrade.
+- Recent profit.
+- Upgrade ready.
+- Blocked by no power.
+- Blocked by missing road access.
+- Blocked by low demand.
+- Blocked by weak goods/customer flow.
+
+Implementation status:
+
+- Phase A: Done. Commercial and industrial business cash/profit are tracked and exposed through inspect notes.
+- Phase B: Done. Profitable commercial and industrial buildings can auto-upgrade from level 1 to 2 at weekly boundaries.
+- Phase C: Remaining. Add level 3, stronger effects, and tick events such as `Commercial upgraded from reinvestment`.

@@ -20,7 +20,7 @@ pub(crate) fn refresh_population_and_jobs(world: &mut World) {
                 .is_some_and(|consumer| consumer.powered)
                 && road_connectivity::is_road_connected(world, **entity)
         })
-        .map(|(_entity, building)| building.kind.jobs())
+        .map(|(_entity, building)| building.kind.jobs_at_level(building.level))
         .sum();
 
     world.stats.population = population;

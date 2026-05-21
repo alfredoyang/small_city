@@ -1,8 +1,8 @@
 //! Shared building placement logic used by build and replace command systems.
 
 use crate::core::components::{
-    Building, BuildingData, HappinessEffect, PollutionSource, Population, Position, PowerConsumer,
-    PowerProvider,
+    Building, BuildingData, BusinessFinance, HappinessEffect, PollutionSource, Population,
+    Position, PowerConsumer, PowerProvider,
 };
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;
@@ -73,10 +73,13 @@ fn building_data_for_kind(kind: BuildingKind) -> BuildingData {
     match kind {
         BuildingKind::Commercial => BuildingData::Commercial {
             local_goods_stored: 0,
+            business: BusinessFinance::default(),
+        },
+        BuildingKind::Industrial => BuildingData::Industrial {
+            business: BusinessFinance::default(),
         },
         BuildingKind::Road
         | BuildingKind::Residential
-        | BuildingKind::Industrial
         | BuildingKind::PowerPlant
         | BuildingKind::Park => BuildingData::None,
     }

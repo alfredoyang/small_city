@@ -96,9 +96,11 @@ fn tick_returns_structured_summary_events() {
                 before: 52,
                 after: 56
             },
+            // The profitable industrial can auto-upgrade at the weekly boundary,
+            // increasing its pollution source after the economy event is applied.
             pollution: MetricChange {
                 before: 1,
-                after: 1
+                after: 2
             },
             unemployment: MetricChange {
                 before: 0,

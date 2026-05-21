@@ -513,40 +513,60 @@ pub fn format_inspect(inspect: &InspectView) -> String {
             powered,
             power_demand,
             road_connected,
+            upgrade_level,
             maintenance_cost,
             sales_tax_per_shopper,
             goods_stored,
             goods_capacity,
+            business_cash,
+            upgrade_threshold,
+            recent_profit,
+            upgrade_ready,
             jobs,
         } => format!(
-            "({}, {}) Commercial | Powered: {} | Demand: {} | Road: {} | Maintenance: {} | Sales Tax: {} | Goods: {}/{} | Jobs: {}",
+            "({}, {}) Commercial | Powered: {} | Demand: {} | Road: {} | Level: {} | Maintenance: {} | Sales Tax: {} | Goods: {}/{} | Business: {}/{} recent {} ready {} | Jobs: {}",
             inspect.x,
             inspect.y,
             yes_no(*powered),
             power_demand,
             yes_no(*road_connected),
+            upgrade_level,
             maintenance_cost,
             sales_tax_per_shopper,
             goods_stored,
             goods_capacity,
+            business_cash,
+            optional_threshold(*upgrade_threshold),
+            recent_profit,
+            yes_no(*upgrade_ready),
             jobs
         ),
         InspectDetailsView::Industrial {
             powered,
             power_demand,
             road_connected,
+            upgrade_level,
             maintenance_cost,
             goods_production,
+            business_cash,
+            upgrade_threshold,
+            recent_profit,
+            upgrade_ready,
             jobs,
         } => format!(
-            "({}, {}) Industrial | Powered: {} | Demand: {} | Road: {} | Maintenance: {} | Goods: {} | Jobs: {}",
+            "({}, {}) Industrial | Powered: {} | Demand: {} | Road: {} | Level: {} | Maintenance: {} | Goods: {} | Business: {}/{} recent {} ready {} | Jobs: {}",
             inspect.x,
             inspect.y,
             yes_no(*powered),
             power_demand,
             yes_no(*road_connected),
+            upgrade_level,
             maintenance_cost,
             goods_production,
+            business_cash,
+            optional_threshold(*upgrade_threshold),
+            recent_profit,
+            yes_no(*upgrade_ready),
             jobs
         ),
         InspectDetailsView::PowerPlant {
@@ -588,6 +608,12 @@ fn yes_no(value: bool) -> &'static str {
 }
 
 fn optional_number(value: Option<i32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "None".to_string())
+}
+
+fn optional_threshold(value: Option<i32>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "None".to_string())

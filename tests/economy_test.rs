@@ -188,6 +188,154 @@ fn commercial_without_shoppers_pays_no_sales_tax() {
 }
 
 #[test]
+fn profitable_industrial_auto_upgrades_from_business_cash() {
+    let mut game = Game::new(10, 10);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Industrial).success);
+    for x in 2..=5 {
+        assert!(game.build(x, 0, BuildingKind::Residential).success);
+    }
+    for x in 0..=5 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+
+    advance_one_week(&mut game);
+
+    match game.inspect(1, 0).details.expect("industrial details") {
+        InspectDetailsView::Industrial {
+            upgrade_level,
+            maintenance_cost,
+            goods_production,
+            business_cash,
+            recent_profit,
+            upgrade_ready,
+            jobs,
+            ..
+        } => {
+            assert_eq!(upgrade_level, 2);
+            assert_eq!(maintenance_cost, 2);
+            assert_eq!(goods_production, 6);
+            assert!(business_cash >= 14);
+            assert!(recent_profit > 0);
+            assert!(!upgrade_ready);
+            assert_eq!(jobs, 4);
+        }
+        other => panic!("expected industrial details, got {other:?}"),
+    }
+}
+
+#[test]
+fn profitable_commercial_auto_upgrades_from_shopping_profit() {
+    let mut game = Game::new(10, 10);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    for x in 1..=5 {
+        assert!(game.build(x, 0, BuildingKind::Residential).success);
+    }
+    assert!(game.build(6, 0, BuildingKind::Commercial).success);
+    assert!(game.build(7, 0, BuildingKind::Industrial).success);
+    for x in 0..=7 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+
+    advance_one_week(&mut game);
+    advance_one_week(&mut game);
+
+    match game.inspect(6, 0).details.expect("commercial details") {
+        InspectDetailsView::Commercial {
+            upgrade_level,
+            maintenance_cost,
+            goods_capacity,
+            business_cash,
+            upgrade_threshold,
+            recent_profit,
+            upgrade_ready,
+            jobs,
+            ..
+        } => {
+            assert_eq!(upgrade_level, 2);
+            assert_eq!(maintenance_cost, 2);
+            assert_eq!(goods_capacity, 12);
+            assert!(business_cash >= 0);
+            assert_eq!(upgrade_threshold, Some(8));
+            assert!(recent_profit > 0);
+            assert!(!upgrade_ready);
+            assert_eq!(jobs, 3);
+        }
+        other => panic!("expected commercial details, got {other:?}"),
+    }
+}
+
+#[test]
+fn unprofitable_commercial_tracks_blocked_business_progress() {
+    let mut game = Game::new(10, 10);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Commercial).success);
+    assert!(game.build(0, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+
+    advance_one_week(&mut game);
+
+    let inspect = game.inspect(1, 0);
+    match inspect.details.expect("commercial details") {
+        InspectDetailsView::Commercial {
+            upgrade_level,
+            business_cash,
+            upgrade_threshold,
+            recent_profit,
+            upgrade_ready,
+            ..
+        } => {
+            assert_eq!(upgrade_level, 1);
+            assert_eq!(business_cash, 0);
+            assert_eq!(upgrade_threshold, Some(8));
+            assert_eq!(recent_profit, -1);
+            assert!(!upgrade_ready);
+        }
+        other => panic!("expected commercial details, got {other:?}"),
+    }
+    assert!(
+        inspect
+            .explanations
+            .iter()
+            .any(|note| note.contains("blocked by low demand"))
+    );
+}
+
+#[test]
+fn profitable_industrial_waits_when_demand_is_low() {
+    let mut game = Game::new(10, 10);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Industrial).success);
+    assert!(game.build(0, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+
+    advance_one_week(&mut game);
+
+    let inspect = game.inspect(1, 0);
+    match inspect.details.expect("industrial details") {
+        InspectDetailsView::Industrial {
+            upgrade_level,
+            business_cash,
+            recent_profit,
+            upgrade_ready,
+            ..
+        } => {
+            assert_eq!(upgrade_level, 1);
+            assert!(business_cash >= 14);
+            assert!(recent_profit > 0);
+            assert!(!upgrade_ready);
+        }
+        other => panic!("expected industrial details, got {other:?}"),
+    }
+    assert!(
+        inspect
+            .explanations
+            .iter()
+            .any(|note| note.contains("blocked by low demand"))
+    );
+}
+
+#[test]
 fn disconnected_commercial_does_not_receive_shoppers_or_pay_sales_tax() {
     let mut game = Game::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
@@ -257,6 +405,8 @@ fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
         tick_economy(&second_tick.event),
         // After the road is bulldozed, commercial shopping and industrial goods
         // flow stop. Maintenance still applies because the buildings remain.
+        // This populated city gives the industrial enough demand to auto-upgrade
+        // before the road is removed, so maintenance remains at the upgraded rate.
         EconomyBreakdownView {
             salaries_paid: 0,
             workplace_tax: 0,
@@ -271,8 +421,8 @@ fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
             manufacturing_tax: 0,
             export_tax: 0,
             rent_failures: 1,
-            maintenance_cost: 3,
-            net: -3,
+            maintenance_cost: 4,
+            net: -4,
         }
     );
 }

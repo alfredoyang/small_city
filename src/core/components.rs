@@ -51,6 +51,13 @@ pub enum BuildingData {
     /// delayed, limited, or trucked, this variant can grow an `imported_goods_stored` field.
     Commercial {
         local_goods_stored: i32,
+        #[serde(default)]
+        business: BusinessFinance,
+    },
+    /// Industrial business state for tracking private profit and reinvestment.
+    Industrial {
+        #[serde(default)]
+        business: BusinessFinance,
     },
 }
 
@@ -58,6 +65,22 @@ impl Default for BuildingData {
     fn default() -> Self {
         Self::None
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Private business finance attached to revenue-generating buildings.
+///
+/// City money still tracks public taxes and fees. This finance record tracks the building owner's
+/// retained profit so commercial and industrial buildings can later reinvest in automatic upgrades.
+pub struct BusinessFinance {
+    #[serde(default)]
+    pub business_cash: i32,
+    #[serde(default)]
+    pub lifetime_profit: i32,
+    #[serde(default)]
+    pub days_profitable: i32,
+    #[serde(default)]
+    pub last_period_profit: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

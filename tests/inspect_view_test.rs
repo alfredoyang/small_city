@@ -79,10 +79,15 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
             powered: true,
             power_demand: 2,
             road_connected: true,
+            upgrade_level: 1,
             maintenance_cost: 1,
             sales_tax_per_shopper: 1,
             goods_stored: 4,
             goods_capacity: 8,
+            business_cash: 0,
+            upgrade_threshold: Some(8),
+            recent_profit: -1,
+            upgrade_ready: false,
             jobs: 2
         })
     );
@@ -94,8 +99,13 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
             powered: true,
             power_demand: 3,
             road_connected: true,
+            upgrade_level: 1,
             maintenance_cost: 1,
             goods_production: 4,
+            business_cash: 3,
+            upgrade_threshold: Some(14),
+            recent_profit: 3,
+            upgrade_ready: false,
             jobs: 3
         })
     );
@@ -103,11 +113,11 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
         format_inspect(&commercial),
         // ASCII formatting changed only because it renders the new InspectView
         // fields; the UI still does not read core storage directly.
-        "(1, 0) Commercial | Powered: Yes | Demand: 2 | Road: Yes | Maintenance: 1 | Sales Tax: 1 | Goods: 4/8 | Jobs: 2"
+        "(1, 0) Commercial | Powered: Yes | Demand: 2 | Road: Yes | Level: 1 | Maintenance: 1 | Sales Tax: 1 | Goods: 4/8 | Business: 0/8 recent -1 ready No | Jobs: 2"
     );
     assert_eq!(
         format_inspect(&industrial),
-        "(2, 0) Industrial | Powered: Yes | Demand: 3 | Road: Yes | Maintenance: 1 | Goods: 4 | Jobs: 3"
+        "(2, 0) Industrial | Powered: Yes | Demand: 3 | Road: Yes | Level: 1 | Maintenance: 1 | Goods: 4 | Business: 3/14 recent 3 ready No | Jobs: 3"
     );
 }
 

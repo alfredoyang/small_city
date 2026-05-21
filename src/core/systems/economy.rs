@@ -6,7 +6,7 @@
 //! `EconomyBreakdown` so UI layers can explain the money change without reading
 //! ECS internals.
 
-use crate::core::components::BuildingData;
+use crate::core::components::{BuildingData, BusinessFinance};
 use crate::core::systems::{road_connectivity, road_network_analysis};
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;
@@ -26,6 +26,8 @@ const COMMERCIAL_GOODS_STORAGE: i32 = 8;
 const COMMERCIAL_GOODS_STORAGE_PER_EXTRA_LEVEL: i32 = 4;
 const MANUFACTURING_TAX_PER_GOOD: i32 = 1;
 const EXPORT_TAX_PER_GOOD: i32 = 1;
+const COMMERCIAL_LOCAL_GOOD_PROFIT: i32 = 2;
+const COMMERCIAL_IMPORTED_GOOD_PROFIT: i32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct EconomyBreakdown {
@@ -54,7 +56,8 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
     // Workplaces and shops are recalculated every tick from powered,
     // road-connected buildings. This keeps employment and shopping deterministic
     // after build, bulldoze, replace, upgrade, save, or load.
-    ensure_commercial_building_data(world);
+    ensure_business_building_data(world);
+    reset_business_periods(world);
     assign_workplaces(world);
 
     // Industry flow:
@@ -114,6 +117,7 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
             });
 
         let mut sold_local_good_from = None;
+        let mut business_profit_from_sale = None;
         {
             let Some(citizen) = world.citizens.get_mut(&citizen_entity) else {
                 continue;
@@ -154,8 +158,12 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
                 if shopping.local_goods {
                     local_goods_sold += 1;
                     sold_local_good_from = Some(shopping.commercial);
+                    business_profit_from_sale =
+                        Some((shopping.commercial, COMMERCIAL_LOCAL_GOOD_PROFIT));
                 } else {
                     imported_goods_sold += 1;
+                    business_profit_from_sale =
+                        Some((shopping.commercial, COMMERCIAL_IMPORTED_GOOD_PROFIT));
                 }
             } else {
                 citizen.happiness -= MISSED_SHOPPING_HAPPINESS_PENALTY;
@@ -166,7 +174,12 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
         if let Some(commercial) = sold_local_good_from {
             consume_local_good(world, commercial);
         }
+        if let Some((commercial, profit)) = business_profit_from_sale {
+            record_business_profit(world, commercial, profit);
+        }
     }
+
+    finalize_business_periods(world);
 
     // City money changes only through tax/rent income minus public maintenance.
     // Salaries and shopping costs are tracked on citizens but are not direct
@@ -252,7 +265,7 @@ fn workplace_slots(world: &World) -> Vec<crate::core::entity::Entity> {
             continue;
         }
 
-        for _ in 0..building.kind.jobs().max(0) {
+        for _ in 0..building.kind.jobs_at_level(building.level).max(0) {
             slots.push(*entity);
         }
     }
@@ -280,7 +293,7 @@ fn commercial_shopping_slot_entities(world: &World) -> Vec<crate::core::entity::
     for commercial in commercials {
         // Shopping capacity is separate from job count. A small fixed capacity
         // keeps the model readable while still letting disconnected shops matter.
-        for _ in 0..COMMERCIAL_SHOPPER_CAPACITY {
+        for _ in 0..commercial_shopper_capacity(world, commercial) {
             slots.push(commercial);
         }
     }
@@ -296,6 +309,7 @@ fn distribute_local_goods(world: &mut World) -> GoodsFlow {
     let commercials = productive_commercials(world);
 
     for industrial in productive_industrials(world) {
+        let mut industrial_profit = 0;
         let produced = industrial_goods_production(world, industrial);
         local_goods_produced += produced;
         let mut remaining_goods = produced;
@@ -313,7 +327,9 @@ fn distribute_local_goods(world: &mut World) -> GoodsFlow {
             local_goods_stored += supplied;
             let distance =
                 road_network_analysis::distance_between_buildings(world, industrial, commercial);
-            manufacturing_tax += supplied * margin_per_good(MANUFACTURING_TAX_PER_GOOD, distance);
+            let margin = supplied * margin_per_good(MANUFACTURING_TAX_PER_GOOD, distance);
+            manufacturing_tax += margin;
+            industrial_profit += margin;
             if remaining_goods == 0 {
                 break;
             }
@@ -323,10 +339,14 @@ fn distribute_local_goods(world: &mut World) -> GoodsFlow {
             exported_goods += remaining_goods;
             let distance =
                 road_network_analysis::access_for(world, industrial).import_export_distance;
-            export_tax += remaining_goods * margin_per_good(EXPORT_TAX_PER_GOOD, distance);
-            manufacturing_tax +=
+            let export_margin = remaining_goods * margin_per_good(EXPORT_TAX_PER_GOOD, distance);
+            let manufacturing_margin =
                 remaining_goods * margin_per_good(MANUFACTURING_TAX_PER_GOOD, distance);
+            export_tax += export_margin;
+            manufacturing_tax += manufacturing_margin;
+            industrial_profit += export_margin + manufacturing_margin;
         }
+        record_business_profit(world, industrial, industrial_profit);
     }
 
     GoodsFlow {
@@ -372,6 +392,14 @@ fn sort_entities_by_position(world: &World, entities: &mut [crate::core::entity:
             .map(|position| (position.y, position.x, entity.0))
             .unwrap_or((usize::MAX, usize::MAX, entity.0))
     });
+}
+
+fn commercial_shopper_capacity(world: &World, commercial: crate::core::entity::Entity) -> i32 {
+    world
+        .buildings
+        .get(&commercial)
+        .map(|building| COMMERCIAL_SHOPPER_CAPACITY + (i32::from(building.level.max(1)) - 1) * 2)
+        .unwrap_or(COMMERCIAL_SHOPPER_CAPACITY)
 }
 
 fn salary_for_workplace(world: &World, workplace: crate::core::entity::Entity) -> Option<i32> {
@@ -463,8 +491,10 @@ pub(crate) fn commercial_goods_stored(
         .buildings
         .get(&commercial)
         .and_then(|building| match building.data {
-            BuildingData::Commercial { local_goods_stored } => Some(local_goods_stored),
-            BuildingData::None => None,
+            BuildingData::Commercial {
+                local_goods_stored, ..
+            } => Some(local_goods_stored),
+            BuildingData::Industrial { .. } | BuildingData::None => None,
         })
         .unwrap_or(0)
 }
@@ -570,7 +600,10 @@ fn margin_per_good(base: i32, distance: Option<u32>) -> i32 {
 
 fn consume_local_good(world: &mut World, commercial: crate::core::entity::Entity) {
     if let Some(building) = world.buildings.get_mut(&commercial) {
-        if let BuildingData::Commercial { local_goods_stored } = &mut building.data {
+        if let BuildingData::Commercial {
+            local_goods_stored, ..
+        } = &mut building.data
+        {
             if *local_goods_stored > 0 {
                 *local_goods_stored -= 1;
             }
@@ -584,36 +617,160 @@ fn add_commercial_goods(world: &mut World, commercial: crate::core::entity::Enti
     }
     if let Some(building) = world.buildings.get_mut(&commercial) {
         let capacity = commercial_goods_capacity(building.level);
-        if let BuildingData::Commercial { local_goods_stored } = &mut building.data {
+        if let BuildingData::Commercial {
+            local_goods_stored, ..
+        } = &mut building.data
+        {
             *local_goods_stored = (*local_goods_stored + amount).clamp(0, capacity);
         }
     }
 }
 
-fn ensure_commercial_building_data(world: &mut World) {
-    let commercials: Vec<_> = world
+pub(crate) fn ensure_business_building_data(world: &mut World) {
+    let businesses: Vec<_> = world
         .buildings
         .iter()
         .filter_map(|(entity, building)| {
-            (building.kind == BuildingKind::Commercial).then_some((*entity, building.level))
+            matches!(
+                building.kind,
+                BuildingKind::Commercial | BuildingKind::Industrial
+            )
+            .then_some((*entity, building.kind, building.level))
         })
         .collect();
 
-    for (commercial, level) in commercials {
-        let capacity = commercial_goods_capacity(level);
-        if let Some(building) = world.buildings.get_mut(&commercial) {
-            match &mut building.data {
-                BuildingData::Commercial { local_goods_stored } => {
-                    *local_goods_stored = (*local_goods_stored).clamp(0, capacity);
+    for (entity, kind, level) in businesses {
+        if let Some(building) = world.buildings.get_mut(&entity) {
+            match (kind, &mut building.data) {
+                (
+                    BuildingKind::Commercial,
+                    BuildingData::Commercial {
+                        local_goods_stored, ..
+                    },
+                ) => {
+                    *local_goods_stored =
+                        (*local_goods_stored).clamp(0, commercial_goods_capacity(level));
                 }
-                BuildingData::None => {
+                (BuildingKind::Commercial, _) => {
                     building.data = BuildingData::Commercial {
                         local_goods_stored: 0,
+                        business: BusinessFinance::default(),
                     };
                 }
+                (BuildingKind::Industrial, BuildingData::Industrial { .. }) => {}
+                (BuildingKind::Industrial, _) => {
+                    building.data = BuildingData::Industrial {
+                        business: BusinessFinance::default(),
+                    };
+                }
+                _ => {}
             }
         }
     }
+}
+
+pub(crate) fn business_finance(
+    world: &World,
+    entity: crate::core::entity::Entity,
+) -> Option<BusinessFinance> {
+    world
+        .buildings
+        .get(&entity)
+        .and_then(|building| match building.data {
+            BuildingData::Commercial { business, .. } | BuildingData::Industrial { business } => {
+                Some(business)
+            }
+            BuildingData::None => None,
+        })
+}
+
+pub(crate) fn business_cash(world: &World, entity: crate::core::entity::Entity) -> i32 {
+    business_finance(world, entity)
+        .map(|business| business.business_cash)
+        .unwrap_or(0)
+}
+
+pub(crate) fn recent_business_profit(world: &World, entity: crate::core::entity::Entity) -> i32 {
+    business_finance(world, entity)
+        .map(|business| business.last_period_profit)
+        .unwrap_or(0)
+}
+
+pub(crate) fn spend_business_cash(
+    world: &mut World,
+    entity: crate::core::entity::Entity,
+    amount: i32,
+) {
+    if amount <= 0 {
+        return;
+    }
+    if let Some(business) = business_finance_mut(world, entity) {
+        business.business_cash = (business.business_cash - amount).max(0);
+    }
+}
+
+fn record_business_profit(world: &mut World, entity: crate::core::entity::Entity, gross: i32) {
+    if let Some(business) = business_finance_mut(world, entity) {
+        business.last_period_profit += gross;
+    }
+}
+
+fn reset_business_periods(world: &mut World) {
+    for entity in business_entities(world) {
+        if let Some(business) = business_finance_mut(world, entity) {
+            business.last_period_profit = 0;
+        }
+    }
+}
+
+fn finalize_business_periods(world: &mut World) {
+    for entity in business_entities(world) {
+        let maintenance = world
+            .buildings
+            .get(&entity)
+            .map(|building| maintenance_for_building(building.kind, building.level))
+            .unwrap_or(0);
+        if let Some(business) = business_finance_mut(world, entity) {
+            let profit = business.last_period_profit - maintenance;
+            business.last_period_profit = profit;
+            if profit > 0 {
+                business.business_cash += profit;
+                business.lifetime_profit += profit;
+                business.days_profitable += 1;
+            } else {
+                business.days_profitable = 0;
+            }
+        }
+    }
+}
+
+fn business_entities(world: &World) -> Vec<crate::core::entity::Entity> {
+    world
+        .buildings
+        .iter()
+        .filter_map(|(entity, building)| {
+            matches!(
+                building.kind,
+                BuildingKind::Commercial | BuildingKind::Industrial
+            )
+            .then_some(*entity)
+        })
+        .collect()
+}
+
+fn business_finance_mut(
+    world: &mut World,
+    entity: crate::core::entity::Entity,
+) -> Option<&mut BusinessFinance> {
+    world
+        .buildings
+        .get_mut(&entity)
+        .and_then(|building| match &mut building.data {
+            BuildingData::Commercial { business, .. } | BuildingData::Industrial { business } => {
+                Some(business)
+            }
+            BuildingData::None => None,
+        })
 }
 
 fn is_effective_workplace(world: &World, entity: crate::core::entity::Entity) -> bool {

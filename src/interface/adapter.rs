@@ -1,6 +1,8 @@
 //! Adapter that converts private ECS world data into UI-safe view and inspect models.
 
-use crate::core::systems::{citizens, economy, power, road_connectivity, road_network_analysis};
+use crate::core::systems::{
+    business_growth, citizens, economy, power, road_connectivity, road_network_analysis,
+};
 use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
@@ -176,10 +178,15 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 .map(|consumer| consumer.demand)
                 .unwrap_or(0),
             road_connected: road_connectivity::is_road_connected(world, entity),
+            upgrade_level: building.level,
             maintenance_cost: economy::maintenance_for_building(building.kind, building.level),
             sales_tax_per_shopper: economy::commercial_sales_tax_for_purchase(world, entity),
             goods_stored: economy::commercial_goods_stored(world, entity),
             goods_capacity: economy::commercial_goods_capacity_for_entity(world, entity),
+            business_cash: economy::business_cash(world, entity),
+            upgrade_threshold: business_growth::reinvestment_threshold(building.kind),
+            recent_profit: economy::recent_business_profit(world, entity),
+            upgrade_ready: business_growth::can_reinvest(world, entity, building.kind),
             jobs: effective_jobs(world, entity, building.kind),
         },
         BuildingKind::Industrial => InspectDetailsView::Industrial {
@@ -194,8 +201,13 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 .map(|consumer| consumer.demand)
                 .unwrap_or(0),
             road_connected: road_connectivity::is_road_connected(world, entity),
+            upgrade_level: building.level,
             maintenance_cost: economy::maintenance_for_building(building.kind, building.level),
             goods_production: economy::industrial_goods_production(world, entity),
+            business_cash: economy::business_cash(world, entity),
+            upgrade_threshold: business_growth::reinvestment_threshold(building.kind),
+            recent_profit: economy::recent_business_profit(world, entity),
+            upgrade_ready: business_growth::can_reinvest(world, entity, building.kind),
             jobs: effective_jobs(world, entity, building.kind),
         },
         BuildingKind::PowerPlant => InspectDetailsView::PowerPlant {
@@ -296,6 +308,7 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
                     economy::commercial_goods_stored(world, entity),
                     economy::commercial_goods_capacity_for_entity(world, entity)
                 ));
+                explain_business_reinvestment(world, entity, building.kind, &mut explanations);
             } else {
                 explanations.push(
                     "Jobs and income are blocked until road and power requirements are met."
@@ -312,6 +325,7 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
                     "Goods: produces {} local goods per turn for commercial storage or export.",
                     economy::industrial_goods_production(world, entity)
                 ));
+                explain_business_reinvestment(world, entity, building.kind, &mut explanations);
             } else {
                 explanations.push(
                     "Jobs and income are blocked until road and power requirements are met."
@@ -402,6 +416,35 @@ fn explain_road_access(
             ));
         }
         _ => {}
+    }
+}
+
+fn explain_business_reinvestment(
+    world: &World,
+    entity: crate::core::entity::Entity,
+    kind: BuildingKind,
+    explanations: &mut Vec<String>,
+) {
+    let cash = economy::business_cash(world, entity);
+    let recent_profit = economy::recent_business_profit(world, entity);
+    let threshold = business_growth::reinvestment_threshold(kind).unwrap_or(0);
+    explanations.push(format!(
+        "Business: cash {cash}/{threshold}; recent profit {recent_profit}."
+    ));
+
+    let Some(building) = world.buildings.get(&entity) else {
+        return;
+    };
+    if building.level >= crate::core::systems::upgrade::MAX_UPGRADE_LEVEL {
+        explanations.push("Business: already fully upgraded.".to_string());
+    } else if business_growth::can_reinvest(world, entity, kind) {
+        explanations.push("Business: upgrade ready from reinvestment.".to_string());
+    } else if !business_growth::demand_allows_reinvestment(world, kind) {
+        explanations.push("Business: blocked by low demand.".to_string());
+    } else if cash < threshold {
+        explanations.push("Business: needs more retained profit before upgrading.".to_string());
+    } else if recent_profit <= 0 {
+        explanations.push("Business: blocked by weak recent goods or customer flow.".to_string());
     }
 }
 
@@ -542,7 +585,11 @@ fn effective_jobs(world: &World, entity: crate::core::entity::Entity, kind: Buil
         .get(&entity)
         .is_some_and(|consumer| consumer.powered);
     if powered && road_connectivity::is_road_connected(world, entity) {
-        kind.jobs()
+        world
+            .buildings
+            .get(&entity)
+            .map(|building| kind.jobs_at_level(building.level))
+            .unwrap_or_else(|| kind.jobs())
     } else {
         0
     }

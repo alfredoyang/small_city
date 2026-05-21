@@ -58,9 +58,15 @@ impl BuildingKind {
 
     /// Jobs contributed to city statistics by workplace buildings.
     pub fn jobs(self) -> i32 {
+        self.jobs_at_level(1)
+    }
+
+    /// Jobs contributed by one effective workplace at the given building level.
+    pub fn jobs_at_level(self, level: u8) -> i32 {
+        let extra_level = i32::from(level.saturating_sub(1));
         match self {
-            Self::Commercial => 2,
-            Self::Industrial => 3,
+            Self::Commercial => 2 + extra_level,
+            Self::Industrial => 3 + extra_level,
             _ => 0,
         }
     }

@@ -6,8 +6,8 @@ use std::path::Path;
 
 use crate::core::resources::{is_new_day, is_new_week};
 use crate::core::systems::{
-    build, bulldoze, citizens, economy, happiness, local_effects, pollution, population, power,
-    replace, road_network_analysis, stats, upgrade,
+    build, bulldoze, business_growth, citizens, economy, happiness, local_effects, pollution,
+    population, power, replace, road_network_analysis, stats, upgrade,
 };
 use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
@@ -136,6 +136,9 @@ impl Game {
         } else {
             economy::EconomyBreakdown::default()
         };
+        if is_new_week(before_time, after_time) {
+            business_growth::run(&mut self.world);
+        }
         stats::refresh_population_and_jobs(&mut self.world);
         pollution::run(&mut self.world);
         happiness::run(&mut self.world);
