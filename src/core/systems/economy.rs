@@ -6,7 +6,7 @@
 //! `EconomyBreakdown` so UI layers can explain the money change without reading
 //! ECS internals.
 
-use crate::core::components::{BuildingData, BusinessFinance};
+use crate::core::components::{BuildingData, BusinessFinance, Citizen};
 use crate::core::entity::Entity;
 use crate::core::systems::{road_connectivity, road_network_analysis};
 use crate::core::world::World;
@@ -19,6 +19,8 @@ const LOCAL_SHOPPING_COST: i32 = 1;
 const IMPORTED_SHOPPING_COST: i32 = 2;
 const LOCAL_SHOPPING_HAPPINESS_BONUS: i32 = 3;
 const IMPORTED_SHOPPING_HAPPINESS_BONUS: i32 = 1;
+const LOCAL_SHOPPING_DECAY_RECOVERY: i32 = 4;
+const IMPORTED_SHOPPING_DECAY_RECOVERY: i32 = 2;
 const MISSED_RENT_HAPPINESS_PENALTY: i32 = 5;
 const MISSED_SHOPPING_HAPPINESS_PENALTY: i32 = 1;
 const INDUSTRIAL_GOODS_PRODUCTION: i32 = 4;
@@ -146,11 +148,13 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
                 shoppers_served += 1;
                 citizen.happiness += shopping.happiness_bonus;
                 if shopping.local_goods {
+                    recover_happiness_from_shopping(citizen, LOCAL_SHOPPING_DECAY_RECOVERY);
                     local_goods_sold += 1;
                     sold_local_good_from = Some(shopping.commercial);
                     business_profit_from_sale =
                         Some((shopping.commercial, COMMERCIAL_LOCAL_GOOD_PROFIT));
                 } else {
+                    recover_happiness_from_shopping(citizen, IMPORTED_SHOPPING_DECAY_RECOVERY);
                     imported_goods_sold += 1;
                     business_profit_from_sale =
                         Some((shopping.commercial, COMMERCIAL_IMPORTED_GOOD_PROFIT));
@@ -569,6 +573,12 @@ fn consume_local_good(world: &mut World, commercial: Entity) {
     }
 }
 
+fn recover_happiness_from_shopping(citizen: &mut Citizen, amount: i32) {
+    let recovered = citizen.happiness_decay.min(amount.max(0));
+    citizen.happiness_decay -= recovered;
+    citizen.happiness += recovered;
+}
+
 fn add_commercial_goods(world: &mut World, commercial: Entity, amount: i32) {
     if amount <= 0 {
         return;
@@ -724,8 +734,9 @@ pub(crate) fn maintenance_for_building(kind: BuildingKind, level: u8) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::EconomyIndex;
-    use crate::core::systems::placement;
+    use super::{EconomyIndex, run};
+    use crate::core::entity::Entity;
+    use crate::core::systems::{citizens, placement, road_network_analysis};
     use crate::core::world::World;
     use crate::interface::input::BuildingKind;
 
@@ -750,5 +761,106 @@ mod tests {
         assert_eq!(index.workplace_slots.len(), 5);
         assert_eq!(index.shopping_slots, vec![commercial; 4]);
         assert_eq!(index.maintenance_cost, 2);
+    }
+
+    #[test]
+    fn successful_shopping_reduces_existing_happiness_decay() {
+        let (mut world, citizen) = shopping_recovery_world(false, true);
+        let before_happiness = citizen_happiness(&world, citizen);
+
+        let economy = run(&mut world);
+
+        assert_eq!(economy.shoppers_served, 1);
+        assert_eq!(economy.imported_goods_sold, 1);
+        assert_eq!(citizen_decay(&world, citizen), 8);
+        assert_eq!(citizen_happiness(&world, citizen), before_happiness + 4);
+    }
+
+    #[test]
+    fn local_goods_recover_more_happiness_decay_than_imported_goods() {
+        let (mut local_world, local_citizen) = shopping_recovery_world(true, true);
+        let (mut imported_world, imported_citizen) = shopping_recovery_world(false, true);
+
+        let local_economy = run(&mut local_world);
+        let imported_economy = run(&mut imported_world);
+
+        assert_eq!(local_economy.local_goods_sold, 1);
+        assert_eq!(imported_economy.imported_goods_sold, 1);
+        assert_eq!(citizen_decay(&local_world, local_citizen), 6);
+        assert_eq!(citizen_decay(&imported_world, imported_citizen), 8);
+    }
+
+    #[test]
+    fn disconnected_citizen_does_not_recover_happiness_decay() {
+        let (mut world, citizen) = shopping_recovery_world(false, false);
+
+        let economy = run(&mut world);
+
+        assert_eq!(economy.shoppers_served, 0);
+        assert_eq!(citizen_decay(&world, citizen), 10);
+    }
+
+    #[test]
+    fn repeated_local_shopping_offsets_daily_decay_without_going_below_zero() {
+        let (mut world, citizen) = shopping_recovery_world(true, true);
+        set_citizen_decay(&mut world, citizen, 0);
+
+        for _ in 0..5 {
+            citizens::apply_daily_happiness_decay(&mut world);
+            citizens::update_happiness(&mut world);
+            let economy = run(&mut world);
+            assert_eq!(economy.shoppers_served, 1);
+        }
+
+        assert_eq!(citizen_decay(&world, citizen), 0);
+    }
+
+    fn shopping_recovery_world(with_local_goods: bool, connected_shop: bool) -> (World, Entity) {
+        let mut world = World::new(5, 3);
+        placement::place_building(&mut world, 0, 0, BuildingKind::Residential);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Commercial);
+        if with_local_goods {
+            placement::place_building(&mut world, 2, 0, BuildingKind::Industrial);
+        }
+        placement::place_building(&mut world, 0, 1, BuildingKind::Road);
+        if connected_shop {
+            placement::place_building(&mut world, 1, 1, BuildingKind::Road);
+            if with_local_goods {
+                placement::place_building(&mut world, 2, 1, BuildingKind::Road);
+            }
+        }
+
+        let residential = world.grid.get(0, 0).expect("residential entity");
+        let commercial = world.grid.get(1, 0).expect("commercial entity");
+        citizens::spawn_for_home(&mut world, residential, 1);
+        let citizen = *world.citizens.keys().next().expect("citizen");
+        if let Some(citizen) = world.citizens.get_mut(&citizen) {
+            citizen.money = 10;
+            citizen.happiness_decay = 10;
+        }
+        world.power_consumers.get_mut(&commercial).unwrap().powered = true;
+        if with_local_goods {
+            let industrial = world.grid.get(2, 0).expect("industrial entity");
+            world.power_consumers.get_mut(&industrial).unwrap().powered = true;
+        }
+        road_network_analysis::run(&mut world);
+        (world, citizen)
+    }
+
+    fn set_citizen_decay(world: &mut World, citizen: Entity, decay: i32) {
+        let citizen = world.citizens.get_mut(&citizen).expect("citizen");
+        citizen.happiness_decay = decay;
+    }
+
+    fn citizen_decay(world: &World, citizen: Entity) -> i32 {
+        world
+            .citizens
+            .get(&citizen)
+            .expect("citizen")
+            .happiness_decay
+    }
+
+    fn citizen_happiness(world: &World, citizen: Entity) -> i32 {
+        world.citizens.get(&citizen).expect("citizen").happiness
     }
 }
