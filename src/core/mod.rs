@@ -1,5 +1,6 @@
 //! Core simulation layer containing the custom ECS data model and deterministic systems.
 
+pub(crate) mod actor_executor;
 pub mod components;
 pub mod entity;
 pub mod game;

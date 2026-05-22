@@ -5,6 +5,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::core::actor_executor::{
+    ActorExecutor, PhaseWork, SingleThreadActorExecutor, ThreadedActorExecutor,
+};
 use crate::core::region::{RegionBounds, RegionPartition};
 use crate::core::region_promise::{
     PromiseChain, PromiseGroup, PromiseId, PromiseResolved, PromiseResponse,
@@ -157,7 +160,7 @@ impl RegionActor {
         self.promise_chains.insert(chain.id(), chain);
     }
 
-    fn process_inbox_to_local_events(
+    pub(crate) fn process_inbox_to_local_events(
         &mut self,
         tick: SimTick,
         phase: SimPhase,
@@ -219,7 +222,7 @@ impl RegionActor {
         outgoing
     }
 
-    fn commit_local_events(&mut self, tick: SimTick, phase: SimPhase) {
+    pub(crate) fn commit_local_events(&mut self, tick: SimTick, phase: SimPhase) {
         self.local_events.sort_by_key(region_event_order);
         let events = std::mem::take(&mut self.local_events);
         let mut border_pollution = 0;
@@ -262,11 +265,11 @@ impl RegionActor {
         }
     }
 
-    fn current_cursor(&self) -> (SimTick, SimPhase) {
+    pub(crate) fn current_cursor(&self) -> (SimTick, SimPhase) {
         (self.current_tick, self.current_phase)
     }
 
-    fn advance_to_phase(&mut self, tick: SimTick, phase: SimPhase) {
+    pub(crate) fn advance_to_phase(&mut self, tick: SimTick, phase: SimPhase) {
         self.current_tick = tick;
         self.current_phase = phase;
     }
@@ -311,6 +314,13 @@ impl RegionActor {
 pub struct ActorRuntime {
     actors: BTreeMap<RegionId, RegionActor>,
     next_sequence: MessageSequence,
+    executor_mode: ActorRuntimeExecutorMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActorRuntimeExecutorMode {
+    SingleThread,
+    Threaded,
 }
 
 impl ActorRuntime {
@@ -322,7 +332,14 @@ impl ActorRuntime {
         Self {
             actors,
             next_sequence: MessageSequence(0),
+            executor_mode: ActorRuntimeExecutorMode::SingleThread,
         }
+    }
+
+    pub fn new_threaded(region_ids: impl IntoIterator<Item = RegionId>) -> Self {
+        let mut runtime = Self::new(region_ids);
+        runtime.executor_mode = ActorRuntimeExecutorMode::Threaded;
+        runtime
     }
 
     pub fn next_sequence(&mut self) -> MessageSequence {
@@ -358,6 +375,24 @@ impl ActorRuntime {
     }
 
     pub fn run_phase(&mut self, tick: SimTick, phase: SimPhase) -> BTreeMap<RegionId, PhaseRun> {
+        match self.executor_mode {
+            ActorRuntimeExecutorMode::SingleThread => {
+                let mut executor = SingleThreadActorExecutor;
+                self.run_phase_with_executor(tick, phase, &mut executor)
+            }
+            ActorRuntimeExecutorMode::Threaded => {
+                let mut executor = ThreadedActorExecutor;
+                self.run_phase_with_executor(tick, phase, &mut executor)
+            }
+        }
+    }
+
+    pub(crate) fn run_phase_with_executor(
+        &mut self,
+        tick: SimTick,
+        phase: SimPhase,
+        executor: &mut impl ActorExecutor,
+    ) -> BTreeMap<RegionId, PhaseRun> {
         let mut results = BTreeMap::new();
         let runnable_actors: Vec<_> = self
             .actors
@@ -367,12 +402,19 @@ impl ActorRuntime {
         let actors_before_run = self.actors.clone();
 
         for _ in 0..MAX_SAME_PHASE_DRAIN_PASSES {
-            let mut outgoing = Vec::new();
-            for actor_id in &runnable_actors {
-                if let Some(actor) = self.actors.get_mut(actor_id) {
-                    outgoing.extend(actor.process_inbox_to_local_events(tick, phase));
-                }
+            let work = PhaseWork {
+                tick,
+                phase,
+                actors: runnable_actors
+                    .iter()
+                    .filter_map(|actor_id| self.actors.get(actor_id).cloned())
+                    .collect(),
+            };
+            let phase_result = executor.run_phase(work);
+            for actor in phase_result.actors {
+                self.actors.insert(actor.id, actor);
             }
+            let outgoing = phase_result.outgoing;
             if outgoing.is_empty() {
                 for actor in self.actors.values_mut() {
                     if runnable_actors.contains(&actor.id) {
@@ -532,6 +574,7 @@ fn border_cells(bounds: RegionBounds) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::actor_executor::ThreadedActorExecutor;
     use crate::core::components::{Building, BuildingData, Position};
     use crate::core::region::RegionPartition;
     use crate::core::region_promise::{PromiseChain, PromiseGroup, PromiseId, PromiseResponse};
@@ -1001,6 +1044,25 @@ mod tests {
     }
 
     #[test]
+    fn threaded_runtime_executor_matches_single_thread_runtime_result() {
+        let single = runtime_after_fake_query_with_executor([RegionId(1), RegionId(2)], None);
+        let mut threaded_executor = ThreadedActorExecutor;
+        let threaded = runtime_after_fake_query_with_executor(
+            [RegionId(2), RegionId(1)],
+            Some(&mut threaded_executor),
+        );
+
+        assert_eq!(single.actor(RegionId(0)).unwrap().state.counter, 5);
+        assert_eq!(threaded.actor(RegionId(0)).unwrap().state.counter, 5);
+        assert_eq!(
+            only_promise_resolution(single.actor(RegionId(0)).unwrap()).ordered_dependencies,
+            only_promise_resolution(threaded.actor(RegionId(0)).unwrap()).ordered_dependencies
+        );
+        assert_eq!(single.actor(RegionId(1)).unwrap().state.counter, 0);
+        assert_eq!(threaded.actor(RegionId(1)).unwrap().state.counter, 0);
+    }
+
+    #[test]
     fn fake_neighbor_query_commits_only_at_expected_phase() {
         let partition = RegionPartition::new(4, 4, 2, 2);
         let mut runtime = ActorRuntime::new([RegionId(0), RegionId(1), RegionId(2), RegionId(3)]);
@@ -1113,6 +1175,13 @@ mod tests {
     fn runtime_after_fake_query_requests<const N: usize>(
         request_order: [RegionId; N],
     ) -> ActorRuntime {
+        runtime_after_fake_query_with_executor(request_order, None)
+    }
+
+    fn runtime_after_fake_query_with_executor<const N: usize>(
+        request_order: [RegionId; N],
+        mut executor: Option<&mut ThreadedActorExecutor>,
+    ) -> ActorRuntime {
         let mut runtime = ActorRuntime::new([RegionId(0), RegionId(1), RegionId(2)]);
         runtime
             .actors
@@ -1128,7 +1197,11 @@ mod tests {
             let message = fake_metric_request(1, 1, RegionId(0), neighbor, index as u64, 9);
             assert_eq!(runtime.deliver(message), MessageDelivery::Accepted);
         }
-        runtime.run_phase(SimTick(1), SimPhase(1));
+        if let Some(executor) = executor.as_mut() {
+            runtime.run_phase_with_executor(SimTick(1), SimPhase(1), *executor);
+        } else {
+            runtime.run_phase(SimTick(1), SimPhase(1));
+        }
         runtime
     }
 

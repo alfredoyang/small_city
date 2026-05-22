@@ -153,6 +153,7 @@ fn ascii_ui_does_not_import_ecs_internals() {
         "crate::core::grid",
         "crate::core::region",
         "crate::core::region_actor",
+        "crate::core::actor_executor",
     ] {
         assert!(
             !source.contains(forbidden_import),
@@ -173,6 +174,7 @@ fn tui_does_not_import_ecs_internals() {
         "crate::core::grid",
         "crate::core::region",
         "crate::core::region_actor",
+        "crate::core::actor_executor",
     ] {
         assert!(
             !source.contains(forbidden_import),
