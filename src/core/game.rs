@@ -4,6 +4,8 @@ use std::fmt;
 use std::fs::File;
 use std::path::Path;
 
+use crate::core::region::RegionPartition;
+use crate::core::region_actor::{ActorRuntime, SimPhase, SimTick};
 use crate::core::resources::{is_new_day, is_new_week};
 use crate::core::systems::{
     build, bulldoze, business_growth, citizens, economy, happiness, local_effects, pollution,
@@ -17,10 +19,14 @@ use crate::interface::view::{BuildPreviewView, GameTimeView, GameView, InspectVi
 
 const DEFAULT_MAP_WIDTH: usize = 20;
 const DEFAULT_MAP_HEIGHT: usize = 15;
+const ACTOR_REGION_WIDTH: usize = 5;
+const ACTOR_REGION_HEIGHT: usize = 5;
 
 #[derive(Debug)]
 pub struct Game {
     world: World,
+    region_partition: RegionPartition,
+    actor_runtime: ActorRuntime,
 }
 
 #[derive(Debug)]
@@ -62,8 +68,13 @@ impl From<serde_json::Error> for GameError {
 impl Game {
     /// Creates a deterministic game state with a private ECS world.
     pub fn new(width: usize, height: usize) -> Self {
+        let world = World::new(width, height);
+        let region_partition = region_partition_for_world(&world);
+        let actor_runtime = ActorRuntime::new(region_partition.region_ids());
         Self {
-            world: World::new(width, height),
+            world,
+            region_partition,
+            actor_runtime,
         }
     }
 
@@ -134,6 +145,7 @@ impl Game {
         }
         citizens::update_happiness(&mut self.world);
         local_effects::run(&mut self.world);
+        self.refresh_actor_runtime();
         let economy = if is_new_day(before_time, after_time) {
             economy::run(&mut self.world)
         } else {
@@ -205,8 +217,13 @@ impl Game {
     /// Loads a JSON save and refreshes derived state before returning a usable Game API value.
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Game, GameError> {
         let file = File::open(path)?;
+        let world = serde_json::from_reader(file)?;
+        let region_partition = region_partition_for_world(&world);
+        let actor_runtime = ActorRuntime::new(region_partition.region_ids());
         let mut game = Self {
-            world: serde_json::from_reader(file)?,
+            world,
+            region_partition,
+            actor_runtime,
         };
         game.world.rebuild_entity_records();
         game.refresh_derived_state();
@@ -221,6 +238,20 @@ impl Game {
         citizens::update_happiness(&mut self.world);
         happiness::run(&mut self.world);
         local_effects::run(&mut self.world);
+        self.refresh_actor_runtime();
+    }
+
+    fn refresh_actor_runtime(&mut self) {
+        self.region_partition = region_partition_for_world(&self.world);
+        self.actor_runtime = ActorRuntime::new(self.region_partition.region_ids());
+        self.actor_runtime.enqueue_border_pollution_samples(
+            &self.region_partition,
+            &self.world.local_effects,
+            SimTick(self.world.resources.turn as u64 + 1),
+            SimPhase(1),
+        );
+        self.actor_runtime
+            .run_phase(SimTick(self.world.resources.turn as u64 + 1), SimPhase(1));
     }
 }
 
@@ -273,10 +304,21 @@ fn game_time_view(time: crate::core::resources::GameTime) -> GameTimeView {
     }
 }
 
+fn region_partition_for_world(world: &World) -> RegionPartition {
+    RegionPartition::new(
+        world.grid.width(),
+        world.grid.height(),
+        ACTOR_REGION_WIDTH,
+        ACTOR_REGION_HEIGHT,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::Game;
+    use crate::core::region_actor::border_pollution_summary;
     use crate::core::systems::citizens;
+    use crate::interface::input::BuildingKind;
 
     #[test]
     fn citizen_happiness_decay_happens_on_daily_boundary_not_hourly() {
@@ -298,6 +340,25 @@ mod tests {
         assert_eq!(citizen_happiness_decay(&game), 1);
         assert!(average_happiness < 50);
         assert!(game.view().status.happiness < 50);
+    }
+
+    #[test]
+    fn actor_runtime_refreshes_private_border_pollution_shadow_state() {
+        let mut game = Game::new(6, 4);
+        assert!(game.build(1, 1, BuildingKind::Industrial).success);
+        assert!(game.build(4, 2, BuildingKind::Industrial).success);
+
+        for region in game.region_partition.region_ids() {
+            assert_eq!(
+                game.actor_runtime
+                    .actor(region)
+                    .expect("region actor")
+                    .state
+                    .read_only
+                    .border_pollution,
+                border_pollution_summary(&game.region_partition, &game.world.local_effects, region)
+            );
+        }
     }
 
     fn game_with_one_citizen() -> (Game, crate::core::entity::Entity) {

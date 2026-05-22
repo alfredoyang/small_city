@@ -5,13 +5,10 @@
 
 use std::collections::BTreeMap;
 
-#[cfg(test)]
-use crate::core::region::RegionBounds;
-use crate::core::region::RegionPartition;
+use crate::core::region::{RegionBounds, RegionPartition};
 use crate::core::region_promise::{
     PromiseChain, PromiseGroup, PromiseId, PromiseResolved, PromiseResponse,
 };
-#[cfg(test)]
 use crate::core::resources::LocalEffectsMap;
 
 const MAX_SAME_PHASE_DRAIN_PASSES: usize = 16;
@@ -437,7 +434,6 @@ impl ActorRuntime {
             .collect()
     }
 
-    #[cfg(test)]
     pub(crate) fn enqueue_border_pollution_samples(
         &mut self,
         partition: &RegionPartition,
@@ -502,7 +498,6 @@ pub(crate) fn border_pollution_summary(
         .sum()
 }
 
-#[cfg(test)]
 fn border_pollution_samples(
     partition: &RegionPartition,
     effects: &LocalEffectsMap,
@@ -518,7 +513,6 @@ fn border_pollution_samples(
         .collect()
 }
 
-#[cfg(test)]
 fn border_cells(bounds: RegionBounds) -> Vec<(usize, usize)> {
     let mut cells = Vec::new();
     for y in bounds.min_y..bounds.max_y {

@@ -151,10 +151,12 @@ fn ascii_ui_does_not_import_ecs_internals() {
         "crate::core::systems",
         "crate::core::resources",
         "crate::core::grid",
+        "crate::core::region",
+        "crate::core::region_actor",
     ] {
         assert!(
             !source.contains(forbidden_import),
-            "ASCII UI must not import ECS internals via {forbidden_import}"
+            "ASCII UI must not import ECS or actor internals via {forbidden_import}"
         );
     }
 }
@@ -169,10 +171,12 @@ fn tui_does_not_import_ecs_internals() {
         "crate::core::systems",
         "crate::core::resources",
         "crate::core::grid",
+        "crate::core::region",
+        "crate::core::region_actor",
     ] {
         assert!(
             !source.contains(forbidden_import),
-            "TUI must not import ECS internals via {forbidden_import}"
+            "TUI must not import ECS or actor internals via {forbidden_import}"
         );
     }
 }

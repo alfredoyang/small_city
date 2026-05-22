@@ -34,6 +34,22 @@ fn saving_a_game_creates_a_file() {
 }
 
 #[test]
+fn save_file_does_not_expose_private_actor_runtime() {
+    let path = save_path("private-actor-runtime");
+    let mut game = Game::new(6, 4);
+    assert!(game.build(1, 1, BuildingKind::Industrial).success);
+
+    game.save_to_file(&path).expect("save succeeds");
+    let save_json = std::fs::read_to_string(&path).expect("read save");
+
+    assert!(!save_json.contains("actor_runtime"));
+    assert!(!save_json.contains("region_partition"));
+    assert!(!save_json.contains("RegionActor"));
+    assert!(!save_json.contains("border_pollution"));
+    std::fs::remove_file(path).expect("remove save file");
+}
+
+#[test]
 fn save_load_roundtrip_restores_city_state_visible_through_game_view() {
     let path = save_path("roundtrip");
     let game = full_city_game();
