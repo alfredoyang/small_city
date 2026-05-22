@@ -5,10 +5,14 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+use crate::core::region::RegionBounds;
 use crate::core::region::RegionPartition;
 use crate::core::region_promise::{
     PromiseChain, PromiseGroup, PromiseId, PromiseResolved, PromiseResponse,
 };
+#[cfg(test)]
+use crate::core::resources::LocalEffectsMap;
 
 const MAX_SAME_PHASE_DRAIN_PASSES: usize = 16;
 
@@ -40,6 +44,9 @@ pub enum RegionMessageKind {
     FakeBorderMetricRequest {
         promise_id: PromiseId,
     },
+    ReadOnlyBorderPollutionSample {
+        value: i32,
+    },
     #[cfg(test)]
     CyclicSamePhaseRequest,
     PromiseGroupResponse(PromiseResponse),
@@ -58,6 +65,7 @@ pub struct RegionEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegionEventKind {
     CommitCounterDelta(i32),
+    CommitBorderPollutionSample(i32),
     PromiseResolved(PromiseResolved),
 }
 
@@ -85,7 +93,13 @@ pub struct ActorPhaseRun {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ActorState {
     pub counter: i32,
+    pub read_only: ReadOnlyDerivedMetrics,
     pub committed_events: Vec<RegionEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReadOnlyDerivedMetrics {
+    pub border_pollution: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +186,15 @@ impl RegionActor {
                 RegionMessageKind::FakeBorderMetricRequest { promise_id } => {
                     outgoing.push(self.fake_border_metric_response(message, promise_id));
                 }
+                RegionMessageKind::ReadOnlyBorderPollutionSample { value } => {
+                    self.local_events.push(RegionEvent {
+                        tick: message.tick,
+                        phase: message.phase,
+                        source: message.source,
+                        sequence: message.sequence,
+                        kind: RegionEventKind::CommitBorderPollutionSample(value),
+                    });
+                }
                 #[cfg(test)]
                 RegionMessageKind::CyclicSamePhaseRequest => {
                     outgoing.push(RegionMessage {
@@ -202,6 +225,7 @@ impl RegionActor {
     fn commit_local_events(&mut self, tick: SimTick, phase: SimPhase) {
         self.local_events.sort_by_key(region_event_order);
         let events = std::mem::take(&mut self.local_events);
+        let mut border_pollution = 0;
         for event in events {
             if event.tick != tick || event.phase != phase {
                 self.local_events.push(event);
@@ -212,12 +236,17 @@ impl RegionActor {
                     self.state.counter += delta;
                     self.state.committed_events.push(event);
                 }
+                RegionEventKind::CommitBorderPollutionSample(value) => {
+                    border_pollution += value;
+                    self.state.committed_events.push(event);
+                }
                 RegionEventKind::PromiseResolved(ref resolved) => {
                     self.state.counter += resolved.total;
                     self.state.committed_events.push(event);
                 }
             }
         }
+        self.state.read_only.border_pollution = border_pollution;
     }
 
     pub fn run_phase(&mut self, tick: SimTick, phase: SimPhase) -> ActorPhaseRun {
@@ -408,6 +437,34 @@ impl ActorRuntime {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn enqueue_border_pollution_samples(
+        &mut self,
+        partition: &RegionPartition,
+        effects: &LocalEffectsMap,
+        tick: SimTick,
+        phase: SimPhase,
+    ) -> BTreeMap<RegionId, Vec<MessageDelivery>> {
+        let mut deliveries = BTreeMap::new();
+        for region in partition.region_ids() {
+            let samples = border_pollution_samples(partition, effects, region);
+            let region_deliveries = samples
+                .into_iter()
+                .map(|value| {
+                    self.send(
+                        tick,
+                        phase,
+                        region,
+                        region,
+                        RegionMessageKind::ReadOnlyBorderPollutionSample { value },
+                    )
+                })
+                .collect();
+            deliveries.insert(region, region_deliveries);
+        }
+        deliveries
+    }
+
     pub fn advance_actor_to_tick(&mut self, actor: RegionId, tick: SimTick) -> Option<PhaseRun> {
         self.actors
             .get_mut(&actor)
@@ -435,10 +492,58 @@ pub fn region_event_order(event: &RegionEvent) -> (SimTick, SimPhase, RegionId, 
 }
 
 #[cfg(test)]
+pub(crate) fn border_pollution_summary(
+    partition: &RegionPartition,
+    effects: &LocalEffectsMap,
+    region: RegionId,
+) -> i32 {
+    border_pollution_samples(partition, effects, region)
+        .into_iter()
+        .sum()
+}
+
+#[cfg(test)]
+fn border_pollution_samples(
+    partition: &RegionPartition,
+    effects: &LocalEffectsMap,
+    region: RegionId,
+) -> Vec<i32> {
+    let Some(bounds) = partition.bounds(region) else {
+        return Vec::new();
+    };
+
+    border_cells(bounds)
+        .into_iter()
+        .map(|(x, y)| effects.get(x, y).pollution_pressure)
+        .collect()
+}
+
+#[cfg(test)]
+fn border_cells(bounds: RegionBounds) -> Vec<(usize, usize)> {
+    let mut cells = Vec::new();
+    for y in bounds.min_y..bounds.max_y {
+        for x in bounds.min_x..bounds.max_x {
+            if x == bounds.min_x
+                || x + 1 == bounds.max_x
+                || y == bounds.min_y
+                || y + 1 == bounds.max_y
+            {
+                cells.push((x, y));
+            }
+        }
+    }
+    cells
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::components::{Building, BuildingData, Position};
     use crate::core::region::RegionPartition;
     use crate::core::region_promise::{PromiseChain, PromiseGroup, PromiseId, PromiseResponse};
+    use crate::core::systems::local_effects;
+    use crate::core::world::World;
+    use crate::interface::input::BuildingKind;
 
     #[test]
     fn messages_sort_by_tick_phase_source_sequence() {
@@ -920,6 +1025,64 @@ mod tests {
         assert_eq!(runtime.actor(RegionId(0)).unwrap().state.counter, 5);
     }
 
+    #[test]
+    fn actor_border_pollution_matches_existing_local_effects_result() {
+        let mut world = World::new(6, 4);
+        attach_building(&mut world, 1, 1, BuildingKind::Industrial);
+        attach_building(&mut world, 4, 2, BuildingKind::Industrial);
+        local_effects::run(&mut world);
+        let partition = RegionPartition::new(6, 4, 3, 2);
+        let mut runtime = ActorRuntime::new(partition.region_ids());
+
+        let deliveries = runtime.enqueue_border_pollution_samples(
+            &partition,
+            &world.local_effects,
+            SimTick(1),
+            SimPhase(1),
+        );
+        runtime.run_phase(SimTick(1), SimPhase(1));
+
+        for region in partition.region_ids() {
+            assert!(
+                deliveries[&region]
+                    .iter()
+                    .all(|delivery| *delivery == MessageDelivery::Accepted)
+            );
+            assert_eq!(
+                runtime
+                    .actor(region)
+                    .unwrap()
+                    .state
+                    .read_only
+                    .border_pollution,
+                border_pollution_summary(&partition, &world.local_effects, region)
+            );
+        }
+    }
+
+    #[test]
+    fn shuffled_border_pollution_samples_produce_same_actor_result() {
+        let ordered = actor_after_border_pollution_samples([1, 4, 2]);
+        let shuffled = actor_after_border_pollution_samples([2, 1, 4]);
+
+        assert_eq!(ordered.state.read_only.border_pollution, 7);
+        assert_eq!(
+            ordered.state.read_only.border_pollution,
+            shuffled.state.read_only.border_pollution
+        );
+    }
+
+    #[test]
+    fn border_pollution_clears_when_later_phase_has_no_samples() {
+        let mut actor = actor_after_border_pollution_samples([1, 4, 2]);
+        assert_eq!(actor.state.read_only.border_pollution, 7);
+
+        let result = actor.run_phase(SimTick(1), SimPhase(2));
+
+        assert_eq!(result.status, PhaseRun::Completed);
+        assert_eq!(actor.state.read_only.border_pollution, 0);
+    }
+
     fn runtime_state_after_delivery(messages: Vec<RegionMessage>) -> ActorState {
         let mut runtime = ActorRuntime::new([RegionId(99)]);
         for mut message in messages {
@@ -930,6 +1093,27 @@ mod tests {
         runtime.run_phase(SimTick(1), SimPhase(2));
         runtime.run_phase(SimTick(2), SimPhase(1));
         runtime.actor(RegionId(99)).unwrap().state.clone()
+    }
+
+    fn actor_after_border_pollution_samples<const N: usize>(samples: [i32; N]) -> RegionActor {
+        let mut actor = RegionActor::new(RegionId(3));
+        for (sequence, value) in samples.into_iter().enumerate() {
+            assert_eq!(
+                actor.deliver(border_pollution_sample_message(
+                    1,
+                    1,
+                    RegionId(3),
+                    sequence as u64,
+                    value
+                )),
+                MessageDelivery::Accepted
+            );
+        }
+        assert_eq!(
+            actor.run_phase(SimTick(1), SimPhase(1)).status,
+            PhaseRun::Completed
+        );
+        actor
     }
 
     fn runtime_after_fake_query_requests<const N: usize>(
@@ -1048,6 +1232,23 @@ mod tests {
         }
     }
 
+    fn border_pollution_sample_message(
+        tick: u64,
+        phase: u8,
+        target: RegionId,
+        sequence: u64,
+        value: i32,
+    ) -> RegionMessage {
+        RegionMessage {
+            tick: SimTick(tick),
+            phase: SimPhase(phase),
+            source: target,
+            target,
+            sequence: MessageSequence(sequence),
+            kind: RegionMessageKind::ReadOnlyBorderPollutionSample { value },
+        }
+    }
+
     fn cyclic_same_phase_message(
         tick: u64,
         phase: u8,
@@ -1075,5 +1276,18 @@ mod tests {
             RegionEventKind::PromiseResolved(resolved) => resolved,
             other => panic!("expected promise resolution, got {other:?}"),
         }
+    }
+
+    fn attach_building(world: &mut World, x: usize, y: usize, kind: BuildingKind) {
+        let entity = world.spawn();
+        world.attach_position(entity, Position { x, y });
+        world.attach_building(
+            entity,
+            Building {
+                kind,
+                level: 1,
+                data: BuildingData::None,
+            },
+        );
     }
 }
