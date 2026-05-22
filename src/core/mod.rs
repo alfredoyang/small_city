@@ -4,6 +4,7 @@ pub mod components;
 pub mod entity;
 pub mod game;
 pub mod grid;
+pub mod region;
 pub mod region_actor;
 pub mod region_promise;
 pub mod resources;
