@@ -12,7 +12,7 @@ use crate::core::region::{RegionBounds, RegionPartition};
 use crate::core::region_promise::{
     PromiseChain, PromiseGroup, PromiseId, PromiseResolved, PromiseResponse,
 };
-use crate::core::resources::LocalEffectsMap;
+use crate::core::resources::{LocalEffects, LocalEffectsMap};
 
 const MAX_SAME_PHASE_DRAIN_PASSES: usize = 16;
 
@@ -47,6 +47,7 @@ pub enum RegionMessageKind {
     ReadOnlyBorderPollutionSample {
         value: i32,
     },
+    LocalEffectsCellSample(LocalEffectsCell),
     #[cfg(test)]
     CyclicSamePhaseRequest,
     PromiseGroupResponse(PromiseResponse),
@@ -66,6 +67,7 @@ pub struct RegionEvent {
 pub enum RegionEventKind {
     CommitCounterDelta(i32),
     CommitBorderPollutionSample(i32),
+    CommitLocalEffectsCell(LocalEffectsCell),
     PromiseResolved(PromiseResolved),
 }
 
@@ -100,6 +102,14 @@ pub struct ActorState {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReadOnlyDerivedMetrics {
     pub border_pollution: i32,
+    pub(crate) local_effect_cells: Vec<LocalEffectsCell>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalEffectsCell {
+    pub(crate) x: usize,
+    pub(crate) y: usize,
+    pub(crate) effects: LocalEffects,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +205,15 @@ impl RegionActor {
                         kind: RegionEventKind::CommitBorderPollutionSample(value),
                     });
                 }
+                RegionMessageKind::LocalEffectsCellSample(cell) => {
+                    self.local_events.push(RegionEvent {
+                        tick: message.tick,
+                        phase: message.phase,
+                        source: message.source,
+                        sequence: message.sequence,
+                        kind: RegionEventKind::CommitLocalEffectsCell(cell),
+                    });
+                }
                 #[cfg(test)]
                 RegionMessageKind::CyclicSamePhaseRequest => {
                     outgoing.push(RegionMessage {
@@ -226,6 +245,7 @@ impl RegionActor {
         self.local_events.sort_by_key(region_event_order);
         let events = std::mem::take(&mut self.local_events);
         let mut border_pollution = 0;
+        let mut local_effect_cells = Vec::new();
         for event in events {
             if event.tick != tick || event.phase != phase {
                 self.local_events.push(event);
@@ -240,6 +260,10 @@ impl RegionActor {
                     border_pollution += value;
                     self.state.committed_events.push(event);
                 }
+                RegionEventKind::CommitLocalEffectsCell(cell) => {
+                    local_effect_cells.push(cell);
+                    self.state.committed_events.push(event);
+                }
                 RegionEventKind::PromiseResolved(ref resolved) => {
                     self.state.counter += resolved.total;
                     self.state.committed_events.push(event);
@@ -247,6 +271,8 @@ impl RegionActor {
             }
         }
         self.state.read_only.border_pollution = border_pollution;
+        local_effect_cells.sort_by_key(|cell| (cell.y, cell.x));
+        self.state.read_only.local_effect_cells = local_effect_cells;
     }
 
     pub fn run_phase(&mut self, tick: SimTick, phase: SimPhase) -> ActorPhaseRun {
@@ -1129,6 +1155,35 @@ mod tests {
     }
 
     #[test]
+    fn shuffled_local_effect_cells_produce_same_actor_result() {
+        let ordered = actor_after_local_effect_cells([(0, 0, 2), (1, 0, 5), (0, 1, 3)]);
+        let shuffled = actor_after_local_effect_cells([(0, 1, 3), (0, 0, 2), (1, 0, 5)]);
+
+        assert_eq!(
+            ordered.state.read_only.local_effect_cells,
+            shuffled.state.read_only.local_effect_cells
+        );
+        assert_eq!(
+            ordered.state.read_only.local_effect_cells[0]
+                .effects
+                .land_value,
+            2
+        );
+        assert_eq!(
+            ordered.state.read_only.local_effect_cells[1]
+                .effects
+                .land_value,
+            5
+        );
+        assert_eq!(
+            ordered.state.read_only.local_effect_cells[2]
+                .effects
+                .land_value,
+            3
+        );
+    }
+
+    #[test]
     fn border_pollution_clears_when_later_phase_has_no_samples() {
         let mut actor = actor_after_border_pollution_samples([1, 4, 2]);
         assert_eq!(actor.state.read_only.border_pollution, 7);
@@ -1161,6 +1216,31 @@ mod tests {
                     RegionId(3),
                     sequence as u64,
                     value
+                )),
+                MessageDelivery::Accepted
+            );
+        }
+        assert_eq!(
+            actor.run_phase(SimTick(1), SimPhase(1)).status,
+            PhaseRun::Completed
+        );
+        actor
+    }
+
+    fn actor_after_local_effect_cells<const N: usize>(
+        cells: [(usize, usize, i32); N],
+    ) -> RegionActor {
+        let mut actor = RegionActor::new(RegionId(4));
+        for (sequence, (x, y, land_value)) in cells.into_iter().enumerate() {
+            assert_eq!(
+                actor.deliver(local_effect_cell_message(
+                    1,
+                    1,
+                    RegionId(4),
+                    sequence as u64,
+                    x,
+                    y,
+                    land_value
                 )),
                 MessageDelivery::Accepted
             );
@@ -1313,6 +1393,34 @@ mod tests {
             target,
             sequence: MessageSequence(sequence),
             kind: RegionMessageKind::ReadOnlyBorderPollutionSample { value },
+        }
+    }
+
+    fn local_effect_cell_message(
+        tick: u64,
+        phase: u8,
+        target: RegionId,
+        sequence: u64,
+        x: usize,
+        y: usize,
+        land_value: i32,
+    ) -> RegionMessage {
+        RegionMessage {
+            tick: SimTick(tick),
+            phase: SimPhase(phase),
+            source: target,
+            target,
+            sequence: MessageSequence(sequence),
+            kind: RegionMessageKind::LocalEffectsCellSample(LocalEffectsCell {
+                x,
+                y,
+                effects: LocalEffects {
+                    land_value,
+                    pollution_pressure: 0,
+                    accessibility: 0,
+                    desirability: land_value,
+                },
+            }),
         }
     }
 
