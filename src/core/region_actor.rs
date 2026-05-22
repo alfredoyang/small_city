@@ -5,6 +5,10 @@
 
 use std::collections::BTreeMap;
 
+use crate::core::region_promise::{
+    PromiseChain, PromiseGroup, PromiseId, PromiseResolved, PromiseResponse,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RegionId(pub u32);
 
@@ -30,6 +34,8 @@ pub struct RegionMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionMessageKind {
     AddCounter(i32),
+    PromiseGroupResponse(PromiseResponse),
+    PromiseChainResponse(PromiseResponse),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,9 +47,10 @@ pub struct RegionEvent {
     pub kind: RegionEventKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegionEventKind {
     CommitCounterDelta(i32),
+    PromiseResolved(PromiseResolved),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +80,8 @@ pub struct RegionActor {
     pub current_phase: SimPhase,
     pub inbox: Vec<RegionMessage>,
     pub local_events: Vec<RegionEvent>,
+    pub promise_groups: BTreeMap<PromiseId, PromiseGroup>,
+    pub promise_chains: BTreeMap<PromiseId, PromiseChain>,
     pub state: ActorState,
 }
 
@@ -84,6 +93,8 @@ impl RegionActor {
             current_phase: SimPhase(0),
             inbox: Vec::new(),
             local_events: Vec::new(),
+            promise_groups: BTreeMap::new(),
+            promise_chains: BTreeMap::new(),
             state: ActorState::default(),
         }
     }
@@ -112,6 +123,14 @@ impl RegionActor {
         PhaseRun::Completed
     }
 
+    pub fn register_promise_group(&mut self, group: PromiseGroup) {
+        self.promise_groups.insert(group.id(), group);
+    }
+
+    pub fn register_promise_chain(&mut self, chain: PromiseChain) {
+        self.promise_chains.insert(chain.id(), chain);
+    }
+
     fn process_inbox_to_local_events(&mut self, tick: SimTick, phase: SimPhase) {
         self.inbox.sort_by_key(region_message_order);
         let messages = std::mem::take(&mut self.inbox);
@@ -130,6 +149,20 @@ impl RegionActor {
                         kind: RegionEventKind::CommitCounterDelta(delta),
                     });
                 }
+                RegionMessageKind::PromiseGroupResponse(response) => {
+                    if let Some(group) = self.promise_groups.get_mut(&response.promise_id) {
+                        if let Some(resolved) = group.record_response(response) {
+                            self.enqueue_promise_resolved(message, resolved);
+                        }
+                    }
+                }
+                RegionMessageKind::PromiseChainResponse(response) => {
+                    if let Some(chain) = self.promise_chains.get_mut(&response.promise_id) {
+                        if let Some(resolved) = chain.record_response(response) {
+                            self.enqueue_promise_resolved(message, resolved);
+                        }
+                    }
+                }
             }
         }
     }
@@ -145,6 +178,10 @@ impl RegionActor {
             match event.kind {
                 RegionEventKind::CommitCounterDelta(delta) => {
                     self.state.counter += delta;
+                    self.state.committed_events.push(event);
+                }
+                RegionEventKind::PromiseResolved(ref resolved) => {
+                    self.state.counter += resolved.total;
                     self.state.committed_events.push(event);
                 }
             }
@@ -168,6 +205,16 @@ impl RegionActor {
     fn advance_to_phase(&mut self, tick: SimTick, phase: SimPhase) {
         self.current_tick = tick;
         self.current_phase = phase;
+    }
+
+    fn enqueue_promise_resolved(&mut self, message: RegionMessage, resolved: PromiseResolved) {
+        self.local_events.push(RegionEvent {
+            tick: message.tick,
+            phase: message.phase,
+            source: message.source,
+            sequence: message.sequence,
+            kind: RegionEventKind::PromiseResolved(resolved),
+        });
     }
 }
 
@@ -258,6 +305,7 @@ pub fn region_event_order(event: &RegionEvent) -> (SimTick, SimPhase, RegionId, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::region_promise::{PromiseChain, PromiseGroup, PromiseId, PromiseResponse};
 
     #[test]
     fn messages_sort_by_tick_phase_source_sequence() {
@@ -419,6 +467,204 @@ mod tests {
         assert!(actor.inbox.is_empty());
     }
 
+    #[test]
+    fn promise_group_resolves_after_all_responses_arrive() {
+        let mut actor = RegionActor::new(RegionId(10));
+        actor.register_promise_group(PromiseGroup::new(
+            PromiseId(1),
+            SimTick(1),
+            SimPhase(1),
+            [RegionId(1), RegionId(2)],
+        ));
+        assert_eq!(
+            actor.deliver(promise_group_message(1, 1, 1, 1, 1, 7)),
+            MessageDelivery::Accepted
+        );
+
+        actor.process_inbox_to_local_events(SimTick(1), SimPhase(1));
+        assert!(actor.local_events.is_empty());
+        assert_eq!(
+            actor.deliver(promise_group_message(1, 1, 2, 2, 1, 11)),
+            MessageDelivery::Accepted
+        );
+
+        actor.process_inbox_to_local_events(SimTick(1), SimPhase(1));
+
+        assert_eq!(actor.local_events.len(), 1);
+        actor.commit_local_events(SimTick(1), SimPhase(1));
+        assert_eq!(actor.state.counter, 18);
+    }
+
+    #[test]
+    fn promise_group_applies_responses_in_stable_dependency_order() {
+        let mut runtime = ActorRuntime::new([RegionId(10)]);
+        runtime
+            .actors
+            .get_mut(&RegionId(10))
+            .unwrap()
+            .register_promise_group(PromiseGroup::new(
+                PromiseId(2),
+                SimTick(1),
+                SimPhase(1),
+                [RegionId(3), RegionId(1), RegionId(2)],
+            ));
+        for message in [
+            promise_group_message(1, 1, 3, 1, 2, 30),
+            promise_group_message(1, 1, 1, 2, 2, 10),
+            promise_group_message(1, 1, 2, 3, 2, 20),
+        ] {
+            assert_eq!(runtime.deliver(message), MessageDelivery::Accepted);
+        }
+
+        runtime.run_phase(SimTick(1), SimPhase(1));
+
+        let event = only_committed_event(runtime.actor(RegionId(10)).unwrap());
+        match &event.kind {
+            RegionEventKind::PromiseResolved(resolved) => {
+                assert_eq!(
+                    resolved.ordered_dependencies,
+                    vec![RegionId(1), RegionId(2), RegionId(3)]
+                );
+                assert_eq!(resolved.total, 60);
+            }
+            other => panic!("expected promise resolution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn promise_chain_preserves_declared_step_order() {
+        let mut runtime = ActorRuntime::new([RegionId(10)]);
+        runtime
+            .actors
+            .get_mut(&RegionId(10))
+            .unwrap()
+            .register_promise_chain(PromiseChain::new(
+                PromiseId(3),
+                SimTick(1),
+                SimPhase(1),
+                [RegionId(2), RegionId(1)],
+            ));
+        assert_eq!(
+            runtime.deliver(promise_chain_message(1, 1, 1, 1, 3, 10)),
+            MessageDelivery::Accepted
+        );
+        assert_eq!(
+            runtime.deliver(promise_chain_message(1, 1, 2, 2, 3, 20)),
+            MessageDelivery::Accepted
+        );
+
+        runtime.run_phase(SimTick(1), SimPhase(1));
+
+        let event = only_committed_event(runtime.actor(RegionId(10)).unwrap());
+        match &event.kind {
+            RegionEventKind::PromiseResolved(resolved) => {
+                assert_eq!(
+                    resolved.ordered_dependencies,
+                    vec![RegionId(2), RegionId(1)]
+                );
+                assert_eq!(resolved.total, 30);
+            }
+            other => panic!("expected promise resolution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn promise_callback_enqueues_local_event_without_committing_state() {
+        let mut actor = RegionActor::new(RegionId(10));
+        actor.register_promise_group(PromiseGroup::new(
+            PromiseId(4),
+            SimTick(1),
+            SimPhase(1),
+            [RegionId(1)],
+        ));
+        assert_eq!(
+            actor.deliver(promise_group_message(1, 1, 1, 1, 4, 12)),
+            MessageDelivery::Accepted
+        );
+
+        actor.process_inbox_to_local_events(SimTick(1), SimPhase(1));
+
+        assert_eq!(actor.state.counter, 0);
+        assert_eq!(actor.local_events.len(), 1);
+
+        actor.commit_local_events(SimTick(1), SimPhase(1));
+
+        assert_eq!(actor.state.counter, 12);
+    }
+
+    #[test]
+    fn late_promise_response_cannot_modify_completed_tick() {
+        let mut runtime = ActorRuntime::new([RegionId(10)]);
+        runtime
+            .actors
+            .get_mut(&RegionId(10))
+            .unwrap()
+            .register_promise_group(PromiseGroup::new(
+                PromiseId(5),
+                SimTick(1),
+                SimPhase(1),
+                [RegionId(1)],
+            ));
+        runtime.run_phase(SimTick(1), SimPhase(1));
+
+        let delivery = runtime.deliver(promise_group_message(1, 1, 1, 1, 5, 99));
+        let rerun = runtime.run_phase(SimTick(1), SimPhase(1));
+
+        assert_eq!(delivery, MessageDelivery::RejectedStale);
+        assert_eq!(rerun[&RegionId(10)], PhaseRun::RejectedStale);
+        assert_eq!(runtime.actor(RegionId(10)).unwrap().state.counter, 0);
+    }
+
+    #[test]
+    fn promise_group_ignores_responses_from_different_phase_scope() {
+        let mut actor = RegionActor::new(RegionId(10));
+        actor.register_promise_group(PromiseGroup::new(
+            PromiseId(6),
+            SimTick(1),
+            SimPhase(1),
+            [RegionId(1), RegionId(2)],
+        ));
+        assert_eq!(
+            actor.deliver(promise_group_message(1, 1, 1, 1, 6, 7)),
+            MessageDelivery::Accepted
+        );
+        assert_eq!(
+            actor.deliver(promise_group_message(2, 1, 2, 2, 6, 11)),
+            MessageDelivery::Accepted
+        );
+
+        actor.process_inbox_to_local_events(SimTick(1), SimPhase(1));
+        actor.process_inbox_to_local_events(SimTick(2), SimPhase(1));
+
+        assert!(actor.local_events.is_empty());
+        assert_eq!(actor.state.counter, 0);
+    }
+
+    #[test]
+    fn promise_chain_ignores_responses_from_different_phase_scope() {
+        let mut actor = RegionActor::new(RegionId(10));
+        actor.register_promise_chain(PromiseChain::new(
+            PromiseId(7),
+            SimTick(1),
+            SimPhase(1),
+            [RegionId(1), RegionId(2)],
+        ));
+        assert_eq!(
+            actor.deliver(promise_chain_message(1, 1, 1, 1, 7, 7)),
+            MessageDelivery::Accepted
+        );
+        assert_eq!(
+            actor.deliver(promise_chain_message(1, 2, 2, 2, 7, 11)),
+            MessageDelivery::Accepted
+        );
+
+        actor.process_inbox_to_local_events(SimTick(1), SimPhase(1));
+        actor.process_inbox_to_local_events(SimTick(1), SimPhase(2));
+
+        assert!(actor.local_events.is_empty());
+        assert_eq!(actor.state.counter, 0);
+    }
+
     fn runtime_state_after_delivery(messages: Vec<RegionMessage>) -> ActorState {
         let mut runtime = ActorRuntime::new([RegionId(99)]);
         for mut message in messages {
@@ -440,5 +686,73 @@ mod tests {
             sequence: MessageSequence(sequence),
             kind: RegionMessageKind::AddCounter(delta),
         }
+    }
+
+    fn promise_group_message(
+        tick: u64,
+        phase: u8,
+        source: u32,
+        sequence: u64,
+        promise: u64,
+        value: i32,
+    ) -> RegionMessage {
+        promise_message(
+            tick,
+            phase,
+            source,
+            sequence,
+            RegionMessageKind::PromiseGroupResponse(PromiseResponse {
+                promise_id: PromiseId(promise),
+                tick: SimTick(tick),
+                phase: SimPhase(phase),
+                dependency: RegionId(source),
+                value,
+            }),
+        )
+    }
+
+    fn promise_chain_message(
+        tick: u64,
+        phase: u8,
+        source: u32,
+        sequence: u64,
+        promise: u64,
+        value: i32,
+    ) -> RegionMessage {
+        promise_message(
+            tick,
+            phase,
+            source,
+            sequence,
+            RegionMessageKind::PromiseChainResponse(PromiseResponse {
+                promise_id: PromiseId(promise),
+                tick: SimTick(tick),
+                phase: SimPhase(phase),
+                dependency: RegionId(source),
+                value,
+            }),
+        )
+    }
+
+    fn promise_message(
+        tick: u64,
+        phase: u8,
+        source: u32,
+        sequence: u64,
+        kind: RegionMessageKind,
+    ) -> RegionMessage {
+        RegionMessage {
+            tick: SimTick(tick),
+            phase: SimPhase(phase),
+            source: RegionId(source),
+            target: RegionId(10),
+            sequence: MessageSequence(sequence),
+            kind,
+        }
+    }
+
+    fn only_committed_event(actor: &RegionActor) -> &RegionEvent {
+        assert_eq!(actor.state.committed_events.len(), 1);
+        &actor.state.committed_events[0]
     }
 }
