@@ -5,9 +5,12 @@
 
 use std::collections::BTreeMap;
 
+use crate::core::region::RegionPartition;
 use crate::core::region_promise::{
     PromiseChain, PromiseGroup, PromiseId, PromiseResolved, PromiseResponse,
 };
+
+const MAX_SAME_PHASE_DRAIN_PASSES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RegionId(pub u32);
@@ -34,6 +37,11 @@ pub struct RegionMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionMessageKind {
     AddCounter(i32),
+    FakeBorderMetricRequest {
+        promise_id: PromiseId,
+    },
+    #[cfg(test)]
+    CyclicSamePhaseRequest,
     PromiseGroupResponse(PromiseResponse),
     PromiseChainResponse(PromiseResponse),
 }
@@ -65,6 +73,13 @@ pub enum MessageDelivery {
 pub enum PhaseRun {
     Completed,
     RejectedStale,
+    RejectedMessageLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorPhaseRun {
+    pub status: PhaseRun,
+    pub outgoing: Vec<RegionMessage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -131,7 +146,12 @@ impl RegionActor {
         self.promise_chains.insert(chain.id(), chain);
     }
 
-    fn process_inbox_to_local_events(&mut self, tick: SimTick, phase: SimPhase) {
+    fn process_inbox_to_local_events(
+        &mut self,
+        tick: SimTick,
+        phase: SimPhase,
+    ) -> Vec<RegionMessage> {
+        let mut outgoing = Vec::new();
         self.inbox.sort_by_key(region_message_order);
         let messages = std::mem::take(&mut self.inbox);
         for message in messages {
@@ -147,6 +167,17 @@ impl RegionActor {
                         source: message.source,
                         sequence: message.sequence,
                         kind: RegionEventKind::CommitCounterDelta(delta),
+                    });
+                }
+                RegionMessageKind::FakeBorderMetricRequest { promise_id } => {
+                    outgoing.push(self.fake_border_metric_response(message, promise_id));
+                }
+                #[cfg(test)]
+                RegionMessageKind::CyclicSamePhaseRequest => {
+                    outgoing.push(RegionMessage {
+                        target: message.source,
+                        source: self.id,
+                        ..message
                     });
                 }
                 RegionMessageKind::PromiseGroupResponse(response) => {
@@ -165,6 +196,7 @@ impl RegionActor {
                 }
             }
         }
+        outgoing
     }
 
     fn commit_local_events(&mut self, tick: SimTick, phase: SimPhase) {
@@ -188,14 +220,20 @@ impl RegionActor {
         }
     }
 
-    pub fn run_phase(&mut self, tick: SimTick, phase: SimPhase) -> PhaseRun {
+    pub fn run_phase(&mut self, tick: SimTick, phase: SimPhase) -> ActorPhaseRun {
         if (tick, phase) <= self.current_cursor() {
-            return PhaseRun::RejectedStale;
+            return ActorPhaseRun {
+                status: PhaseRun::RejectedStale,
+                outgoing: Vec::new(),
+            };
         }
-        self.process_inbox_to_local_events(tick, phase);
+        let outgoing = self.process_inbox_to_local_events(tick, phase);
         self.commit_local_events(tick, phase);
         self.advance_to_phase(tick, phase);
-        PhaseRun::Completed
+        ActorPhaseRun {
+            status: PhaseRun::Completed,
+            outgoing,
+        }
     }
 
     fn current_cursor(&self) -> (SimTick, SimPhase) {
@@ -215,6 +253,31 @@ impl RegionActor {
             sequence: message.sequence,
             kind: RegionEventKind::PromiseResolved(resolved),
         });
+    }
+
+    fn fake_border_metric_response(
+        &self,
+        request: RegionMessage,
+        promise_id: PromiseId,
+    ) -> RegionMessage {
+        RegionMessage {
+            tick: request.tick,
+            phase: request.phase,
+            source: self.id,
+            target: request.source,
+            sequence: request.sequence,
+            kind: RegionMessageKind::PromiseGroupResponse(PromiseResponse {
+                promise_id,
+                tick: request.tick,
+                phase: request.phase,
+                dependency: self.id,
+                value: self.fake_border_metric(),
+            }),
+        }
+    }
+
+    fn fake_border_metric(&self) -> i32 {
+        self.id.0 as i32 + 1
     }
 }
 
@@ -270,10 +333,79 @@ impl ActorRuntime {
 
     pub fn run_phase(&mut self, tick: SimTick, phase: SimPhase) -> BTreeMap<RegionId, PhaseRun> {
         let mut results = BTreeMap::new();
-        for actor in self.actors.values_mut() {
-            results.insert(actor.id, actor.run_phase(tick, phase));
+        let runnable_actors: Vec<_> = self
+            .actors
+            .iter()
+            .filter_map(|(id, actor)| ((tick, phase) > actor.current_cursor()).then_some(*id))
+            .collect();
+        let actors_before_run = self.actors.clone();
+
+        for _ in 0..MAX_SAME_PHASE_DRAIN_PASSES {
+            let mut outgoing = Vec::new();
+            for actor_id in &runnable_actors {
+                if let Some(actor) = self.actors.get_mut(actor_id) {
+                    outgoing.extend(actor.process_inbox_to_local_events(tick, phase));
+                }
+            }
+            if outgoing.is_empty() {
+                for actor in self.actors.values_mut() {
+                    if runnable_actors.contains(&actor.id) {
+                        actor.commit_local_events(tick, phase);
+                        actor.advance_to_phase(tick, phase);
+                        results.insert(actor.id, PhaseRun::Completed);
+                    } else {
+                        results.insert(actor.id, PhaseRun::RejectedStale);
+                    }
+                }
+                return results;
+            }
+            for message in outgoing {
+                self.deliver(message);
+            }
+        }
+
+        self.actors = actors_before_run;
+        for actor in self.actors.values() {
+            if runnable_actors.contains(&actor.id) {
+                results.insert(actor.id, PhaseRun::RejectedMessageLimit);
+            } else {
+                results.insert(actor.id, PhaseRun::RejectedStale);
+            }
         }
         results
+    }
+
+    pub fn start_fake_neighbor_metric_query(
+        &mut self,
+        partition: &RegionPartition,
+        requester: RegionId,
+        tick: SimTick,
+        phase: SimPhase,
+        promise_id: PromiseId,
+    ) -> Vec<(RegionId, MessageDelivery)> {
+        let neighbors = partition.neighbors(requester);
+        if let Some(actor) = self.actors.get_mut(&requester) {
+            actor.register_promise_group(PromiseGroup::new(
+                promise_id,
+                tick,
+                phase,
+                neighbors.clone(),
+            ));
+        }
+
+        neighbors
+            .into_iter()
+            .map(|neighbor| {
+                let delivery = self.send(
+                    tick,
+                    phase,
+                    requester,
+                    neighbor,
+                    RegionMessageKind::FakeBorderMetricRequest { promise_id },
+                );
+                (neighbor, delivery)
+            })
+            .collect()
     }
 
     pub fn advance_actor_to_tick(&mut self, actor: RegionId, tick: SimTick) -> Option<PhaseRun> {
@@ -305,6 +437,7 @@ pub fn region_event_order(event: &RegionEvent) -> (SimTick, SimPhase, RegionId, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::region::RegionPartition;
     use crate::core::region_promise::{PromiseChain, PromiseGroup, PromiseId, PromiseResponse};
 
     #[test]
@@ -444,12 +577,12 @@ mod tests {
     fn actor_clock_rejects_backward_phase_and_tick_movement() {
         let mut actor = RegionActor::new(RegionId(1));
         assert_eq!(
-            actor.run_phase(SimTick(1), SimPhase(2)),
+            actor.run_phase(SimTick(1), SimPhase(2)).status,
             PhaseRun::Completed
         );
 
         assert_eq!(
-            actor.run_phase(SimTick(1), SimPhase(1)),
+            actor.run_phase(SimTick(1), SimPhase(1)).status,
             PhaseRun::RejectedStale
         );
         assert_eq!(actor.advance_to_tick(SimTick(1)), PhaseRun::RejectedStale);
@@ -465,6 +598,71 @@ mod tests {
 
         assert_eq!(delivery, MessageDelivery::WrongTarget);
         assert!(actor.inbox.is_empty());
+    }
+
+    #[test]
+    fn direct_actor_run_phase_returns_generated_fake_metric_responses() {
+        let mut actor = RegionActor::new(RegionId(2));
+        let request = fake_metric_request(1, 1, RegionId(0), RegionId(2), 12, 8);
+        assert_eq!(actor.deliver(request), MessageDelivery::Accepted);
+
+        let result = actor.run_phase(SimTick(1), SimPhase(1));
+
+        assert_eq!(result.status, PhaseRun::Completed);
+        assert!(actor.state.committed_events.is_empty());
+        assert_eq!(result.outgoing.len(), 1);
+        let response = &result.outgoing[0];
+        assert_eq!(response.tick, SimTick(1));
+        assert_eq!(response.phase, SimPhase(1));
+        assert_eq!(response.source, RegionId(2));
+        assert_eq!(response.target, RegionId(0));
+        assert_eq!(response.sequence, MessageSequence(12));
+        match response.kind {
+            RegionMessageKind::PromiseGroupResponse(response) => {
+                assert_eq!(response.promise_id, PromiseId(8));
+                assert_eq!(response.dependency, RegionId(2));
+                assert_eq!(response.value, 3);
+            }
+            other => panic!("expected fake metric response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_rejects_same_phase_message_cycles_instead_of_spinning() {
+        let mut runtime = ActorRuntime::new([RegionId(1), RegionId(2)]);
+        assert_eq!(
+            runtime.deliver(cyclic_same_phase_message(1, 1, RegionId(1), RegionId(2), 1)),
+            MessageDelivery::Accepted
+        );
+
+        let result = runtime.run_phase(SimTick(1), SimPhase(1));
+
+        assert_eq!(result[&RegionId(1)], PhaseRun::RejectedMessageLimit);
+        assert_eq!(result[&RegionId(2)], PhaseRun::RejectedMessageLimit);
+        assert_eq!(
+            runtime.actor(RegionId(1)).unwrap().current_cursor(),
+            (SimTick(0), SimPhase(0))
+        );
+        assert_eq!(
+            runtime.actor(RegionId(2)).unwrap().current_cursor(),
+            (SimTick(0), SimPhase(0))
+        );
+        assert!(
+            runtime
+                .actor(RegionId(1))
+                .unwrap()
+                .state
+                .committed_events
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .actor(RegionId(2))
+                .unwrap()
+                .state
+                .committed_events
+                .is_empty()
+        );
     }
 
     #[test]
@@ -665,6 +863,63 @@ mod tests {
         assert_eq!(actor.state.counter, 0);
     }
 
+    #[test]
+    fn fake_neighbor_query_requests_only_expected_regions() {
+        let partition = RegionPartition::new(4, 4, 2, 2);
+        let mut runtime = ActorRuntime::new([RegionId(0), RegionId(1), RegionId(2), RegionId(3)]);
+
+        let requested = runtime.start_fake_neighbor_metric_query(
+            &partition,
+            RegionId(0),
+            SimTick(1),
+            SimPhase(1),
+            PromiseId(8),
+        );
+
+        assert_eq!(
+            requested,
+            vec![
+                (RegionId(1), MessageDelivery::Accepted),
+                (RegionId(2), MessageDelivery::Accepted)
+            ]
+        );
+        assert_eq!(runtime.actor(RegionId(1)).unwrap().inbox.len(), 1);
+        assert_eq!(runtime.actor(RegionId(2)).unwrap().inbox.len(), 1);
+        assert!(runtime.actor(RegionId(3)).unwrap().inbox.is_empty());
+    }
+
+    #[test]
+    fn fake_neighbor_query_response_order_does_not_change_metric() {
+        let ordered = runtime_after_fake_query_requests([RegionId(1), RegionId(2)]);
+        let shuffled = runtime_after_fake_query_requests([RegionId(2), RegionId(1)]);
+
+        assert_eq!(ordered.actor(RegionId(0)).unwrap().state.counter, 5);
+        assert_eq!(shuffled.actor(RegionId(0)).unwrap().state.counter, 5);
+        assert_eq!(
+            only_promise_resolution(ordered.actor(RegionId(0)).unwrap()).ordered_dependencies,
+            only_promise_resolution(shuffled.actor(RegionId(0)).unwrap()).ordered_dependencies
+        );
+    }
+
+    #[test]
+    fn fake_neighbor_query_commits_only_at_expected_phase() {
+        let partition = RegionPartition::new(4, 4, 2, 2);
+        let mut runtime = ActorRuntime::new([RegionId(0), RegionId(1), RegionId(2), RegionId(3)]);
+
+        runtime.start_fake_neighbor_metric_query(
+            &partition,
+            RegionId(0),
+            SimTick(1),
+            SimPhase(2),
+            PromiseId(10),
+        );
+        runtime.run_phase(SimTick(1), SimPhase(1));
+        assert_eq!(runtime.actor(RegionId(0)).unwrap().state.counter, 0);
+
+        runtime.run_phase(SimTick(1), SimPhase(2));
+        assert_eq!(runtime.actor(RegionId(0)).unwrap().state.counter, 5);
+    }
+
     fn runtime_state_after_delivery(messages: Vec<RegionMessage>) -> ActorState {
         let mut runtime = ActorRuntime::new([RegionId(99)]);
         for mut message in messages {
@@ -675,6 +930,28 @@ mod tests {
         runtime.run_phase(SimTick(1), SimPhase(2));
         runtime.run_phase(SimTick(2), SimPhase(1));
         runtime.actor(RegionId(99)).unwrap().state.clone()
+    }
+
+    fn runtime_after_fake_query_requests<const N: usize>(
+        request_order: [RegionId; N],
+    ) -> ActorRuntime {
+        let mut runtime = ActorRuntime::new([RegionId(0), RegionId(1), RegionId(2)]);
+        runtime
+            .actors
+            .get_mut(&RegionId(0))
+            .unwrap()
+            .register_promise_group(PromiseGroup::new(
+                PromiseId(9),
+                SimTick(1),
+                SimPhase(1),
+                [RegionId(1), RegionId(2)],
+            ));
+        for (index, neighbor) in request_order.into_iter().enumerate() {
+            let message = fake_metric_request(1, 1, RegionId(0), neighbor, index as u64, 9);
+            assert_eq!(runtime.deliver(message), MessageDelivery::Accepted);
+        }
+        runtime.run_phase(SimTick(1), SimPhase(1));
+        runtime
     }
 
     fn message(tick: u64, phase: u8, source: u32, sequence: u64, delta: i32) -> RegionMessage {
@@ -751,8 +1028,52 @@ mod tests {
         }
     }
 
+    fn fake_metric_request(
+        tick: u64,
+        phase: u8,
+        source: RegionId,
+        target: RegionId,
+        sequence: u64,
+        promise: u64,
+    ) -> RegionMessage {
+        RegionMessage {
+            tick: SimTick(tick),
+            phase: SimPhase(phase),
+            source,
+            target,
+            sequence: MessageSequence(sequence),
+            kind: RegionMessageKind::FakeBorderMetricRequest {
+                promise_id: PromiseId(promise),
+            },
+        }
+    }
+
+    fn cyclic_same_phase_message(
+        tick: u64,
+        phase: u8,
+        source: RegionId,
+        target: RegionId,
+        sequence: u64,
+    ) -> RegionMessage {
+        RegionMessage {
+            tick: SimTick(tick),
+            phase: SimPhase(phase),
+            source,
+            target,
+            sequence: MessageSequence(sequence),
+            kind: RegionMessageKind::CyclicSamePhaseRequest,
+        }
+    }
+
     fn only_committed_event(actor: &RegionActor) -> &RegionEvent {
         assert_eq!(actor.state.committed_events.len(), 1);
         &actor.state.committed_events[0]
+    }
+
+    fn only_promise_resolution(actor: &RegionActor) -> &PromiseResolved {
+        match &only_committed_event(actor).kind {
+            RegionEventKind::PromiseResolved(resolved) => resolved,
+            other => panic!("expected promise resolution, got {other:?}"),
+        }
     }
 }
