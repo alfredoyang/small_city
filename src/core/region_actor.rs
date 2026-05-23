@@ -2,6 +2,16 @@
 //!
 //! This module is intentionally disconnected from the real city `World`. It proves the
 //! tick/phase/message ordering rules that a future multithreaded region model can reuse.
+//!
+//! The model has three layers:
+//! - `RegionMessage` is input work addressed to one actor for one `(SimTick, SimPhase)`.
+//! - `RegionEvent` is staged output created while processing messages.
+//! - `ActorState` is committed only when the phase closes.
+//!
+//! Keeping messages, events, and committed state separate is the main safety rule. Worker
+//! scheduling can decide when code runs, but only the coordinator decides which phase is open.
+//! Future messages stay queued, late messages are rejected, and state changes happen through
+//! sorted local events so delivery timing does not change simulation results.
 
 use std::collections::BTreeMap;
 
@@ -30,27 +40,35 @@ pub struct MessageSequence(pub u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionMessage {
+    /// Simulation tick this message belongs to. Actors only process matching ticks.
     pub tick: SimTick,
+    /// Ordered phase inside the tick. A completed phase rejects late messages.
     pub phase: SimPhase,
+    /// Region that produced the message. Used for deterministic ordering and replies.
     pub source: RegionId,
+    /// Region that owns this message. Direct delivery rejects wrong-target messages.
     pub target: RegionId,
+    /// Runtime-assigned sequence number used as a final stable sort key.
     pub sequence: MessageSequence,
     pub kind: RegionMessageKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionMessageKind {
+    /// Prototype/test message that stages a counter delta event.
     AddCounter(i32),
-    FakeBorderMetricRequest {
-        promise_id: PromiseId,
-    },
-    ReadOnlyBorderPollutionSample {
-        value: i32,
-    },
+    /// Prototype cross-region request used to prove deterministic promise resolution.
+    FakeBorderMetricRequest { promise_id: PromiseId },
+    /// Read-only derived metric sample used by the border-pollution actor prototype.
+    ReadOnlyBorderPollutionSample { value: i32 },
+    /// One already-computed local-effects cell result owned by the target region actor.
     LocalEffectsCellSample(LocalEffectsCell),
     #[cfg(test)]
+    /// Test-only message that intentionally creates a same-phase cycle.
     CyclicSamePhaseRequest,
+    /// Response for an unordered dependency group. Resolves after all dependencies reply.
     PromiseGroupResponse(PromiseResponse),
+    /// Response for an ordered dependency chain. Resolves in declared dependency order.
     PromiseChainResponse(PromiseResponse),
 }
 
@@ -65,9 +83,13 @@ pub struct RegionEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegionEventKind {
+    /// Commits a counter delta after phase-local message processing has finished.
     CommitCounterDelta(i32),
+    /// Commits one border pollution sample into the phase's read-only metric total.
     CommitBorderPollutionSample(i32),
+    /// Commits one local-effects cell into the actor's read-only cell list.
     CommitLocalEffectsCell(LocalEffectsCell),
+    /// Commits a resolved promise result after its dependency responses are complete.
     PromiseResolved(PromiseResolved),
 }
 
@@ -139,9 +161,11 @@ impl RegionActor {
     }
 
     pub fn deliver(&mut self, message: RegionMessage) -> MessageDelivery {
+        // Actor ownership is strict: a message can only enter the inbox of its target region.
         if message.target != self.id {
             return MessageDelivery::WrongTarget;
         }
+        // The cursor represents the last completed phase. Same-phase late delivery is stale.
         if (message.tick, message.phase) <= self.current_cursor() {
             return MessageDelivery::RejectedStale;
         }
@@ -176,9 +200,11 @@ impl RegionActor {
         phase: SimPhase,
     ) -> Vec<RegionMessage> {
         let mut outgoing = Vec::new();
+        // Process messages in a stable order so worker scheduling cannot affect outcomes.
         self.inbox.sort_by_key(region_message_order);
         let messages = std::mem::take(&mut self.inbox);
         for message in messages {
+            // Future messages stay queued until the coordinator opens their exact phase.
             if message.tick != tick || message.phase != phase {
                 self.inbox.push(message);
                 continue;
@@ -242,6 +268,7 @@ impl RegionActor {
     }
 
     pub(crate) fn commit_local_events(&mut self, tick: SimTick, phase: SimPhase) {
+        // Events are the mutation boundary. They are sorted before commit for determinism.
         self.local_events.sort_by_key(region_event_order);
         let events = std::mem::take(&mut self.local_events);
         let mut border_pollution = 0;
@@ -270,6 +297,7 @@ impl RegionActor {
                 }
             }
         }
+        // Read-only metrics are fresh phase outputs, so missing samples clear old values.
         self.state.read_only.border_pollution = border_pollution;
         local_effect_cells.sort_by_key(|cell| (cell.y, cell.x));
         self.state.read_only.local_effect_cells = local_effect_cells;
@@ -282,6 +310,8 @@ impl RegionActor {
                 outgoing: Vec::new(),
             };
         }
+        // A direct actor run returns generated outgoing messages to the caller. The runtime
+        // path drains those messages across actors before committing the shared phase.
         let outgoing = self.process_inbox_to_local_events(tick, phase);
         self.commit_local_events(tick, phase);
         self.advance_to_phase(tick, phase);
@@ -428,6 +458,8 @@ impl ActorRuntime {
         let actors_before_run = self.actors.clone();
 
         for _ in 0..MAX_SAME_PHASE_DRAIN_PASSES {
+            // Each pass runs the still-open phase for the original runnable actor set. Outgoing
+            // messages are delivered back into actor inboxes and drained in the next pass.
             let work = PhaseWork {
                 tick,
                 phase,
@@ -442,6 +474,8 @@ impl ActorRuntime {
             }
             let outgoing = phase_result.outgoing;
             if outgoing.is_empty() {
+                // No more same-phase messages exist, so the runtime can close the phase and
+                // commit every runnable actor at the same coordinator-controlled boundary.
                 for actor in self.actors.values_mut() {
                     if runnable_actors.contains(&actor.id) {
                         actor.commit_local_events(tick, phase);
@@ -458,6 +492,8 @@ impl ActorRuntime {
             }
         }
 
+        // A same-phase message cycle would otherwise spin forever. Roll back to the snapshot
+        // from before the phase and report a deterministic rejection.
         self.actors = actors_before_run;
         for actor in self.actors.values() {
             if runnable_actors.contains(&actor.id) {
