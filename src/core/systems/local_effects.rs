@@ -240,6 +240,22 @@ mod tests {
         assert_eq!(world.local_effects, expected);
     }
 
+    #[test]
+    fn actor_local_effects_apply_across_region_boundaries() {
+        let mut world = World::new(10, 5);
+        // Actor regions are 5 cells wide, so x=4 is in region A and x=5 starts region B.
+        attach_building(&mut world, 4, 2, BuildingKind::Park);
+
+        let expected = derive_local_effects_direct(&world);
+        run(&mut world);
+
+        assert_eq!(world.local_effects, expected);
+        assert_eq!(world.local_effects.get(5, 2).land_value, 8);
+        assert_eq!(world.local_effects.get(5, 2).desirability, 8);
+        assert_eq!(world.local_effects.get(6, 2).land_value, 6);
+        assert_eq!(world.local_effects.get(6, 2).desirability, 6);
+    }
+
     fn attach_building(world: &mut World, x: usize, y: usize, kind: BuildingKind) {
         let entity = world.spawn();
         world.attach_position(entity, Position { x, y });
