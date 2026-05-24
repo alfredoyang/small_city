@@ -1,8 +1,10 @@
 //! Local effects system deriving land value, pollution pressure, accessibility, and desirability.
 
-use crate::core::region::{GridPos, RegionPartition};
+use std::sync::Arc;
+
+use crate::core::region::{RegionBounds, RegionPartition};
 use crate::core::region_actor::{
-    ActorRuntime, LocalEffectsCell, PhaseRun, RegionMessageKind, SimPhase, SimTick,
+    ActorRuntime, LocalEffectsCell, PhaseRun, RegionId, RegionMessageKind, SimPhase, SimTick,
 };
 use crate::core::resources::{LocalEffects, LocalEffectsMap};
 use crate::core::world::World;
@@ -21,29 +23,39 @@ pub(crate) fn run(world: &mut World) {
 }
 
 fn derive_local_effects_with_region_actors(world: &World) -> LocalEffectsMap {
-    let width = world.grid.width();
-    let height = world.grid.height();
-    let partition = RegionPartition::new(width, height, ACTOR_REGION_WIDTH, ACTOR_REGION_HEIGHT);
-    let mut runtime = ActorRuntime::new_threaded(partition.region_ids());
-    let tick = SimTick(world.resources.turn as u64 + 1);
+    let snapshot = LocalEffectsSnapshot::from_world(world);
+    let region_order = region_partition_for_snapshot(&snapshot)
+        .region_ids()
+        .collect::<Vec<_>>();
+    derive_local_effects_with_region_order(
+        snapshot.clone(),
+        region_order,
+        SimTick(world.resources.turn as u64 + 1),
+    )
+    .unwrap_or_else(|| derive_local_effects_direct_from_snapshot(&snapshot))
+}
 
-    for y in 0..height {
-        for x in 0..width {
-            let Some(region) = partition.region_for_cell(GridPos { x, y }) else {
-                continue;
-            };
-            runtime.send(
-                tick,
-                LOCAL_EFFECTS_PHASE,
-                region,
-                region,
-                RegionMessageKind::LocalEffectsCellSample(LocalEffectsCell {
-                    x,
-                    y,
-                    effects: derive_cell_effects(world, x, y),
-                }),
-            );
-        }
+fn derive_local_effects_with_region_order(
+    snapshot: LocalEffectsSnapshot,
+    region_order: Vec<RegionId>,
+    tick: SimTick,
+) -> Option<LocalEffectsMap> {
+    let partition = region_partition_for_snapshot(&snapshot);
+    let mut runtime = ActorRuntime::new_threaded(partition.region_ids());
+    let snapshot = Arc::new(snapshot);
+
+    for region in region_order {
+        let bounds = partition.bounds(region)?;
+        runtime.send(
+            tick,
+            LOCAL_EFFECTS_PHASE,
+            region,
+            region,
+            RegionMessageKind::LocalEffectsRegionWork(LocalEffectsRegionWork {
+                bounds,
+                snapshot: Arc::clone(&snapshot),
+            }),
+        );
     }
 
     let results = runtime.run_phase(tick, LOCAL_EFFECTS_PHASE);
@@ -51,46 +63,58 @@ fn derive_local_effects_with_region_actors(world: &World) -> LocalEffectsMap {
         .values()
         .all(|result| *result == PhaseRun::Completed)
     {
-        return derive_local_effects_direct(world);
+        return None;
     }
 
-    let mut map = LocalEffectsMap::new(width, height);
+    let mut map = LocalEffectsMap::new(snapshot.width, snapshot.height);
     for region in partition.region_ids() {
         let Some(actor) = runtime.actor(region) else {
             continue;
         };
         for cell in &actor.state.read_only.local_effect_cells {
-            if cell.x < width && cell.y < height {
-                map.cells[cell.y * width + cell.x] = cell.effects;
+            if cell.x < snapshot.width && cell.y < snapshot.height {
+                map.cells[cell.y * snapshot.width + cell.x] = cell.effects;
             }
         }
     }
-    map
+    Some(map)
 }
 
-fn derive_local_effects_direct(world: &World) -> LocalEffectsMap {
-    let width = world.grid.width();
-    let height = world.grid.height();
-    let mut map = LocalEffectsMap::new(width, height);
-    for y in 0..height {
-        for x in 0..width {
-            map.cells[y * width + x] = derive_cell_effects(world, x, y);
+fn derive_local_effects_direct_from_snapshot(snapshot: &LocalEffectsSnapshot) -> LocalEffectsMap {
+    let mut map = LocalEffectsMap::new(snapshot.width, snapshot.height);
+    for y in 0..snapshot.height {
+        for x in 0..snapshot.width {
+            map.cells[y * snapshot.width + x] = derive_cell_effects(snapshot, x, y);
         }
     }
     map
 }
 
-fn derive_cell_effects(world: &World, x: usize, y: usize) -> LocalEffects {
+pub(crate) fn derive_region_local_effect_cells(
+    snapshot: &LocalEffectsSnapshot,
+    bounds: RegionBounds,
+) -> Vec<LocalEffectsCell> {
+    let mut cells = Vec::new();
+    for y in bounds.min_y..bounds.max_y.min(snapshot.height) {
+        for x in bounds.min_x..bounds.max_x.min(snapshot.width) {
+            cells.push(LocalEffectsCell {
+                x,
+                y,
+                effects: derive_cell_effects(snapshot, x, y),
+            });
+        }
+    }
+    cells
+}
+
+fn derive_cell_effects(snapshot: &LocalEffectsSnapshot, x: usize, y: usize) -> LocalEffects {
     let mut effects = LocalEffects {
-        accessibility: adjacent_road_count(world, x, y) as i32 * 3,
+        accessibility: adjacent_road_count(snapshot, x, y) as i32 * 3,
         ..LocalEffects::default()
     };
 
-    for (entity, building) in &world.buildings {
-        let Some(position) = world.positions.get(entity) else {
-            continue;
-        };
-        let distance = manhattan_distance(x, y, position.x, position.y);
+    for building in &snapshot.buildings {
+        let distance = manhattan_distance(x, y, building.x, building.y);
 
         match building.kind {
             BuildingKind::Park if distance <= PARK_RADIUS => {
@@ -109,11 +133,8 @@ fn derive_cell_effects(world: &World, x: usize, y: usize) -> LocalEffects {
         }
     }
 
-    for citizen in world.citizens.values() {
-        let Some(position) = world.positions.get(&citizen.home) else {
-            continue;
-        };
-        let distance = manhattan_distance(x, y, position.x, position.y);
+    for citizen in &snapshot.citizens {
+        let distance = manhattan_distance(x, y, citizen.home_x, citizen.home_y);
         if distance > CITIZEN_RADIUS {
             continue;
         }
@@ -134,6 +155,78 @@ fn derive_cell_effects(world: &World, x: usize, y: usize) -> LocalEffects {
     effects
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalEffectsRegionWork {
+    pub(crate) bounds: RegionBounds,
+    pub(crate) snapshot: Arc<LocalEffectsSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalEffectsSnapshot {
+    width: usize,
+    height: usize,
+    roads: Vec<bool>,
+    buildings: Vec<BuildingEffectSample>,
+    citizens: Vec<CitizenEffectSample>,
+}
+
+impl LocalEffectsSnapshot {
+    fn from_world(world: &World) -> Self {
+        let width = world.grid.width();
+        let height = world.grid.height();
+        let mut roads = vec![false; width * height];
+        let mut buildings = Vec::new();
+        let mut citizens = Vec::new();
+
+        for y in 0..height {
+            for x in 0..width {
+                roads[y * width + x] = world
+                    .grid
+                    .get(x, y)
+                    .and_then(|entity| world.buildings.get(&entity))
+                    .is_some_and(|building| building.kind == BuildingKind::Road);
+            }
+        }
+
+        for (entity, building) in &world.buildings {
+            let Some(position) = world.positions.get(entity) else {
+                continue;
+            };
+            buildings.push(BuildingEffectSample {
+                kind: building.kind,
+                x: position.x,
+                y: position.y,
+            });
+        }
+
+        for citizen in world.citizens.values() {
+            let Some(position) = world.positions.get(&citizen.home) else {
+                continue;
+            };
+            citizens.push(CitizenEffectSample {
+                home_x: position.x,
+                home_y: position.y,
+                happiness: citizen.happiness,
+            });
+        }
+
+        buildings.sort_by_key(|sample| (sample.y, sample.x, building_kind_order(sample.kind)));
+        citizens.sort_by_key(|sample| (sample.home_y, sample.home_x, sample.happiness));
+
+        Self {
+            width,
+            height,
+            roads,
+            buildings,
+            citizens,
+        }
+    }
+
+    fn has_road(&self, x: usize, y: usize) -> bool {
+        x < self.width && y < self.height && self.roads[y * self.width + x]
+    }
+}
+
 pub(crate) fn desirability_level(world: &World, x: usize, y: usize) -> DesirabilityLevel {
     match world.local_effects.get(x, y).desirability {
         0..=3 => DesirabilityLevel::Low,
@@ -149,18 +242,46 @@ pub(crate) enum DesirabilityLevel {
     High,
 }
 
-fn adjacent_road_count(world: &World, x: usize, y: usize) -> usize {
+fn adjacent_road_count(snapshot: &LocalEffectsSnapshot, x: usize, y: usize) -> usize {
     adjacent_coordinates(x, y)
         .into_iter()
         .flatten()
-        .filter(|(x, y)| {
-            world
-                .grid
-                .get(*x, *y)
-                .and_then(|entity| world.buildings.get(&entity))
-                .is_some_and(|building| building.kind == BuildingKind::Road)
-        })
+        .filter(|(x, y)| snapshot.has_road(*x, *y))
         .count()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BuildingEffectSample {
+    kind: BuildingKind,
+    x: usize,
+    y: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CitizenEffectSample {
+    home_x: usize,
+    home_y: usize,
+    happiness: i32,
+}
+
+fn region_partition_for_snapshot(snapshot: &LocalEffectsSnapshot) -> RegionPartition {
+    RegionPartition::new(
+        snapshot.width,
+        snapshot.height,
+        ACTOR_REGION_WIDTH,
+        ACTOR_REGION_HEIGHT,
+    )
+}
+
+fn building_kind_order(kind: BuildingKind) -> u8 {
+    match kind {
+        BuildingKind::Road => 0,
+        BuildingKind::Residential => 1,
+        BuildingKind::Commercial => 2,
+        BuildingKind::Industrial => 3,
+        BuildingKind::PowerPlant => 4,
+        BuildingKind::Park => 5,
+    }
 }
 
 fn adjacent_coordinates(x: usize, y: usize) -> [Option<(usize, usize)>; 4] {
@@ -178,8 +299,13 @@ fn manhattan_distance(ax: usize, ay: usize, bx: usize, by: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesirabilityLevel, derive_local_effects_direct, desirability_level, run};
-    use crate::core::components::{Building, BuildingData, Position};
+    use super::{
+        DesirabilityLevel, LocalEffectsSnapshot, derive_local_effects_direct_from_snapshot,
+        derive_local_effects_with_region_order, desirability_level, region_partition_for_snapshot,
+        run,
+    };
+    use crate::core::components::{Building, BuildingData, Citizen, Position};
+    use crate::core::region_actor::SimTick;
     use crate::core::world::World;
     use crate::interface::input::BuildingKind;
 
@@ -234,7 +360,8 @@ mod tests {
         attach_building(&mut world, 5, 3, BuildingKind::Commercial);
         attach_building(&mut world, 2, 2, BuildingKind::Road);
 
-        let expected = derive_local_effects_direct(&world);
+        let snapshot = LocalEffectsSnapshot::from_world(&world);
+        let expected = derive_local_effects_direct_from_snapshot(&snapshot);
         run(&mut world);
 
         assert_eq!(world.local_effects, expected);
@@ -245,8 +372,11 @@ mod tests {
         let mut world = World::new(10, 5);
         // Actor regions are 5 cells wide, so x=4 is in region A and x=5 starts region B.
         attach_building(&mut world, 4, 2, BuildingKind::Park);
+        let home = attach_building(&mut world, 4, 4, BuildingKind::Residential);
+        attach_citizen(&mut world, home, 70);
 
-        let expected = derive_local_effects_direct(&world);
+        let snapshot = LocalEffectsSnapshot::from_world(&world);
+        let expected = derive_local_effects_direct_from_snapshot(&snapshot);
         run(&mut world);
 
         assert_eq!(world.local_effects, expected);
@@ -254,9 +384,58 @@ mod tests {
         assert_eq!(world.local_effects.get(5, 2).desirability, 8);
         assert_eq!(world.local_effects.get(6, 2).land_value, 6);
         assert_eq!(world.local_effects.get(6, 2).desirability, 6);
+        assert_eq!(world.local_effects.get(5, 4).land_value, 5);
+        assert_eq!(world.local_effects.get(5, 4).desirability, 5);
     }
 
-    fn attach_building(world: &mut World, x: usize, y: usize, kind: BuildingKind) {
+    #[test]
+    fn actor_local_effects_are_stable_with_different_region_order() {
+        let mut world = World::new(11, 6);
+        attach_building(&mut world, 4, 2, BuildingKind::Park);
+        attach_building(&mut world, 5, 2, BuildingKind::Industrial);
+        attach_building(&mut world, 7, 3, BuildingKind::Commercial);
+        let home = attach_building(&mut world, 4, 4, BuildingKind::Residential);
+        attach_citizen(&mut world, home, 30);
+
+        let snapshot = LocalEffectsSnapshot::from_world(&world);
+        let forward_order = region_partition_for_snapshot(&snapshot)
+            .region_ids()
+            .collect::<Vec<_>>();
+        let mut reverse_order = forward_order.clone();
+        reverse_order.reverse();
+
+        let forward =
+            derive_local_effects_with_region_order(snapshot.clone(), forward_order, SimTick(1))
+                .expect("forward actor local effects");
+        let reverse = derive_local_effects_with_region_order(snapshot, reverse_order, SimTick(1))
+            .expect("reverse actor local effects");
+
+        assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn actor_local_effects_handle_empty_and_small_maps() {
+        let mut empty = World::new(0, 0);
+        run(&mut empty);
+        assert_eq!(empty.local_effects.width, 0);
+        assert_eq!(empty.local_effects.height, 0);
+        assert!(empty.local_effects.cells.is_empty());
+
+        let mut single_cell = World::new(1, 1);
+        attach_building(&mut single_cell, 0, 0, BuildingKind::Park);
+        let snapshot = LocalEffectsSnapshot::from_world(&single_cell);
+        let expected = derive_local_effects_direct_from_snapshot(&snapshot);
+        run(&mut single_cell);
+
+        assert_eq!(single_cell.local_effects, expected);
+    }
+
+    fn attach_building(
+        world: &mut World,
+        x: usize,
+        y: usize,
+        kind: BuildingKind,
+    ) -> crate::core::entity::Entity {
         let entity = world.spawn();
         world.attach_position(entity, Position { x, y });
         world.attach_building(
@@ -265,6 +444,23 @@ mod tests {
                 kind,
                 level: 1,
                 data: BuildingData::None,
+            },
+        );
+        entity
+    }
+
+    fn attach_citizen(world: &mut World, home: crate::core::entity::Entity, happiness: i32) {
+        let citizen = world.spawn();
+        world.attach_citizen(
+            citizen,
+            Citizen {
+                age: 0,
+                home,
+                workplace: None,
+                happiness,
+                happiness_decay: 0,
+                money: 0,
+                rent_stress: 0,
             },
         );
     }

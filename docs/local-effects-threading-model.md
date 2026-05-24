@@ -1,297 +1,298 @@
-# Local Effects On The Region Actor Threading Model
+# Local Effects Threading Model
 
-## Purpose
+## The Big Idea
 
-This document explains how the current local-effects system uses the new region
-actor runtime, how actor messages and events move through worker execution, and
-how `Game::tick()` and UI-safe views retrieve the final data.
+Local effects now use worker-side region computation.
 
-The current implementation is intentionally conservative:
-
-- The ECS `World` remains owned by `Game`.
-- UI still reads only `GameView` / `InspectView`.
-- Region actors do not expose ECS internals.
-- Threading happens behind `ActorRuntime`.
-- Local-effects output is deterministic and has a direct fallback path.
-
-## Terms
-
-`RegionPartition`
-: Splits the map into stable rectangular regions. Current local effects use
-`5x5` actor regions.
-
-`RegionActor`
-: Owns an inbox, staged local events, and committed read-only derived state for
-one region.
-
-`RegionMessage`
-: Input work addressed to one region actor for one `(SimTick, SimPhase)`.
-Messages can be delivered by the runtime and processed by worker threads.
-
-`RegionEvent`
-: A local staged commit record created while an actor processes messages. Events
-are not sent as standalone cross-thread messages. In threaded execution they
-stay inside the owned `RegionActor` clone that is returned to the runtime, then
-the runtime commits them into actor state at the phase boundary.
-
-`LocalEffectsCellSample`
-: A message containing one cell coordinate and its already-computed
-`LocalEffects` result.
-
-## Current Local-Effects Responsibility Split
-
-The current system still computes the actual formula in
-`src/core/systems/local_effects.rs`.
-
-The actor runtime is used to prove region ownership, worker execution, stable
-message ordering, and deterministic collection. It does not yet move ECS reads
-inside actors.
+`Game` still owns the ECS `World`. Worker threads do **not** receive `World`.
+Instead, the coordinator builds a read-only `LocalEffectsSnapshot`, gives each
+region actor one region job, and workers calculate the cells inside their own
+region.
 
 ```text
-ECS World
-  buildings, positions, citizens, grid
-      |
-      | derive_cell_effects(world, x, y)
-      v
-LocalEffectsCellSample messages
-      |
-      v
-Region actors
-  stage CommitLocalEffectsCell events
-      |
-      v
-Actor read_only.local_effect_cells
-      |
-      v
-World.local_effects
+Coordinator thread:
+  World -> LocalEffectsSnapshot -> LocalEffectsRegionWork messages
+
+Worker threads:
+  LocalEffectsRegionWork -> derive local effects for region cells
+
+Coordinator thread:
+  committed actor cells -> LocalEffectsMap -> world.local_effects
 ```
 
-That means this mission converted the collection/execution shape first. A later
-mission can move more real region-owned data into actors if measurements show the
-message overhead is worth it.
+This means the expensive per-cell calculation is no longer done by the
+coordinator in the normal actor path.
 
-## Local-Effects Data Flow
+## Which Functions Run On Which Thread
+
+| Function / Step | Runs On | What It Does |
+|---|---|---|
+| `Game::tick` | Coordinator | Runs the fixed tick order. |
+| `local_effects::run` | Coordinator | Entry point for refreshing `world.local_effects`. |
+| `LocalEffectsSnapshot::from_world` | Coordinator | Copies only the needed read-only data out of `World`. |
+| `RegionPartition::new` | Coordinator | Splits the map into `5x5` regions. |
+| `ActorRuntime::send` | Coordinator | Sends one `LocalEffectsRegionWork` message to each region actor. |
+| `ActorRuntime::run_phase` | Coordinator | Starts the actor phase and later commits results. |
+| `ThreadedActorExecutor::run_phase` | Coordinator starts it | Spawns worker threads for actor phase work. |
+| `run_actor_phase` | Worker | Runs one actor clone for the opened tick/phase. |
+| `RegionActor::process_inbox_to_local_events` | Worker | Processes region messages. |
+| `derive_region_local_effect_cells` | Worker | Loops over cells in one region. |
+| `derive_cell_effects` | Worker | Calculates one cell's local effects from the snapshot. |
+| `RegionActor::commit_local_events` | Coordinator | Commits staged actor events after workers finish. |
+| Assemble `LocalEffectsMap` | Coordinator | Copies committed actor cells into `world.local_effects`. |
+
+## Function Flow Diagram
 
 ```mermaid
-flowchart TD
-    A[Game::tick or refresh_derived_state] --> B[local_effects::run World]
-    B --> C[Create RegionPartition 5x5]
-    C --> D[Create ActorRuntime::new_threaded]
-    D --> E[For each map cell]
-    E --> F[derive_cell_effects World x y]
-    F --> G[Send LocalEffectsCellSample to owning RegionActor]
-    G --> H[ActorRuntime::run_phase tick phase 1]
-    H --> I[ThreadedActorExecutor spawns worker per actor]
-    I --> J[Worker processes actor inbox into local events]
-    J --> K[Runtime collects actors and outgoing messages]
-    K --> L{Any outgoing same-phase messages?}
-    L -- no --> M[Runtime commits local events]
-    L -- yes --> N[Runtime delivers outgoing messages and drains another pass]
-    N --> I
-    M --> O[Read actor.state.read_only.local_effect_cells]
-    O --> P[Assemble LocalEffectsMap]
-    P --> Q[world.local_effects = map]
+flowchart TB
+    subgraph C["Coordinator Thread"]
+        A["Game::tick()"]
+        B["local_effects::run(&mut World)"]
+        C1["LocalEffectsSnapshot::from_world(&World)"]
+        D["RegionPartition::new(..., 5, 5)"]
+        E["ActorRuntime::send(LocalEffectsRegionWork)"]
+        F["ActorRuntime::run_phase(tick, phase)"]
+        G["ThreadedActorExecutor::run_phase(...)"]
+        H["commit_local_events(tick, phase)"]
+        I["assemble LocalEffectsMap"]
+        J["world.local_effects = map"]
+    end
+
+    subgraph W["Worker Threads"]
+        K["run_actor_phase(actor, tick, phase)"]
+        L["RegionActor::process_inbox_to_local_events"]
+        M["derive_region_local_effect_cells"]
+        N["derive_cell_effects(snapshot, x, y)"]
+        O["stage CommitLocalEffectsCell events"]
+    end
+
+    A --> B --> C1 --> D --> E --> F --> G
+    G --> K
+    K --> L --> M --> N --> O
+    O --> F
+    F --> H --> I --> J
 ```
 
-## Message And Event Flow Across Threads
+The important line is:
 
-The runtime sends messages before workers start. Each worker receives an owned
-clone of one `RegionActor` for the current phase. The worker processes the actor
-inbox and returns the actor plus any outgoing messages.
-
-```mermaid
-sequenceDiagram
-    participant Game
-    participant Runtime as ActorRuntime
-    participant W1 as Worker thread: Region 0
-    participant W2 as Worker thread: Region 1
-    participant Actor as RegionActor
-
-    Game->>Runtime: send LocalEffectsCellSample messages
-    Game->>Runtime: run_phase(tick, phase)
-    Runtime->>W1: cloned RegionActor 0 with inbox
-    Runtime->>W2: cloned RegionActor 1 with inbox
-    W1->>Actor: process_inbox_to_local_events
-    W2->>Actor: process_inbox_to_local_events
-    Actor-->>W1: staged CommitLocalEffectsCell events
-    Actor-->>W2: staged CommitLocalEffectsCell events
-    W1-->>Runtime: actor + outgoing messages
-    W2-->>Runtime: actor + outgoing messages
-    Runtime->>Runtime: sort actors and outgoing messages
-    Runtime->>Runtime: commit_local_events at phase boundary
-    Runtime-->>Game: completed phase statuses
+```text
+derive_cell_effects(snapshot, x, y)
 ```
 
-Important detail: `RegionEvent` is not the cross-thread communication format.
-The cross-thread input/output boundary is:
+That runs inside worker-side actor processing.
+
+## What Data Crosses The Thread Boundary
+
+Workers do not borrow ECS storage. The coordinator sends actor clones that
+contain messages.
+
+The work sent into workers is:
 
 ```text
 PhaseWork {
   tick,
   phase,
-  actors: Vec<RegionActor>
+  actors: Vec<RegionActor>,
 }
+```
 
+For local effects, each `RegionActor` inbox contains one message:
+
+```text
+RegionMessageKind::LocalEffectsRegionWork(LocalEffectsRegionWork {
+  bounds,
+  snapshot: Arc<LocalEffectsSnapshot>,
+})
+```
+
+The snapshot contains only copied, read-only data:
+
+```text
+LocalEffectsSnapshot {
+  width,
+  height,
+  roads: Vec<bool>,
+  buildings: Vec<BuildingEffectSample>,
+  citizens: Vec<CitizenEffectSample>,
+}
+```
+
+The work returned from workers is:
+
+```text
 PhaseResult {
   actors: Vec<RegionActor>,
   outgoing: Vec<RegionMessage>,
-  statuses
+  statuses,
 }
 ```
 
-Inside each returned actor, local events are staged. The runtime commits them
-only after the same-phase message drain is complete.
-
-## Why There Are Messages And Events
-
-Messages and events solve different problems.
-
-Messages:
-
-- address work to a target region
-- carry `tick` and `phase`
-- can cross actor/thread boundaries
-- are sorted by tick, phase, source, and sequence
-- may generate outgoing messages
-
-Events:
-
-- are local to one actor
-- stage state changes before commit
-- are sorted before commit
-- are the only path from processed messages into actor state
-- keep phase commits deterministic
-
-For local effects, one cell becomes:
-
-```text
-RegionMessageKind::LocalEffectsCellSample(cell)
-  -> RegionEventKind::CommitLocalEffectsCell(cell)
-  -> actor.state.read_only.local_effect_cells
-  -> world.local_effects
-```
-
-## Tick Integration
-
-`Game::tick()` currently calls `local_effects::run()` twice.
-
-```mermaid
-flowchart TD
-    A[Game::tick] --> B[advance time by 1 hour]
-    B --> C[power::run]
-    C --> D[stats::run]
-    D --> E[first local_effects::run]
-    E --> F{new day?}
-    F -- yes --> G[citizen daily happiness decay]
-    F -- no --> H{new week?}
-    G --> H
-    H -- yes --> I[population::run]
-    H -- no --> J[citizens::update_happiness]
-    I --> J
-    J --> K[second local_effects::run]
-    K --> L[refresh_actor_runtime border-pollution shadow]
-    L --> M{new day? economy::run}
-    M --> N{new week? business_growth::run}
-    N --> O[stats, pollution, happiness]
-    O --> P[increment turn]
-    P --> Q[return TickSummary events]
-```
-
-The two local-effects passes have different purposes:
-
-1. First pass: refreshes desirability/accessibility before weekly population
-growth reads desirability. It runs after power and stats in the tick order, but
-the local-effects formula itself reads grid/building/citizen data rather than
-power or stats output.
-2. Second pass: refreshes local effects after citizen happiness updates, because
-nearby happy/unhappy citizens affect land value and pollution pressure.
-
-After the second pass, `world.local_effects` is the final local-effects map for
-the rest of the tick.
-
-## UI Data Retrieval
-
-The UI never reads actor state or ECS internals.
+The computed local-effect cells are not returned as a separate global buffer.
+They are staged inside each returned actor as `CommitLocalEffectsCell` events,
+then committed by the coordinator.
 
 ```mermaid
 flowchart LR
-    A[world.local_effects] --> B[interface adapter]
-    B --> C[GameView map cells and overlays]
-    B --> D[InspectView local explanations]
-    C --> E[ASCII UI / TUI]
+    A["World"] --> B["LocalEffectsSnapshot"]
+    B --> C["Arc<LocalEffectsSnapshot>"]
+    C --> D["LocalEffectsRegionWork"]
+    D --> E["RegionActor inbox"]
+    E --> F["Worker thread"]
+    F --> G["RegionActor with staged events"]
+    G --> H["Coordinator commit"]
+    H --> I["actor.state.read_only.local_effect_cells"]
+    I --> J["LocalEffectsMap"]
+```
+
+## How Worker Threads Communicate
+
+Worker threads do not directly call each other.
+
+All communication goes through `ActorRuntime` on the coordinator thread.
+
+```mermaid
+sequenceDiagram
+    participant R as ActorRuntime Coordinator
+    participant W0 as Worker Region 0
+    participant W1 as Worker Region 1
+
+    R->>W0: RegionActor 0 clone
+    R->>W1: RegionActor 1 clone
+    W0-->>R: actor 0 + outgoing messages
+    W1-->>R: actor 1 + outgoing messages
+    R->>R: sort outgoing messages
+    R->>R: deliver messages to target actor inboxes
+    R->>W0: next drain pass if needed
+    R->>W1: next drain pass if needed
+```
+
+For local effects today, workers normally produce no outgoing messages. They
+only compute cells for their own region.
+
+Future systems can use outgoing `RegionMessage` values for cross-region
+requests. Even then, workers still do not directly share memory or call each
+other. The runtime collects, sorts, and delivers messages deterministically.
+
+## Why Cross-Region Effects Still Work
+
+Local effects can cross region borders because every worker receives the same
+global read-only snapshot.
+
+Example:
+
+```text
+Region 0 owns x = 0..4
+Region 1 owns x = 5..9
+
+Park is at x = 4
+Cell to calculate is x = 5
+```
+
+The Region 1 worker can see the park in the snapshot, so it can correctly apply
+the park effect to its own x=5 cell. It does not need to ask Region 0.
+
+```mermaid
+flowchart LR
+    A["Snapshot contains park at x=4"] --> B["Region 1 worker"]
+    B --> C["Calculates cell x=5"]
+    C --> D["Applies park bonus"]
+```
+
+## Local Effects Formula
+
+Both the actor path and fallback path use:
+
+```text
+derive_cell_effects(&LocalEffectsSnapshot, x, y)
+```
+
+The formula is unchanged:
+
+- adjacent roads add accessibility
+- parks increase nearby land value
+- industrial buildings add pollution pressure and reduce land value
+- commercial buildings add a small land value boost
+- happy nearby citizens increase land value
+- unhappy nearby citizens add pollution pressure and reduce land value
+- land value, pollution pressure, accessibility, and desirability are clamped
+
+The direct fallback uses the same snapshot and the same formula, so tests can
+compare actor output against direct output without duplicating the rules.
+
+## Tick Integration
+
+`Game::tick()` still calls local effects twice.
+
+```text
+Game::tick
+  power::run
+  stats::run
+  local_effects::run        first pass
+  daily/weekly systems
+  citizens::update_happiness
+  local_effects::run        second pass
+  refresh_actor_runtime     border-pollution shadow only
+  economy/business systems
+  stats/pollution/happiness
+  turn += 1
+```
+
+The first pass refreshes desirability before weekly population growth can read
+it. The second pass refreshes local effects after citizen happiness changes.
+
+After the second pass, `world.local_effects` is the final map used by views,
+inspect output, overlays, economy rent calculations, and later systems.
+
+## UI Boundary
+
+The UI does not know actors exist.
+
+```mermaid
+flowchart LR
+    A["world.local_effects"] --> B["interface adapter"]
+    B --> C["GameView"]
+    B --> D["InspectView"]
+    C --> E["ASCII UI / TUI"]
     D --> E
 ```
 
-The retrieval path is:
+The UI still uses only:
 
 ```text
 Game::view()
-  -> view_world(&world)
-  -> GameView
-  -> UI render
-
 Game::view_with_overlay(...)
-  -> view_world_with_overlay(&world, overlay)
-  -> GameView with overlay cells
-  -> UI render
-
 Game::inspect(x, y)
-  -> inspect_world(&world, x, y)
-  -> InspectView
-  -> UI render
 ```
 
-The view adapter reads `world.local_effects` after the core systems have already
-updated it. The UI sees only copied view-model data such as land value,
-pollution pressure, accessibility, desirability, overlay symbols, and inspect
-notes.
+It never reads `World`, `ActorRuntime`, `RegionActor`, worker queues, or actor
+events.
 
-## Failure And Fallback Behavior
+## Fallback
 
-If the actor phase returns a non-completed status for any region, local effects
-fall back to the old direct calculation path:
+If actor execution does not complete for every region, local effects fall back
+to direct snapshot calculation:
 
 ```text
 derive_local_effects_with_region_actors
-  -> runtime.run_phase
-  -> if any result != Completed
-  -> derive_local_effects_direct
+  -> build LocalEffectsSnapshot
+  -> run region actors
+  -> if any phase result is not Completed
+  -> derive_local_effects_direct_from_snapshot
 ```
 
-This keeps gameplay functional if the actor runtime rejects a phase or hits the
-same-phase message limit. Worker panics are not swallowed by this fallback; they
-still surface as failures from the threaded executor.
+This keeps gameplay functional while preserving the exact same formula.
 
 ## Determinism Rules
 
-The actor model protects determinism with these rules:
+The threaded path is deterministic because:
 
-- Every message belongs to exactly one `(SimTick, SimPhase)`.
-- Actors reject messages for already-completed phases.
-- Future messages remain queued until their phase opens.
-- Wrong-target messages are rejected.
-- Inboxes are sorted before processing.
-- Local events are sorted before commit.
-- Worker results are sorted by actor ID.
-- Outgoing messages are sorted before delivery.
-- Same-phase generated-message draining has a hard pass limit.
-- State commits happen only at the coordinator-controlled phase boundary.
+- snapshot data is immutable during actor execution
+- every work message belongs to one `(SimTick, SimPhase)`
+- inboxes are sorted before processing
+- local events are sorted before commit
+- region-local cell results are sorted by `(y, x)`
+- returned actors are sorted by actor id
+- commits happen only at the coordinator-controlled phase boundary
 
-These rules are why the threaded executor should produce the same results as the
-single-threaded executor even when worker scheduling changes.
-
-## Current Limitations
-
-The current local-effects actor conversion is not a full data-oriented actor
-system yet.
-
-- The ECS `World` still owns all building, citizen, and grid data.
-- `derive_cell_effects` still reads `World` on the coordinator side.
-- Actors currently collect and commit per-cell derived results.
-- Cross-region promise support exists in the prototype, but local effects do not
-need promises yet.
-- UI reads final `World`-owned view data, not actor state.
-
-This is deliberate. It gives us deterministic threading infrastructure and
-performance measurements before moving more expensive real systems into actor
-owned storage.
+Worker scheduling can change when threads finish, but it should not change the
+final `LocalEffectsMap`.

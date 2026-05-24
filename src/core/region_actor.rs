@@ -23,6 +23,9 @@ use crate::core::region_promise::{
     PromiseChain, PromiseGroup, PromiseId, PromiseResolved, PromiseResponse,
 };
 use crate::core::resources::{LocalEffects, LocalEffectsMap};
+use crate::core::systems::local_effects::{
+    LocalEffectsRegionWork, derive_region_local_effect_cells,
+};
 
 const MAX_SAME_PHASE_DRAIN_PASSES: usize = 16;
 
@@ -53,7 +56,7 @@ pub struct RegionMessage {
     pub kind: RegionMessageKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegionMessageKind {
     /// Prototype/test message that stages a counter delta event.
     AddCounter(i32),
@@ -63,6 +66,8 @@ pub enum RegionMessageKind {
     ReadOnlyBorderPollutionSample { value: i32 },
     /// One already-computed local-effects cell result owned by the target region actor.
     LocalEffectsCellSample(LocalEffectsCell),
+    /// One region-level local-effects job computed on the actor worker.
+    LocalEffectsRegionWork(LocalEffectsRegionWork),
     #[cfg(test)]
     /// Test-only message that intentionally creates a same-phase cycle.
     CyclicSamePhaseRequest,
@@ -239,6 +244,17 @@ impl RegionActor {
                         sequence: message.sequence,
                         kind: RegionEventKind::CommitLocalEffectsCell(cell),
                     });
+                }
+                RegionMessageKind::LocalEffectsRegionWork(work) => {
+                    for cell in derive_region_local_effect_cells(&work.snapshot, work.bounds) {
+                        self.local_events.push(RegionEvent {
+                            tick: message.tick,
+                            phase: message.phase,
+                            source: message.source,
+                            sequence: message.sequence,
+                            kind: RegionEventKind::CommitLocalEffectsCell(cell),
+                        });
+                    }
                 }
                 #[cfg(test)]
                 RegionMessageKind::CyclicSamePhaseRequest => {
@@ -821,7 +837,7 @@ mod tests {
         assert_eq!(response.source, RegionId(2));
         assert_eq!(response.target, RegionId(0));
         assert_eq!(response.sequence, MessageSequence(12));
-        match response.kind {
+        match &response.kind {
             RegionMessageKind::PromiseGroupResponse(response) => {
                 assert_eq!(response.promise_id, PromiseId(8));
                 assert_eq!(response.dependency, RegionId(2));

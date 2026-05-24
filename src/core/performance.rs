@@ -37,13 +37,12 @@ pub struct ActorPhaseMeasurement {
 
 /// Estimates local-effects actor traffic from public map dimensions.
 pub fn estimate_local_effects_actor_load(width: usize, height: usize) -> LocalEffectsActorEstimate {
+    let actor_count = region_count(width, height);
     LocalEffectsActorEstimate {
-        actor_count: region_count(width, height),
-        message_count_per_tick: width
-            .saturating_mul(height)
-            .saturating_mul(LOCAL_EFFECTS_PASSES_PER_TICK),
+        actor_count,
+        message_count_per_tick: actor_count.saturating_mul(LOCAL_EFFECTS_PASSES_PER_TICK),
         promise_count_per_tick: 0,
-        max_actor_queue_len_per_phase: max_region_cell_count(width, height),
+        max_actor_queue_len_per_phase: usize::from(actor_count > 0),
     }
 }
 
@@ -96,39 +95,18 @@ fn region_count(width: usize, height: usize) -> usize {
         * height.div_ceil(LOCAL_EFFECTS_ACTOR_REGION_HEIGHT)
 }
 
-fn max_region_cell_count(width: usize, height: usize) -> usize {
-    if width == 0 || height == 0 {
-        return 0;
-    }
-    let mut max_cells = 0;
-    for region_y in (0..height).step_by(LOCAL_EFFECTS_ACTOR_REGION_HEIGHT) {
-        for region_x in (0..width).step_by(LOCAL_EFFECTS_ACTOR_REGION_WIDTH) {
-            let region_width = (width - region_x).min(LOCAL_EFFECTS_ACTOR_REGION_WIDTH);
-            let region_height = (height - region_y).min(LOCAL_EFFECTS_ACTOR_REGION_HEIGHT);
-            max_cells = max_cells.max(region_width * region_height);
-        }
-    }
-    max_cells
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        LOCAL_EFFECTS_ACTOR_REGION_HEIGHT, LOCAL_EFFECTS_ACTOR_REGION_WIDTH,
-        estimate_local_effects_actor_load, measure_synthetic_actor_phase,
-    };
+    use super::{estimate_local_effects_actor_load, measure_synthetic_actor_phase};
 
     #[test]
-    fn local_effects_actor_load_estimate_counts_two_cell_passes_per_tick() {
+    fn local_effects_actor_load_estimate_counts_two_region_work_passes_per_tick() {
         let estimate = estimate_local_effects_actor_load(20, 15);
 
         assert_eq!(estimate.actor_count, 12);
-        assert_eq!(estimate.message_count_per_tick, 20 * 15 * 2);
+        assert_eq!(estimate.message_count_per_tick, 12 * 2);
         assert_eq!(estimate.promise_count_per_tick, 0);
-        assert_eq!(
-            estimate.max_actor_queue_len_per_phase,
-            LOCAL_EFFECTS_ACTOR_REGION_WIDTH * LOCAL_EFFECTS_ACTOR_REGION_HEIGHT
-        );
+        assert_eq!(estimate.max_actor_queue_len_per_phase, 1);
     }
 
     #[test]
@@ -136,11 +114,8 @@ mod tests {
         let estimate = estimate_local_effects_actor_load(6, 6);
 
         assert_eq!(estimate.actor_count, 4);
-        assert_eq!(estimate.message_count_per_tick, 6 * 6 * 2);
-        assert_eq!(
-            estimate.max_actor_queue_len_per_phase,
-            LOCAL_EFFECTS_ACTOR_REGION_WIDTH * LOCAL_EFFECTS_ACTOR_REGION_HEIGHT
-        );
+        assert_eq!(estimate.message_count_per_tick, 4 * 2);
+        assert_eq!(estimate.max_actor_queue_len_per_phase, 1);
     }
 
     #[test]
