@@ -1,0 +1,199 @@
+//! Regional resource identities and cache rules for future cross-region simulation.
+//!
+//! This module is intentionally data-only for the first regional threading step.
+//! It does not own or expose an ECS `World`; it only defines the compact resource
+//! summaries that regions can later exchange through runtimes and workers.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Stable identity for one independently owned simulation region.
+///
+/// Future runtimes and workers will use this as a routing key. It is not an ECS
+/// entity ID and should never identify another region's local `World` storage.
+pub struct RegionId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Compact categories of cross-region access that can be imported as cache.
+///
+/// These variants describe what a region offers through its borders without
+/// exposing the building, citizen, or road entities that produced the offer.
+pub enum ResourceKind {
+    Jobs,
+    ParkAccess,
+    ServiceAccess,
+    ShoppingAccess,
+    RoadExitAccess,
+    TrafficPressure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Stable identity for one exported regional resource generation.
+///
+/// The origin region and kind identify the source of the offer, while
+/// `generation` changes when that source's exported value changes. Forwarding
+/// regions must preserve this ID so the same remote supply cannot echo back as
+/// new supply under a different origin.
+pub struct ResourceId {
+    pub origin_region: RegionId,
+    pub resource_kind: ResourceKind,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Rebuildable imported resource cache entry received from a neighboring region.
+///
+/// This is not authoritative remote state. It is a compact summary that a region
+/// may use locally and forward to other neighbors until capacity or hop limits
+/// are exhausted.
+pub struct ImportedResource {
+    /// Original exported resource identity. It stays unchanged while forwarded.
+    pub id: ResourceId,
+    /// Capacity still available after earlier regions have used part of it.
+    pub remaining_capacity: u32,
+    /// Number of border-to-border forwards already taken from the origin.
+    pub hop_count: u32,
+    /// Maximum allowed forwards before propagation stops.
+    pub max_hops: u32,
+    /// Integer distance/cost accumulated along the import path.
+    pub travel_cost: u32,
+    /// Neighbor that sent this resource to the receiving region.
+    pub source_neighbor: RegionId,
+}
+
+impl ImportedResource {
+    /// Builds the copy that should be sent from `current_region` to one neighbor.
+    ///
+    /// This returns `None` when forwarding would immediately echo the resource
+    /// back to the sender, exceed the hop limit, or leave no capacity for the
+    /// next region.
+    pub fn forwarded_to(
+        self,
+        current_region: RegionId,
+        target_neighbor: RegionId,
+        local_used_capacity: u32,
+        border_crossing_cost: u32,
+    ) -> Option<Self> {
+        if target_neighbor == self.source_neighbor || self.hop_count >= self.max_hops {
+            return None;
+        }
+
+        let remaining_capacity = self.remaining_capacity.saturating_sub(local_used_capacity);
+        if remaining_capacity == 0 {
+            return None;
+        }
+
+        Some(Self {
+            remaining_capacity,
+            hop_count: self.hop_count.saturating_add(1),
+            travel_cost: self.travel_cost.saturating_add(border_crossing_cost),
+            // From the target region's view, this region becomes the neighbor
+            // that supplied the forwarded resource.
+            source_neighbor: current_region,
+            ..self
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Outcome of attempting to place an imported resource into a region cache.
+///
+/// Runtime code can use this later for deterministic tracing and for deciding
+/// whether there is anything new to forward to neighboring regions.
+pub enum ImportDecision {
+    /// The cache had no matching origin/kind/generation and stored the resource.
+    Accepted,
+    /// The exact same `ResourceId` was already known.
+    RejectedDuplicate,
+    /// A newer generation for the same origin and kind was already known.
+    RejectedStale,
+    /// The resource was newer than older cached generations for its origin/kind.
+    ReplacedOlderGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Region-local cache of imported resources accepted from neighbors.
+///
+/// The cache intentionally stores a small vector. Patch 1 favors readable,
+/// deterministic behavior over lookup complexity, and expected regional border
+/// offer counts are small.
+pub struct ImportedResourceCache {
+    resources: Vec<ImportedResource>,
+}
+
+impl ImportedResourceCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn resources(&self) -> &[ImportedResource] {
+        &self.resources
+    }
+
+    /// Accepts a resource if it is new enough for this region's local cache.
+    ///
+    /// The same `ResourceId` is rejected as a duplicate. An older generation is
+    /// rejected after a newer generation for the same origin and kind is known.
+    /// A newer generation replaces older cached entries for that origin/kind.
+    pub fn accept(&mut self, resource: ImportedResource) -> ImportDecision {
+        if self.resources.iter().any(|known| known.id == resource.id) {
+            return ImportDecision::RejectedDuplicate;
+        }
+
+        let same_source_kind = |known: &&ImportedResource| {
+            known.id.origin_region == resource.id.origin_region
+                && known.id.resource_kind == resource.id.resource_kind
+        };
+
+        if self
+            .resources
+            .iter()
+            .filter(same_source_kind)
+            .any(|known| known.id.generation > resource.id.generation)
+        {
+            return ImportDecision::RejectedStale;
+        }
+
+        let before_len = self.resources.len();
+        self.resources.retain(|known| {
+            known.id.origin_region != resource.id.origin_region
+                || known.id.resource_kind != resource.id.resource_kind
+                || known.id.generation > resource.id.generation
+        });
+
+        let decision = if self.resources.len() == before_len {
+            ImportDecision::Accepted
+        } else {
+            ImportDecision::ReplacedOlderGeneration
+        };
+
+        self.resources.push(resource);
+        decision
+    }
+
+    /// Produces deterministic outbound resource copies for neighboring regions.
+    ///
+    /// Target neighbors are considered in caller-provided order. Each resource
+    /// copy subtracts the same locally used capacity and adds the same border
+    /// crossing cost; later gameplay patches can replace those inputs with
+    /// per-neighbor route costs without changing the cache identity rule.
+    pub fn forwarded_resources(
+        &self,
+        current_region: RegionId,
+        local_used_capacity: u32,
+        border_crossing_cost: u32,
+        target_neighbors: &[RegionId],
+    ) -> Vec<ImportedResource> {
+        self.resources
+            .iter()
+            .flat_map(|resource| {
+                target_neighbors.iter().filter_map(move |target_neighbor| {
+                    resource.forwarded_to(
+                        current_region,
+                        *target_neighbor,
+                        local_used_capacity,
+                        border_crossing_cost,
+                    )
+                })
+            })
+            .collect()
+    }
+}

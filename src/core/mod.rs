@@ -4,6 +4,7 @@ pub mod components;
 pub mod entity;
 pub mod game;
 pub mod grid;
+pub mod regions;
 pub mod resources;
 pub mod systems;
 
