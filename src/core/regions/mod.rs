@@ -22,10 +22,10 @@
 //!
 //! Imported resource processing:
 //!
-//!   RegionState::process_imported_offer(...)
+//!   RegionState::process_imported_resource(...)
 //!                 |
 //!                 v
-//!   imported_resources.accept(offer)
+//!   imported_resources.accept(resource)
 //!                 |
 //!       +---------+-------------------+
 //!       |         |                   |
@@ -33,9 +33,9 @@
 //!   Accepted  ReplacedOlderGeneration RejectedDuplicate/RejectedStale
 //!       |         |                   |
 //!       +----+----+                   v
-//!            |                 forwarded_offers = []
+//!            |                 forwarded_resources = []
 //!            v
-//!   Build forwarded offers for target neighbors:
+//!   Build forwarded resources for target neighbors:
 //!     - skip source neighbor
 //!     - subtract local_used_capacity
 //!     - add border_crossing_cost
@@ -43,9 +43,9 @@
 //!     - stop at max_hops or zero capacity
 //!            |
 //!            v
-//!   ImportedOfferResult
+//!   ImportedResourceResult
 //!     decision
-//!     forwarded_offers
+//!     forwarded_resources
 //!
 //! Neighbor reply recording:
 //!
@@ -63,6 +63,8 @@ use crate::interface::adapter::{inspect_world, view_world};
 use crate::interface::events::CommandResult;
 use crate::interface::view::{GameView, InspectView};
 
+pub mod runtime;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// Stable identity for one independently owned simulation region.
 ///
@@ -73,8 +75,8 @@ pub struct RegionId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// Compact categories of cross-region access that can be imported as cache.
 ///
-/// These variants describe what a region offers through its borders without
-/// exposing the building, citizen, or road entities that produced the offer.
+/// These variants describe what a region exports through its borders without
+/// exposing the building, citizen, or road entities that produced the resource.
 pub enum ResourceKind {
     Jobs,
     ParkAccess,
@@ -87,7 +89,7 @@ pub enum ResourceKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Stable identity for one exported regional resource generation.
 ///
-/// The origin region and kind identify the source of the offer, while
+/// The origin region and kind identify the source of the resource, while
 /// `generation` changes when that source's exported value changes. Forwarding
 /// regions must preserve this ID so the same remote supply cannot echo back as
 /// new supply under a different origin.
@@ -169,13 +171,13 @@ pub enum ImportDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Result returned after one region processes a neighbor's imported offer.
+/// Result returned after one region processes a neighbor's imported resource.
 ///
 /// Later runtime patches can route this owned value back to the caller region
 /// without giving either side access to the other's ECS `World`.
-pub struct ImportedOfferResult {
+pub struct ImportedResourceResult {
     pub decision: ImportDecision,
-    pub forwarded_offers: Vec<ImportedResource>,
+    pub forwarded_resources: Vec<ImportedResource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -183,7 +185,7 @@ pub struct ImportedOfferResult {
 ///
 /// The cache intentionally stores a small vector. Patch 1 favors readable,
 /// deterministic behavior over lookup complexity, and expected regional border
-/// offer counts are small.
+/// resource counts are small.
 pub struct ImportedResourceCache {
     resources: Vec<ImportedResource>,
 }
@@ -277,7 +279,7 @@ pub struct RegionState {
     id: RegionId,
     world: World,
     imported_resources: ImportedResourceCache,
-    neighbor_import_results: Vec<ImportedOfferResult>,
+    neighbor_import_results: Vec<ImportedResourceResult>,
 }
 
 impl RegionState {
@@ -300,23 +302,23 @@ impl RegionState {
         tick_world(&mut self.world)
     }
 
-    /// Accepts one imported resource offer and builds deterministic forwarded copies.
-    pub fn process_imported_offer(
+    /// Accepts one imported resource and builds deterministic forwarded copies.
+    pub fn process_imported_resource(
         &mut self,
-        offer: ImportedResource,
+        resource: ImportedResource,
         local_used_capacity: u32,
         border_crossing_cost: u32,
         target_neighbors: &[RegionId],
-    ) -> ImportedOfferResult {
-        let decision = self.imported_resources.accept(offer);
-        let forwarded_offers = if matches!(
+    ) -> ImportedResourceResult {
+        let decision = self.imported_resources.accept(resource);
+        let forwarded_resources = if matches!(
             decision,
             ImportDecision::Accepted | ImportDecision::ReplacedOlderGeneration
         ) {
             target_neighbors
                 .iter()
                 .filter_map(|target_neighbor| {
-                    offer.forwarded_to(
+                    resource.forwarded_to(
                         self.id,
                         *target_neighbor,
                         local_used_capacity,
@@ -328,14 +330,14 @@ impl RegionState {
             Vec::new()
         };
 
-        ImportedOfferResult {
+        ImportedResourceResult {
             decision,
-            forwarded_offers,
+            forwarded_resources,
         }
     }
 
     /// Records a completed neighbor import reply in this caller-owned region.
-    pub fn apply_neighbor_import_result(&mut self, result: ImportedOfferResult) {
+    pub fn apply_neighbor_import_result(&mut self, result: ImportedResourceResult) {
         self.neighbor_import_results.push(result);
     }
 
@@ -353,7 +355,7 @@ impl RegionState {
         self.imported_resources.resources()
     }
 
-    pub fn neighbor_import_results(&self) -> &[ImportedOfferResult] {
+    pub fn neighbor_import_results(&self) -> &[ImportedResourceResult] {
         &self.neighbor_import_results
     }
 }

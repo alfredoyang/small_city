@@ -2,7 +2,7 @@
 
 use small_city::core::game::Game;
 use small_city::core::regions::{
-    ImportDecision, ImportedOfferResult, ImportedResource, RegionId, RegionState, ResourceId,
+    ImportDecision, ImportedResource, ImportedResourceResult, RegionId, RegionState, ResourceId,
     ResourceKind,
 };
 
@@ -19,31 +19,32 @@ fn region_tick_local_matches_game_tick_for_same_empty_city() {
 }
 
 #[test]
-fn imported_offer_processing_stays_in_target_region_cache() {
+fn imported_resource_processing_stays_in_target_region_cache() {
     let mut caller = RegionState::new(RegionId(1), 2, 2);
     let mut target = RegionState::new(RegionId(2), 2, 2);
-    let offer = resource(9, ResourceKind::Jobs, 3, 8, 0, 3, 1, 1);
+    let imported_resource = resource(9, ResourceKind::Jobs, 3, 8, 0, 3, 1, 1);
 
-    let result = target.process_imported_offer(offer, 2, 4, &[RegionId(1), RegionId(3)]);
+    let result =
+        target.process_imported_resource(imported_resource, 2, 4, &[RegionId(1), RegionId(3)]);
 
     assert_eq!(result.decision, ImportDecision::Accepted);
-    assert_eq!(target.imported_resources(), &[offer]);
+    assert_eq!(target.imported_resources(), &[imported_resource]);
     assert!(caller.imported_resources().is_empty());
     assert_eq!(
-        result.forwarded_offers,
+        result.forwarded_resources,
         vec![ImportedResource {
             remaining_capacity: 6,
             hop_count: 1,
             travel_cost: 5,
             source_neighbor: RegionId(2),
-            ..offer
+            ..imported_resource
         }]
     );
 
     caller.apply_neighbor_import_result(result.clone());
 
     assert_eq!(caller.neighbor_import_results(), &[result]);
-    assert_eq!(target.imported_resources(), &[offer]);
+    assert_eq!(target.imported_resources(), &[imported_resource]);
 }
 
 #[test]
@@ -62,9 +63,9 @@ fn region_view_and_inspect_return_ui_safe_models() {
 #[test]
 fn applying_neighbor_import_result_records_owned_reply_only() {
     let mut region = RegionState::new(RegionId(3), 2, 2);
-    let result = ImportedOfferResult {
+    let result = ImportedResourceResult {
         decision: ImportDecision::RejectedDuplicate,
-        forwarded_offers: Vec::new(),
+        forwarded_resources: Vec::new(),
     };
 
     region.apply_neighbor_import_result(result.clone());
