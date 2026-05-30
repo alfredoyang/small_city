@@ -340,14 +340,15 @@ Review focus:
 - Thread lifecycle and shutdown are explicit.
 - The non-threaded tests still cover deterministic behavior.
 
-## Patch 9: Regional Game Facade
+## Patch 9: Regional Game Facade And Snapshot Requests
 
 Goal: expose regional simulation through a high-level API without changing UI
-boundaries.
+boundaries, and make the UI snapshot request/reply path explicit.
 
 Likely files:
 
 - `src/core/regional_game.rs`
+- `src/core/regions/runtime.rs` if a snapshot event or outbound message is added
 - `src/core/game.rs` if shared behavior is needed
 - `src/interface/adapter.rs` only if a new view model is needed
 - `tests/regional_game_api_test.rs`
@@ -356,8 +357,47 @@ Implementation:
 
 - Add a separate facade first, such as `RegionalGame`, instead of changing
   `Game` directly.
+- Treat `RegionalGame` as the UI-facing region manager/owner. The UI should
+  send commands and snapshot requests to this facade, not to `RegionRuntime`.
 - Keep UI rendering from view models only.
 - Add methods for regional tick and regional inspect/view composition.
+- Add owned request/reply data for snapshots. For example:
+
+```text
+UiRequest::GetRegionSnapshot { request_id, region_id }
+
+RegionEvent::BuildSnapshot { request_id }
+
+OutboundMessage::RegionSnapshotReady {
+  request_id,
+  region_id,
+  snapshot,
+}
+```
+
+- Add a UI-safe owned snapshot type if `GameView` is not enough:
+
+```text
+RegionViewSnapshot
+  region_id
+  revision
+  view: GameView or region-specific view model
+  recent_events
+
+RegionalGameView
+  regions: Vec<RegionViewSnapshot>
+  selected_region
+```
+
+- In the first single-threaded facade, `RegionalGame` can own
+  `Vec<RegionRuntime>` directly and dispatch snapshot events by calling runtime
+  methods.
+- In the later threaded facade, `RegionalGame` should own region handles or
+  mailboxes while worker threads own the actual `RegionRuntime` values.
+- Keep all UI request and snapshot reply payloads owned. Do not use references,
+  closures, `World`, or ECS entity storage in UI-facing messages.
+- Design these request/reply payloads so they can later become serializable for
+  another process boundary.
 - Avoid save/load integration until the authoritative state and cache rebuild
   rules are proven.
 
@@ -365,12 +405,19 @@ Tests:
 
 - regional facade exposes view data without exposing `World`
 - regional tick advances each region through its runtime
+- UI snapshot request reaches the requested region and returns the matching
+  region snapshot
+- snapshot request for an unknown region returns a deterministic error
+- UI-facing snapshot data is owned and does not expose ECS internals
 - imported resource cache can be rebuilt from authoritative region state
 
 Review focus:
 
 - Public API remains clear.
 - UI boundary remains protected.
+- UI talks only to `RegionalGame`, never directly to `RegionRuntime` or `World`.
+- Snapshot request/reply messages are safe to move across threads and can be
+  adapted for process boundaries later.
 - Save/load compatibility is not accidentally changed.
 
 ## Patch 10: Load Manager
@@ -420,7 +467,18 @@ No UI work is needed for the first runtime patches. When regional state becomes
 player-visible:
 
 - Add view-model fields before adding UI rendering.
-- Keep terminal UI code using `Game` or a regional facade only.
+- Keep terminal UI code using `Game` or `RegionalGame` only.
+- Route snapshot requests through the regional facade:
+
+```text
+UI thread/process
+  -> RegionalGame / RegionManager
+  -> RegionRuntime
+  -> RegionalGame / RegionManager
+  -> UI-safe snapshot reply
+```
+
+- Use explicit request IDs for async/threaded/process snapshot replies.
 - Add UI boundary tests for every new public view path.
 
 ## Dependency Plan
