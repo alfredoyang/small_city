@@ -1,8 +1,67 @@
-//! Regional resource identities and cache rules for future cross-region simulation.
+//! Regional state ownership plus resource cache rules for future cross-region simulation.
 //!
-//! This module is intentionally data-only for the first regional threading step.
-//! It does not own or expose an ECS `World`; it only defines the compact resource
-//! summaries that regions can later exchange through runtimes and workers.
+//! This module keeps each region's ECS `World` private inside `RegionState`.
+//! Runtime and worker code can use owned resource summaries and UI-safe views
+//! without reading another region's ECS storage.
+//!
+//! ```text
+//! Local tick path:
+//!
+//!   RegionState::tick_local()
+//!                 |
+//!                 v
+//!   tick_world(&mut World)
+//!                 |
+//!                 v
+//!   same deterministic systems as Game::tick
+//!     power -> stats -> local effects
+//!     -> citizens/population/economy/business
+//!                 |
+//!                 v
+//!   CommandResult events
+//!
+//! Imported resource processing:
+//!
+//!   RegionState::process_imported_offer(...)
+//!                 |
+//!                 v
+//!   imported_resources.accept(offer)
+//!                 |
+//!       +---------+-------------------+
+//!       |         |                   |
+//!       v         v                   v
+//!   Accepted  ReplacedOlderGeneration RejectedDuplicate/RejectedStale
+//!       |         |                   |
+//!       +----+----+                   v
+//!            |                 forwarded_offers = []
+//!            v
+//!   Build forwarded offers for target neighbors:
+//!     - skip source neighbor
+//!     - subtract local_used_capacity
+//!     - add border_crossing_cost
+//!     - increment hop_count
+//!     - stop at max_hops or zero capacity
+//!            |
+//!            v
+//!   ImportedOfferResult
+//!     decision
+//!     forwarded_offers
+//!
+//! Neighbor reply recording:
+//!
+//!   RegionState::apply_neighbor_import_result(result)
+//!                 |
+//!                 v
+//!   neighbor_import_results.push(result)
+//!
+//!   No other region's World is touched.
+//! ```
+
+use crate::core::game::tick_world;
+use crate::core::world::World;
+use crate::interface::adapter::{inspect_world, view_world};
+use crate::interface::events::CommandResult;
+use crate::interface::view::{GameView, InspectView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// Stable identity for one independently owned simulation region.
@@ -109,6 +168,16 @@ pub enum ImportDecision {
     ReplacedOlderGeneration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Result returned after one region processes a neighbor's imported offer.
+///
+/// Later runtime patches can route this owned value back to the caller region
+/// without giving either side access to the other's ECS `World`.
+pub struct ImportedOfferResult {
+    pub decision: ImportDecision,
+    pub forwarded_offers: Vec<ImportedResource>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 /// Region-local cache of imported resources accepted from neighbors.
 ///
@@ -195,5 +264,96 @@ impl ImportedResourceCache {
                 })
             })
             .collect()
+    }
+}
+
+#[derive(Debug)]
+/// Authoritative state for one independently simulated region.
+///
+/// The ECS `World` stays private inside this core wrapper. Runtime and worker
+/// code should interact through these methods and owned regional resource
+/// summaries, while UI code continues to use `Game` and UI-safe view models.
+pub struct RegionState {
+    id: RegionId,
+    world: World,
+    imported_resources: ImportedResourceCache,
+    neighbor_import_results: Vec<ImportedOfferResult>,
+}
+
+impl RegionState {
+    /// Creates a region with its own private ECS world and empty import cache.
+    pub fn new(id: RegionId, width: usize, height: usize) -> Self {
+        Self {
+            id,
+            world: World::new(width, height),
+            imported_resources: ImportedResourceCache::new(),
+            neighbor_import_results: Vec::new(),
+        }
+    }
+
+    pub fn id(&self) -> RegionId {
+        self.id
+    }
+
+    /// Advances only this region's local simulation using the same order as `Game::tick`.
+    pub fn tick_local(&mut self) -> CommandResult {
+        tick_world(&mut self.world)
+    }
+
+    /// Accepts one imported resource offer and builds deterministic forwarded copies.
+    pub fn process_imported_offer(
+        &mut self,
+        offer: ImportedResource,
+        local_used_capacity: u32,
+        border_crossing_cost: u32,
+        target_neighbors: &[RegionId],
+    ) -> ImportedOfferResult {
+        let decision = self.imported_resources.accept(offer);
+        let forwarded_offers = if matches!(
+            decision,
+            ImportDecision::Accepted | ImportDecision::ReplacedOlderGeneration
+        ) {
+            target_neighbors
+                .iter()
+                .filter_map(|target_neighbor| {
+                    offer.forwarded_to(
+                        self.id,
+                        *target_neighbor,
+                        local_used_capacity,
+                        border_crossing_cost,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        ImportedOfferResult {
+            decision,
+            forwarded_offers,
+        }
+    }
+
+    /// Records a completed neighbor import reply in this caller-owned region.
+    pub fn apply_neighbor_import_result(&mut self, result: ImportedOfferResult) {
+        self.neighbor_import_results.push(result);
+    }
+
+    /// Returns a UI-safe snapshot without exposing this region's ECS world.
+    pub fn view(&self) -> GameView {
+        view_world(&self.world)
+    }
+
+    /// Returns a UI-safe inspect model without exposing this region's ECS world.
+    pub fn inspect(&self, x: usize, y: usize) -> InspectView {
+        inspect_world(&self.world, x, y)
+    }
+
+    pub fn imported_resources(&self) -> &[ImportedResource] {
+        self.imported_resources.resources()
+    }
+
+    pub fn neighbor_import_results(&self) -> &[ImportedOfferResult] {
+        &self.neighbor_import_results
     }
 }

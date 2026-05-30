@@ -119,75 +119,7 @@ impl Game {
 
     /// Advances the simulation by one deterministic hour.
     pub fn tick(&mut self) -> CommandResult {
-        let before = TickSummarySnapshot::from_world(&self.world);
-        let before_time = self.world.resources.time;
-        self.world.resources.time.advance_hours(1);
-        let after_time = self.world.resources.time;
-        power::run(&mut self.world);
-        stats::run(&mut self.world);
-        local_effects::run(&mut self.world);
-        if is_new_day(before_time, after_time) {
-            citizens::apply_daily_happiness_decay(&mut self.world);
-        }
-        if is_new_week(before_time, after_time) {
-            population::run(&mut self.world);
-        }
-        citizens::update_happiness(&mut self.world);
-        local_effects::run(&mut self.world);
-        let economy = if is_new_day(before_time, after_time) {
-            economy::run(&mut self.world)
-        } else {
-            economy::EconomyBreakdown::default()
-        };
-        let business_upgrades = if is_new_week(before_time, after_time) {
-            business_growth::run(&mut self.world).upgrades
-        } else {
-            Vec::new()
-        };
-        stats::refresh_population_and_jobs(&mut self.world);
-        pollution::run(&mut self.world);
-        happiness::run(&mut self.world);
-        self.world.resources.turn += 1;
-        let after = TickSummarySnapshot::from_world(&self.world);
-
-        let tick_summary = GameEventView::TickSummary {
-            turn: self.world.resources.turn,
-            time: game_time_view(self.world.resources.time),
-            population: metric_change(before.population, after.population),
-            money: metric_change(before.money, after.money),
-            happiness: metric_change(before.happiness, after.happiness),
-            pollution: metric_change(before.pollution, after.pollution),
-            unemployment: metric_change(before.unemployment, after.unemployment),
-            powered_buildings: metric_change(before.powered_buildings, after.powered_buildings),
-            economy: EconomyBreakdownView {
-                salaries_paid: economy.salaries_paid,
-                workplace_tax: economy.workplace_tax,
-                rent_income: economy.rent_income,
-                commercial_sales_tax: economy.commercial_sales_tax,
-                shoppers_served: economy.shoppers_served,
-                local_goods_produced: economy.local_goods_produced,
-                local_goods_stored: economy.local_goods_stored,
-                local_goods_sold: economy.local_goods_sold,
-                imported_goods_sold: economy.imported_goods_sold,
-                exported_goods: economy.exported_goods,
-                manufacturing_tax: economy.manufacturing_tax,
-                export_tax: economy.export_tax,
-                rent_failures: economy.rent_failures,
-                maintenance_cost: economy.maintenance_cost,
-                net: economy.net,
-            },
-        };
-        let mut events = vec![tick_summary];
-        events.extend(business_upgrades.into_iter().map(|upgrade| {
-            GameEventView::BusinessAutoUpgraded {
-                x: upgrade.x,
-                y: upgrade.y,
-                kind: upgrade.kind,
-                level: upgrade.level,
-            }
-        }));
-
-        CommandResult::success_events(events)
+        tick_world(&mut self.world)
     }
 
     /// Returns a UI-safe view of one map coordinate without exposing ECS storage.
@@ -214,14 +146,90 @@ impl Game {
     }
 
     fn refresh_derived_state(&mut self) {
-        power::run(&mut self.world);
-        road_network_analysis::run(&mut self.world);
-        stats::refresh_population_and_jobs(&mut self.world);
-        pollution::run(&mut self.world);
-        citizens::update_happiness(&mut self.world);
-        happiness::run(&mut self.world);
-        local_effects::run(&mut self.world);
+        refresh_derived_state_for_world(&mut self.world);
     }
+}
+
+pub(crate) fn tick_world(world: &mut World) -> CommandResult {
+    let before = TickSummarySnapshot::from_world(world);
+    let before_time = world.resources.time;
+    world.resources.time.advance_hours(1);
+    let after_time = world.resources.time;
+    power::run(world);
+    stats::run(world);
+    local_effects::run(world);
+    if is_new_day(before_time, after_time) {
+        citizens::apply_daily_happiness_decay(world);
+    }
+    if is_new_week(before_time, after_time) {
+        population::run(world);
+    }
+    citizens::update_happiness(world);
+    local_effects::run(world);
+    let economy = if is_new_day(before_time, after_time) {
+        economy::run(world)
+    } else {
+        economy::EconomyBreakdown::default()
+    };
+    let business_upgrades = if is_new_week(before_time, after_time) {
+        business_growth::run(world).upgrades
+    } else {
+        Vec::new()
+    };
+    stats::refresh_population_and_jobs(world);
+    pollution::run(world);
+    happiness::run(world);
+    world.resources.turn += 1;
+    let after = TickSummarySnapshot::from_world(world);
+
+    let tick_summary = GameEventView::TickSummary {
+        turn: world.resources.turn,
+        time: game_time_view(world.resources.time),
+        population: metric_change(before.population, after.population),
+        money: metric_change(before.money, after.money),
+        happiness: metric_change(before.happiness, after.happiness),
+        pollution: metric_change(before.pollution, after.pollution),
+        unemployment: metric_change(before.unemployment, after.unemployment),
+        powered_buildings: metric_change(before.powered_buildings, after.powered_buildings),
+        economy: EconomyBreakdownView {
+            salaries_paid: economy.salaries_paid,
+            workplace_tax: economy.workplace_tax,
+            rent_income: economy.rent_income,
+            commercial_sales_tax: economy.commercial_sales_tax,
+            shoppers_served: economy.shoppers_served,
+            local_goods_produced: economy.local_goods_produced,
+            local_goods_stored: economy.local_goods_stored,
+            local_goods_sold: economy.local_goods_sold,
+            imported_goods_sold: economy.imported_goods_sold,
+            exported_goods: economy.exported_goods,
+            manufacturing_tax: economy.manufacturing_tax,
+            export_tax: economy.export_tax,
+            rent_failures: economy.rent_failures,
+            maintenance_cost: economy.maintenance_cost,
+            net: economy.net,
+        },
+    };
+    let mut events = vec![tick_summary];
+    events.extend(business_upgrades.into_iter().map(|upgrade| {
+        GameEventView::BusinessAutoUpgraded {
+            x: upgrade.x,
+            y: upgrade.y,
+            kind: upgrade.kind,
+            level: upgrade.level,
+        }
+    }));
+
+    CommandResult::success_events(events)
+}
+
+pub(crate) fn refresh_derived_state_for_world(world: &mut World) {
+    power::run(world);
+    road_network_analysis::run(world);
+    stats::refresh_population_and_jobs(world);
+    pollution::run(world);
+    citizens::update_happiness(world);
+    happiness::run(world);
+    local_effects::run(world);
 }
 
 impl Default for Game {
