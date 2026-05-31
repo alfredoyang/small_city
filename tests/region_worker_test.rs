@@ -124,11 +124,12 @@ fn add_region_rejects_duplicate_region_id() {
         .expect_err("duplicate region should be rejected");
 
     assert_eq!(
-        error,
+        error.routing_error(),
         WorkerRoutingError::DuplicateRegion {
             region_id: RegionId(9),
         }
     );
+    assert_eq!(error.into_runtime().region_id(), RegionId(9));
 }
 
 #[test]

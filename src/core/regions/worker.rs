@@ -28,6 +28,23 @@ pub enum WorkerRoutingError {
     },
 }
 
+#[derive(Debug)]
+/// Failed region attachment that returns the still-owned runtime to the caller.
+pub struct RegionAddError {
+    error: WorkerRoutingError,
+    runtime: Box<RegionRuntime>,
+}
+
+impl RegionAddError {
+    pub fn routing_error(&self) -> WorkerRoutingError {
+        self.error
+    }
+
+    pub fn into_runtime(self) -> RegionRuntime {
+        *self.runtime
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 /// Summary returned after one worker scheduling pass.
 pub struct WorkerRunSummary {
@@ -54,14 +71,27 @@ impl RegionWorker {
         self.id
     }
 
-    pub fn add_region(&mut self, runtime: RegionRuntime) -> Result<(), WorkerRoutingError> {
+    pub fn add_region(&mut self, runtime: RegionRuntime) -> Result<(), RegionAddError> {
         let region_id = runtime.region_id();
         if self.region(region_id).is_some() {
-            return Err(WorkerRoutingError::DuplicateRegion { region_id });
+            return Err(RegionAddError {
+                error: WorkerRoutingError::DuplicateRegion { region_id },
+                runtime: Box::new(runtime),
+            });
         }
 
         self.regions.push(runtime);
         Ok(())
+    }
+
+    /// Removes one owned runtime so a caller can move it at a safe point.
+    pub fn remove_region(&mut self, region_id: RegionId) -> Option<RegionRuntime> {
+        let position = self
+            .regions
+            .iter()
+            .position(|runtime| runtime.region_id() == region_id)?;
+
+        Some(self.regions.remove(position))
     }
 
     pub fn region(&self, region_id: RegionId) -> Option<&RegionRuntime> {
