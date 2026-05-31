@@ -6,9 +6,12 @@
 
 use std::collections::VecDeque;
 
+pub mod continuation;
+
+use crate::core::regions::runtime::continuation::{CallerContinuation, NeighborRequest};
 use crate::core::regions::{ImportedResource, ImportedResourceResult, RegionId, RegionState};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 /// Event owned by one region runtime inbox.
 pub enum RegionEvent {
     /// Advance this region's local deterministic simulation by one tick.
@@ -16,30 +19,43 @@ pub enum RegionEvent {
     /// Process an imported resource in this target region.
     ProcessImportedResource(ImportedResourceRequest),
     /// Apply a completed neighbor result after it has been routed back here.
-    RunImportedResourceContinuation { result: ImportedResourceResult },
+    RunImportedResourceContinuation {
+        continuation: CallerContinuation<ImportedResourceResult>,
+        result: ImportedResourceResult,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Owned request for target-region imported resource work.
-///
-/// The target region processes only this payload and returns an outbound result
-/// for the caller. It does not borrow or mutate the caller's region state.
-pub struct ImportedResourceRequest {
-    pub caller_region: RegionId,
+/// Owned payload for target-region imported resource work.
+pub struct ImportedResourcePayload {
     pub resource: ImportedResource,
     pub local_used_capacity: u32,
     pub border_crossing_cost: u32,
     pub target_neighbors: Vec<RegionId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub type ImportedResourceRequest = NeighborRequest<ImportedResourcePayload, ImportedResourceResult>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Deterministic runtime error returned as outbound routing feedback.
+pub enum RegionRuntimeError {
+    /// A continuation arrived at a region other than its caller region.
+    ContinuationRoutedToWrongRegion {
+        expected_region: RegionId,
+        actual_region: RegionId,
+    },
+}
+
+#[derive(Debug)]
 /// Message returned by a runtime for the caller or worker to route.
 pub enum OutboundMessage {
-    /// A completed imported-resource result that must be routed back to the caller.
-    ReturnImportedResourceResult {
+    /// A completed imported-resource continuation that must be routed to caller.
+    ReturnImportedResourceContinuation {
         caller_region: RegionId,
+        continuation: CallerContinuation<ImportedResourceResult>,
         result: ImportedResourceResult,
     },
+    RuntimeError(RegionRuntimeError),
 }
 
 #[derive(Debug)]
@@ -106,21 +122,43 @@ impl RegionRuntime {
             }
             RegionEvent::ProcessImportedResource(request) => {
                 let result = self.state.process_imported_resource(
-                    request.resource,
-                    request.local_used_capacity,
-                    request.border_crossing_cost,
-                    &request.target_neighbors,
+                    request.payload.resource,
+                    request.payload.local_used_capacity,
+                    request.payload.border_crossing_cost,
+                    &request.payload.target_neighbors,
                 );
+                let caller_region = request.continuation.caller_region();
 
-                vec![OutboundMessage::ReturnImportedResourceResult {
-                    caller_region: request.caller_region,
+                vec![OutboundMessage::ReturnImportedResourceContinuation {
+                    caller_region,
+                    continuation: request.continuation,
                     result,
                 }]
             }
-            RegionEvent::RunImportedResourceContinuation { result } => {
-                self.state.apply_neighbor_import_result(result);
-                Vec::new()
-            }
+            RegionEvent::RunImportedResourceContinuation {
+                continuation,
+                result,
+            } => self.run_imported_resource_continuation(continuation, result),
         }
+    }
+
+    fn run_imported_resource_continuation(
+        &mut self,
+        continuation: CallerContinuation<ImportedResourceResult>,
+        result: ImportedResourceResult,
+    ) -> Vec<OutboundMessage> {
+        let expected_region = continuation.caller_region();
+        let actual_region = self.region_id();
+        if expected_region != actual_region {
+            return vec![OutboundMessage::RuntimeError(
+                RegionRuntimeError::ContinuationRoutedToWrongRegion {
+                    expected_region,
+                    actual_region,
+                },
+            )];
+        }
+
+        continuation.run(&mut self.state, result);
+        Vec::new()
     }
 }

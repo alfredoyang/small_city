@@ -64,6 +64,7 @@ use crate::interface::events::CommandResult;
 use crate::interface::view::{GameView, InspectView};
 
 pub mod runtime;
+pub use runtime::continuation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// Stable identity for one independently owned simulation region.

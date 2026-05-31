@@ -1,10 +1,12 @@
 //! Integration tests for the single-threaded regional event runtime.
 
+use small_city::core::regions::continuation::{CallerContinuation, NeighborRequest};
 use small_city::core::regions::runtime::{
-    ImportedResourceRequest, OutboundMessage, RegionEvent, RegionRuntime,
+    ImportedResourcePayload, ImportedResourceRequest, OutboundMessage, RegionEvent, RegionRuntime,
 };
 use small_city::core::regions::{
-    ImportDecision, ImportedResource, RegionId, RegionState, ResourceId, ResourceKind,
+    ImportDecision, ImportedResource, ImportedResourceResult, RegionId, RegionState, ResourceId,
+    ResourceKind,
 };
 
 #[test]
@@ -62,35 +64,43 @@ fn neighbor_import_event_processes_only_target_payload() {
     let mut target = RegionRuntime::new(RegionState::new(RegionId(5), 2, 2));
     let imported_resource = resource(8, ResourceKind::ParkAccess, 1, 9, 0, 3, 2, 4);
 
-    target.push_event(RegionEvent::ProcessImportedResource(
-        ImportedResourceRequest {
-            caller_region: caller.region_id(),
+    target.push_event(RegionEvent::ProcessImportedResource(NeighborRequest {
+        payload: ImportedResourcePayload {
             resource: imported_resource,
             local_used_capacity: 3,
             border_crossing_cost: 2,
             target_neighbors: vec![RegionId(4), RegionId(6)],
         },
-    ));
+        continuation: record_import_result(caller.region_id()),
+    }));
 
     let outbound = target.process_next_event();
 
     assert!(caller.state().imported_resources().is_empty());
     assert_eq!(target.state().imported_resources(), &[imported_resource]);
+    let [
+        OutboundMessage::ReturnImportedResourceContinuation {
+            caller_region,
+            result,
+            ..
+        },
+    ] = outbound.as_slice()
+    else {
+        panic!("expected one returned imported-resource continuation");
+    };
+    assert_eq!(*caller_region, RegionId(4));
     assert_eq!(
-        outbound,
-        vec![OutboundMessage::ReturnImportedResourceResult {
-            caller_region: RegionId(4),
-            result: small_city::core::regions::ImportedResourceResult {
-                decision: ImportDecision::Accepted,
-                forwarded_resources: vec![ImportedResource {
-                    remaining_capacity: 6,
-                    hop_count: 1,
-                    travel_cost: 4,
-                    source_neighbor: RegionId(5),
-                    ..imported_resource
-                }],
-            },
-        }]
+        result,
+        &ImportedResourceResult {
+            decision: ImportDecision::Accepted,
+            forwarded_resources: vec![ImportedResource {
+                remaining_capacity: 6,
+                hop_count: 1,
+                travel_cost: 4,
+                source_neighbor: RegionId(5),
+                ..imported_resource
+            }],
+        }
     );
 }
 
@@ -109,18 +119,22 @@ fn outbound_continuation_message_is_returned_before_caller_mutates() {
     assert!(caller.state().neighbor_import_results().is_empty());
 
     let [
-        OutboundMessage::ReturnImportedResourceResult {
+        OutboundMessage::ReturnImportedResourceContinuation {
             caller_region,
             result,
+            ..
         },
     ] = outbound.as_slice()
     else {
-        panic!("expected one returned imported-resource result");
+        panic!("expected one returned imported-resource continuation");
     };
 
     assert_eq!(*caller_region, caller.region_id());
+    let result = result.clone();
+    let continuation = take_continuation(outbound);
 
     caller.push_event(RegionEvent::RunImportedResourceContinuation {
+        continuation,
         result: result.clone(),
     });
     assert!(caller.process_next_event().is_empty());
@@ -132,18 +146,37 @@ fn decisions(outbound: &[OutboundMessage]) -> Vec<ImportDecision> {
     outbound
         .iter()
         .map(|message| match message {
-            OutboundMessage::ReturnImportedResourceResult { result, .. } => result.decision,
+            OutboundMessage::ReturnImportedResourceContinuation { result, .. } => result.decision,
+            OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
         })
         .collect()
 }
 
 fn request(caller_region: RegionId, resource: ImportedResource) -> ImportedResourceRequest {
-    ImportedResourceRequest {
-        caller_region,
-        resource,
-        local_used_capacity: 0,
-        border_crossing_cost: 1,
-        target_neighbors: Vec::new(),
+    NeighborRequest {
+        payload: ImportedResourcePayload {
+            resource,
+            local_used_capacity: 0,
+            border_crossing_cost: 1,
+            target_neighbors: Vec::new(),
+        },
+        continuation: record_import_result(caller_region),
+    }
+}
+
+fn record_import_result(caller_region: RegionId) -> CallerContinuation<ImportedResourceResult> {
+    CallerContinuation::new(caller_region, |region, result| {
+        region.apply_neighbor_import_result(result);
+    })
+}
+
+fn take_continuation(
+    mut outbound: Vec<OutboundMessage>,
+) -> CallerContinuation<ImportedResourceResult> {
+    let message = outbound.pop().expect("outbound message");
+    match message {
+        OutboundMessage::ReturnImportedResourceContinuation { continuation, .. } => continuation,
+        OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
     }
 }
 
