@@ -63,6 +63,7 @@ use crate::interface::adapter::{inspect_world, view_world};
 use crate::interface::events::CommandResult;
 use crate::interface::view::{GameView, InspectView};
 
+pub mod handle;
 pub mod runtime;
 pub mod worker;
 pub use runtime::continuation;

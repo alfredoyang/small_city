@@ -5,6 +5,7 @@
 //! `RegionRuntime`.
 
 use crate::core::regions::RegionId;
+use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::runtime::{
     OutboundMessage, RegionEvent, RegionRuntime, RegionRuntimeError,
 };
@@ -69,16 +70,20 @@ impl RegionWorker {
             .find(|runtime| runtime.region_id() == region_id)
     }
 
+    pub fn handle_for(&self, region_id: RegionId) -> Option<RegionHandle> {
+        self.region(region_id).map(RegionRuntime::handle)
+    }
+
     pub fn push_event(
         &mut self,
         target_region: RegionId,
         event: RegionEvent,
     ) -> Result<(), WorkerRoutingError> {
-        let Some(runtime) = self.region_mut(target_region) else {
+        let Some(handle) = self.handle_for(target_region) else {
             return Err(WorkerRoutingError::MissingTargetRegion { target_region });
         };
 
-        runtime.push_event(event);
+        handle.send(event);
         Ok(())
     }
 
@@ -145,11 +150,5 @@ impl RegionWorker {
                 error,
             }),
         }
-    }
-
-    fn region_mut(&mut self, region_id: RegionId) -> Option<&mut RegionRuntime> {
-        self.regions
-            .iter_mut()
-            .find(|runtime| runtime.region_id() == region_id)
     }
 }

@@ -4,10 +4,9 @@
 //! spawning OS threads or exposing ECS storage. Worker patches can later route
 //! `OutboundMessage` values between runtimes.
 
-use std::collections::VecDeque;
-
 pub mod continuation;
 
+use crate::core::regions::handle::{RegionEventReceiver, RegionHandle, mailbox};
 use crate::core::regions::runtime::continuation::{CallerContinuation, NeighborRequest};
 use crate::core::regions::{ImportedResource, ImportedResourceResult, RegionId, RegionState};
 
@@ -62,15 +61,18 @@ pub enum OutboundMessage {
 /// Single-region event loop with deterministic FIFO processing.
 pub struct RegionRuntime {
     state: RegionState,
-    inbox: VecDeque<RegionEvent>,
+    handle: RegionHandle,
+    receiver: RegionEventReceiver,
 }
 
 impl RegionRuntime {
     /// Creates a runtime that owns one region and an empty inbox.
     pub fn new(state: RegionState) -> Self {
+        let (handle, receiver) = mailbox(state.id());
         Self {
             state,
-            inbox: VecDeque::new(),
+            handle,
+            receiver,
         }
     }
 
@@ -82,18 +84,26 @@ impl RegionRuntime {
         &self.state
     }
 
+    pub fn handle(&self) -> RegionHandle {
+        self.handle.clone()
+    }
+
+    pub fn send_to_region(&self, target: &RegionHandle, event: RegionEvent) {
+        target.send(event);
+    }
+
     /// Adds one event to the back of this region's FIFO inbox.
     pub fn push_event(&mut self, event: RegionEvent) {
-        self.inbox.push_back(event);
+        self.receiver.push_event(event);
     }
 
     pub fn pending_event_count(&self) -> usize {
-        self.inbox.len()
+        self.receiver.pending_event_count()
     }
 
     /// Processes the next inbox event, returning messages for external routing.
     pub fn process_next_event(&mut self) -> Vec<OutboundMessage> {
-        let Some(event) = self.inbox.pop_front() else {
+        let Some(event) = self.receiver.pop_event() else {
             return Vec::new();
         };
 
@@ -105,7 +115,7 @@ impl RegionRuntime {
         let mut outbound = Vec::new();
 
         for _ in 0..max_events {
-            if self.inbox.is_empty() {
+            if self.pending_event_count() == 0 {
                 break;
             }
             outbound.extend(self.process_next_event());
