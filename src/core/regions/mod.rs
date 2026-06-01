@@ -359,6 +359,15 @@ impl RegionState {
         self.imported_resources.resources()
     }
 
+    /// Rebuilds transient imported cache state from authoritative local data.
+    ///
+    /// Regional export generation does not exist yet, so the current
+    /// authoritative rebuild is an empty cache. Later export rules can populate
+    /// this method without making imported resources permanent save data.
+    pub fn rebuild_imported_resource_cache(&mut self) {
+        self.imported_resources = ImportedResourceCache::new();
+    }
+
     pub fn neighbor_import_results(&self) -> &[ImportedResourceResult] {
         &self.neighbor_import_results
     }

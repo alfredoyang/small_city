@@ -84,6 +84,10 @@ impl RegionRuntime {
         &self.state
     }
 
+    pub fn rebuild_imported_resource_cache(&mut self) {
+        self.state.rebuild_imported_resource_cache();
+    }
+
     pub fn handle(&self) -> RegionHandle {
         self.handle.clone()
     }
