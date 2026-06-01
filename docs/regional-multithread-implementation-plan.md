@@ -420,10 +420,58 @@ Review focus:
   adapted for process boundaries later.
 - Save/load compatibility is not accidentally changed.
 
-## Patch 10: Load Manager
+## Patch 10: Regional Game Runner With One Threaded Worker
 
-Goal: add optional load-based movement after stable handles and safe movement
-are tested.
+Goal: add the production execution owner that starts and stops the threaded
+regional worker path, while keeping the initial runtime topology to one
+`ThreadedRegionWorker` and one OS thread.
+
+Likely files:
+
+- `src/core/regional_game_runner.rs`
+- `src/core/regional_game.rs`
+- `src/core/regions/threaded.rs`
+- `tests/regional_game_runner_test.rs`
+
+Implementation:
+
+- Add `RegionalGameRunner` as the public execution owner above `RegionalGame`.
+- Keep it threaded internally from the start, but create only one
+  `ThreadedRegionWorker` for now.
+- Move one `RegionWorker` into that threaded worker. The `RegionWorker` owns the
+  `RegionRuntime` values, and each runtime owns its `RegionState`.
+- Keep UI and future UI-facing code talking only to `RegionalGameRunner` methods,
+  not to `ThreadedRegionWorker`, `RegionWorker`, `RegionRuntime`, or `World`.
+- Expose a narrow first API:
+  - start from one or more `RegionState` values
+  - process/tick one region through the worker
+  - request an owned region snapshot
+  - shut down and recover the worker/state
+- Use explicit request/reply data and deterministic errors. Do not expose raw
+  channels, handles, worker internals, or ECS storage through the runner API.
+- Do not add multi-worker routing, load balancing, UI migration, or save/load in
+  this patch.
+
+Tests:
+
+- runner starts one threaded worker and processes a regional tick
+- runner returns an owned snapshot for the requested region
+- runner shutdown recovers authoritative region state
+- unknown region requests return deterministic errors
+- UI-facing code can use runner APIs without importing worker/runtime/ECS types
+
+Review focus:
+
+- `RegionalGameRunner` owns thread lifecycle.
+- There is exactly one `ThreadedRegionWorker` in this patch.
+- UI boundary remains protected.
+- Shutdown is explicit and recovers state for later save/load or handoff.
+- No multi-thread load balancing is introduced early.
+
+## Patch 11: Load Manager
+
+Goal: add optional load-based movement after stable handles, safe movement, and
+the runner-owned execution boundary are tested.
 
 Likely files:
 
@@ -438,6 +486,8 @@ Implementation:
 - Add a deterministic policy for choosing a move.
 - Keep the load manager separate from normal message routing.
 - Start with static assignment as the default.
+- Do not connect this to `RegionalGameRunner` until the deterministic movement
+  policy is reviewed independently.
 
 Tests:
 
@@ -467,14 +517,17 @@ No UI work is needed for the first runtime patches. When regional state becomes
 player-visible:
 
 - Add view-model fields before adding UI rendering.
-- Keep terminal UI code using `Game` or `RegionalGame` only.
-- Route snapshot requests through the regional facade:
+- Keep terminal UI code using `Game` or `RegionalGameRunner` only after the
+  runner API reaches feature parity for the needed workflow.
+- Route snapshot requests through the runner/facade:
 
 ```text
 UI thread/process
-  -> RegionalGame / RegionManager
+  -> RegionalGameRunner
+  -> ThreadedRegionWorker
+  -> RegionWorker
   -> RegionRuntime
-  -> RegionalGame / RegionManager
+  -> RegionalGameRunner
   -> UI-safe snapshot reply
 ```
 
