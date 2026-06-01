@@ -65,6 +65,7 @@ use crate::interface::view::{GameView, InspectView};
 
 pub mod handle;
 pub mod runtime;
+pub mod threaded;
 pub mod worker;
 pub use runtime::continuation;
 

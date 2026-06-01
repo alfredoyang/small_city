@@ -1,17 +1,16 @@
-//! Stable in-process region mailbox handles.
+//! Stable thread-safe region mailbox handles.
 //!
 //! A `RegionHandle` is the sender endpoint that neighboring regions can keep.
 //! The matching receiver is owned by the target `RegionRuntime` and moves with
 //! that runtime when worker ownership changes in later patches.
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::core::regions::RegionId;
 use crate::core::regions::runtime::RegionEvent;
 
-type EventQueue = Rc<RefCell<VecDeque<RegionEvent>>>;
+type EventQueue = Arc<Mutex<VecDeque<RegionEvent>>>;
 
 #[derive(Debug, Clone)]
 /// Cloneable sender endpoint for one region mailbox.
@@ -30,53 +29,57 @@ impl RegionHandle {
     }
 }
 
-#[derive(Debug, Clone)]
 /// In-process event sender shared by region handles.
-pub struct RegionEventSender {
+#[derive(Debug, Clone)]
+struct RegionEventSender {
     queue: EventQueue,
 }
 
 impl RegionEventSender {
     fn send(&self, event: RegionEvent) {
-        self.queue.borrow_mut().push_back(event);
+        self.queue
+            .lock()
+            .expect("region mailbox poisoned")
+            .push_back(event);
     }
 }
 
 #[derive(Debug)]
 /// Receiver side owned by exactly one `RegionRuntime`.
-pub struct RegionEventReceiver {
-    region_id: RegionId,
+pub(crate) struct RegionEventReceiver {
     queue: EventQueue,
 }
 
 impl RegionEventReceiver {
-    pub fn region_id(&self) -> RegionId {
-        self.region_id
+    pub(crate) fn push_event(&mut self, event: RegionEvent) {
+        self.queue
+            .lock()
+            .expect("region mailbox poisoned")
+            .push_back(event);
     }
 
-    pub fn push_event(&mut self, event: RegionEvent) {
-        self.queue.borrow_mut().push_back(event);
+    pub(crate) fn pop_event(&mut self) -> Option<RegionEvent> {
+        self.queue
+            .lock()
+            .expect("region mailbox poisoned")
+            .pop_front()
     }
 
-    pub fn pop_event(&mut self) -> Option<RegionEvent> {
-        self.queue.borrow_mut().pop_front()
-    }
-
-    pub fn pending_event_count(&self) -> usize {
-        self.queue.borrow().len()
+    pub(crate) fn pending_event_count(&self) -> usize {
+        self.queue.lock().expect("region mailbox poisoned").len()
     }
 }
 
 /// Creates a matched handle and receiver for one region runtime.
-pub fn mailbox(region_id: RegionId) -> (RegionHandle, RegionEventReceiver) {
-    let queue = Rc::new(RefCell::new(VecDeque::new()));
+pub(crate) fn mailbox(region_id: RegionId) -> (RegionHandle, RegionEventReceiver) {
+    let queue = Arc::new(Mutex::new(VecDeque::new()));
     let handle = RegionHandle {
         region_id,
         sender: RegionEventSender {
-            queue: Rc::clone(&queue),
+            queue: Arc::clone(&queue),
         },
     };
-    let receiver = RegionEventReceiver { region_id, queue };
+    let receiver = RegionEventReceiver { queue };
 
     (handle, receiver)
 }
