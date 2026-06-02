@@ -1,4 +1,4 @@
-//! Panel-based ratatui terminal frontend built only from Game API view models.
+//! Panel-based ratatui terminal frontend built only from facade view models.
 
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
@@ -15,12 +15,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
-use crate::core::game::Game;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
     BuildPreviewView, CellView, DemandLevel, GameView, InspectDetailsView, InspectView,
 };
 use crate::ui::ascii;
+use crate::ui::city_driver::{CityDriver, CityLaunchMode};
 use crate::ui::tui_input::{TuiAction, map_key_event};
 
 const DEFAULT_SAVE_FILE: &str = "city1";
@@ -64,7 +64,7 @@ impl Default for TuiState {
     }
 }
 
-/// UI-only fast-forward speed. The core simulation still advances by repeated `Game::tick()` calls.
+/// UI-only fast-forward speed. The simulation still advances by repeated facade tick calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunSpeed {
     One,
@@ -334,20 +334,28 @@ enum PromptKind {
 }
 
 struct TuiRuntime {
-    game: Game,
+    game: CityDriver,
     state: TuiState,
     next_auto_tick: Instant,
     dirty: bool,
 }
 
 impl TuiRuntime {
+    #[cfg(test)]
     fn new(now: Instant) -> Self {
-        Self {
-            game: Game::default(),
+        Self::with_mode(now, CityLaunchMode::SingleCity).expect("single-city TUI runtime")
+    }
+
+    fn with_mode(
+        now: Instant,
+        mode: CityLaunchMode,
+    ) -> Result<Self, crate::ui::city_driver::CityDriverError> {
+        Ok(Self {
+            game: CityDriver::new(mode)?,
             state: TuiState::default(),
             next_auto_tick: now + RunSpeed::One.interval(),
             dirty: true,
-        }
+        })
     }
 
     fn apply_due_auto_tick(&mut self, now: Instant) {
@@ -401,9 +409,8 @@ impl TuiRuntime {
                         };
                     }
                     PromptKind::Load => {
-                        self.state.message = match Game::load_from_file(&filename) {
-                            Ok(loaded_game) => {
-                                self.game = loaded_game;
+                        self.state.message = match self.game.load_from_file(&filename) {
+                            Ok(()) => {
                                 self.state.is_running = false;
                                 // Loading swaps in a new game state, so the cursor is reset and then
                                 // clamped against the loaded map dimensions.
@@ -523,10 +530,20 @@ enum TuiFlow {
     Quit,
 }
 
-/// Runs the ratatui frontend while preserving the public Game API boundary.
+/// Runs the ratatui frontend on the default single-city facade path.
 pub fn run() -> io::Result<()> {
+    run_with_mode(CityLaunchMode::SingleCity)
+}
+
+/// Runs the ratatui frontend on the regional facade behind an explicit flag.
+pub fn run_regional() -> io::Result<()> {
+    run_with_mode(CityLaunchMode::RegionalSingleRegion)
+}
+
+fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
     let mut terminal = TerminalGuard::enter()?;
-    let mut runtime = TuiRuntime::new(Instant::now());
+    let mut runtime = TuiRuntime::with_mode(Instant::now(), mode)
+        .map_err(|error| io::Error::other(error.to_string()))?;
 
     loop {
         runtime.apply_due_auto_tick(Instant::now());
@@ -547,6 +564,9 @@ pub fn run() -> io::Result<()> {
                 runtime.state.cursor_y,
                 runtime.state.selected_build,
             );
+            if let Some(error) = runtime.game.take_read_error_message() {
+                runtime.state.message = error;
+            }
 
             // ratatui redraws the whole frame into an off-screen buffer and then flushes the diff
             // to the terminal. The closure receives a `Frame` that all render functions write into.
@@ -1370,6 +1390,7 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::game::Game;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
 
@@ -1575,7 +1596,7 @@ mod tests {
     fn manual_tick_advances_only_when_paused() {
         let now = Instant::now();
         let mut runtime = TuiRuntime::new(now);
-        runtime.game = Game::new(10, 10);
+        runtime.game = CityDriver::single_city_with_size(10, 10);
         runtime.state.run_speed = RunSpeed::Four;
 
         assert_eq!(
@@ -1592,7 +1613,7 @@ mod tests {
     fn manual_tick_is_blocked_while_running() {
         let now = Instant::now();
         let mut runtime = TuiRuntime::new(now);
-        runtime.game = Game::new(10, 10);
+        runtime.game = CityDriver::single_city_with_size(10, 10);
         runtime.state.is_running = true;
         runtime.state.run_speed = RunSpeed::Four;
 
@@ -1610,7 +1631,7 @@ mod tests {
     fn apply_action_updates_build_tool_and_cursor() {
         let now = Instant::now();
         let mut runtime = TuiRuntime::new(now);
-        runtime.game = Game::new(3, 3);
+        runtime.game = CityDriver::single_city_with_size(3, 3);
         runtime.mark_clean();
 
         assert_eq!(
@@ -1634,7 +1655,7 @@ mod tests {
     fn runtime_applies_due_auto_tick_when_running() {
         let now = Instant::now();
         let mut runtime = TuiRuntime::new(now);
-        runtime.game = Game::new(10, 10);
+        runtime.game = CityDriver::single_city_with_size(10, 10);
         runtime.state.is_running = true;
         runtime.next_auto_tick = now;
         runtime.mark_clean();
@@ -1650,7 +1671,7 @@ mod tests {
     fn runtime_applies_due_auto_tick_using_current_speed_interval() {
         let now = Instant::now();
         let mut runtime = TuiRuntime::new(now);
-        runtime.game = Game::new(10, 10);
+        runtime.game = CityDriver::single_city_with_size(10, 10);
         runtime.state.is_running = true;
         runtime.state.run_speed = RunSpeed::Four;
         runtime.next_auto_tick = now;

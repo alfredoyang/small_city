@@ -3,11 +3,11 @@
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::Command;
 
-use crate::core::game::Game;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
     BuildPreviewView, DemandLevel, GameView, InspectDetailsView, InspectView,
 };
+use crate::ui::city_driver::{CityDriver, CityLaunchMode};
 
 const DEFAULT_SAVE_FILE: &str = "city1";
 
@@ -80,10 +80,19 @@ enum UiAction {
     Noop,
 }
 
-/// Runs the ASCII terminal UI using only the public Game API and interface view models.
+/// Runs the ASCII terminal UI using only facade APIs and interface view models.
 pub fn run() -> io::Result<()> {
+    run_with_mode(CityLaunchMode::SingleCity)
+}
+
+/// Runs the ASCII terminal UI on the regional facade behind an explicit flag.
+pub fn run_regional() -> io::Result<()> {
+    run_with_mode(CityLaunchMode::RegionalSingleRegion)
+}
+
+fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
     let _raw_terminal = RawTerminal::enter()?;
-    let mut game = Game::default();
+    let mut game = CityDriver::new(mode).map_err(|error| io::Error::other(error.to_string()))?;
     let mut state = AsciiUiState::default();
     let mut message = String::from("Tiny City Builder");
 
@@ -92,6 +101,9 @@ pub fn run() -> io::Result<()> {
         state.clamp_cursor(&view);
         let inspect = game.inspect(state.cursor_x, state.cursor_y);
         let preview = game.preview_build(state.cursor_x, state.cursor_y, state.selected_build);
+        if let Some(error) = game.take_read_error_message() {
+            message = error;
+        }
         render_screen(&view, &inspect, &preview, &state, &message)?;
 
         match read_action()? {
@@ -120,7 +132,10 @@ pub fn run() -> io::Result<()> {
                 message = game.bulldoze(state.cursor_x, state.cursor_y).message();
             }
             UiAction::Inspect => {
-                message = format_inspect(&game.inspect(state.cursor_x, state.cursor_y));
+                let inspect = game.inspect(state.cursor_x, state.cursor_y);
+                message = game
+                    .take_read_error_message()
+                    .unwrap_or_else(|| format_inspect(&inspect));
             }
             UiAction::NextTurn => {
                 message = game.tick().message();
@@ -138,9 +153,8 @@ pub fn run() -> io::Result<()> {
             }
             UiAction::Load => {
                 let filename = prompt_filename("Load filename", DEFAULT_SAVE_FILE)?;
-                message = match Game::load_from_file(&filename) {
-                    Ok(loaded_game) => {
-                        game = loaded_game;
+                message = match game.load_from_file(&filename) {
+                    Ok(()) => {
                         let loaded_view = game.view_with_overlay(state.current_overlay);
                         state.reset_cursor();
                         state.clamp_cursor(&loaded_view);

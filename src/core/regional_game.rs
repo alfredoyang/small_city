@@ -20,9 +20,11 @@ pub use crate::core::regional_types::{
     UiRequestId,
 };
 use crate::core::regions::{RegionId, RegionState, RegionStateSaveRecord};
-use crate::interface::events::CommandResult;
+use crate::interface::events::{CommandResult, GameEventView};
 use crate::interface::input::{BuildingKind, MapOverlayInput};
-use crate::interface::view::{BuildPreviewView, InspectView};
+use crate::interface::view::{BuildPreviewView, GameView, InspectView};
+
+const DEFAULT_SINGLE_REGION_ID: RegionId = RegionId(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Deterministic errors returned by regional facade operations.
@@ -45,6 +47,7 @@ pub enum RegionalGameError {
         request_id: UiRequestId,
         region_id: RegionId,
     },
+    NoSelectedRegion,
     WorkerRoutingFailed,
     RegionAttachFailed,
     WorkerStopped,
@@ -141,6 +144,14 @@ pub struct RegionalGame {
 }
 
 impl RegionalGame {
+    pub fn single_region(width: usize, height: usize) -> Result<Self, RegionalGameError> {
+        Self::from_regions(vec![RegionState::new(
+            DEFAULT_SINGLE_REGION_ID,
+            width,
+            height,
+        )])
+    }
+
     pub fn from_regions(regions: Vec<RegionState>) -> Result<Self, RegionalGameError> {
         let region_ids = regions.iter().map(RegionState::id).collect::<Vec<_>>();
         let selected_region = region_ids.first().copied();
@@ -156,6 +167,10 @@ impl RegionalGame {
 
     pub fn view(&self) -> Result<RegionalGameView, RegionalGameError> {
         self.view_with_overlay(MapOverlayInput::Normal)
+    }
+
+    pub fn selected_region_view(&self) -> Result<GameView, RegionalGameError> {
+        self.selected_region_view_with_overlay(MapOverlayInput::Normal)
     }
 
     pub fn view_with_overlay(
@@ -176,6 +191,19 @@ impl RegionalGame {
         })
     }
 
+    pub fn selected_region_view_with_overlay(
+        &self,
+        overlay: MapOverlayInput,
+    ) -> Result<GameView, RegionalGameError> {
+        let region_id = self.selected_region_or_first()?;
+        let view = self.view_with_overlay(overlay)?;
+        view.regions
+            .into_iter()
+            .find(|snapshot| snapshot.region_id == region_id)
+            .map(|snapshot| snapshot.view)
+            .ok_or(RegionalGameError::UnknownRegion { region_id })
+    }
+
     pub fn inspect_region(
         &self,
         region_id: RegionId,
@@ -185,6 +213,14 @@ impl RegionalGame {
         self.runner
             .inspect_region(region_id, x, y)
             .map_err(RegionalGameError::from)
+    }
+
+    pub fn inspect_selected_region(
+        &self,
+        x: usize,
+        y: usize,
+    ) -> Result<InspectView, RegionalGameError> {
+        self.inspect_region(self.selected_region_or_first()?, x, y)
     }
 
     pub fn tick_region(&self, region_id: RegionId) -> Result<(), RegionalGameError> {
@@ -200,6 +236,17 @@ impl RegionalGame {
         Ok(())
     }
 
+    pub fn tick_selected_region(&self) -> Result<CommandResult, RegionalGameError> {
+        let region_id = self.selected_region_or_first()?;
+        self.tick_region(region_id)?;
+        // TODO: Preserve tick-result parity with `Game::tick` by routing the real
+        // `RegionState::tick_local` CommandResult back through the runtime instead
+        // of fabricating a minimal TurnAdvanced event from a follow-up snapshot.
+        Ok(CommandResult::success(GameEventView::TurnAdvanced {
+            turn: self.selected_region_view()?.status.turn,
+        }))
+    }
+
     pub fn build(
         &self,
         region_id: RegionId,
@@ -208,6 +255,15 @@ impl RegionalGame {
         kind: BuildingKind,
     ) -> Result<CommandResult, RegionalGameError> {
         self.run_result_command(region_id, RegionCommand::Build { x, y, kind })
+    }
+
+    pub fn build_selected_region(
+        &self,
+        x: usize,
+        y: usize,
+        kind: BuildingKind,
+    ) -> Result<CommandResult, RegionalGameError> {
+        self.build(self.selected_region_or_first()?, x, y, kind)
     }
 
     pub fn preview_build(
@@ -233,6 +289,15 @@ impl RegionalGame {
         }
     }
 
+    pub fn preview_build_selected_region(
+        &self,
+        x: usize,
+        y: usize,
+        kind: BuildingKind,
+    ) -> Result<BuildPreviewView, RegionalGameError> {
+        self.preview_build(self.selected_region_or_first()?, x, y, kind)
+    }
+
     pub fn bulldoze(
         &self,
         region_id: RegionId,
@@ -240,6 +305,14 @@ impl RegionalGame {
         y: usize,
     ) -> Result<CommandResult, RegionalGameError> {
         self.run_result_command(region_id, RegionCommand::Bulldoze { x, y })
+    }
+
+    pub fn bulldoze_selected_region(
+        &self,
+        x: usize,
+        y: usize,
+    ) -> Result<CommandResult, RegionalGameError> {
+        self.bulldoze(self.selected_region_or_first()?, x, y)
     }
 
     pub fn replace(
@@ -252,6 +325,15 @@ impl RegionalGame {
         self.run_result_command(region_id, RegionCommand::Replace { x, y, kind })
     }
 
+    pub fn replace_selected_region(
+        &self,
+        x: usize,
+        y: usize,
+        kind: BuildingKind,
+    ) -> Result<CommandResult, RegionalGameError> {
+        self.replace(self.selected_region_or_first()?, x, y, kind)
+    }
+
     pub fn upgrade(
         &self,
         region_id: RegionId,
@@ -259,6 +341,14 @@ impl RegionalGame {
         y: usize,
     ) -> Result<CommandResult, RegionalGameError> {
         self.run_result_command(region_id, RegionCommand::Upgrade { x, y })
+    }
+
+    pub fn upgrade_selected_region(
+        &self,
+        x: usize,
+        y: usize,
+    ) -> Result<CommandResult, RegionalGameError> {
+        self.upgrade(self.selected_region_or_first()?, x, y)
     }
 
     pub fn handle_ui_request(&self, request: UiRequest) -> Result<UiReply, RegionalGameError> {
@@ -310,6 +400,19 @@ impl RegionalGame {
 
     fn next_request_id(&self) -> UiRequestId {
         UiRequestId(self.next_request_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn selected_region_or_first(&self) -> Result<RegionId, RegionalGameError> {
+        if let Some(region_id) = self.selected_region {
+            if self.region_ids.contains(&region_id) {
+                return Ok(region_id);
+            }
+        }
+
+        self.region_ids
+            .first()
+            .copied()
+            .ok_or(RegionalGameError::NoSelectedRegion)
     }
 
     pub fn shutdown(self) -> Result<RecoveredRegionalGame, RegionalGameError> {

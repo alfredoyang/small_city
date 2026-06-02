@@ -6,11 +6,13 @@ Small City is a minimal SimCity-like simulation game written in Rust. The goal i
 
 The project is split into three layers:
 
-- `core`: ECS data, resources, systems, grid, and the public `Game` API.
+- `core`: ECS data, resources, systems, grid, and the public `Game` API. It also contains `core/regions`, an in-progress multi-region threading model, and the `RegionalGame` facade built on top of it.
 - `interface`: UI-safe input types, events, view models, and adapters from ECS state to renderable data.
-- `ui`: terminal frontends, including the ratatui TUI and cursor-based ASCII fallback UI.
+- `ui`: terminal frontends, including the ratatui TUI and cursor-based ASCII fallback UI, plus a `CityDriver` adapter that lets a frontend run on either the single-city or regional backend.
 
-The main public API is `Game`, which owns the private ECS `World` and exposes operations such as `build`, `preview_build`, `replace`, `upgrade`, `bulldoze`, `tick`, `inspect`, `view`, `view_with_overlay`, `save_to_file`, and `load_from_file`.
+The default public API is `Game`, which owns the private ECS `World` and exposes operations such as `build`, `preview_build`, `replace`, `upgrade`, `bulldoze`, `tick`, `inspect`, `view`, `view_with_overlay`, `save_to_file`, and `load_from_file`.
+
+A second, opt-in API is `RegionalGame`: a UI-facing facade over one or more independent regions that each own a private `World`. It exposes the same per-region command and view surface (`build`, `preview_build`, `replace`, `upgrade`, `bulldoze`, `tick_region`, `inspect_region`, `view`, `view_with_overlay`, `save_to_file`, `load_from_file`) while keeping all ECS state behind message passing. See "Regional Simulation" below.
 
 ## ECS Core
 
@@ -27,7 +29,7 @@ Citizens are ECS entities, but they do not occupy grid cells. Buildings remain t
 
 ## UI Boundary
 
-UI code must not access ECS internals. It must use the public `Game` API and render only from interface view models such as `GameView`, `CellView`, and `InspectView`.
+UI code must not access ECS internals. It must use the public `Game` or `RegionalGame` API (through the `CityDriver` adapter) and render only from interface view models such as `GameView`, `CellView`, and `InspectView`. UI modules never import worker, runtime, or `World` types; a contract test enforces this for the regional path.
 
 The adapter in `src/interface/adapter.rs` is the boundary where private ECS data becomes UI-safe view data. Map overlays, demand, road-connected status, local effects, build previews, and inspect details are generated before the ASCII UI renders them.
 
@@ -42,8 +44,10 @@ cargo run
 You can choose a frontend explicitly:
 
 ```sh
-cargo run -- tui
-cargo run -- ascii
+cargo run -- tui              # default panel-based TUI (single city)
+cargo run -- ascii            # ASCII fallback (single city)
+cargo run -- regional         # TUI on the regional facade (single region, experimental)
+cargo run -- regional-ascii   # ASCII fallback on the regional facade (experimental)
 ```
 
 The TUI uses `ratatui` and `crossterm` for panels, styling, alternate-screen rendering, keyboard input, and raw terminal mode. The older ASCII UI remains available as a fallback/debug frontend.
@@ -133,6 +137,30 @@ The TUI presents the same view data in panels: city map, selected cell, city sta
 
 The TUI needs at least a 100x30 terminal. Smaller terminals show a resize warning and suggest `cargo run -- ascii`.
 
+## Regional Simulation
+
+Alongside the single-city `Game`, the project is building a multi-region model where several regions simulate independently and communicate by message passing instead of shared ECS access. This path is opt-in and does not change the default single-city behavior.
+
+Layers, from lowest to highest:
+
+- `RegionState`: owns one private `World` plus a rebuildable imported-resource cache, and exposes the same command/view surface as `Game`.
+- `RegionRuntime`: an actor-style event loop around one `RegionState`. It processes owned events (tick, run command, build snapshot, imported-resource work) in FIFO order and returns owned reply messages.
+- `RegionWorker`: schedules several runtimes fairly on one thread and routes messages between region mailboxes without ever reading ECS state.
+- `RegionHandle`: a cloneable mailbox endpoint that the runner and neighboring regions use to send events.
+- `ThreadedRegionWorker`: runs one `RegionWorker` on its own OS thread, controlled through a command channel with deterministic shutdown.
+- `RegionalGameRunner`: starts exactly one threaded worker, keeps the handles private, and exposes narrow UI-safe operations (tick, command, snapshot, inspect, shutdown/recover).
+- `RegionalGame`: the UI-facing facade. The UI talks only to this facade, never to the worker, runtime, or `World`.
+- `LoadManager`: a deterministic, not-yet-wired policy for moving a region between workers based on simple load summaries.
+
+Cross-region resources are modeled as imported offers with origin, kind, generation, remaining capacity, hop count, and max hops. Offers are treated as rebuildable cache: they are propagated at runtime, not saved as permanent truth.
+
+Today the terminal frontends drive a single region through this facade when launched with `cargo run -- regional` (or `regional-ascii`). Single-region behavior is verified to match `Game` command-for-command and view-for-view, including overlays. Player-visible multi-region play is not yet exposed in the UI.
+
+Status:
+
+- Done: imported-resource model, region state wrapper, single-threaded runtime, opaque caller continuations, shared worker scheduling, stable mailbox handles, worker reassignment safe point, optional OS-thread runner, regional facade and snapshot requests, runner with one threaded worker, load-manager policy, regional command path, single-region view parity with `Game`, regional save/load, and the single-region UI behind a flag.
+- Next: player-visible multi-region play, with region switching and visible cross-region effects.
+
 ## Save And Load
 
 Save the current city from the ASCII UI:
@@ -151,6 +179,8 @@ Save/load prompts for a filename. Press Enter at the prompt to use the default `
 
 Save files are JSON snapshots of the private game state. Loading refreshes derived state before the game continues and resets the UI cursor to the loaded map.
 
+In regional mode the save stores only authoritative per-region state. On load, derived state is refreshed and the imported-resource cache is rebuilt rather than restored, so cross-region offers regenerate as the simulation runs. Recovery happens at an explicit safe point through the runner, so no ECS state is read across the worker thread.
+
 ## Tests
 
 Run the standard checks:
@@ -162,6 +192,8 @@ cargo clippy -- -D warnings
 ```
 
 Tests cover core simulation rules, citizen economy, road connectivity, demand, bulldoze, build previews, save/load behavior, inspect output, map overlays, cursor/action parsing, TUI key mapping, and UI boundary contracts.
+
+Regional tests cover imported-resource propagation, the region runtime and opaque continuations, worker scheduling, stable handles, worker reassignment, the threaded runner, the regional facade, command routing, single-region parity with `Game`, regional save/load, the load-manager policy, and the regional UI boundary (a contract test asserts UI sources never import worker, runtime, or ECS types).
 
 Scenario-style integration tests cover longer multi-turn cities that combine power networks, demand-driven growth, citizen salary/rent/shopping economy, land-value effects, upgrades, replace, bulldoze, overlays, and save/load.
 

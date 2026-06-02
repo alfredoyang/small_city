@@ -1,8 +1,14 @@
 //! UI boundary contract tests ensuring the ASCII UI uses public view models and Game APIs.
 
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use small_city::core::game::Game;
+use small_city::core::regional_game::RegionalGame;
+use small_city::core::regions::{RegionId, RegionState};
 use small_city::interface::input::{BuildingKind, MapOverlayInput, UiCommand, parse_command};
 use small_city::interface::view::GameView;
+use small_city::ui::city_driver::{CityDriver, CityLaunchMode};
 
 #[test]
 fn game_view_contains_width_times_height_cells() {
@@ -182,7 +188,7 @@ fn ascii_ui_save_load_uses_game_api_only() {
     let source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii ui source");
 
     assert!(source.contains("game.save_to_file"));
-    assert!(source.contains("Game::load_from_file"));
+    assert!(source.contains("game.load_from_file"));
     for forbidden in ["serde", "serde_json", "std::fs", "File::"] {
         assert!(
             !source.contains(forbidden),
@@ -225,4 +231,95 @@ fn ascii_ui_renders_inspect_explanations_from_inspect_view() {
 
     assert!(source.contains("inspect.explanations"));
     assert!(source.contains("Inspect Notes:"));
+}
+
+#[test]
+fn regional_ui_driver_uses_facade_commands_and_snapshots() {
+    let mut driver =
+        CityDriver::new(CityLaunchMode::RegionalSingleRegion).expect("regional UI driver");
+
+    let preview = driver.preview_build(1, 1, BuildingKind::Residential);
+    let build = driver.build(1, 1, BuildingKind::Residential);
+    let inspect = driver.inspect(1, 1);
+    let view = driver.view_with_overlay(MapOverlayInput::Normal);
+
+    assert!(preview.can_build);
+    assert!(build.success);
+    assert_eq!(
+        inspect.cell.expect("regional inspected cell").building,
+        Some(BuildingKind::Residential)
+    );
+    assert_eq!(
+        view.map.cells[1 + view.map.width].building,
+        Some(BuildingKind::Residential)
+    );
+}
+
+#[test]
+fn regional_ui_driver_load_uses_loaded_selected_region() {
+    let path = save_path("regional-ui-selected-region");
+    let game = RegionalGame::from_regions(vec![RegionState::new(RegionId(2), 3, 3)]).unwrap();
+    let saved_game = game.save_to_file(&path).unwrap();
+    let mut driver =
+        CityDriver::new(CityLaunchMode::RegionalSingleRegion).expect("regional UI driver");
+
+    driver.load_from_file(&path).unwrap();
+    let build = driver.build(1, 1, BuildingKind::Residential);
+    let view = driver.view();
+
+    assert!(build.success);
+    assert_eq!(
+        view.map.cells[1 + view.map.width].building,
+        Some(BuildingKind::Residential)
+    );
+    drop(saved_game);
+    remove_save_file(path);
+}
+
+#[test]
+fn regional_launch_flag_is_available_without_replacing_default_tui() {
+    let source = std::fs::read_to_string("src/main.rs").expect("main source");
+
+    assert!(source.contains("Some(\"regional\")"));
+    assert!(source.contains("small_city::ui::tui::run_regional()"));
+    assert!(source.contains("Some(\"tui\") | None => small_city::ui::tui::run()"));
+}
+
+#[test]
+fn ui_regional_path_does_not_import_worker_runtime_or_ecs_internals() {
+    for path in ["src/ui/ascii.rs", "src/ui/tui.rs", "src/ui/city_driver.rs"] {
+        let source = std::fs::read_to_string(path).expect("ui source");
+
+        for forbidden in [
+            "crate::core::world",
+            "crate::core::components",
+            "crate::core::systems",
+            "crate::core::resources",
+            "crate::core::grid",
+            "crate::core::regions::runtime",
+            "crate::core::regions::worker",
+            "crate::core::regions::threaded",
+            "RegionState",
+            "RegionRuntime",
+            "RegionWorker",
+            "ThreadedRegionWorker",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{path} must not import or name {forbidden}"
+            );
+        }
+    }
+}
+
+fn save_path(name: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    std::env::temp_dir().join(format!("small_city_{name}_{unique}.json"))
+}
+
+fn remove_save_file(path: PathBuf) {
+    std::fs::remove_file(path).expect("remove save file");
 }
