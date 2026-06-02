@@ -5,6 +5,8 @@ pub mod entity;
 pub mod game;
 pub mod grid;
 pub mod regional_game;
+pub mod regional_game_runner;
+pub mod regional_types;
 pub mod regions;
 pub mod resources;
 pub mod systems;

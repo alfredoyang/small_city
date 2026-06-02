@@ -1,0 +1,121 @@
+//! Integration tests for the threaded regional game runner boundary.
+
+use small_city::core::regional_game::{UiReply, UiRequestId};
+use small_city::core::regional_game_runner::{RegionalGameRunner, RegionalGameRunnerError};
+use small_city::core::regions::{RegionId, RegionState};
+
+#[test]
+fn runner_starts_one_threaded_worker_and_processes_regional_tick() {
+    let runner = RegionalGameRunner::start(vec![RegionState::new(RegionId(1), 2, 2)]).unwrap();
+
+    runner.tick_region(RegionId(1)).unwrap();
+    let reply = runner
+        .request_region_snapshot(UiRequestId(10), RegionId(1))
+        .unwrap();
+
+    let UiReply::RegionSnapshotReady {
+        request_id,
+        region_id,
+        snapshot,
+    } = reply;
+
+    assert_eq!(request_id, UiRequestId(10));
+    assert_eq!(region_id, RegionId(1));
+    assert_eq!(snapshot.view.status.turn, 1);
+    runner.shutdown().unwrap();
+}
+
+#[test]
+fn runner_returns_owned_snapshot_for_requested_region() {
+    let runner = RegionalGameRunner::start(vec![
+        RegionState::new(RegionId(2), 2, 2),
+        RegionState::new(RegionId(3), 4, 3),
+    ])
+    .unwrap();
+
+    let reply = runner
+        .request_region_snapshot(UiRequestId(20), RegionId(3))
+        .unwrap();
+
+    let UiReply::RegionSnapshotReady { snapshot, .. } = reply;
+
+    assert_eq!(snapshot.region_id, RegionId(3));
+    assert_eq!(snapshot.view.map.width, 4);
+    assert_eq!(snapshot.view.map.height, 3);
+    assert_eq!(snapshot.revision, 0);
+    runner.shutdown().unwrap();
+}
+
+#[test]
+fn runner_shutdown_recovers_authoritative_region_state() {
+    let runner = RegionalGameRunner::start(vec![RegionState::new(RegionId(4), 2, 2)]).unwrap();
+
+    runner.tick_region(RegionId(4)).unwrap();
+    let recovered = runner.shutdown().unwrap();
+    let snapshot = recovered.region_snapshot(RegionId(4)).unwrap();
+
+    assert_eq!(snapshot.region_id, RegionId(4));
+    assert_eq!(snapshot.view.status.turn, 1);
+}
+
+#[test]
+fn unknown_region_requests_return_deterministic_errors() {
+    let runner = RegionalGameRunner::start(vec![RegionState::new(RegionId(5), 2, 2)]).unwrap();
+
+    let tick_error = runner
+        .tick_region(RegionId(99))
+        .expect_err("unknown tick region should fail");
+    let snapshot_error = runner
+        .request_region_snapshot(UiRequestId(30), RegionId(99))
+        .expect_err("unknown snapshot region should fail");
+
+    assert_eq!(
+        tick_error,
+        RegionalGameRunnerError::UnknownRegion {
+            region_id: RegionId(99),
+        }
+    );
+    assert_eq!(
+        snapshot_error,
+        RegionalGameRunnerError::UnknownRegion {
+            region_id: RegionId(99),
+        }
+    );
+    runner.shutdown().unwrap();
+}
+
+#[test]
+fn duplicate_regions_are_rejected_before_thread_start() {
+    let error = RegionalGameRunner::start(vec![
+        RegionState::new(RegionId(6), 2, 2),
+        RegionState::new(RegionId(6), 3, 3),
+    ])
+    .expect_err("duplicate region should fail");
+
+    assert_eq!(
+        error,
+        RegionalGameRunnerError::DuplicateRegion {
+            region_id: RegionId(6),
+        }
+    );
+}
+
+#[test]
+fn ui_facing_code_can_use_runner_without_worker_or_runtime_types() {
+    fn request_turn_snapshot(
+        runner: &RegionalGameRunner,
+        region_id: RegionId,
+    ) -> Result<u32, RegionalGameRunnerError> {
+        let reply = runner.request_region_snapshot(UiRequestId(40), region_id)?;
+        let UiReply::RegionSnapshotReady { snapshot, .. } = reply;
+
+        Ok(snapshot.view.status.turn)
+    }
+
+    let runner = RegionalGameRunner::start(vec![RegionState::new(RegionId(7), 2, 2)]).unwrap();
+
+    runner.tick_region(RegionId(7)).unwrap();
+
+    assert_eq!(request_turn_snapshot(&runner, RegionId(7)).unwrap(), 1);
+    runner.shutdown().unwrap();
+}

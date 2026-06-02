@@ -8,7 +8,9 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
+use crate::core::regions::RegionId;
 use crate::core::regions::worker::{RegionWorker, WorkerId, WorkerRunSummary};
+use crate::interface::view::{GameView, InspectView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Deterministic shutdown behavior for a threaded worker.
@@ -79,6 +81,56 @@ impl ThreadedRegionWorker {
             })
     }
 
+    pub fn region_view(
+        &self,
+        region_id: RegionId,
+    ) -> Result<Option<GameView>, ThreadedWorkerError> {
+        // This is a synchronous worker control command, not a region inbox event.
+        // Callers that need a post-event snapshot must request event processing first.
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.commands
+            .send(ThreadedWorkerCommand::View {
+                region_id,
+                reply: reply_sender,
+            })
+            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
+                worker_id: self.worker_id,
+            })?;
+
+        reply_receiver
+            .recv()
+            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
+                worker_id: self.worker_id,
+            })
+    }
+
+    pub fn inspect_region(
+        &self,
+        region_id: RegionId,
+        x: usize,
+        y: usize,
+    ) -> Result<Option<InspectView>, ThreadedWorkerError> {
+        // Like region_view, inspect reads the worker-owned runtime directly on
+        // the worker thread after explicitly requested event processing.
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.commands
+            .send(ThreadedWorkerCommand::Inspect {
+                region_id,
+                x,
+                y,
+                reply: reply_sender,
+            })
+            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
+                worker_id: self.worker_id,
+            })?;
+
+        reply_receiver
+            .recv()
+            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
+                worker_id: self.worker_id,
+            })
+    }
+
     pub fn shutdown(
         mut self,
         mode: ThreadedWorkerShutdown,
@@ -130,6 +182,16 @@ enum ThreadedWorkerCommand {
         max_events_per_region: usize,
         reply: Sender<WorkerRunSummary>,
     },
+    View {
+        region_id: RegionId,
+        reply: Sender<Option<GameView>>,
+    },
+    Inspect {
+        region_id: RegionId,
+        x: usize,
+        y: usize,
+        reply: Sender<Option<InspectView>>,
+    },
     Shutdown {
         mode: ThreadedWorkerShutdown,
         reply: Sender<ThreadedWorkerShutdownResult>,
@@ -145,6 +207,17 @@ fn run_worker(mut worker: RegionWorker, commands: Receiver<ThreadedWorkerCommand
             } => {
                 let _ = reply.send(worker.process_region_events(max_events_per_region));
             }
+            ThreadedWorkerCommand::View { region_id, reply } => {
+                let _ = reply.send(view_from_worker(&worker, region_id));
+            }
+            ThreadedWorkerCommand::Inspect {
+                region_id,
+                x,
+                y,
+                reply,
+            } => {
+                let _ = reply.send(inspect_from_worker(&worker, region_id, x, y));
+            }
             ThreadedWorkerCommand::Shutdown { mode, reply } => {
                 let final_pass = match mode {
                     ThreadedWorkerShutdown::RejectPending => WorkerRunSummary::default(),
@@ -157,6 +230,23 @@ fn run_worker(mut worker: RegionWorker, commands: Receiver<ThreadedWorkerCommand
             }
         }
     }
+}
+
+fn view_from_worker(worker: &RegionWorker, region_id: RegionId) -> Option<GameView> {
+    worker
+        .region(region_id)
+        .map(|runtime| runtime.state().view())
+}
+
+fn inspect_from_worker(
+    worker: &RegionWorker,
+    region_id: RegionId,
+    x: usize,
+    y: usize,
+) -> Option<InspectView> {
+    worker
+        .region(region_id)
+        .map(|runtime| runtime.state().inspect(x, y))
 }
 
 #[cfg(test)]

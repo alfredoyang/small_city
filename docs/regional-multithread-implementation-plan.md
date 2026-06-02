@@ -430,23 +430,44 @@ Likely files:
 
 - `src/core/regional_game_runner.rs`
 - `src/core/regional_game.rs`
+- `src/core/regional_types.rs`
 - `src/core/regions/threaded.rs`
 - `tests/regional_game_runner_test.rs`
 
 Implementation:
 
-- Add `RegionalGameRunner` as the public execution owner above `RegionalGame`.
+- Add `RegionalGameRunner` as the threaded execution owner that sits below the
+  `RegionalGame` facade and above the worker layer. `RegionalGame` stays the
+  UI-facing facade and owns/delegates to one `RegionalGameRunner`; the runner
+  owns the thread lifecycle, region handles, and the single threaded worker.
 - Keep it threaded internally from the start, but create only one
   `ThreadedRegionWorker` for now.
 - Move one `RegionWorker` into that threaded worker. The `RegionWorker` owns the
   `RegionRuntime` values, and each runtime owns its `RegionState`.
-- Keep UI and future UI-facing code talking only to `RegionalGameRunner` methods,
-  not to `ThreadedRegionWorker`, `RegionWorker`, `RegionRuntime`, or `World`.
+- Keep UI and future UI-facing code talking only to the `RegionalGame` facade,
+  which delegates to `RegionalGameRunner`. UI code must not touch
+  `ThreadedRegionWorker`, `RegionWorker`, `RegionRuntime`, or `World` directly.
+- Keep shared UI-safe request/reply/snapshot values (`UiRequest`, `UiReply`,
+  `RegionViewSnapshot`, `RegionalGameView`, `UiRequestId`) in a neutral
+  `regional_types` leaf module so the runner and threaded worker do not depend
+  upward on the `RegionalGame` facade module.
 - Expose a narrow first API:
   - start from one or more `RegionState` values
   - process/tick one region through the worker
   - request an owned region snapshot
   - shut down and recover the worker/state
+- In Patch 10, `tick_region` sends `RegionEvent::Tick` only to the requested
+  region, then asks the worker for one fair scheduling pass across all owned
+  regions. That can drain already queued work from another region. This is
+  acceptable for the first one-worker runner, but target-only event processing
+  should be a separate worker command if later APIs need that guarantee.
+- For Patch 10, snapshot and inspect requests are synchronous worker control
+  commands. They read the selected runtime on the worker thread and return a
+  blocking reply; they do not enqueue `RegionEvent::BuildSnapshot` through the
+  region inbox. If a caller needs a snapshot after pending region events, it must
+  first request bounded event processing. The `UiRequestId` remains part of the
+  UI-facing reply contract so a later asynchronous/event-routed snapshot path can
+  use it for correlation without changing facade payloads.
 - Use explicit request/reply data and deterministic errors. Do not expose raw
   channels, handles, worker internals, or ECS storage through the runner API.
 - Do not add multi-worker routing, load balancing, UI migration, or save/load in
@@ -463,6 +484,10 @@ Tests:
 Review focus:
 
 - `RegionalGameRunner` owns thread lifecycle.
+- `RegionalGame` remains the single UI-facing entry point and delegates to the
+  runner; UI code never calls the runner, worker, or runtime directly.
+- Lower-level modules (`regional_game_runner`, `regions::threaded`) do not import
+  the `RegionalGame` facade module; shared payload types live in `regional_types`.
 - There is exactly one `ThreadedRegionWorker` in this patch.
 - UI boundary remains protected.
 - Shutdown is explicit and recovers state for later save/load or handoff.
@@ -517,17 +542,23 @@ No UI work is needed for the first runtime patches. When regional state becomes
 player-visible:
 
 - Add view-model fields before adding UI rendering.
-- Keep terminal UI code using `Game` or `RegionalGameRunner` only after the
-  runner API reaches feature parity for the needed workflow.
-- Route snapshot requests through the runner/facade:
+- Keep terminal UI code using `Game` or the `RegionalGame` facade only after the
+  facade/runner API reaches feature parity for the needed workflow.
+- Current Patch 10 snapshot/inspect requests stop at the worker control surface
+  and synchronously read the target runtime after whatever processing the caller
+  has explicitly requested. A future asynchronous snapshot path can replace that
+  with event-routed `RegionEvent::BuildSnapshot` /
+  `OutboundMessage::RegionSnapshotReady` correlation.
+- Route snapshot requests down through the facade and runner:
 
 ```text
 UI thread/process
+  -> RegionalGame (facade)
   -> RegionalGameRunner
   -> ThreadedRegionWorker
   -> RegionWorker
-  -> RegionRuntime
   -> RegionalGameRunner
+  -> RegionalGame (facade)
   -> UI-safe snapshot reply
 ```
 

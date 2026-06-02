@@ -1,50 +1,18 @@
-//! UI-facing facade for single-threaded regional simulation.
+//! UI-facing facade for threaded regional simulation.
 //!
-//! `RegionalGame` owns region runtimes and exposes only owned view models,
-//! request/reply values, and deterministic errors. It does not expose ECS
-//! `World` storage or require UI callers to talk directly to `RegionRuntime`.
+//! `RegionalGame` owns the regional execution runner and exposes only owned view
+//! models, request/reply values, and deterministic errors. It does not expose
+//! ECS `World` storage or require UI callers to talk directly to workers or
+//! runtimes.
 
-use crate::core::regions::runtime::{RegionEvent, RegionRuntime};
+use crate::core::regional_game_runner::{
+    RecoveredRegionalGame, RegionalGameRunner, RegionalGameRunnerError,
+};
+pub use crate::core::regional_types::{
+    RegionViewSnapshot, RegionalGameView, UiReply, UiRequest, UiRequestId,
+};
 use crate::core::regions::{RegionId, RegionState};
-use crate::interface::view::{GameView, InspectView};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-/// Stable request identity for UI-to-region snapshot requests.
-pub struct UiRequestId(pub u64);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// Owned UI-safe snapshot for one region.
-pub struct RegionViewSnapshot {
-    pub region_id: RegionId,
-    pub revision: u64,
-    pub view: GameView,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// Owned UI-safe composed view of all known regions.
-pub struct RegionalGameView {
-    pub regions: Vec<RegionViewSnapshot>,
-    pub selected_region: Option<RegionId>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// UI-facing request payloads for the regional facade.
-pub enum UiRequest {
-    GetRegionSnapshot {
-        request_id: UiRequestId,
-        region_id: RegionId,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// UI-facing reply payloads returned by the regional facade.
-pub enum UiReply {
-    RegionSnapshotReady {
-        request_id: UiRequestId,
-        region_id: RegionId,
-        snapshot: RegionViewSnapshot,
-    },
-}
+use crate::interface::view::InspectView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Deterministic errors returned by regional facade operations.
@@ -59,42 +27,45 @@ pub enum RegionalGameError {
         request_id: UiRequestId,
         region_id: RegionId,
     },
+    RegionAttachFailed,
+    WorkerStopped,
+    WorkerPanicked,
 }
 
 #[derive(Debug)]
-/// Single-threaded owner/facade for regional simulation.
+/// UI-facing owner/facade for threaded regional simulation.
 pub struct RegionalGame {
-    runtimes: Vec<RegionRuntime>,
+    runner: RegionalGameRunner,
+    region_ids: Vec<RegionId>,
     selected_region: Option<RegionId>,
 }
 
 impl RegionalGame {
     pub fn from_regions(regions: Vec<RegionState>) -> Result<Self, RegionalGameError> {
-        let mut runtimes = Vec::new();
+        let region_ids = regions.iter().map(RegionState::id).collect::<Vec<_>>();
+        let selected_region = region_ids.first().copied();
+        let runner = RegionalGameRunner::start(regions)?;
 
-        for region in regions {
-            let region_id = region.id();
-            if runtimes
-                .iter()
-                .any(|runtime: &RegionRuntime| runtime.region_id() == region_id)
-            {
-                return Err(RegionalGameError::DuplicateRegion { region_id });
-            }
-            runtimes.push(RegionRuntime::new(region));
-        }
-
-        let selected_region = runtimes.first().map(RegionRuntime::region_id);
         Ok(Self {
-            runtimes,
+            runner,
+            region_ids,
             selected_region,
         })
     }
 
-    pub fn view(&self) -> RegionalGameView {
-        RegionalGameView {
-            regions: self.runtimes.iter().map(snapshot_from_runtime).collect(),
-            selected_region: self.selected_region,
+    pub fn view(&self) -> Result<RegionalGameView, RegionalGameError> {
+        let mut regions = Vec::new();
+        for region_id in &self.region_ids {
+            let UiReply::RegionSnapshotReady { snapshot, .. } = self
+                .runner
+                .request_region_snapshot(UiRequestId(0), *region_id)?;
+            regions.push(snapshot);
         }
+
+        Ok(RegionalGameView {
+            regions,
+            selected_region: self.selected_region,
+        })
     }
 
     pub fn inspect_region(
@@ -103,38 +74,25 @@ impl RegionalGame {
         x: usize,
         y: usize,
     ) -> Result<InspectView, RegionalGameError> {
-        let runtime = self
-            .region(region_id)
-            .ok_or(RegionalGameError::UnknownRegion { region_id })?;
-
-        Ok(runtime.state().inspect(x, y))
+        self.runner
+            .inspect_region(region_id, x, y)
+            .map_err(RegionalGameError::from)
     }
 
-    pub fn tick_region(&mut self, region_id: RegionId) -> Result<(), RegionalGameError> {
-        let runtime = self
-            .region_mut(region_id)
-            .ok_or(RegionalGameError::UnknownRegion { region_id })?;
+    pub fn tick_region(&self, region_id: RegionId) -> Result<(), RegionalGameError> {
+        self.runner
+            .tick_region(region_id)
+            .map_err(RegionalGameError::from)
+    }
 
-        runtime.push_event(RegionEvent::Tick);
-        runtime.process_next_event();
+    pub fn tick_all_regions(&self) -> Result<(), RegionalGameError> {
+        for region_id in &self.region_ids {
+            self.tick_region(*region_id)?;
+        }
         Ok(())
     }
 
-    pub fn tick_all_regions(&mut self) {
-        let region_ids = self
-            .runtimes
-            .iter()
-            .map(RegionRuntime::region_id)
-            .collect::<Vec<_>>();
-
-        for region_id in region_ids {
-            // The region IDs come from the owned runtime list, so this cannot
-            // fail unless the list is mutated during this method.
-            let _ = self.tick_region(region_id);
-        }
-    }
-
-    pub fn handle_ui_request(&mut self, request: UiRequest) -> Result<UiReply, RegionalGameError> {
+    pub fn handle_ui_request(&self, request: UiRequest) -> Result<UiReply, RegionalGameError> {
         match request {
             UiRequest::GetRegionSnapshot {
                 request_id,
@@ -144,39 +102,32 @@ impl RegionalGame {
     }
 
     fn request_region_snapshot(
-        &mut self,
+        &self,
         request_id: UiRequestId,
         region_id: RegionId,
     ) -> Result<UiReply, RegionalGameError> {
-        let runtime = self
-            .region(region_id)
-            .ok_or(RegionalGameError::UnknownRegion { region_id })?;
-
-        Ok(UiReply::RegionSnapshotReady {
-            request_id,
-            region_id,
-            snapshot: snapshot_from_runtime(runtime),
-        })
+        self.runner
+            .request_region_snapshot(request_id, region_id)
+            .map_err(RegionalGameError::from)
     }
 
-    fn region(&self, region_id: RegionId) -> Option<&RegionRuntime> {
-        self.runtimes
-            .iter()
-            .find(|runtime| runtime.region_id() == region_id)
-    }
-
-    fn region_mut(&mut self, region_id: RegionId) -> Option<&mut RegionRuntime> {
-        self.runtimes
-            .iter_mut()
-            .find(|runtime| runtime.region_id() == region_id)
+    pub fn shutdown(self) -> Result<RecoveredRegionalGame, RegionalGameError> {
+        self.runner.shutdown().map_err(RegionalGameError::from)
     }
 }
 
-fn snapshot_from_runtime(runtime: &RegionRuntime) -> RegionViewSnapshot {
-    let view = runtime.state().view();
-    RegionViewSnapshot {
-        region_id: runtime.region_id(),
-        revision: view.status.turn as u64,
-        view,
+impl From<RegionalGameRunnerError> for RegionalGameError {
+    fn from(error: RegionalGameRunnerError) -> Self {
+        match error {
+            RegionalGameRunnerError::DuplicateRegion { region_id } => {
+                Self::DuplicateRegion { region_id }
+            }
+            RegionalGameRunnerError::UnknownRegion { region_id } => {
+                Self::UnknownRegion { region_id }
+            }
+            RegionalGameRunnerError::RegionAddFailed { .. } => Self::RegionAttachFailed,
+            RegionalGameRunnerError::WorkerStopped { .. } => Self::WorkerStopped,
+            RegionalGameRunnerError::WorkerPanicked { .. } => Self::WorkerPanicked,
+        }
     }
 }
