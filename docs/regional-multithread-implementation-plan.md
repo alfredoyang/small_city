@@ -525,6 +525,213 @@ Review focus:
 - Movement policy is understandable and stable.
 - Load manager does not inspect region ECS state.
 
+## Player-Facing Gameplay Track
+
+Patches 1 to 11 build a tested threading skeleton, but the regional path can only
+tick, view, and inspect. It cannot accept a single player action, so it is not
+yet a game. The goal of this track is to make multi-region gameplay real for
+players: a player can build, change, and grow more than one region and see the
+results, with the terminal UI talking only to the `RegionalGame` facade.
+
+These patches keep the same rules as the earlier ones: one mission per patch, no
+UI access to `World`, deterministic local formulas, owned request/reply payloads,
+and roughly five files or 400 lines per patch.
+
+Sequencing rationale: the command path (Patch 12) must come first because every
+later step depends on a player being able to act on a region. View parity
+(Patch 13) proves the regional path matches `Game` before any UI sees it.
+Save/load (Patch 14) protects player progress. Only then is it safe to point the
+UI at the facade (Patch 15) and make a second region reachable in play
+(Patch 16).
+
+## Patch 12: Regional Command Path
+
+Goal: let a player act on one region through the facade with the same command
+surface the single-city `Game` already exposes. This is the missing player-action
+layer and the first step toward real gameplay.
+
+Likely files:
+
+- `src/core/regions/mod.rs` (add command methods to `RegionState`)
+- `src/core/regions/runtime/mod.rs` (add a command event and owned result routing)
+- `src/core/regional_types.rs` (owned command request/reply payloads)
+- `src/core/regional_game.rs` and `src/core/regional_game_runner.rs`
+- `tests/regional_command_test.rs`
+
+Implementation:
+
+- Add `RegionState` command methods that mirror `Game`: `build`, `preview_build`,
+  `bulldoze`, `replace`, `upgrade`. Reuse the existing core systems; do not fork
+  building logic.
+- Add an owned `RegionCommand` request type in `regional_types` covering build,
+  bulldoze, replace, upgrade, and preview. Keep it `Send + 'static`, with no
+  references, closures, `World`, or ECS entity storage. Use `BuildingKind` and
+  coordinate fields only.
+- Add `RegionEvent::RunCommand { request_id, command }` (or similar) and route the
+  owned `CommandResult` / `BuildPreviewView` back as a reply, not as a direct
+  mutation of any other region.
+- Decide explicitly how command replies reach the caller. Prefer routing through
+  the region event loop so command ordering and snapshot ordering share one
+  deterministic path. If a synchronous worker command is used instead, document
+  why and confirm it cannot read partial state. This is the right time to resolve
+  the snapshot-vs-event-loop divergence noted for Patch 9.
+- Expose `RegionalGame::build/preview_build/bulldoze/replace/upgrade(region_id, ...)`
+  that delegate to the runner. Return deterministic errors for unknown regions.
+- Do not add overlays, save/load, or UI wiring in this patch.
+
+Tests:
+
+- a build command applied to a region changes only that region's view
+- preview returns owned data and does not mutate the region
+- bulldoze, replace, and upgrade route through the facade and produce the same
+  `CommandResult` shape as `Game`
+- a command for an unknown region returns a deterministic error
+- command payloads and replies are owned and expose no ECS internals
+- commands and ticks on one region are processed in a deterministic order
+
+Review focus:
+
+- Building logic is reused from core systems, not duplicated.
+- Command request/reply payloads are owned and safe to move across threads.
+- One region's command never mutates another region.
+- Command and snapshot ordering use one explained path.
+
+## Patch 13: Regional View Parity
+
+Goal: prove that driving a single region through the regional path produces the
+same player-visible state as the single-city `Game`, before any UI migration.
+
+Likely files:
+
+- `tests/regional_game_parity_test.rs`
+- small core additions only if a shared scripted-input helper is needed
+
+Implementation:
+
+- Add a deterministic scripted sequence of commands and ticks.
+- Run it through `Game` and through a single-region `RegionalGame`.
+- Compare resulting `GameView` values turn for turn and after each command.
+- Add `view_with_overlay` parity once the overlay path exists on the facade. If
+  overlays are not yet exposed, add the facade overlay method here as a small,
+  isolated addition.
+
+Tests:
+
+- identical command and tick scripts yield identical views from `Game` and the
+  single-region facade
+- divergence anywhere in the script fails loudly with the first differing turn
+- overlay views match when overlays are exposed
+
+Review focus:
+
+- The parity test is strict and deterministic.
+- Any facade additions stay minimal and do not change `Game` behavior.
+
+## Patch 14: Regional Save And Load
+
+Goal: protect player progress by saving and loading authoritative regional state,
+following the existing Save And Load Plan.
+
+Likely files:
+
+- `src/core/regional_game.rs` and `src/core/regional_game_runner.rs`
+- `src/core/regions/mod.rs` (per-region serialization of authoritative state)
+- `tests/regional_save_load_test.rs`
+
+Implementation:
+
+- Save authoritative per-region state and local resource generation counters.
+- Do not save imported offers as permanent truth.
+- Rebuild imported offers after load by regenerating exports and propagating them
+  again, using `rebuild_imported_resource_cache`.
+- Recover state at a safe point through the runner shutdown/handoff path rather
+  than reading ECS across threads.
+- Add compatibility tests before changing any existing single-city save format.
+
+Tests:
+
+- a multi-region game round-trips through save and load with identical views
+- imported resource cache is rebuilt, not loaded as truth
+- loading does not corrupt or read another region's authoritative state
+- existing single-city saves remain loadable
+
+Review focus:
+
+- Authoritative state is the only saved truth.
+- Cache rebuild is deterministic and matches a freshly propagated game.
+- Save/load happens at explicit safe points.
+
+## Patch 15: UI On The Regional Facade Behind A Flag
+
+Goal: let the terminal UI run on the regional facade without removing the working
+single-city path, so the migration is reversible.
+
+Likely files:
+
+- `src/main.rs` (launch flag/mode selection)
+- `src/ui/tui.rs` and `src/ui/ascii.rs` (drive `RegionalGame` for one region)
+- `tests/ui_regional_smoke_test.rs` or an interface-level boundary test
+
+Implementation:
+
+- Add a launch mode, for example `cargo run -- regional`, that drives a
+  single-region `RegionalGame`. Keep `cargo run` on `Game` as the default and the
+  fallback.
+- Render only from view models. The UI must not import worker, runtime, or
+  `World` types.
+- Map existing UI inputs to facade commands and snapshot requests.
+- Do not flip the default to regional and do not add a second player-visible
+  region in this patch.
+
+Tests:
+
+- a UI boundary test drives the regional mode through facade commands and view
+  snapshots only
+- the UI builds no dependency on ECS, worker, or runtime types
+- the default `Game` path is unchanged
+
+Review focus:
+
+- UI talks only to `RegionalGame`.
+- The single-city path still works and remains the default.
+- Every new public view path has a boundary test.
+
+## Patch 16: Multi-Region Play
+
+Goal: make a second region reachable in normal play so multi-region gameplay is
+real for players: build in more than one region, move between regions, and see
+cross-region resources take effect.
+
+Likely files:
+
+- `src/core/regional_game.rs` (selected-region navigation, composed view)
+- `src/ui/tui.rs` and `src/ui/ascii.rs` (region switching, region indicator)
+- `tests/regional_multi_region_play_test.rs`
+
+Implementation:
+
+- Start the regional mode with two or more regions on the one threaded worker.
+- Add region selection and switching to `RegionalGameView` and the UI, using the
+  existing `selected_region` field.
+- Let a player build and tick in each region and see per-region results.
+- Surface cross-region imported resources in the view models so their effect is
+  visible, reusing the propagation already built in Patches 1 and 4.
+- Only after this path is stable, consider flipping the default launch mode to
+  regional in a separate reviewed change.
+
+Tests:
+
+- a player can build in two regions and each region reflects only its own builds
+- switching the selected region changes the composed view deterministically
+- a cross-region imported resource produced in one region affects the intended
+  neighbor and is visible in view models
+
+Review focus:
+
+- Multiple regions are genuinely playable, not just present.
+- Cross-region effects are deterministic and visible only through view models.
+- Flipping the default launch mode stays a separate, explicit decision.
+
 ## Save And Load Plan
 
 Save/load should wait until the regional facade exists. When implemented:
