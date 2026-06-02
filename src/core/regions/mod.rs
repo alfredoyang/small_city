@@ -64,6 +64,7 @@ use crate::interface::events::CommandResult;
 use crate::interface::view::{GameView, InspectView};
 
 pub mod handle;
+pub mod load_manager;
 pub mod runtime;
 pub mod threaded;
 pub mod worker;

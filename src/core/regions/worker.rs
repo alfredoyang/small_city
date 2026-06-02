@@ -6,6 +6,7 @@
 
 use crate::core::regions::RegionId;
 use crate::core::regions::handle::RegionHandle;
+use crate::core::regions::load_manager::WorkerLoad;
 use crate::core::regions::runtime::{
     OutboundMessage, RegionEvent, RegionRuntime, RegionRuntimeError,
 };
@@ -102,6 +103,21 @@ impl RegionWorker {
 
     pub fn handle_for(&self, region_id: RegionId) -> Option<RegionHandle> {
         self.region(region_id).map(RegionRuntime::handle)
+    }
+
+    pub fn load(&self) -> WorkerLoad {
+        let region_ids = self
+            .regions
+            .iter()
+            .map(RegionRuntime::region_id)
+            .collect::<Vec<_>>();
+        let queued_events = self
+            .regions
+            .iter()
+            .map(RegionRuntime::pending_event_count)
+            .sum();
+
+        WorkerLoad::new(self.id, region_ids, queued_events)
     }
 
     pub fn push_event(
