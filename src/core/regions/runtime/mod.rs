@@ -6,6 +6,10 @@
 
 pub mod continuation;
 
+use crate::core::regional_types::{
+    RegionCommand, RegionCommandReply, RegionCommandResponse, RegionSnapshotResponse,
+    RegionViewSnapshot, UiRequestId,
+};
 use crate::core::regions::handle::{RegionEventReceiver, RegionHandle, mailbox};
 use crate::core::regions::runtime::continuation::{CallerContinuation, NeighborRequest};
 use crate::core::regions::{ImportedResource, ImportedResourceResult, RegionId, RegionState};
@@ -15,8 +19,15 @@ use crate::core::regions::{ImportedResource, ImportedResourceResult, RegionId, R
 pub enum RegionEvent {
     /// Advance this region's local deterministic simulation by one tick.
     Tick,
+    /// Build an owned UI-safe snapshot through the region event loop.
+    BuildSnapshot { request_id: UiRequestId },
     /// Process an imported resource in this target region.
     ProcessImportedResource(ImportedResourceRequest),
+    /// Run one player command through this region's local event loop.
+    RunCommand {
+        request_id: UiRequestId,
+        command: RegionCommand,
+    },
     /// Apply a completed neighbor result after it has been routed back here.
     RunImportedResourceContinuation {
         continuation: CallerContinuation<ImportedResourceResult>,
@@ -54,6 +65,8 @@ pub enum OutboundMessage {
         continuation: CallerContinuation<ImportedResourceResult>,
         result: ImportedResourceResult,
     },
+    RegionCommandCompleted(RegionCommandResponse),
+    RegionSnapshotReady(RegionSnapshotResponse),
     RuntimeError(RegionRuntimeError),
 }
 
@@ -134,6 +147,11 @@ impl RegionRuntime {
                 self.state.tick_local();
                 Vec::new()
             }
+            RegionEvent::BuildSnapshot { request_id } => {
+                vec![OutboundMessage::RegionSnapshotReady(
+                    self.build_snapshot(request_id),
+                )]
+            }
             RegionEvent::ProcessImportedResource(request) => {
                 let result = self.state.process_imported_resource(
                     request.payload.resource,
@@ -149,6 +167,12 @@ impl RegionRuntime {
                     result,
                 }]
             }
+            RegionEvent::RunCommand {
+                request_id,
+                command,
+            } => vec![OutboundMessage::RegionCommandCompleted(
+                self.run_command(request_id, command),
+            )],
             RegionEvent::RunImportedResourceContinuation {
                 continuation,
                 result,
@@ -174,5 +198,44 @@ impl RegionRuntime {
 
         continuation.run(&mut self.state, result);
         Vec::new()
+    }
+
+    fn run_command(
+        &mut self,
+        request_id: UiRequestId,
+        command: RegionCommand,
+    ) -> RegionCommandResponse {
+        let reply = match command {
+            RegionCommand::Build { x, y, kind } => {
+                RegionCommandReply::CommandResult(self.state.build(x, y, kind))
+            }
+            RegionCommand::PreviewBuild { x, y, kind } => {
+                RegionCommandReply::BuildPreview(self.state.preview_build(x, y, kind))
+            }
+            RegionCommand::Bulldoze { x, y } => {
+                RegionCommandReply::CommandResult(self.state.bulldoze(x, y))
+            }
+            RegionCommand::Replace { x, y, kind } => {
+                RegionCommandReply::CommandResult(self.state.replace(x, y, kind))
+            }
+            RegionCommand::Upgrade { x, y } => {
+                RegionCommandReply::CommandResult(self.state.upgrade(x, y))
+            }
+        };
+
+        RegionCommandResponse {
+            request_id,
+            region_id: self.region_id(),
+            reply,
+        }
+    }
+
+    fn build_snapshot(&self, request_id: UiRequestId) -> RegionSnapshotResponse {
+        let view = self.state.view();
+        RegionSnapshotResponse {
+            request_id,
+            region_id: self.region_id(),
+            snapshot: RegionViewSnapshot::from_view(self.region_id(), view),
+        }
     }
 }

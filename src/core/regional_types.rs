@@ -5,6 +5,9 @@
 //! module.
 
 use crate::core::regions::RegionId;
+use crate::interface::events::CommandResult;
+use crate::interface::input::BuildingKind;
+use crate::interface::view::BuildPreviewView;
 use crate::interface::view::GameView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -17,6 +20,24 @@ pub struct RegionViewSnapshot {
     pub region_id: RegionId,
     pub revision: u64,
     pub view: GameView,
+}
+
+impl RegionViewSnapshot {
+    pub fn from_view(region_id: RegionId, view: GameView) -> Self {
+        Self {
+            region_id,
+            revision: view.status.turn as u64,
+            view,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Correlated owned snapshot reply produced by a region runtime event.
+pub struct RegionSnapshotResponse {
+    pub request_id: UiRequestId,
+    pub region_id: RegionId,
+    pub snapshot: RegionViewSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,4 +64,66 @@ pub enum UiReply {
         region_id: RegionId,
         snapshot: RegionViewSnapshot,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Owned player command payload for one region.
+pub enum RegionCommand {
+    Build {
+        x: usize,
+        y: usize,
+        kind: BuildingKind,
+    },
+    PreviewBuild {
+        x: usize,
+        y: usize,
+        kind: BuildingKind,
+    },
+    Bulldoze {
+        x: usize,
+        y: usize,
+    },
+    Replace {
+        x: usize,
+        y: usize,
+        kind: BuildingKind,
+    },
+    Upgrade {
+        x: usize,
+        y: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Owned result for one regional command.
+pub enum RegionCommandReply {
+    CommandResult(CommandResult),
+    BuildPreview(BuildPreviewView),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Correlated regional command reply produced by a runtime event.
+pub struct RegionCommandResponse {
+    pub request_id: UiRequestId,
+    pub region_id: RegionId,
+    pub reply: RegionCommandReply,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::game::Game;
+
+    #[test]
+    fn snapshot_revision_is_derived_from_view_turn() {
+        let mut game = Game::new(3, 3);
+        game.tick();
+        game.tick();
+
+        let snapshot = RegionViewSnapshot::from_view(RegionId(7), game.view());
+
+        assert_eq!(snapshot.region_id, RegionId(7));
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(snapshot.view.status.turn, 2);
+    }
 }

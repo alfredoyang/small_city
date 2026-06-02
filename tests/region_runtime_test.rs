@@ -147,6 +147,12 @@ fn decisions(outbound: &[OutboundMessage]) -> Vec<ImportDecision> {
         .iter()
         .map(|message| match message {
             OutboundMessage::ReturnImportedResourceContinuation { result, .. } => result.decision,
+            OutboundMessage::RegionCommandCompleted(reply) => {
+                panic!("unexpected command reply: {reply:?}")
+            }
+            OutboundMessage::RegionSnapshotReady(reply) => {
+                panic!("unexpected snapshot reply: {reply:?}")
+            }
             OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
         })
         .collect()
@@ -176,6 +182,12 @@ fn take_continuation(
     let message = outbound.pop().expect("outbound message");
     match message {
         OutboundMessage::ReturnImportedResourceContinuation { continuation, .. } => continuation,
+        OutboundMessage::RegionCommandCompleted(reply) => {
+            panic!("unexpected command reply: {reply:?}")
+        }
+        OutboundMessage::RegionSnapshotReady(reply) => {
+            panic!("unexpected snapshot reply: {reply:?}")
+        }
         OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
     }
 }

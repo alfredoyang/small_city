@@ -210,6 +210,12 @@ fn returned_continuation(
             result,
             ..
         } => (continuation, result),
+        OutboundMessage::RegionCommandCompleted(reply) => {
+            panic!("unexpected command reply: {reply:?}")
+        }
+        OutboundMessage::RegionSnapshotReady(reply) => {
+            panic!("unexpected snapshot reply: {reply:?}")
+        }
         OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
     }
 }
@@ -220,6 +226,8 @@ fn runtime_errors(outbound: &[OutboundMessage]) -> Vec<RegionRuntimeError> {
         .filter_map(|message| match message {
             OutboundMessage::RuntimeError(error) => Some(*error),
             OutboundMessage::ReturnImportedResourceContinuation { .. } => None,
+            OutboundMessage::RegionCommandCompleted(_) => None,
+            OutboundMessage::RegionSnapshotReady(_) => None,
         })
         .collect()
 }

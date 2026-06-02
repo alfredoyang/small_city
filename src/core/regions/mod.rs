@@ -57,11 +57,13 @@
 //!   No other region's World is touched.
 //! ```
 
-use crate::core::game::tick_world;
+use crate::core::game::{refresh_derived_state_for_world, tick_world};
+use crate::core::systems::{build, bulldoze, replace, upgrade};
 use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world};
 use crate::interface::events::CommandResult;
-use crate::interface::view::{GameView, InspectView};
+use crate::interface::input::BuildingKind;
+use crate::interface::view::{BuildPreviewView, GameView, InspectView};
 
 pub mod handle;
 pub mod load_manager;
@@ -305,6 +307,45 @@ impl RegionState {
     /// Advances only this region's local simulation using the same order as `Game::tick`.
     pub fn tick_local(&mut self) -> CommandResult {
         tick_world(&mut self.world)
+    }
+
+    /// Applies one player build command through the same systems as `Game`.
+    pub fn build(&mut self, x: usize, y: usize, kind: BuildingKind) -> CommandResult {
+        let result = build::build(&mut self.world, x, y, kind);
+        refresh_derived_state_for_world(&mut self.world);
+        result
+    }
+
+    /// Explains whether a build would succeed without mutating this region.
+    pub fn preview_build(&self, x: usize, y: usize, kind: BuildingKind) -> BuildPreviewView {
+        build::preview_build(&self.world, x, y, kind)
+    }
+
+    /// Removes one occupied cell through the same systems as `Game`.
+    pub fn bulldoze(&mut self, x: usize, y: usize) -> CommandResult {
+        let result = bulldoze::bulldoze(&mut self.world, x, y);
+        if result.success {
+            refresh_derived_state_for_world(&mut self.world);
+        }
+        result
+    }
+
+    /// Replaces one occupied cell through the same systems as `Game`.
+    pub fn replace(&mut self, x: usize, y: usize, kind: BuildingKind) -> CommandResult {
+        let result = replace::replace(&mut self.world, x, y, kind);
+        if result.success {
+            refresh_derived_state_for_world(&mut self.world);
+        }
+        result
+    }
+
+    /// Upgrades one supported occupied cell through the same systems as `Game`.
+    pub fn upgrade(&mut self, x: usize, y: usize) -> CommandResult {
+        let result = upgrade::upgrade(&mut self.world, x, y);
+        if result.success {
+            refresh_derived_state_for_world(&mut self.world);
+        }
+        result
     }
 
     /// Accepts one imported resource and builds deterministic forwarded copies.

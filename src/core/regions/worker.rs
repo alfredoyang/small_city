@@ -4,6 +4,7 @@
 //! reads or mutates ECS state directly; all simulation work stays inside each
 //! `RegionRuntime`.
 
+use crate::core::regional_types::{RegionCommandResponse, RegionSnapshotResponse};
 use crate::core::regions::RegionId;
 use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::load_manager::WorkerLoad;
@@ -51,6 +52,8 @@ impl RegionAddError {
 pub struct WorkerRunSummary {
     pub processed_regions: usize,
     pub routing_errors: Vec<WorkerRoutingError>,
+    pub command_replies: Vec<RegionCommandResponse>,
+    pub snapshot_replies: Vec<RegionSnapshotResponse>,
 }
 
 #[derive(Debug)]
@@ -161,16 +164,24 @@ impl RegionWorker {
             );
         }
 
-        let routing_errors = outbound
-            .into_iter()
-            .filter_map(|(source_region, message)| {
-                self.route_outbound(source_region, message).err()
-            })
-            .collect();
+        let mut routing_errors = Vec::new();
+        let mut command_replies = Vec::new();
+        let mut snapshot_replies = Vec::new();
+
+        for (source_region, message) in outbound {
+            match self.route_outbound(source_region, message) {
+                Ok(WorkerRoutedMessage::CommandReply(reply)) => command_replies.push(reply),
+                Ok(WorkerRoutedMessage::SnapshotReply(reply)) => snapshot_replies.push(reply),
+                Ok(WorkerRoutedMessage::None) => {}
+                Err(error) => routing_errors.push(error),
+            }
+        }
 
         WorkerRunSummary {
             processed_regions,
             routing_errors,
+            command_replies,
+            snapshot_replies,
         }
     }
 
@@ -178,23 +189,38 @@ impl RegionWorker {
         &mut self,
         source_region: RegionId,
         message: OutboundMessage,
-    ) -> Result<(), WorkerRoutingError> {
+    ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
         match message {
             OutboundMessage::ReturnImportedResourceContinuation {
                 caller_region,
                 continuation,
                 result,
-            } => self.push_event(
-                caller_region,
-                RegionEvent::RunImportedResourceContinuation {
-                    continuation,
-                    result,
-                },
-            ),
+            } => {
+                self.push_event(
+                    caller_region,
+                    RegionEvent::RunImportedResourceContinuation {
+                        continuation,
+                        result,
+                    },
+                )?;
+                Ok(WorkerRoutedMessage::None)
+            }
+            OutboundMessage::RegionCommandCompleted(reply) => {
+                Ok(WorkerRoutedMessage::CommandReply(reply))
+            }
+            OutboundMessage::RegionSnapshotReady(reply) => {
+                Ok(WorkerRoutedMessage::SnapshotReply(reply))
+            }
             OutboundMessage::RuntimeError(error) => Err(WorkerRoutingError::RuntimeError {
                 source_region,
                 error,
             }),
         }
     }
+}
+
+enum WorkerRoutedMessage {
+    None,
+    CommandReply(RegionCommandResponse),
+    SnapshotReply(RegionSnapshotResponse),
 }
