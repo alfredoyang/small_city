@@ -60,9 +60,9 @@
 use crate::core::game::{refresh_derived_state_for_world, tick_world};
 use crate::core::systems::{build, bulldoze, replace, upgrade};
 use crate::core::world::World;
-use crate::interface::adapter::{inspect_world, view_world};
+use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
 use crate::interface::events::CommandResult;
-use crate::interface::input::BuildingKind;
+use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{BuildPreviewView, GameView, InspectView};
 
 pub mod handle;
@@ -390,6 +390,11 @@ impl RegionState {
     /// Returns a UI-safe snapshot without exposing this region's ECS world.
     pub fn view(&self) -> GameView {
         view_world(&self.world)
+    }
+
+    /// Returns a UI-safe snapshot using the requested map overlay.
+    pub fn view_with_overlay(&self, overlay: MapOverlayInput) -> GameView {
+        view_world_with_overlay(&self.world, overlay)
     }
 
     /// Returns a UI-safe inspect model without exposing this region's ECS world.

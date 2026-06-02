@@ -9,7 +9,7 @@ use small_city::core::regional_types::UiRequestId;
 use small_city::core::regions::runtime::{OutboundMessage, RegionEvent, RegionRuntime};
 use small_city::core::regions::{RegionId, RegionState};
 use small_city::interface::events::CommandResult;
-use small_city::interface::input::BuildingKind;
+use small_city::interface::input::{BuildingKind, MapOverlayInput};
 use small_city::interface::view::BuildPreviewView;
 
 #[test]
@@ -152,6 +152,7 @@ fn command_and_snapshot_events_share_fifo_ordering() {
     });
     runtime.push_event(RegionEvent::BuildSnapshot {
         request_id: UiRequestId(2),
+        overlay: MapOverlayInput::Normal,
     });
 
     let outbound = runtime.process_some_events(2);

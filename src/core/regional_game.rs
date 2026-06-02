@@ -16,7 +16,7 @@ pub use crate::core::regional_types::{
 };
 use crate::core::regions::{RegionId, RegionState};
 use crate::interface::events::CommandResult;
-use crate::interface::input::BuildingKind;
+use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{BuildPreviewView, InspectView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,11 +70,18 @@ impl RegionalGame {
     }
 
     pub fn view(&self) -> Result<RegionalGameView, RegionalGameError> {
+        self.view_with_overlay(MapOverlayInput::Normal)
+    }
+
+    pub fn view_with_overlay(
+        &self,
+        overlay: MapOverlayInput,
+    ) -> Result<RegionalGameView, RegionalGameError> {
         let mut regions = Vec::new();
         for region_id in &self.region_ids {
             let UiReply::RegionSnapshotReady { snapshot, .. } = self
                 .runner
-                .request_region_snapshot(UiRequestId(0), *region_id)?;
+                .request_region_snapshot_with_overlay(UiRequestId(0), *region_id, overlay)?;
             regions.push(snapshot);
         }
 

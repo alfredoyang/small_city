@@ -16,6 +16,7 @@ use crate::core::regions::threaded::{
 };
 use crate::core::regions::worker::{RegionWorker, WorkerId, WorkerRoutingError};
 use crate::core::regions::{RegionId, RegionState};
+use crate::interface::input::MapOverlayInput;
 use crate::interface::view::InspectView;
 
 const INITIAL_WORKER_ID: WorkerId = WorkerId(1);
@@ -141,6 +142,15 @@ impl RegionalGameRunner {
         request_id: UiRequestId,
         region_id: RegionId,
     ) -> Result<UiReply, RegionalGameRunnerError> {
+        self.request_region_snapshot_with_overlay(request_id, region_id, MapOverlayInput::Normal)
+    }
+
+    pub fn request_region_snapshot_with_overlay(
+        &self,
+        request_id: UiRequestId,
+        region_id: RegionId,
+        overlay: MapOverlayInput,
+    ) -> Result<UiReply, RegionalGameRunnerError> {
         let handle = self
             .handle_for(region_id)
             .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })?;
@@ -149,7 +159,10 @@ impl RegionalGameRunner {
             .operation_lock
             .lock()
             .expect("regional runner operation lock poisoned");
-        handle.send(crate::core::regions::runtime::RegionEvent::BuildSnapshot { request_id });
+        handle.send(crate::core::regions::runtime::RegionEvent::BuildSnapshot {
+            request_id,
+            overlay,
+        });
         let snapshot = self.wait_for_snapshot_reply(request_id, region_id)?;
 
         Ok(UiReply::RegionSnapshotReady {

@@ -13,6 +13,7 @@ use crate::core::regional_types::{
 use crate::core::regions::handle::{RegionEventReceiver, RegionHandle, mailbox};
 use crate::core::regions::runtime::continuation::{CallerContinuation, NeighborRequest};
 use crate::core::regions::{ImportedResource, ImportedResourceResult, RegionId, RegionState};
+use crate::interface::input::MapOverlayInput;
 
 #[derive(Debug)]
 /// Event owned by one region runtime inbox.
@@ -20,7 +21,10 @@ pub enum RegionEvent {
     /// Advance this region's local deterministic simulation by one tick.
     Tick,
     /// Build an owned UI-safe snapshot through the region event loop.
-    BuildSnapshot { request_id: UiRequestId },
+    BuildSnapshot {
+        request_id: UiRequestId,
+        overlay: MapOverlayInput,
+    },
     /// Process an imported resource in this target region.
     ProcessImportedResource(ImportedResourceRequest),
     /// Run one player command through this region's local event loop.
@@ -147,9 +151,12 @@ impl RegionRuntime {
                 self.state.tick_local();
                 Vec::new()
             }
-            RegionEvent::BuildSnapshot { request_id } => {
+            RegionEvent::BuildSnapshot {
+                request_id,
+                overlay,
+            } => {
                 vec![OutboundMessage::RegionSnapshotReady(
-                    self.build_snapshot(request_id),
+                    self.build_snapshot(request_id, overlay),
                 )]
             }
             RegionEvent::ProcessImportedResource(request) => {
@@ -230,8 +237,12 @@ impl RegionRuntime {
         }
     }
 
-    fn build_snapshot(&self, request_id: UiRequestId) -> RegionSnapshotResponse {
-        let view = self.state.view();
+    fn build_snapshot(
+        &self,
+        request_id: UiRequestId,
+        overlay: MapOverlayInput,
+    ) -> RegionSnapshotResponse {
+        let view = self.state.view_with_overlay(overlay);
         RegionSnapshotResponse {
             request_id,
             region_id: self.region_id(),
