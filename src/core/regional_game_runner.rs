@@ -275,6 +275,21 @@ pub struct RecoveredRegionalGame {
 }
 
 impl RecoveredRegionalGame {
+    pub(crate) fn into_region_states_in_order(
+        mut self,
+        region_ids: &[RegionId],
+    ) -> Vec<RegionState> {
+        region_ids
+            .iter()
+            .copied()
+            .filter_map(|region_id| {
+                self.worker
+                    .remove_region(region_id)
+                    .map(RegionRuntime::into_state)
+            })
+            .collect()
+    }
+
     pub fn region_snapshot(
         &self,
         region_id: RegionId,

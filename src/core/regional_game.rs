@@ -5,7 +5,12 @@
 //! ECS `World` storage or require UI callers to talk directly to workers or
 //! runtimes.
 
+use std::fmt;
+use std::fs::File;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde::{Deserialize, Serialize};
 
 use crate::core::regional_game_runner::{
     RecoveredRegionalGame, RegionalGameRunner, RegionalGameRunnerError,
@@ -14,7 +19,7 @@ pub use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionViewSnapshot, RegionalGameView, UiReply, UiRequest,
     UiRequestId,
 };
-use crate::core::regions::{RegionId, RegionState};
+use crate::core::regions::{RegionId, RegionState, RegionStateSaveRecord};
 use crate::interface::events::CommandResult;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{BuildPreviewView, InspectView};
@@ -44,6 +49,86 @@ pub enum RegionalGameError {
     RegionAttachFailed,
     WorkerStopped,
     WorkerPanicked,
+}
+
+#[derive(Debug)]
+/// File and format errors returned by regional save/load operations.
+pub enum RegionalGameSaveError {
+    Io(std::io::Error),
+    SaveFormat(serde_json::Error),
+    Regional(RegionalGameError),
+}
+
+impl fmt::Display for RegionalGameSaveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "File error: {error}"),
+            Self::SaveFormat(error) => write!(formatter, "Save file error: {error}"),
+            Self::Regional(error) => write!(formatter, "Regional game error: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for RegionalGameSaveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::SaveFormat(error) => Some(error),
+            Self::Regional(_) => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for RegionalGameSaveError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for RegionalGameSaveError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::SaveFormat(error)
+    }
+}
+
+impl From<RegionalGameError> for RegionalGameSaveError {
+    fn from(error: RegionalGameError) -> Self {
+        Self::Regional(error)
+    }
+}
+
+#[derive(Debug)]
+/// Save failures that may return a restarted game to preserve progress.
+pub enum RegionalGameSaveFailure {
+    Recoverable {
+        game: Box<RegionalGame>,
+        error: RegionalGameSaveError,
+    },
+    Unrecoverable(RegionalGameSaveError),
+}
+
+impl fmt::Display for RegionalGameSaveFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Recoverable { error, .. } => write!(formatter, "{error}"),
+            Self::Unrecoverable(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for RegionalGameSaveFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Recoverable { error, .. } | Self::Unrecoverable(error) => Some(error),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+/// Serialized regional game state containing only authoritative region data.
+struct RegionalGameSave {
+    selected_region: Option<RegionId>,
+    regions: Vec<RegionStateSaveRecord>,
 }
 
 #[derive(Debug)]
@@ -229,6 +314,65 @@ impl RegionalGame {
 
     pub fn shutdown(self) -> Result<RecoveredRegionalGame, RegionalGameError> {
         self.runner.shutdown().map_err(RegionalGameError::from)
+    }
+
+    pub fn save_to_file(self, path: impl AsRef<Path>) -> Result<Self, RegionalGameSaveFailure> {
+        let selected_region = self.selected_region;
+        let region_ids = self.region_ids.clone();
+        let recovered = self
+            .shutdown()
+            .map_err(|error| RegionalGameSaveFailure::Unrecoverable(error.into()))?;
+        let save = RegionalGameSave {
+            selected_region,
+            regions: recovered
+                .into_region_states_in_order(&region_ids)
+                .into_iter()
+                .map(RegionState::into_save_record)
+                .collect(),
+        };
+
+        let file = match File::create(path) {
+            Ok(file) => file,
+            Err(error) => return Self::recover_save_failure(save, error.into()),
+        };
+
+        if let Err(error) = serde_json::to_writer_pretty(file, &save) {
+            return Self::recover_save_failure(save, error.into());
+        }
+
+        Self::from_save(save)
+            .map_err(RegionalGameSaveError::from)
+            .map_err(RegionalGameSaveFailure::Unrecoverable)
+    }
+
+    pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, RegionalGameSaveError> {
+        let file = File::open(path)?;
+        let save = serde_json::from_reader(file)?;
+        Self::from_save(save).map_err(RegionalGameSaveError::from)
+    }
+
+    fn from_save(save: RegionalGameSave) -> Result<Self, RegionalGameError> {
+        let regions = save
+            .regions
+            .into_iter()
+            .map(RegionState::from_save_record)
+            .collect::<Vec<_>>();
+        let mut game = Self::from_regions(regions)?;
+        game.selected_region = save.selected_region;
+        Ok(game)
+    }
+
+    fn recover_save_failure(
+        save: RegionalGameSave,
+        error: RegionalGameSaveError,
+    ) -> Result<Self, RegionalGameSaveFailure> {
+        let game = Self::from_save(save)
+            .map_err(RegionalGameSaveError::from)
+            .map_err(RegionalGameSaveFailure::Unrecoverable)?;
+        Err(RegionalGameSaveFailure::Recoverable {
+            game: Box::new(game),
+            error,
+        })
     }
 }
 

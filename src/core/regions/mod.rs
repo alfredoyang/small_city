@@ -64,6 +64,7 @@ use crate::interface::adapter::{inspect_world, view_world, view_world_with_overl
 use crate::interface::events::CommandResult;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{BuildPreviewView, GameView, InspectView};
+use serde::{Deserialize, Serialize};
 
 pub mod handle;
 pub mod load_manager;
@@ -72,7 +73,7 @@ pub mod threaded;
 pub mod worker;
 pub use runtime::continuation;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 /// Stable identity for one independently owned simulation region.
 ///
 /// Future runtimes and workers will use this as a routing key. It is not an ECS
@@ -195,6 +196,16 @@ pub struct ImportedResourceResult {
 /// resource counts are small.
 pub struct ImportedResourceCache {
     resources: Vec<ImportedResource>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+/// Serialized authoritative region state.
+///
+/// Rebuildable imported-resource caches and neighbor reply traces are
+/// intentionally excluded from permanent saves.
+pub(crate) struct RegionStateSaveRecord {
+    id: RegionId,
+    world: World,
 }
 
 impl ImportedResourceCache {
@@ -417,5 +428,64 @@ impl RegionState {
 
     pub fn neighbor_import_results(&self) -> &[ImportedResourceResult] {
         &self.neighbor_import_results
+    }
+
+    pub(crate) fn into_save_record(self) -> RegionStateSaveRecord {
+        RegionStateSaveRecord {
+            id: self.id,
+            world: self.world,
+        }
+    }
+
+    pub(crate) fn from_save_record(record: RegionStateSaveRecord) -> Self {
+        let mut world = record.world;
+        world.rebuild_entity_records();
+        refresh_derived_state_for_world(&mut world);
+
+        let mut state = Self {
+            id: record.id,
+            world,
+            imported_resources: ImportedResourceCache::new(),
+            neighbor_import_results: Vec::new(),
+        };
+        state.rebuild_imported_resource_cache();
+        state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_record_restores_authoritative_world_without_import_cache() {
+        let mut region = RegionState::new(RegionId(1), 3, 3);
+        assert!(region.build(1, 1, BuildingKind::Residential).success);
+        let result = region.process_imported_resource(
+            ImportedResource {
+                id: ResourceId {
+                    origin_region: RegionId(9),
+                    resource_kind: ResourceKind::Jobs,
+                    generation: 1,
+                },
+                remaining_capacity: 4,
+                hop_count: 0,
+                max_hops: 2,
+                travel_cost: 0,
+                source_neighbor: RegionId(9),
+            },
+            0,
+            1,
+            &[],
+        );
+        assert_eq!(result.decision, ImportDecision::Accepted);
+        assert_eq!(region.imported_resources().len(), 1);
+
+        let saved_view = region.view();
+        let restored = RegionState::from_save_record(region.into_save_record());
+
+        assert_eq!(restored.view(), saved_view);
+        assert!(restored.imported_resources().is_empty());
+        assert!(restored.neighbor_import_results().is_empty());
     }
 }

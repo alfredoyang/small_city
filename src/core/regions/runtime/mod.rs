@@ -101,6 +101,10 @@ impl RegionRuntime {
         &self.state
     }
 
+    pub(crate) fn into_state(self) -> RegionState {
+        self.state
+    }
+
     pub fn rebuild_imported_resource_cache(&mut self) {
         self.state.rebuild_imported_resource_cache();
     }
