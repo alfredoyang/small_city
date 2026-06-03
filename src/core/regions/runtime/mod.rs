@@ -44,6 +44,30 @@ pub enum RegionEvent {
     RefreshExports,
 }
 
+impl RegionEvent {
+    /// Builds target-region imported-resource work with the standard caller reply continuation.
+    pub fn process_imported_resource(
+        caller_region: RegionId,
+        resource: ImportedResource,
+        target_neighbors: Vec<RegionId>,
+    ) -> Self {
+        Self::ProcessImportedResource(NeighborRequest {
+            payload: ImportedResourcePayload {
+                resource,
+                local_used_capacity: 0,
+                border_crossing_cost: 1,
+                target_neighbors,
+            },
+            continuation: CallerContinuation::<ImportedResourceResult>::new(
+                caller_region,
+                |region, result| {
+                    region.apply_neighbor_import_result(result);
+                },
+            ),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Owned payload for target-region imported resource work.
 pub struct ImportedResourcePayload {

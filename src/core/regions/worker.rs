@@ -5,13 +5,12 @@
 //! `RegionRuntime`.
 
 use crate::core::regional_types::{RegionCommandResponse, RegionSnapshotResponse};
-use crate::core::regions::continuation::CallerContinuation;
 use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::load_manager::WorkerLoad;
 use crate::core::regions::runtime::{
-    ImportedResourcePayload, OutboundMessage, RegionEvent, RegionRuntime, RegionRuntimeError,
+    OutboundMessage, RegionEvent, RegionRuntime, RegionRuntimeError,
 };
-use crate::core::regions::{ImportedResourceResult, RegionId, RegionalExportChange};
+use crate::core::regions::{RegionId, RegionalExportChange};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// Stable identity for one single-threaded worker scheduler.
@@ -244,22 +243,22 @@ impl RegionWorker {
             for export in &change.current {
                 self.push_event(
                     *target_region,
-                    RegionEvent::ProcessImportedResource(imported_resource_request(
+                    RegionEvent::process_imported_resource(
                         change.source_region,
                         export.imported_resource(),
                         target_neighbors.clone(),
-                    )),
+                    ),
                 )?;
             }
 
             for removed_kind in &change.removed {
                 self.push_event(
                     *target_region,
-                    RegionEvent::ProcessImportedResource(imported_resource_request(
+                    RegionEvent::process_imported_resource(
                         change.source_region,
                         RegionalExportChange::tombstone(change.source_region, *removed_kind),
                         target_neighbors.clone(),
-                    )),
+                    ),
                 )?;
             }
         }
@@ -272,25 +271,4 @@ enum WorkerRoutedMessage {
     None,
     CommandReply(RegionCommandResponse),
     SnapshotReply(RegionSnapshotResponse),
-}
-
-fn imported_resource_request(
-    caller_region: RegionId,
-    resource: crate::core::regions::ImportedResource,
-    target_neighbors: Vec<RegionId>,
-) -> crate::core::regions::runtime::ImportedResourceRequest {
-    crate::core::regions::continuation::NeighborRequest {
-        payload: ImportedResourcePayload {
-            resource,
-            local_used_capacity: 0,
-            border_crossing_cost: 1,
-            target_neighbors,
-        },
-        continuation: CallerContinuation::<ImportedResourceResult>::new(
-            caller_region,
-            |region, result| {
-                region.apply_neighbor_import_result(result);
-            },
-        ),
-    }
 }

@@ -521,11 +521,8 @@ impl RegionState {
     /// Derives current local exports from authoritative region state.
     pub fn exported_resource_counts(&self) -> Vec<(ResourceKind, u32)> {
         let mut exports: Vec<(ResourceKind, u32)> = Vec::new();
-        for cell in self.view().map.cells {
-            let Some(kind) = cell.building else {
-                continue;
-            };
-            let Some(resource_kind) = exported_resource_kind_for_building(kind) else {
+        for building in self.world.buildings.values() {
+            let Some(resource_kind) = exported_resource_kind_for_building(building.kind) else {
                 continue;
             };
             if let Some((_, count)) = exports
@@ -538,6 +535,7 @@ impl RegionState {
             }
         }
 
+        exports.sort_by_key(|(resource_kind, _)| *resource_kind);
         exports
     }
 
@@ -622,5 +620,19 @@ mod tests {
         assert_eq!(restored.view(), saved_view);
         assert!(restored.imported_resources().is_empty());
         assert!(restored.neighbor_import_results().is_empty());
+    }
+
+    #[test]
+    fn exported_resource_counts_use_authoritative_buildings_without_view_adapter() {
+        let mut region = RegionState::new(RegionId(1), 4, 4);
+        assert!(region.build(0, 0, BuildingKind::Road).success);
+        assert!(region.build(1, 0, BuildingKind::Park).success);
+        assert!(region.build(2, 0, BuildingKind::Park).success);
+        assert!(region.build(3, 0, BuildingKind::Industrial).success);
+
+        assert_eq!(
+            region.exported_resource_counts(),
+            vec![(ResourceKind::Jobs, 1), (ResourceKind::ParkAccess, 2)]
+        );
     }
 }
