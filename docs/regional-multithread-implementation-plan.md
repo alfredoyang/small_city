@@ -732,6 +732,67 @@ Review focus:
 - Cross-region effects are deterministic and visible only through view models.
 - Flipping the default launch mode stays a separate, explicit decision.
 
+## Patch 17: Region-Owned Export Propagation
+
+Goal: move cross-region resource propagation ownership into the region runtime
+and worker routing layers. `RegionalGame` should issue player-facing commands and
+compose view models; `RegionalGameRunner` should own execution and lifecycle.
+Neither layer should contain domain-specific imported-resource send APIs.
+
+Likely files:
+
+- `src/core/regions/mod.rs` (region-owned export summary and import cache
+  updates)
+- `src/core/regions/runtime/mod.rs` (emit export-change outbound messages after
+  region events mutate exports)
+- `src/core/regions/worker.rs` (route export-change messages to neighbor
+  region inboxes)
+- `src/core/regional_game.rs` (remove facade-owned export scanning/sync)
+- `src/core/regional_game_runner.rs` (remove runner-owned
+  `send_imported_resource` domain API)
+- `tests/regional_multi_region_play_test.rs`
+- `tests/region_worker_test.rs`
+- `tests/region_runtime_test.rs`
+
+Implementation:
+
+- Add a region-owned export summary/cache to `RegionState` or `RegionRuntime`.
+- After successful build, bulldoze, replace, upgrade, or tick events, detect
+  export changes inside the region runtime.
+- Emit an outbound message such as `RegionExportsChanged` that carries the
+  source region, current exports, and removed export kinds.
+- Let the worker route export-change messages to neighboring region inboxes as
+  imported-resource events.
+- Keep the worker as a message router only. It must not inspect or mutate ECS
+  world state.
+- Keep `RegionalGameRunner` responsible for pumping worker passes, command
+  requests, snapshot/inspect requests, save handoff, and shutdown only.
+- Remove or make private any temporary runner/facade method that directly sends
+  imported resources, such as `send_imported_resource`.
+- Remove export scanning and cross-region resource sync orchestration from
+  `RegionalGame`.
+
+Tests:
+
+- a successful build in Region A emits an export-change outbound message from
+  Region A's runtime
+- the worker routes Region A's export-change message to neighboring Region B
+- Region B stores the imported resource in its imported warehouse/cache
+- removing the source building emits a tombstone/removal and clears Region B's
+  imported cache entry
+- `RegionalGame` can build in Region A and observe Region B imported-resource
+  visibility without calling a resource-send method
+- the runner API no longer exposes a domain-specific imported-resource send
+  method
+
+Review focus:
+
+- Region runtime/state owns export detection.
+- Imported resources enter a neighbor through normal region events.
+- `RegionalGame` does not know how regional resources are propagated.
+- `RegionalGameRunner` does not expose domain-specific resource delivery APIs.
+- Worker routing remains deterministic and does not access ECS internals.
+
 ## Save And Load Plan
 
 Save/load should wait until the regional facade exists. When implemented:
