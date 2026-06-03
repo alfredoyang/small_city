@@ -74,6 +74,8 @@ enum UiAction {
     Inspect,
     NextTurn,
     CycleOverlay,
+    PreviousRegion,
+    NextRegion,
     Save,
     Load,
     Quit,
@@ -87,7 +89,7 @@ pub fn run() -> io::Result<()> {
 
 /// Runs the ASCII terminal UI on the regional facade behind an explicit flag.
 pub fn run_regional() -> io::Result<()> {
-    run_with_mode(CityLaunchMode::RegionalSingleRegion)
+    run_with_mode(CityLaunchMode::RegionalMultiRegion)
 }
 
 fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
@@ -98,13 +100,14 @@ fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
 
     loop {
         let view = game.view_with_overlay(state.current_overlay);
+        let region_label = game.region_label();
         state.clamp_cursor(&view);
         let inspect = game.inspect(state.cursor_x, state.cursor_y);
         let preview = game.preview_build(state.cursor_x, state.cursor_y, state.selected_build);
         if let Some(error) = game.take_read_error_message() {
             message = error;
         }
-        render_screen(&view, &inspect, &preview, &state, &message)?;
+        render_screen(&view, &inspect, &preview, &state, &region_label, &message)?;
 
         match read_action()? {
             UiAction::MoveUp => state.move_cursor(0, -1, &view),
@@ -143,6 +146,14 @@ fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
             UiAction::CycleOverlay => {
                 state.cycle_overlay();
                 message = format!("Overlay: {}", overlay_label(state.current_overlay));
+            }
+            UiAction::PreviousRegion => {
+                message = game.select_previous_region();
+                state.reset_cursor();
+            }
+            UiAction::NextRegion => {
+                message = game.select_next_region();
+                state.reset_cursor();
             }
             UiAction::Save => {
                 let filename = prompt_filename("Save filename", DEFAULT_SAVE_FILE)?;
@@ -189,7 +200,7 @@ pub fn render(view: &GameView) {
         reason: Some("No game preview available".to_string()),
         effects: Vec::new(),
     };
-    let _ = render_screen(view, &inspect, &preview, &state, "");
+    let _ = render_screen(view, &inspect, &preview, &state, "Region: single city", "");
 }
 
 fn render_screen(
@@ -197,12 +208,14 @@ fn render_screen(
     inspect: &InspectView,
     preview: &BuildPreviewView,
     state: &AsciiUiState,
+    region_label: &str,
     message: &str,
 ) -> io::Result<()> {
     let mut stdout = io::stdout();
     write!(stdout, "\x1B[2J\x1B[H")?;
     writeln!(stdout, "Tiny City Builder")?;
     render_status(&mut stdout, view)?;
+    writeln!(stdout, "{region_label}")?;
     writeln!(
         stdout,
         "Mode: Build {} | Cost: {} | Upkeep: {} | Overlay: {}",
@@ -352,7 +365,7 @@ fn render_controls(stdout: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         stdout,
-        "I = Inspect | N = Next turn | V = Change overlay | S = Save | L = Load | Q = Quit"
+        "I = Inspect | N = Next turn | V = Change overlay | [ ] Region | S = Save | L = Load | Q = Quit"
     )?;
     writeln!(
         stdout,
@@ -473,6 +486,8 @@ fn parse_key_sequence(bytes: &[u8]) -> UiAction {
         [b'i'] | [b'I'] => UiAction::Inspect,
         [b'n'] | [b'N'] => UiAction::NextTurn,
         [b'v'] | [b'V'] => UiAction::CycleOverlay,
+        [b'['] => UiAction::PreviousRegion,
+        [b']'] => UiAction::NextRegion,
         [b'S'] => UiAction::Save,
         [b'l'] | [b'L'] => UiAction::Load,
         [b'q'] | [b'Q'] => UiAction::Quit,

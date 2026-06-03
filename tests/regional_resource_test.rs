@@ -48,6 +48,22 @@ fn cache_rejects_older_generation_after_newer_generation_is_known() {
 }
 
 #[test]
+fn cache_removes_all_resources_for_origin_and_kind() {
+    let mut cache = ImportedResourceCache::new();
+    let park = resource(1, ResourceKind::ParkAccess, 2, 8, 0, 4, 1, 2);
+    let jobs = resource(1, ResourceKind::Jobs, 3, 14, 0, 4, 1, 2);
+    let remote_park = resource(2, ResourceKind::ParkAccess, 1, 6, 0, 4, 1, 2);
+
+    assert_eq!(cache.accept(park), ImportDecision::Accepted);
+    assert_eq!(cache.accept(jobs), ImportDecision::Accepted);
+    assert_eq!(cache.accept(remote_park), ImportDecision::Accepted);
+
+    assert!(cache.remove_origin_kind(RegionId(1), ResourceKind::ParkAccess));
+    assert_eq!(cache.resources(), &[jobs, remote_park]);
+    assert!(!cache.remove_origin_kind(RegionId(1), ResourceKind::ParkAccess));
+}
+
+#[test]
 fn forwarding_uses_remaining_capacity_and_adds_cost_and_hop() {
     let mut cache = ImportedResourceCache::new();
     let original = resource(1, ResourceKind::Jobs, 1, 10, 1, 4, 5, 2);

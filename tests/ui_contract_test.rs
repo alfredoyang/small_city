@@ -236,7 +236,7 @@ fn ascii_ui_renders_inspect_explanations_from_inspect_view() {
 #[test]
 fn regional_ui_driver_uses_facade_commands_and_snapshots() {
     let mut driver =
-        CityDriver::new(CityLaunchMode::RegionalSingleRegion).expect("regional UI driver");
+        CityDriver::new(CityLaunchMode::RegionalMultiRegion).expect("regional UI driver");
 
     let preview = driver.preview_build(1, 1, BuildingKind::Residential);
     let build = driver.build(1, 1, BuildingKind::Residential);
@@ -261,7 +261,7 @@ fn regional_ui_driver_load_uses_loaded_selected_region() {
     let game = RegionalGame::from_regions(vec![RegionState::new(RegionId(2), 3, 3)]).unwrap();
     let saved_game = game.save_to_file(&path).unwrap();
     let mut driver =
-        CityDriver::new(CityLaunchMode::RegionalSingleRegion).expect("regional UI driver");
+        CityDriver::new(CityLaunchMode::RegionalMultiRegion).expect("regional UI driver");
 
     driver.load_from_file(&path).unwrap();
     let build = driver.build(1, 1, BuildingKind::Residential);

@@ -9,13 +9,14 @@ use std::sync::Mutex;
 use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionViewSnapshot, UiReply, UiRequestId,
 };
+use crate::core::regions::continuation::{CallerContinuation, NeighborRequest};
 use crate::core::regions::handle::RegionHandle;
-use crate::core::regions::runtime::RegionRuntime;
+use crate::core::regions::runtime::{ImportedResourcePayload, RegionEvent, RegionRuntime};
 use crate::core::regions::threaded::{
     ThreadedRegionWorker, ThreadedWorkerError, ThreadedWorkerShutdown,
 };
 use crate::core::regions::worker::{RegionWorker, WorkerId, WorkerRoutingError};
-use crate::core::regions::{RegionId, RegionState};
+use crate::core::regions::{ImportedResource, RegionId, RegionState};
 use crate::interface::input::MapOverlayInput;
 use crate::interface::view::InspectView;
 
@@ -137,6 +138,39 @@ impl RegionalGameRunner {
         self.wait_for_command_reply(request_id, region_id)
     }
 
+    pub fn send_imported_resource(
+        &self,
+        caller_region: RegionId,
+        target_region: RegionId,
+        resource: ImportedResource,
+        target_neighbors: Vec<RegionId>,
+    ) -> Result<(), RegionalGameRunnerError> {
+        let handle =
+            self.handle_for(target_region)
+                .ok_or(RegionalGameRunnerError::UnknownRegion {
+                    region_id: target_region,
+                })?;
+
+        let _operation = self
+            .operation_lock
+            .lock()
+            .expect("regional runner operation lock poisoned");
+        handle.send(RegionEvent::ProcessImportedResource(NeighborRequest {
+            payload: ImportedResourcePayload {
+                resource,
+                local_used_capacity: 0,
+                border_crossing_cost: 1,
+                target_neighbors,
+            },
+            continuation: CallerContinuation::new(caller_region, |region, result| {
+                region.apply_neighbor_import_result(result);
+            }),
+        }));
+
+        self.process_imported_resource_until_drained()?;
+        Ok(())
+    }
+
     pub fn request_region_snapshot(
         &self,
         request_id: UiRequestId,
@@ -221,6 +255,20 @@ impl RegionalGameRunner {
         }
 
         Ok(summary)
+    }
+
+    fn process_imported_resource_until_drained(&self) -> Result<(), RegionalGameRunnerError> {
+        // Imported-resource processing is asynchronous within worker passes:
+        // target processing returns a continuation, and a later pass runs that
+        // continuation in the caller region. Stop once a pass finds no queued
+        // work, while keeping the same safety cap used by command replies.
+        for _ in 0..MAX_REPLY_PASSES {
+            let summary = self.process_one_reply_pass()?;
+            if summary.processed_regions == 0 {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn wait_for_command_reply(
@@ -321,6 +369,7 @@ impl From<ThreadedWorkerError> for RegionalGameRunnerError {
 mod tests {
     use super::*;
     use crate::core::regions::runtime::{RegionEvent, RegionRuntime};
+    use crate::core::regions::{ImportDecision, ResourceId, ResourceKind};
     use crate::interface::input::BuildingKind;
 
     #[test]
@@ -361,6 +410,57 @@ mod tests {
 
         assert_eq!(snapshot.view.status.turn, 1);
         runner.shutdown().unwrap();
+    }
+
+    #[test]
+    fn imported_resource_send_pumps_until_continuation_runs() {
+        let caller_region = RegionId(21);
+        let target_region = RegionId(22);
+        let runner = RegionalGameRunner::start(vec![
+            RegionState::new(caller_region, 3, 3),
+            RegionState::new(target_region, 3, 3),
+        ])
+        .unwrap();
+
+        runner
+            .send_imported_resource(
+                caller_region,
+                target_region,
+                ImportedResource {
+                    id: ResourceId {
+                        origin_region: caller_region,
+                        resource_kind: ResourceKind::ParkAccess,
+                        generation: 1,
+                    },
+                    remaining_capacity: 1,
+                    hop_count: 0,
+                    max_hops: 1,
+                    travel_cost: 0,
+                    source_neighbor: caller_region,
+                },
+                Vec::new(),
+            )
+            .unwrap();
+
+        let states = runner
+            .shutdown()
+            .unwrap()
+            .into_region_states_in_order(&[caller_region, target_region]);
+        let caller = states
+            .iter()
+            .find(|state| state.id() == caller_region)
+            .unwrap();
+        let target = states
+            .iter()
+            .find(|state| state.id() == target_region)
+            .unwrap();
+
+        assert_eq!(caller.neighbor_import_results().len(), 1);
+        assert_eq!(
+            caller.neighbor_import_results()[0].decision,
+            ImportDecision::Accepted
+        );
+        assert_eq!(target.imported_resources().len(), 1);
     }
 
     fn runner_with_preloaded_event(

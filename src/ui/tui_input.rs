@@ -24,6 +24,8 @@ pub(crate) enum TuiAction {
     Load,
     ToggleHelp,
     CycleOverlay,
+    PreviousRegion,
+    NextRegion,
     ToggleRun,
     IncreaseSpeed,
     DecreaseSpeed,
@@ -66,6 +68,8 @@ pub(crate) fn map_key_event(event: KeyEvent) -> TuiAction {
         KeyCode::Char('l') | KeyCode::Char('L') => TuiAction::Load,
         KeyCode::Char('h') | KeyCode::Char('H') => TuiAction::ToggleHelp,
         KeyCode::Char('o') | KeyCode::Char('O') => TuiAction::CycleOverlay,
+        KeyCode::Char('[') => TuiAction::PreviousRegion,
+        KeyCode::Char(']') => TuiAction::NextRegion,
         KeyCode::Char(' ') => TuiAction::ToggleRun,
         KeyCode::Char('+') | KeyCode::Char('=') => TuiAction::IncreaseSpeed,
         KeyCode::Char('-') => TuiAction::DecreaseSpeed,
@@ -140,6 +144,14 @@ mod tests {
         assert_eq!(
             map_key_event(key(KeyCode::Char('O'))),
             TuiAction::CycleOverlay
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('['))),
+            TuiAction::PreviousRegion
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Char(']'))),
+            TuiAction::NextRegion
         );
         assert_eq!(map_key_event(key(KeyCode::Char(' '))), TuiAction::ToggleRun);
         assert_eq!(map_key_event(key(KeyCode::Char('Q'))), TuiAction::Quit);

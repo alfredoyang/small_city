@@ -176,6 +176,8 @@ pub enum ImportDecision {
     RejectedStale,
     /// The resource was newer than older cached generations for its origin/kind.
     ReplacedOlderGeneration,
+    /// A zero-capacity tombstone removed cached resources for its origin/kind.
+    Removed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +258,23 @@ impl ImportedResourceCache {
 
         self.resources.push(resource);
         decision
+    }
+
+    /// Removes cached resources for one authoritative origin/kind pair.
+    ///
+    /// Multi-region play uses zero-capacity resource messages as tombstones
+    /// when the source region no longer exports a resource after bulldoze,
+    /// replace, or another mutating command.
+    pub fn remove_origin_kind(
+        &mut self,
+        origin_region: RegionId,
+        resource_kind: ResourceKind,
+    ) -> bool {
+        let before_len = self.resources.len();
+        self.resources.retain(|known| {
+            known.id.origin_region != origin_region || known.id.resource_kind != resource_kind
+        });
+        self.resources.len() != before_len
     }
 
     /// Produces deterministic outbound resource copies for neighboring regions.
@@ -367,6 +386,20 @@ impl RegionState {
         border_crossing_cost: u32,
         target_neighbors: &[RegionId],
     ) -> ImportedResourceResult {
+        if resource.remaining_capacity == 0 {
+            let removed = self
+                .imported_resources
+                .remove_origin_kind(resource.id.origin_region, resource.id.resource_kind);
+            return ImportedResourceResult {
+                decision: if removed {
+                    ImportDecision::Removed
+                } else {
+                    ImportDecision::RejectedStale
+                },
+                forwarded_resources: Vec::new(),
+            };
+        }
+
         let decision = self.imported_resources.accept(resource);
         let forwarded_resources = if matches!(
             decision,
@@ -410,7 +443,17 @@ impl RegionState {
 
     /// Returns a UI-safe inspect model without exposing this region's ECS world.
     pub fn inspect(&self, x: usize, y: usize) -> InspectView {
-        inspect_world(&self.world, x, y)
+        let mut inspect = inspect_world(&self.world, x, y);
+        if !self.imported_resources.resources().is_empty() {
+            // This is region-level imported-resource awareness surfaced through
+            // the existing cell inspect channel until regional status panels
+            // get a dedicated field.
+            inspect.explanations.push(format!(
+                "Imported regional resources: {}",
+                self.imported_resources.resources().len()
+            ));
+        }
+        inspect
     }
 
     pub fn imported_resources(&self) -> &[ImportedResource] {

@@ -41,6 +41,7 @@ struct TuiState {
     current_overlay: MapOverlayInput,
     tile_theme: TileTheme,
     message: String,
+    region_label: String,
     is_running: bool,
     run_speed: RunSpeed,
     show_help: bool,
@@ -56,6 +57,7 @@ impl Default for TuiState {
             current_overlay: MapOverlayInput::Normal,
             tile_theme: TileTheme::AsciiDetailed,
             message: "Tiny City Builder".to_string(),
+            region_label: "Region: single city".to_string(),
             is_running: false,
             run_speed: RunSpeed::One,
             show_help: false,
@@ -489,6 +491,16 @@ impl TuiRuntime {
             }
             TuiAction::ToggleHelp => self.state.show_help = !self.state.show_help,
             TuiAction::CycleOverlay => self.state.cycle_overlay(),
+            TuiAction::PreviousRegion => {
+                self.state.message = self.game.select_previous_region();
+                self.state.region_label = self.game.region_label();
+                self.state.reset_cursor();
+            }
+            TuiAction::NextRegion => {
+                self.state.message = self.game.select_next_region();
+                self.state.region_label = self.game.region_label();
+                self.state.reset_cursor();
+            }
             TuiAction::ToggleRun => {
                 self.state.toggle_run();
                 self.next_auto_tick = now + self.state.run_speed.interval();
@@ -537,7 +549,7 @@ pub fn run() -> io::Result<()> {
 
 /// Runs the ratatui frontend on the regional facade behind an explicit flag.
 pub fn run_regional() -> io::Result<()> {
-    run_with_mode(CityLaunchMode::RegionalSingleRegion)
+    run_with_mode(CityLaunchMode::RegionalMultiRegion)
 }
 
 fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
@@ -555,6 +567,7 @@ fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
             let view = runtime
                 .game
                 .view_with_overlay(runtime.state.current_overlay);
+            runtime.state.region_label = runtime.game.region_label();
             runtime.state.clamp_cursor(&view);
             let inspect = runtime
                 .game
@@ -784,6 +797,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &Tui
     let status = &view.status;
     let lines = vec![
         simulation_status_line(state),
+        Line::from(state.region_label.clone()),
         Line::from(format!(
             "Turn: {} | Money: ${} | Pop: {} | Citizens: {}",
             status.turn, status.money, status.population, status.citizens
@@ -913,7 +927,7 @@ fn render_messages(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         simulation_status_line(state),
         Line::from(format_message(&state.message)),
         Line::from(
-            "Space pause/resume | +/- speed | WASD/Arrows move | 1-6 tools | N next | O overlay | H help | Q quit",
+            "Space pause/resume | +/- speed | WASD/Arrows move | 1-6 tools | N next | O overlay | [ ] region | H help | Q quit",
         ),
     ];
 
@@ -945,7 +959,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  R             Replace selected cell with selected tool"),
         Line::from("  U             Upgrade selected cell"),
         Line::from("  X             Bulldoze selected cell"),
-        Line::from("  N             Next turn"),
+        Line::from("  N             Next turn        [ / ] Previous / next region"),
         Line::from(""),
         help_section("Files And UI"),
         Line::from("  S             Save city"),
