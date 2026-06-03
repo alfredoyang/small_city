@@ -1,11 +1,13 @@
 //! Integration tests for the shared single-threaded region worker.
 
+use small_city::core::regional_types::{RegionCommand, UiRequestId};
 use small_city::core::regions::continuation::{CallerContinuation, NeighborRequest};
 use small_city::core::regions::runtime::{ImportedResourcePayload, RegionEvent, RegionRuntime};
 use small_city::core::regions::worker::{RegionWorker, WorkerId, WorkerRoutingError};
 use small_city::core::regions::{
     ImportedResource, ImportedResourceResult, RegionId, RegionState, ResourceId, ResourceKind,
 };
+use small_city::interface::input::BuildingKind;
 
 #[test]
 fn one_worker_processes_events_for_multiple_regions() {
@@ -148,6 +150,90 @@ fn process_region_events_with_zero_event_limit_reports_no_processed_regions() {
     assert_eq!(pending_events(&worker, RegionId(11)), 1);
 }
 
+#[test]
+fn worker_routes_export_change_to_neighbor_import_cache() {
+    let source = RegionId(12);
+    let target = RegionId(13);
+    let mut worker = worker_with_regions(WorkerId(7), &[source, target]);
+
+    worker
+        .push_event(
+            source,
+            RegionEvent::RunCommand {
+                request_id: UiRequestId(1),
+                command: RegionCommand::Build {
+                    x: 1,
+                    y: 1,
+                    kind: BuildingKind::Park,
+                },
+            },
+        )
+        .unwrap();
+
+    drain_worker(&mut worker);
+
+    let imported = worker
+        .region(target)
+        .expect("target")
+        .state()
+        .imported_resources();
+    assert_eq!(imported.len(), 1);
+    assert_eq!(imported[0].id.origin_region, source);
+    assert_eq!(imported[0].id.resource_kind, ResourceKind::ParkAccess);
+    assert_eq!(imported[0].remaining_capacity, 1);
+}
+
+#[test]
+fn worker_routes_export_removal_to_neighbor_import_cache() {
+    let source = RegionId(14);
+    let target = RegionId(15);
+    let mut worker = worker_with_regions(WorkerId(8), &[source, target]);
+
+    worker
+        .push_event(
+            source,
+            RegionEvent::RunCommand {
+                request_id: UiRequestId(1),
+                command: RegionCommand::Build {
+                    x: 1,
+                    y: 1,
+                    kind: BuildingKind::Park,
+                },
+            },
+        )
+        .unwrap();
+    drain_worker(&mut worker);
+    assert_eq!(
+        worker
+            .region(target)
+            .expect("target")
+            .state()
+            .imported_resources()
+            .len(),
+        1
+    );
+
+    worker
+        .push_event(
+            source,
+            RegionEvent::RunCommand {
+                request_id: UiRequestId(2),
+                command: RegionCommand::Bulldoze { x: 1, y: 1 },
+            },
+        )
+        .unwrap();
+    drain_worker(&mut worker);
+
+    assert!(
+        worker
+            .region(target)
+            .expect("target")
+            .state()
+            .imported_resources()
+            .is_empty()
+    );
+}
+
 fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
     let mut worker = RegionWorker::new(id);
     for region_id in regions {
@@ -190,6 +276,16 @@ fn pending_events(worker: &RegionWorker, region_id: RegionId) -> usize {
         .region(region_id)
         .expect("region")
         .pending_event_count()
+}
+
+fn drain_worker(worker: &mut RegionWorker) {
+    for _ in 0..16 {
+        if worker.process_region_events(1).processed_regions == 0 {
+            return;
+        }
+    }
+
+    panic!("worker did not drain");
 }
 
 fn resource(origin_region: u32, resource_kind: ResourceKind, generation: u64) -> ImportedResource {

@@ -216,6 +216,9 @@ fn returned_continuation(
         OutboundMessage::RegionSnapshotReady(reply) => {
             panic!("unexpected snapshot reply: {reply:?}")
         }
+        OutboundMessage::RegionExportsChanged(change) => {
+            panic!("unexpected export change: {change:?}")
+        }
         OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
     }
 }
@@ -228,6 +231,7 @@ fn runtime_errors(outbound: &[OutboundMessage]) -> Vec<RegionRuntimeError> {
             OutboundMessage::ReturnImportedResourceContinuation { .. } => None,
             OutboundMessage::RegionCommandCompleted(_) => None,
             OutboundMessage::RegionSnapshotReady(_) => None,
+            OutboundMessage::RegionExportsChanged(_) => None,
         })
         .collect()
 }

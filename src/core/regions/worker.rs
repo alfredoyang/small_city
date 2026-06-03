@@ -5,12 +5,13 @@
 //! `RegionRuntime`.
 
 use crate::core::regional_types::{RegionCommandResponse, RegionSnapshotResponse};
-use crate::core::regions::RegionId;
+use crate::core::regions::continuation::CallerContinuation;
 use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::load_manager::WorkerLoad;
 use crate::core::regions::runtime::{
-    OutboundMessage, RegionEvent, RegionRuntime, RegionRuntimeError,
+    ImportedResourcePayload, OutboundMessage, RegionEvent, RegionRuntime, RegionRuntimeError,
 };
+use crate::core::regions::{ImportedResourceResult, RegionId, RegionalExportChange};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// Stable identity for one single-threaded worker scheduler.
@@ -211,11 +212,59 @@ impl RegionWorker {
             OutboundMessage::RegionSnapshotReady(reply) => {
                 Ok(WorkerRoutedMessage::SnapshotReply(reply))
             }
+            OutboundMessage::RegionExportsChanged(change) => {
+                self.route_export_change(change)?;
+                Ok(WorkerRoutedMessage::None)
+            }
             OutboundMessage::RuntimeError(error) => Err(WorkerRoutingError::RuntimeError {
                 source_region,
                 error,
             }),
         }
+    }
+
+    fn route_export_change(
+        &mut self,
+        change: RegionalExportChange,
+    ) -> Result<(), WorkerRoutingError> {
+        let target_regions = self
+            .regions
+            .iter()
+            .map(RegionRuntime::region_id)
+            .filter(|region_id| *region_id != change.source_region)
+            .collect::<Vec<_>>();
+
+        for target_region in &target_regions {
+            let target_neighbors = target_regions
+                .iter()
+                .copied()
+                .filter(|region_id| *region_id != *target_region)
+                .collect::<Vec<_>>();
+
+            for export in &change.current {
+                self.push_event(
+                    *target_region,
+                    RegionEvent::ProcessImportedResource(imported_resource_request(
+                        change.source_region,
+                        export.imported_resource(),
+                        target_neighbors.clone(),
+                    )),
+                )?;
+            }
+
+            for removed_kind in &change.removed {
+                self.push_event(
+                    *target_region,
+                    RegionEvent::ProcessImportedResource(imported_resource_request(
+                        change.source_region,
+                        RegionalExportChange::tombstone(change.source_region, *removed_kind),
+                        target_neighbors.clone(),
+                    )),
+                )?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -223,4 +272,25 @@ enum WorkerRoutedMessage {
     None,
     CommandReply(RegionCommandResponse),
     SnapshotReply(RegionSnapshotResponse),
+}
+
+fn imported_resource_request(
+    caller_region: RegionId,
+    resource: crate::core::regions::ImportedResource,
+    target_neighbors: Vec<RegionId>,
+) -> crate::core::regions::runtime::ImportedResourceRequest {
+    crate::core::regions::continuation::NeighborRequest {
+        payload: ImportedResourcePayload {
+            resource,
+            local_used_capacity: 0,
+            border_crossing_cost: 1,
+            target_neighbors,
+        },
+        continuation: CallerContinuation::<ImportedResourceResult>::new(
+            caller_region,
+            |region, result| {
+                region.apply_neighbor_import_result(result);
+            },
+        ),
+    }
 }

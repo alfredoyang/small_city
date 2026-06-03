@@ -1,5 +1,6 @@
 //! Integration tests for the single-threaded regional event runtime.
 
+use small_city::core::regional_types::{RegionCommand, RegionCommandReply, UiRequestId};
 use small_city::core::regions::continuation::{CallerContinuation, NeighborRequest};
 use small_city::core::regions::runtime::{
     ImportedResourcePayload, ImportedResourceRequest, OutboundMessage, RegionEvent, RegionRuntime,
@@ -8,6 +9,7 @@ use small_city::core::regions::{
     ImportDecision, ImportedResource, ImportedResourceResult, RegionId, RegionState, ResourceId,
     ResourceKind,
 };
+use small_city::interface::input::BuildingKind;
 
 #[test]
 fn local_tick_is_processed_through_runtime() {
@@ -142,6 +144,79 @@ fn outbound_continuation_message_is_returned_before_caller_mutates() {
     assert_eq!(caller.state().neighbor_import_results(), &[result.clone()]);
 }
 
+#[test]
+fn successful_build_emits_export_change_from_runtime() {
+    let mut runtime = RegionRuntime::new(RegionState::new(RegionId(30), 3, 3));
+
+    runtime.push_event(RegionEvent::RunCommand {
+        request_id: UiRequestId(1),
+        command: RegionCommand::Build {
+            x: 1,
+            y: 1,
+            kind: BuildingKind::Park,
+        },
+    });
+
+    let outbound = runtime.process_next_event();
+
+    assert!(
+        outbound.iter().any(|message| matches!(
+            message,
+            OutboundMessage::RegionCommandCompleted(reply)
+                if reply.request_id == UiRequestId(1)
+                    && matches!(reply.reply, RegionCommandReply::CommandResult(ref result) if result.success)
+        ))
+    );
+    let export_change = outbound
+        .iter()
+        .find_map(|message| match message {
+            OutboundMessage::RegionExportsChanged(change) => Some(change),
+            _ => None,
+        })
+        .expect("build should emit export change");
+
+    assert_eq!(export_change.source_region, RegionId(30));
+    assert!(export_change.removed.is_empty());
+    assert_eq!(export_change.current.len(), 1);
+    assert_eq!(
+        export_change.current[0].resource_kind,
+        ResourceKind::ParkAccess
+    );
+    assert_eq!(export_change.current[0].count, 1);
+    assert_eq!(export_change.current[0].generation, 1);
+}
+
+#[test]
+fn removing_source_building_emits_export_tombstone_from_runtime() {
+    let mut runtime = RegionRuntime::new(RegionState::new(RegionId(31), 3, 3));
+
+    runtime.push_event(RegionEvent::RunCommand {
+        request_id: UiRequestId(1),
+        command: RegionCommand::Build {
+            x: 1,
+            y: 1,
+            kind: BuildingKind::Park,
+        },
+    });
+    runtime.process_next_event();
+    runtime.push_event(RegionEvent::RunCommand {
+        request_id: UiRequestId(2),
+        command: RegionCommand::Bulldoze { x: 1, y: 1 },
+    });
+
+    let outbound = runtime.process_next_event();
+    let export_change = outbound
+        .iter()
+        .find_map(|message| match message {
+            OutboundMessage::RegionExportsChanged(change) => Some(change),
+            _ => None,
+        })
+        .expect("bulldoze should emit export change");
+
+    assert!(export_change.current.is_empty());
+    assert_eq!(export_change.removed, vec![ResourceKind::ParkAccess]);
+}
+
 fn decisions(outbound: &[OutboundMessage]) -> Vec<ImportDecision> {
     outbound
         .iter()
@@ -152,6 +227,9 @@ fn decisions(outbound: &[OutboundMessage]) -> Vec<ImportDecision> {
             }
             OutboundMessage::RegionSnapshotReady(reply) => {
                 panic!("unexpected snapshot reply: {reply:?}")
+            }
+            OutboundMessage::RegionExportsChanged(change) => {
+                panic!("unexpected export change: {change:?}")
             }
             OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
         })
@@ -187,6 +265,9 @@ fn take_continuation(
         }
         OutboundMessage::RegionSnapshotReady(reply) => {
             panic!("unexpected snapshot reply: {reply:?}")
+        }
+        OutboundMessage::RegionExportsChanged(change) => {
+            panic!("unexpected export change: {change:?}")
         }
         OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
     }

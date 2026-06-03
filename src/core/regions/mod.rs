@@ -73,6 +73,9 @@ pub mod threaded;
 pub mod worker;
 pub use runtime::continuation;
 
+const IMPORTED_RESOURCE_CAPACITY_PER_SOURCE: u32 = 1;
+const IMPORTED_RESOURCE_MAX_HOPS: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 /// Stable identity for one independently owned simulation region.
 ///
@@ -126,6 +129,61 @@ pub struct ImportedResource {
     pub travel_cost: u32,
     /// Neighbor that sent this resource to the receiving region.
     pub source_neighbor: RegionId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Authoritative export count produced by one region runtime.
+pub struct RegionalExport {
+    pub region_id: RegionId,
+    pub resource_kind: ResourceKind,
+    pub count: u32,
+    /// Monotonic only while a runtime is alive. Imported caches are rebuilt
+    /// empty after load, so save files do not need to preserve this generation.
+    pub generation: u64,
+}
+
+impl RegionalExport {
+    pub fn imported_resource(self) -> ImportedResource {
+        ImportedResource {
+            id: ResourceId {
+                origin_region: self.region_id,
+                resource_kind: self.resource_kind,
+                generation: self.generation,
+            },
+            remaining_capacity: self
+                .count
+                .saturating_mul(IMPORTED_RESOURCE_CAPACITY_PER_SOURCE),
+            hop_count: 0,
+            max_hops: IMPORTED_RESOURCE_MAX_HOPS,
+            travel_cost: 0,
+            source_neighbor: self.region_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Runtime-owned export delta for the worker to route to neighboring regions.
+pub struct RegionalExportChange {
+    pub source_region: RegionId,
+    pub current: Vec<RegionalExport>,
+    pub removed: Vec<ResourceKind>,
+}
+
+impl RegionalExportChange {
+    pub fn tombstone(source_region: RegionId, resource_kind: ResourceKind) -> ImportedResource {
+        ImportedResource {
+            id: ResourceId {
+                origin_region: source_region,
+                resource_kind,
+                generation: u64::MAX,
+            },
+            remaining_capacity: 0,
+            hop_count: 0,
+            max_hops: IMPORTED_RESOURCE_MAX_HOPS,
+            travel_cost: 0,
+            source_neighbor: source_region,
+        }
+    }
 }
 
 impl ImportedResource {
@@ -460,6 +518,29 @@ impl RegionState {
         self.imported_resources.resources()
     }
 
+    /// Derives current local exports from authoritative region state.
+    pub fn exported_resource_counts(&self) -> Vec<(ResourceKind, u32)> {
+        let mut exports: Vec<(ResourceKind, u32)> = Vec::new();
+        for cell in self.view().map.cells {
+            let Some(kind) = cell.building else {
+                continue;
+            };
+            let Some(resource_kind) = exported_resource_kind_for_building(kind) else {
+                continue;
+            };
+            if let Some((_, count)) = exports
+                .iter_mut()
+                .find(|(known_kind, _)| *known_kind == resource_kind)
+            {
+                *count = (*count).saturating_add(1);
+            } else {
+                exports.push((resource_kind, 1));
+            }
+        }
+
+        exports
+    }
+
     /// Rebuilds transient imported cache state from authoritative local data.
     ///
     /// Regional export generation does not exist yet, so the current
@@ -493,6 +574,17 @@ impl RegionState {
         };
         state.rebuild_imported_resource_cache();
         state
+    }
+}
+
+fn exported_resource_kind_for_building(kind: BuildingKind) -> Option<ResourceKind> {
+    match kind {
+        BuildingKind::Road => None,
+        BuildingKind::Residential => Some(ResourceKind::ServiceAccess),
+        BuildingKind::Commercial => Some(ResourceKind::ShoppingAccess),
+        BuildingKind::Industrial => Some(ResourceKind::Jobs),
+        BuildingKind::PowerPlant => Some(ResourceKind::ServiceAccess),
+        BuildingKind::Park => Some(ResourceKind::ParkAccess),
     }
 }
 

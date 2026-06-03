@@ -12,7 +12,10 @@ use crate::core::regional_types::{
 };
 use crate::core::regions::handle::{RegionEventReceiver, RegionHandle, mailbox};
 use crate::core::regions::runtime::continuation::{CallerContinuation, NeighborRequest};
-use crate::core::regions::{ImportedResource, ImportedResourceResult, RegionId, RegionState};
+use crate::core::regions::{
+    ImportedResource, ImportedResourceResult, RegionId, RegionState, RegionalExport,
+    RegionalExportChange,
+};
 use crate::interface::input::MapOverlayInput;
 
 #[derive(Debug)]
@@ -37,6 +40,8 @@ pub enum RegionEvent {
         continuation: CallerContinuation<ImportedResourceResult>,
         result: ImportedResourceResult,
     },
+    /// Internal event used to publish exports after startup or load.
+    RefreshExports,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +76,7 @@ pub enum OutboundMessage {
     },
     RegionCommandCompleted(RegionCommandResponse),
     RegionSnapshotReady(RegionSnapshotResponse),
+    RegionExportsChanged(RegionalExportChange),
     RuntimeError(RegionRuntimeError),
 }
 
@@ -78,6 +84,7 @@ pub enum OutboundMessage {
 /// Single-region event loop with deterministic FIFO processing.
 pub struct RegionRuntime {
     state: RegionState,
+    exports: Vec<RegionalExport>,
     handle: RegionHandle,
     receiver: RegionEventReceiver,
 }
@@ -86,11 +93,17 @@ impl RegionRuntime {
     /// Creates a runtime that owns one region and an empty inbox.
     pub fn new(state: RegionState) -> Self {
         let (handle, receiver) = mailbox(state.id());
-        Self {
+        let has_initial_exports = !state.exported_resource_counts().is_empty();
+        let mut runtime = Self {
             state,
+            exports: Vec::new(),
             handle,
             receiver,
+        };
+        if has_initial_exports {
+            runtime.push_event(RegionEvent::RefreshExports);
         }
+        runtime
     }
 
     pub fn region_id(&self) -> RegionId {
@@ -153,7 +166,7 @@ impl RegionRuntime {
         match event {
             RegionEvent::Tick => {
                 self.state.tick_local();
-                Vec::new()
+                self.export_change_messages()
             }
             RegionEvent::BuildSnapshot {
                 request_id,
@@ -181,14 +194,84 @@ impl RegionRuntime {
             RegionEvent::RunCommand {
                 request_id,
                 command,
-            } => vec![OutboundMessage::RegionCommandCompleted(
-                self.run_command(request_id, command),
-            )],
+            } => {
+                let response = self.run_command(request_id, command);
+                let mut outbound = vec![OutboundMessage::RegionCommandCompleted(response.clone())];
+                if command_can_mutate_exports(command)
+                    && matches!(
+                        response.reply,
+                        RegionCommandReply::CommandResult(ref result) if result.success
+                    )
+                {
+                    outbound.extend(self.export_change_messages());
+                }
+                outbound
+            }
             RegionEvent::RunImportedResourceContinuation {
                 continuation,
                 result,
             } => self.run_imported_resource_continuation(continuation, result),
+            RegionEvent::RefreshExports => self.export_change_messages(),
         }
+    }
+
+    fn export_change_messages(&mut self) -> Vec<OutboundMessage> {
+        self.detect_export_change()
+            .map(|change| vec![OutboundMessage::RegionExportsChanged(change)])
+            .unwrap_or_default()
+    }
+
+    fn detect_export_change(&mut self) -> Option<RegionalExportChange> {
+        let current_counts = self.state.exported_resource_counts();
+        let previous_kinds = self
+            .exports
+            .iter()
+            .map(|export| export.resource_kind)
+            .collect::<Vec<_>>();
+        let current_kinds = current_counts
+            .iter()
+            .map(|(resource_kind, _)| *resource_kind)
+            .collect::<Vec<_>>();
+
+        let current = current_counts
+            .into_iter()
+            .map(|(resource_kind, count)| {
+                let generation = self
+                    .exports
+                    .iter()
+                    .find(|previous| previous.resource_kind == resource_kind)
+                    .map(|previous| {
+                        if previous.count == count {
+                            previous.generation
+                        } else {
+                            previous.generation.saturating_add(1)
+                        }
+                    })
+                    .unwrap_or(1);
+                RegionalExport {
+                    region_id: self.region_id(),
+                    resource_kind,
+                    count,
+                    generation,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let removed = previous_kinds
+            .into_iter()
+            .filter(|resource_kind| !current_kinds.contains(resource_kind))
+            .collect::<Vec<_>>();
+
+        if current == self.exports && removed.is_empty() {
+            return None;
+        }
+
+        self.exports = current.clone();
+        Some(RegionalExportChange {
+            source_region: self.region_id(),
+            current,
+            removed,
+        })
     }
 
     fn run_imported_resource_continuation(
@@ -253,4 +336,14 @@ impl RegionRuntime {
             snapshot: RegionViewSnapshot::from_view(self.region_id(), view),
         }
     }
+}
+
+fn command_can_mutate_exports(command: RegionCommand) -> bool {
+    matches!(
+        command,
+        RegionCommand::Build { .. }
+            | RegionCommand::Bulldoze { .. }
+            | RegionCommand::Replace { .. }
+            | RegionCommand::Upgrade { .. }
+    )
 }
