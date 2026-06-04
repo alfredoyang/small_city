@@ -1,4 +1,7 @@
 /target
 Cargo.lock
 AGENTS.md
+CLAUDE.md
 /.codex
+/.claude
+city1
