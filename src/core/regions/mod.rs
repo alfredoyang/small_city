@@ -57,7 +57,7 @@
 //!   No other region's World is touched.
 //! ```
 
-use crate::core::game::{refresh_derived_state_for_world, tick_world};
+use crate::core::simulation::{refresh_derived_state_for_world, tick_world};
 use crate::core::systems::{build, bulldoze, replace, upgrade};
 use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
@@ -645,5 +645,14 @@ mod tests {
             region.exported_resource_counts(),
             vec![(ResourceKind::Jobs, 1), (ResourceKind::ParkAccess, 2)]
         );
+    }
+
+    #[test]
+    fn regional_state_imports_shared_simulation_helpers_not_game_facade() {
+        let source = std::fs::read_to_string("src/core/regions/mod.rs").expect("region source");
+        let forbidden = ["crate::core::", "game"].concat();
+
+        assert!(!source.contains(&forbidden));
+        assert!(source.contains("crate::core::simulation"));
     }
 }

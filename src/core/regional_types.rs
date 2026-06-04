@@ -125,15 +125,15 @@ pub struct RegionCommandResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::game::Game;
+    use crate::core::regions::RegionState;
 
     #[test]
     fn snapshot_revision_is_derived_from_view_turn() {
-        let mut game = Game::new(3, 3);
-        game.tick();
-        game.tick();
+        let mut region = RegionState::new(RegionId(7), 3, 3);
+        region.tick_local();
+        region.tick_local();
 
-        let snapshot = RegionViewSnapshot::from_view(RegionId(7), game.view());
+        let snapshot = RegionViewSnapshot::from_view(RegionId(7), region.view());
 
         assert_eq!(snapshot.region_id, RegionId(7));
         assert_eq!(snapshot.revision, 2);
