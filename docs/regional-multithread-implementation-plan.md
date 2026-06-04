@@ -718,8 +718,8 @@ Implementation:
 - Surface cross-region imported resources in the view models so their effect is
   visible, reusing the propagation already built in Patches 1 and 4.
 - Only after this path is stable, consider flipping the default launch mode to
-  regional in a separate reviewed change. That later removal is tracked in
-  `docs/remove-old-single-thread-architecture-plan.md`.
+  regional in a separate reviewed change. That later removal is recorded in
+  "Completed Follow-Up: Old Single-Thread Architecture Removal" below.
 
 Tests:
 
@@ -854,6 +854,212 @@ Add single-threaded region resource propagation data structures and tests.
 
 This is the smallest useful step because it validates the cross-region data
 contract before introducing runtimes, continuations, workers, or threads.
+
+## Completed Follow-Up: Old Single-Thread Architecture Removal
+
+This follow-up retired the old UI-facing single-city `Game` execution path after
+the regional runtime became ready to serve as the default. It did not remove the
+deterministic simulation systems. Those systems remain the core rules in shared
+core modules. The cleanup removed the duplicate frontend/backend path where UI
+could still drive `Game` directly instead of the regional facade.
+
+Status: complete. The production `Game` facade has been removed, terminal UIs
+run through `CityDriver` backed by `RegionalGame`, and legacy single-city saves
+load through the regional loader.
+
+Goals:
+
+- Make the regional facade the default UI execution path.
+- Preserve deterministic single-region behavior through the regional runtime.
+- Preserve compatibility with existing single-city save files.
+- Keep UI code using one backend path instead of switching between `Game` and
+  `RegionalGame`.
+- Keep ECS `World` private to core simulation and region state.
+- Remove old single-city UI/backend code only after parity and migration tests
+  are in place.
+
+Non-goals:
+
+- Do not remove core simulation systems such as economy, power, population,
+  citizens, local effects, or road analysis.
+- Do not expose `World` to UI, runner, worker, or coordinator code.
+- Do not add multi-worker load balancing as part of this removal.
+- Do not change regional imported resources from visibility-only cache into full
+  economy inputs in this cleanup.
+
+Resolved blockers:
+
+- Default launch uses the regional path.
+- `CityDriver` owns one regional backend path.
+- Regional ticks return real `CommandResult` data from the region runtime.
+- Save/load uses `RegionalGame::load_from_file`, including legacy single-city
+  conversion.
+- Shared simulation helpers live in `src/core/simulation.rs`.
+- Production `src/core/game.rs` has been removed.
+
+### Patch 18: Regional Tick Result Parity
+
+Goal: make regional ticks return the same player-visible `CommandResult` shape
+as the prior single-city tick path.
+
+Implementation:
+
+- Add a request ID-correlated tick reply path from `RegionRuntime` to the
+  runner, such as `RegionTickCompleted`, mirroring `RegionCommandCompleted`.
+- Return the real `RegionState::tick_local` result instead of fabricating a
+  minimal `TurnAdvanced` event.
+- Keep this as plumbing, not a reimplementation: `RegionState::tick_local`
+  already calls the shared `tick_world` helper.
+- Keep export-change emission after tick deterministic.
+- Preserve command/tick ordering through the same worker pumping rules.
+
+Tests:
+
+- single-region regional tick result matches the prior tick behavior for turn
+  and summary event shape
+- economy, population, power, and pollution tick summaries remain visible
+- regional tick still propagates export changes after local tick work
+
+### Patch 19: Single-City Save Compatibility Through Regional Loader
+
+Goal: let the regional path load existing single-city saves so removing the old
+UI backend does not strand player saves.
+
+Implementation:
+
+- Detect whether a save file is regional or legacy single-city by trying the
+  regional shape first (`selected_region` plus `regions`), then falling back to
+  the legacy bare-`World` save shape. Do not require a new version field for
+  existing saves.
+- Convert a legacy single-city save into a one-region `RegionalGame`.
+- Preserve existing single-city save tests until the compatibility path is
+  covered through `RegionalGame`.
+- Keep imported resources as rebuildable cache, not saved truth.
+- Region-ordering concerns from regional save/load are a known non-issue for
+  converted legacy saves because they contain exactly one region. The two-region
+  default remains explicitly ordered as `[RegionId(1), RegionId(2)]`.
+
+Tests:
+
+- regional loader accepts an existing single-city save
+- converted save exposes the same selected region view as the old load path
+- converted game can continue ticking, building, saving, and loading again
+- invalid save errors stay deterministic and user-readable
+
+### Patch 20: Make Regional UI The Default
+
+Goal: switch normal launch to the regional backend while keeping an emergency
+legacy command only for one patch if needed.
+
+Implementation:
+
+- Change default TUI launch to create a regional game.
+- Keep CLI arguments explicit and documented in error text.
+- If a temporary legacy mode remains, name it clearly, such as `single` or
+  `legacy-single`, and mark it for removal in the next patch.
+- Ensure ASCII and ratatui paths both use the same regional driver mode by
+  default.
+
+Tests:
+
+- default TUI launch uses regional mode
+- regional launch does not import worker/runtime/ECS internals in UI modules
+- save/load from the default UI path uses regional compatibility loading
+- region label and switching still work after default launch changes
+
+### Patch 21: Collapse CityDriver To One Backend
+
+Goal: remove the duplicate UI backend branch and make `CityDriver`
+regional-only.
+
+Implementation:
+
+- Remove `CityBackend::SingleCity`.
+- Remove single-city-specific driver constructors.
+- Keep one driver command/view/save/load path backed by `RegionalGame`.
+- Update UI tests to assert the regional facade is the only backend.
+- Either migrate UI test modules off `Game` parity helpers, or make the boundary
+  test explicitly ignore `#[cfg(test)]` imports until `Game` is retired or
+  re-scoped.
+
+Tests:
+
+- driver commands route through `RegionalGame`
+- driver save/load accepts legacy and regional saves
+- unavailable backend behavior still protects UI after unrecoverable save errors
+- non-test UI code does not import `Game`, ECS, worker, or runtime types
+
+### Patch 22: Move Shared Simulation Helpers Out Of `game.rs`
+
+Goal: remove the regional runtime's dependency on helper functions that lived in
+the UI-facing single-city `Game` module.
+
+Implementation:
+
+- Move `tick_world` out of `game.rs` into a neutral core module.
+- Move `refresh_derived_state_for_world` out of `game.rs` into the same neutral
+  core module, or another clearly named simulation helper module.
+- Update both the old facade and `RegionState` to import these helpers from the
+  neutral module during the transition.
+- Check for any other helper in `game.rs` that regional code imports or would
+  need before `Game` can be retired.
+- Keep behavior unchanged. This patch is a relocation only.
+
+Tests:
+
+- existing behavior tests still pass
+- regional tick, command, save/load, and parity tests still pass
+- no regional module imports `crate::core::game` after the relocation
+
+### Patch 23: Retire `Game`
+
+Goal: remove `Game` from public UI usage and then delete the production facade
+once shared simulation helpers no longer live in `game.rs`.
+
+Implementation:
+
+- Migrate tests to `RegionalGame` or lower-level system helpers.
+- Use test-only wrappers over `RegionalGame` where single-region scenario tests
+  remain clearer with simple city method names.
+- Delete the production `Game` facade.
+- Keep public API changes intentional and documented.
+
+Tests:
+
+- all behavior tests have equivalent regional or system coverage
+- save/load compatibility remains covered after the public API change
+- production core no longer exports the old game facade
+
+### Patch 24: Documentation And Cleanup
+
+Goal: remove stale documentation and tests that describe regional mode as
+experimental or opt-in after it becomes the only UI path.
+
+Implementation:
+
+- Update launch instructions.
+- Update architecture docs to say regional runtime is the default UI execution
+  path.
+- Remove obsolete references to keeping the old single-city UI path as default.
+- Keep design notes that still explain why the region runtime owns isolation and
+  deterministic event flow.
+
+Tests:
+
+- documentation-only changes do not require Rust tests unless examples or CLI
+  behavior change in the same patch
+
+Final removal checklist:
+
+- [x] `cargo run` launches the regional path by default.
+- [x] ASCII and ratatui frontends share one regional driver path.
+- [x] UI modules do not import `Game`, ECS, worker, or runtime internals.
+- [x] Regional tick returns real `CommandResult` data.
+- [x] Existing single-city saves load through the regional path.
+- [x] Multi-region saves still round trip.
+- [x] Production `Game` has been removed; remaining single-region behavioral
+  coverage uses the regional facade or test-only wrappers over it.
+- [x] `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` pass.
 
 ## Review Checklist For Each Patch
 
