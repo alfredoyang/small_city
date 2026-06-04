@@ -277,12 +277,41 @@ fn regional_ui_driver_load_uses_loaded_selected_region() {
 }
 
 #[test]
-fn regional_launch_flag_is_available_without_replacing_default_tui() {
+fn regional_ui_driver_load_accepts_legacy_single_city_save() {
+    let path = save_path("regional-ui-legacy-save");
+    let mut legacy = Game::new(3, 3);
+    assert!(legacy.build(1, 1, BuildingKind::Residential).success);
+    legacy.save_to_file(&path).unwrap();
+    let mut driver =
+        CityDriver::new(CityLaunchMode::RegionalMultiRegion).expect("regional UI driver");
+
+    driver.load_from_file(&path).unwrap();
+    let view = driver.view();
+
+    assert_eq!(
+        view.map.cells[1 + view.map.width].building,
+        Some(BuildingKind::Residential)
+    );
+    assert!(driver.region_label().contains("Region: 1/1"));
+    remove_save_file(path);
+}
+
+#[test]
+fn default_launch_uses_regional_mode_with_explicit_legacy_escape_hatch() {
     let source = std::fs::read_to_string("src/main.rs").expect("main source");
+    let tui_source = std::fs::read_to_string("src/ui/tui.rs").expect("tui source");
+    let ascii_source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii source");
 
     assert!(source.contains("Some(\"regional\")"));
     assert!(source.contains("small_city::ui::tui::run_regional()"));
     assert!(source.contains("Some(\"tui\") | None => small_city::ui::tui::run()"));
+    assert!(source.contains("Some(\"ascii\") => small_city::ui::ascii::run()"));
+    assert!(source.contains("Some(\"legacy-single\")"));
+    assert!(source.contains("Some(\"legacy-ascii\")"));
+    assert!(tui_source.contains("run_with_mode(CityLaunchMode::RegionalMultiRegion)"));
+    assert!(tui_source.contains("pub fn run_legacy_single()"));
+    assert!(ascii_source.contains("run_with_mode(CityLaunchMode::RegionalMultiRegion)"));
+    assert!(ascii_source.contains("pub fn run_legacy_single()"));
 }
 
 #[test]

@@ -542,14 +542,19 @@ enum TuiFlow {
     Quit,
 }
 
-/// Runs the ratatui frontend on the default single-city facade path.
+/// Runs the ratatui frontend on the regional facade.
 pub fn run() -> io::Result<()> {
-    run_with_mode(CityLaunchMode::SingleCity)
+    run_with_mode(CityLaunchMode::RegionalMultiRegion)
 }
 
-/// Runs the ratatui frontend on the regional facade behind an explicit flag.
+/// Backward-compatible alias for the default regional TUI mode.
 pub fn run_regional() -> io::Result<()> {
     run_with_mode(CityLaunchMode::RegionalMultiRegion)
+}
+
+/// Temporary Patch 20 escape hatch for the old single-city UI backend.
+pub fn run_legacy_single() -> io::Result<()> {
+    run_with_mode(CityLaunchMode::SingleCity)
 }
 
 fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
