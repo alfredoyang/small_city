@@ -92,11 +92,6 @@ pub fn run_regional() -> io::Result<()> {
     run_with_mode(CityLaunchMode::RegionalMultiRegion)
 }
 
-/// Temporary Patch 20 escape hatch for the old single-city UI backend.
-pub fn run_legacy_single() -> io::Result<()> {
-    run_with_mode(CityLaunchMode::SingleCity)
-}
-
 fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
     let _raw_terminal = RawTerminal::enter()?;
     let mut game = CityDriver::new(mode).map_err(|error| io::Error::other(error.to_string()))?;

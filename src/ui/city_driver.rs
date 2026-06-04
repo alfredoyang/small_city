@@ -1,13 +1,12 @@
-//! UI-local city driver that selects the single-city or regional facade backend.
+//! UI-local city driver for the regional facade backend.
 //!
 //! Terminal frontends call this adapter for commands, snapshots, inspect data,
 //! and save/load. The adapter keeps worker/runtime details out of UI modules
-//! while preserving the default single-city `Game` path.
+//! while rendering only from interface view models.
 
 use std::fmt;
 use std::path::Path;
 
-use crate::core::game::{Game, GameError};
 use crate::core::regional_game::{
     RegionalGame, RegionalGameError, RegionalGameSaveError, RegionalGameSaveFailure,
 };
@@ -21,14 +20,12 @@ const DEFAULT_MAP_HEIGHT: usize = 15;
 /// Launch mode selected by the binary before entering a terminal frontend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CityLaunchMode {
-    SingleCity,
     RegionalMultiRegion,
 }
 
 /// UI-facing errors from selecting or driving a city backend.
 #[derive(Debug)]
 pub enum CityDriverError {
-    Game(GameError),
     Regional(RegionalGameError),
     RegionalSave(RegionalGameSaveError),
     RegionalSaveFailure(RegionalGameSaveFailure),
@@ -38,7 +35,6 @@ pub enum CityDriverError {
 impl fmt::Display for CityDriverError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Game(error) => write!(formatter, "{error}"),
             Self::Regional(error) => write!(formatter, "Regional game error: {error:?}"),
             Self::RegionalSave(error) => write!(formatter, "{error}"),
             Self::RegionalSaveFailure(error) => write!(formatter, "{error}"),
@@ -48,12 +44,6 @@ impl fmt::Display for CityDriverError {
 }
 
 impl std::error::Error for CityDriverError {}
-
-impl From<GameError> for CityDriverError {
-    fn from(error: GameError) -> Self {
-        Self::Game(error)
-    }
-}
 
 impl From<RegionalGameError> for CityDriverError {
     fn from(error: RegionalGameError) -> Self {
@@ -77,47 +67,23 @@ pub struct CityDriver {
 
 #[derive(Debug)]
 enum CityBackend {
-    SingleCity(Box<Game>),
     RegionalMultiRegion(Box<RegionalGame>),
-    Unavailable {
-        mode: CityLaunchMode,
-        message: String,
-    },
+    Unavailable { message: String },
 }
 
 impl CityDriver {
     pub fn new(mode: CityLaunchMode) -> Result<Self, CityDriverError> {
         match mode {
-            CityLaunchMode::SingleCity => Ok(Self::single_city()),
             CityLaunchMode::RegionalMultiRegion => Self::regional_multi_region(),
         }
     }
 
-    pub fn single_city() -> Self {
-        let game = Box::<Game>::default();
-        let last_view = game.view();
-        Self {
-            backend: CityBackend::SingleCity(game),
-            last_view,
-            read_error: None,
-        }
-    }
-
-    pub fn single_city_with_size(width: usize, height: usize) -> Self {
-        let game = Box::new(Game::new(width, height));
-        let last_view = game.view();
-        Self {
-            backend: CityBackend::SingleCity(game),
-            last_view,
-            read_error: None,
-        }
-    }
-
     pub fn regional_multi_region() -> Result<Self, CityDriverError> {
-        let game = Box::new(RegionalGame::two_region_default(
-            DEFAULT_MAP_WIDTH,
-            DEFAULT_MAP_HEIGHT,
-        )?);
+        Self::regional_with_size(DEFAULT_MAP_WIDTH, DEFAULT_MAP_HEIGHT)
+    }
+
+    pub fn regional_with_size(width: usize, height: usize) -> Result<Self, CityDriverError> {
+        let game = Box::new(RegionalGame::two_region_default(width, height)?);
         let last_view = game.selected_region_view()?;
         Ok(Self {
             backend: CityBackend::RegionalMultiRegion(game),
@@ -128,7 +94,6 @@ impl CityDriver {
 
     pub fn select_next_region(&mut self) -> String {
         match &mut self.backend {
-            CityBackend::SingleCity(_) => "Single-city mode has one region".to_string(),
             CityBackend::RegionalMultiRegion(game) => game
                 .select_next_region()
                 .map(|_| self.region_label())
@@ -139,7 +104,6 @@ impl CityDriver {
 
     pub fn select_previous_region(&mut self) -> String {
         match &mut self.backend {
-            CityBackend::SingleCity(_) => "Single-city mode has one region".to_string(),
             CityBackend::RegionalMultiRegion(game) => game
                 .select_previous_region()
                 .map(|_| self.region_label())
@@ -150,7 +114,6 @@ impl CityDriver {
 
     pub fn region_label(&self) -> String {
         match &self.backend {
-            CityBackend::SingleCity(_) => "Region: single city".to_string(),
             CityBackend::RegionalMultiRegion(game) => match game.selected_region_position() {
                 Ok((index, count)) => match game.selected_region() {
                     Ok(region_id) => format!("Region: {index}/{count} ({})", region_id.0),
@@ -170,7 +133,6 @@ impl CityDriver {
 
     pub fn view_with_overlay(&mut self, overlay: MapOverlayInput) -> GameView {
         match &self.backend {
-            CityBackend::SingleCity(game) => self.remember_view(game.view_with_overlay(overlay)),
             CityBackend::RegionalMultiRegion(game) => {
                 match game.selected_region_view_with_overlay(overlay) {
                     Ok(view) => self.remember_view(view),
@@ -183,7 +145,6 @@ impl CityDriver {
 
     pub fn inspect(&mut self, x: usize, y: usize) -> InspectView {
         match &self.backend {
-            CityBackend::SingleCity(game) => game.inspect(x, y),
             CityBackend::RegionalMultiRegion(game) => {
                 game.inspect_selected_region(x, y).unwrap_or_else(|error| {
                     self.fallback_inspect(x, y, format!("Regional game error: {error:?}"))
@@ -197,7 +158,6 @@ impl CityDriver {
 
     pub fn preview_build(&mut self, x: usize, y: usize, kind: BuildingKind) -> BuildPreviewView {
         match &self.backend {
-            CityBackend::SingleCity(game) => game.preview_build(x, y, kind),
             CityBackend::RegionalMultiRegion(game) => game
                 .preview_build_selected_region(x, y, kind)
                 .unwrap_or_else(|error| {
@@ -211,7 +171,6 @@ impl CityDriver {
 
     pub fn build(&mut self, x: usize, y: usize, kind: BuildingKind) -> CommandResult {
         match &mut self.backend {
-            CityBackend::SingleCity(game) => game.build(x, y, kind),
             CityBackend::RegionalMultiRegion(game) => game
                 .build_selected_region(x, y, kind)
                 .unwrap_or_else(command_failure),
@@ -221,7 +180,6 @@ impl CityDriver {
 
     pub fn replace(&mut self, x: usize, y: usize, kind: BuildingKind) -> CommandResult {
         match &mut self.backend {
-            CityBackend::SingleCity(game) => game.replace(x, y, kind),
             CityBackend::RegionalMultiRegion(game) => game
                 .replace_selected_region(x, y, kind)
                 .unwrap_or_else(command_failure),
@@ -231,7 +189,6 @@ impl CityDriver {
 
     pub fn upgrade(&mut self, x: usize, y: usize) -> CommandResult {
         match &mut self.backend {
-            CityBackend::SingleCity(game) => game.upgrade(x, y),
             CityBackend::RegionalMultiRegion(game) => game
                 .upgrade_selected_region(x, y)
                 .unwrap_or_else(command_failure),
@@ -241,7 +198,6 @@ impl CityDriver {
 
     pub fn bulldoze(&mut self, x: usize, y: usize) -> CommandResult {
         match &mut self.backend {
-            CityBackend::SingleCity(game) => game.bulldoze(x, y),
             CityBackend::RegionalMultiRegion(game) => game
                 .bulldoze_selected_region(x, y)
                 .unwrap_or_else(command_failure),
@@ -251,7 +207,6 @@ impl CityDriver {
 
     pub fn tick(&mut self) -> CommandResult {
         match &mut self.backend {
-            CityBackend::SingleCity(game) => game.tick(),
             CityBackend::RegionalMultiRegion(game) => {
                 game.tick_selected_region().unwrap_or_else(command_failure)
             }
@@ -261,7 +216,6 @@ impl CityDriver {
 
     pub fn save_to_file(&mut self, path: impl AsRef<Path>) -> Result<(), CityDriverError> {
         match &mut self.backend {
-            CityBackend::SingleCity(game) => game.save_to_file(path).map_err(Into::into),
             CityBackend::RegionalMultiRegion(_) => self.save_regional_to_file(path),
             CityBackend::Unavailable { message, .. } => {
                 Err(CityDriverError::Unavailable(message.clone()))
@@ -271,13 +225,6 @@ impl CityDriver {
 
     pub fn load_from_file(&mut self, path: impl AsRef<Path>) -> Result<(), CityDriverError> {
         match &self.backend {
-            CityBackend::SingleCity(_) => {
-                let game = Box::new(Game::load_from_file(path)?);
-                let view = game.view();
-                self.backend = CityBackend::SingleCity(game);
-                self.remember_view(view);
-                Ok(())
-            }
             CityBackend::RegionalMultiRegion(_) => {
                 let game = RegionalGame::load_from_file(path)?;
                 let view = game.selected_region_view()?;
@@ -285,22 +232,13 @@ impl CityDriver {
                 self.remember_view(view);
                 Ok(())
             }
-            CityBackend::Unavailable { mode, .. } => match mode {
-                CityLaunchMode::SingleCity => {
-                    let game = Box::new(Game::load_from_file(path)?);
-                    let view = game.view();
-                    self.backend = CityBackend::SingleCity(game);
-                    self.remember_view(view);
-                    Ok(())
-                }
-                CityLaunchMode::RegionalMultiRegion => {
-                    let game = Box::new(RegionalGame::load_from_file(path)?);
-                    let view = game.selected_region_view()?;
-                    self.backend = CityBackend::RegionalMultiRegion(game);
-                    self.remember_view(view);
-                    Ok(())
-                }
-            },
+            CityBackend::Unavailable { .. } => {
+                let game = Box::new(RegionalGame::load_from_file(path)?);
+                let view = game.selected_region_view()?;
+                self.backend = CityBackend::RegionalMultiRegion(game);
+                self.remember_view(view);
+                Ok(())
+            }
         }
     }
 
@@ -312,7 +250,6 @@ impl CityDriver {
         let current = std::mem::replace(
             &mut self.backend,
             CityBackend::Unavailable {
-                mode: CityLaunchMode::RegionalMultiRegion,
                 message: "Regional game save is in progress".to_string(),
             },
         );
@@ -335,10 +272,7 @@ impl CityDriver {
             }
             Err(error @ RegionalGameSaveFailure::Unrecoverable(_)) => {
                 let message = format!("Regional game unavailable after save failure: {error}");
-                self.backend = CityBackend::Unavailable {
-                    mode: CityLaunchMode::RegionalMultiRegion,
-                    message,
-                };
+                self.backend = CityBackend::Unavailable { message };
                 Err(CityDriverError::RegionalSaveFailure(error))
             }
         }
@@ -396,8 +330,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn single_city_driver_uses_game_command_and_view_surface() {
-        let mut driver = CityDriver::single_city_with_size(3, 3);
+    fn driver_uses_regional_facade_command_and_view_surface() {
+        let mut driver = CityDriver::regional_with_size(3, 3).expect("regional UI driver");
 
         let result = driver.build(1, 1, BuildingKind::Residential);
         let view = driver.view();
@@ -406,6 +340,7 @@ mod tests {
         assert_eq!(view.map.width, 3);
         assert_eq!(view.map.height, 3);
         assert_eq!(view.map.cells[4].building, Some(BuildingKind::Residential));
+        assert!(driver.region_label().contains("1/2"));
     }
 
     #[test]
@@ -429,10 +364,9 @@ mod tests {
 
     #[test]
     fn unavailable_backend_reuses_last_view_and_reports_read_error() {
-        let mut driver = CityDriver::single_city_with_size(3, 3);
+        let mut driver = CityDriver::regional_with_size(3, 3).expect("regional UI driver");
         let last_view = driver.view();
         driver.backend = CityBackend::Unavailable {
-            mode: CityLaunchMode::RegionalMultiRegion,
             message: "regional worker stopped".to_string(),
         };
 
@@ -450,10 +384,9 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_backend_rejects_commands_without_switching_to_single_city() {
+    fn unavailable_backend_rejects_commands_without_replacing_regional_backend() {
         let mut driver = CityDriver::regional_multi_region().expect("regional UI driver");
         driver.backend = CityBackend::Unavailable {
-            mode: CityLaunchMode::RegionalMultiRegion,
             message: "regional game unavailable".to_string(),
         };
 

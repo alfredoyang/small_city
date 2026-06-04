@@ -345,7 +345,7 @@ struct TuiRuntime {
 impl TuiRuntime {
     #[cfg(test)]
     fn new(now: Instant) -> Self {
-        Self::with_mode(now, CityLaunchMode::SingleCity).expect("single-city TUI runtime")
+        Self::with_mode(now, CityLaunchMode::RegionalMultiRegion).expect("regional TUI runtime")
     }
 
     fn with_mode(
@@ -550,11 +550,6 @@ pub fn run() -> io::Result<()> {
 /// Backward-compatible alias for the default regional TUI mode.
 pub fn run_regional() -> io::Result<()> {
     run_with_mode(CityLaunchMode::RegionalMultiRegion)
-}
-
-/// Temporary Patch 20 escape hatch for the old single-city UI backend.
-pub fn run_legacy_single() -> io::Result<()> {
-    run_with_mode(CityLaunchMode::SingleCity)
 }
 
 fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
@@ -1615,7 +1610,7 @@ mod tests {
     fn manual_tick_advances_only_when_paused() {
         let now = Instant::now();
         let mut runtime = TuiRuntime::new(now);
-        runtime.game = CityDriver::single_city_with_size(10, 10);
+        runtime.game = CityDriver::regional_with_size(10, 10).expect("regional UI driver");
         runtime.state.run_speed = RunSpeed::Four;
 
         assert_eq!(
@@ -1632,7 +1627,7 @@ mod tests {
     fn manual_tick_is_blocked_while_running() {
         let now = Instant::now();
         let mut runtime = TuiRuntime::new(now);
-        runtime.game = CityDriver::single_city_with_size(10, 10);
+        runtime.game = CityDriver::regional_with_size(10, 10).expect("regional UI driver");
         runtime.state.is_running = true;
         runtime.state.run_speed = RunSpeed::Four;
 
@@ -1650,7 +1645,7 @@ mod tests {
     fn apply_action_updates_build_tool_and_cursor() {
         let now = Instant::now();
         let mut runtime = TuiRuntime::new(now);
-        runtime.game = CityDriver::single_city_with_size(3, 3);
+        runtime.game = CityDriver::regional_with_size(3, 3).expect("regional UI driver");
         runtime.mark_clean();
 
         assert_eq!(
@@ -1674,7 +1669,7 @@ mod tests {
     fn runtime_applies_due_auto_tick_when_running() {
         let now = Instant::now();
         let mut runtime = TuiRuntime::new(now);
-        runtime.game = CityDriver::single_city_with_size(10, 10);
+        runtime.game = CityDriver::regional_with_size(10, 10).expect("regional UI driver");
         runtime.state.is_running = true;
         runtime.next_auto_tick = now;
         runtime.mark_clean();
@@ -1690,7 +1685,7 @@ mod tests {
     fn runtime_applies_due_auto_tick_using_current_speed_interval() {
         let now = Instant::now();
         let mut runtime = TuiRuntime::new(now);
-        runtime.game = CityDriver::single_city_with_size(10, 10);
+        runtime.game = CityDriver::regional_with_size(10, 10).expect("regional UI driver");
         runtime.state.is_running = true;
         runtime.state.run_speed = RunSpeed::Four;
         runtime.next_auto_tick = now;

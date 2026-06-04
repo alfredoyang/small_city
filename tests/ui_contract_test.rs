@@ -297,7 +297,7 @@ fn regional_ui_driver_load_accepts_legacy_single_city_save() {
 }
 
 #[test]
-fn default_launch_uses_regional_mode_with_explicit_legacy_escape_hatch() {
+fn default_launch_uses_regional_mode_without_legacy_escape_hatch() {
     let source = std::fs::read_to_string("src/main.rs").expect("main source");
     let tui_source = std::fs::read_to_string("src/ui/tui.rs").expect("tui source");
     let ascii_source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii source");
@@ -306,12 +306,22 @@ fn default_launch_uses_regional_mode_with_explicit_legacy_escape_hatch() {
     assert!(source.contains("small_city::ui::tui::run_regional()"));
     assert!(source.contains("Some(\"tui\") | None => small_city::ui::tui::run()"));
     assert!(source.contains("Some(\"ascii\") => small_city::ui::ascii::run()"));
-    assert!(source.contains("Some(\"legacy-single\")"));
-    assert!(source.contains("Some(\"legacy-ascii\")"));
+    assert!(!source.contains("legacy-single"));
+    assert!(!source.contains("legacy-ascii"));
     assert!(tui_source.contains("run_with_mode(CityLaunchMode::RegionalMultiRegion)"));
-    assert!(tui_source.contains("pub fn run_legacy_single()"));
+    assert!(!tui_source.contains("run_legacy_single"));
     assert!(ascii_source.contains("run_with_mode(CityLaunchMode::RegionalMultiRegion)"));
-    assert!(ascii_source.contains("pub fn run_legacy_single()"));
+    assert!(!ascii_source.contains("run_legacy_single"));
+}
+
+#[test]
+fn city_driver_has_only_regional_backend_in_production_code() {
+    let source = std::fs::read_to_string("src/ui/city_driver.rs").expect("city driver source");
+
+    assert!(!source.contains("CityBackend::SingleCity"));
+    assert!(!source.contains("SingleCity"));
+    assert!(!source.contains("crate::core::game"));
+    assert!(source.contains("RegionalMultiRegion(Box<RegionalGame>)"));
 }
 
 #[test]
