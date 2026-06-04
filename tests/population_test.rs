@@ -1,6 +1,8 @@
 //! Integration tests for residential growth rates driven by demand and desirability.
 
-use small_city::core::game::Game;
+mod common;
+
+use common::Game;
 use small_city::interface::input::BuildingKind;
 
 #[test]

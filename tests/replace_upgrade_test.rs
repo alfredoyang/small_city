@@ -1,6 +1,8 @@
 //! Integration tests for replace and upgrade commands plus their derived effects.
 
-use small_city::core::game::Game;
+mod common;
+
+use common::Game;
 use small_city::interface::input::BuildingKind;
 
 #[test]

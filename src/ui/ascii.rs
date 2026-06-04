@@ -722,7 +722,8 @@ mod tests {
         AsciiUiState, UiAction, demand_note, overlay_legend, parse_key_sequence, render_status,
         time_spinner,
     };
-    use crate::core::game::Game;
+    use crate::core::regional_game::RegionalGame;
+    use crate::core::regions::RegionId;
     use crate::interface::input::{BuildingKind, MapOverlayInput};
     use crate::interface::view::DemandLevel;
 
@@ -761,8 +762,8 @@ mod tests {
 
     #[test]
     fn cursor_movement_is_clamped_to_map_bounds() {
-        let game = Game::new(3, 2);
-        let view = game.view();
+        let game = RegionalGame::single_region(3, 2).expect("regional test game");
+        let view = game.selected_region_view().expect("selected region view");
         let mut state = AsciiUiState::default();
 
         state.move_cursor(-1, -1, &view);
@@ -774,8 +775,8 @@ mod tests {
 
     #[test]
     fn cursor_can_reset_after_loading_game() {
-        let game = Game::new(3, 2);
-        let view = game.view();
+        let game = RegionalGame::single_region(3, 2).expect("regional test game");
+        let view = game.selected_region_view().expect("selected region view");
         let mut state = AsciiUiState::default();
         state.move_cursor(10, 10, &view);
 
@@ -820,16 +821,24 @@ mod tests {
 
     #[test]
     fn status_renders_clear_time_with_spinner() {
-        let mut game = Game::new(3, 3);
+        let game = RegionalGame::single_region(3, 3).expect("regional test game");
         let mut output = Vec::new();
 
-        render_status(&mut output, &game.view()).expect("render status");
+        render_status(
+            &mut output,
+            &game.selected_region_view().expect("selected region view"),
+        )
+        .expect("render status");
         let first = String::from_utf8(output).expect("status is utf8");
         assert!(first.contains("Pollution: 0 | Time: | Year 1, Month 1, Week 1, Day 1, 00:00"));
 
-        game.tick();
+        game.tick_region(RegionId(1)).expect("tick region");
         let mut output = Vec::new();
-        render_status(&mut output, &game.view()).expect("render status after tick");
+        render_status(
+            &mut output,
+            &game.selected_region_view().expect("selected region view"),
+        )
+        .expect("render status after tick");
         let second = String::from_utf8(output).expect("status is utf8");
         assert!(second.contains("Pollution: 0 | Time: / Year 1, Month 1, Week 1, Day 1, 01:00"));
     }

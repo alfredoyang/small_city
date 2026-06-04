@@ -1,6 +1,8 @@
 //! Longer scenario tests combining multiple systems over many deterministic turns.
 
-use small_city::core::game::Game;
+mod common;
+
+use common::Game;
 use small_city::interface::events::{EconomyBreakdownView, GameEventView};
 use small_city::interface::view::InspectDetailsView;
 use std::path::PathBuf;

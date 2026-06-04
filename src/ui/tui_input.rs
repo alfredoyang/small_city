@@ -6,7 +6,7 @@ use crate::interface::input::BuildingKind;
 
 /// UI-level actions after raw terminal keys have been translated.
 ///
-/// Keeping this separate from `Game` commands makes keyboard handling easy to test and keeps
+/// Keeping this separate from facade commands makes keyboard handling easy to test and keeps
 /// crossterm details out of the main TUI event loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TuiAction {

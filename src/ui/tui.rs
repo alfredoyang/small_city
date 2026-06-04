@@ -1404,7 +1404,8 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::game::Game;
+    use crate::core::regional_game::RegionalGame;
+    use crate::core::regions::RegionId;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
 
@@ -1756,7 +1757,7 @@ mod tests {
 
     #[test]
     fn render_draws_expected_main_panels() {
-        let game = Game::new(10, 10);
+        let game = RegionalGame::single_region(10, 10).expect("regional test game");
         let output = render_test_screen(&game, TuiState::default());
 
         for expected in [
@@ -1780,7 +1781,7 @@ mod tests {
 
     #[test]
     fn status_time_renders_in_panel_header() {
-        let game = Game::new(10, 10);
+        let game = RegionalGame::single_region(10, 10).expect("regional test game");
         let output = render_test_screen(&game, TuiState::default());
         let header = output
             .lines()
@@ -1792,8 +1793,8 @@ mod tests {
 
     #[test]
     fn status_time_spinner_advances_with_turns() {
-        let mut game = Game::new(10, 10);
-        game.tick();
+        let game = RegionalGame::single_region(10, 10).expect("regional test game");
+        game.tick_region(RegionId(1)).expect("tick region");
         let output = render_test_screen(&game, TuiState::default());
 
         assert!(output.contains("Time: / Year 1, Month 1, Week 1, Day 1, 01:00"));
@@ -1810,7 +1811,7 @@ mod tests {
 
     #[test]
     fn small_terminal_renders_resize_warning() {
-        let game = Game::new(10, 10);
+        let game = RegionalGame::single_region(10, 10).expect("regional test game");
         let output = render_test_screen_with_size(&game, TuiState::default(), 80, 24);
 
         assert!(output.contains("Small City"));
@@ -1824,7 +1825,7 @@ mod tests {
 
     #[test]
     fn help_panel_contains_overlay_order_and_legends() {
-        let game = Game::new(10, 10);
+        let game = RegionalGame::single_region(10, 10).expect("regional test game");
         let state = TuiState {
             show_help: true,
             ..TuiState::default()
@@ -1842,7 +1843,7 @@ mod tests {
 
     #[test]
     fn render_shows_running_status_when_auto_tick_is_enabled() {
-        let game = Game::new(10, 10);
+        let game = RegionalGame::single_region(10, 10).expect("regional test game");
         let state = TuiState {
             is_running: true,
             ..TuiState::default()
@@ -1856,7 +1857,7 @@ mod tests {
 
     #[test]
     fn selected_build_tool_uses_building_color() {
-        let game = Game::new(10, 10);
+        let game = RegionalGame::single_region(10, 10).expect("regional test game");
         let state = TuiState {
             selected_build: BuildingKind::Industrial,
             ..TuiState::default()
@@ -1907,12 +1908,12 @@ mod tests {
         }
     }
 
-    fn render_test_screen(game: &Game, state: TuiState) -> String {
+    fn render_test_screen(game: &RegionalGame, state: TuiState) -> String {
         render_test_screen_with_size(game, state, 120, 36)
     }
 
     fn render_test_screen_with_size(
-        game: &Game,
+        game: &RegionalGame,
         state: TuiState,
         width: u16,
         height: u16,
@@ -1921,20 +1922,31 @@ mod tests {
         buffer_text(terminal.backend().buffer())
     }
 
-    fn render_test_terminal(game: &Game, state: TuiState) -> Terminal<TestBackend> {
+    fn render_test_terminal(game: &RegionalGame, state: TuiState) -> Terminal<TestBackend> {
         render_test_terminal_with_size(game, state, 120, 36)
     }
 
     fn render_test_terminal_with_size(
-        game: &Game,
+        game: &RegionalGame,
         mut state: TuiState,
         width: u16,
         height: u16,
     ) -> Terminal<TestBackend> {
-        let view = game.view_with_overlay(state.current_overlay);
+        let view = game
+            .selected_region_view_with_overlay(state.current_overlay)
+            .expect("selected region view");
         state.clamp_cursor(&view);
-        let inspect = game.inspect(state.cursor_x, state.cursor_y);
-        let preview = game.preview_build(state.cursor_x, state.cursor_y, state.selected_build);
+        let inspect = game
+            .inspect_region(RegionId(1), state.cursor_x, state.cursor_y)
+            .expect("inspect selected region");
+        let preview = game
+            .preview_build(
+                RegionId(1),
+                state.cursor_x,
+                state.cursor_y,
+                state.selected_build,
+            )
+            .expect("preview selected region");
 
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");

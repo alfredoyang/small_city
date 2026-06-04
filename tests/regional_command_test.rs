@@ -3,7 +3,9 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use small_city::core::game::Game;
+mod common;
+
+use common::Game;
 use small_city::core::regional_game::{RegionCommand, RegionCommandReply, RegionalGame};
 use small_city::core::regional_types::UiRequestId;
 use small_city::core::regions::runtime::{OutboundMessage, RegionEvent, RegionRuntime};

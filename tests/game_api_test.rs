@@ -1,6 +1,8 @@
 //! Integration tests for public Game API tick events and basic simulation effects.
 
-use small_city::core::game::Game;
+mod common;
+
+use common::Game;
 use small_city::core::resources::GameTime;
 use small_city::interface::events::{EconomyBreakdownView, GameEventView, MetricChange};
 use small_city::interface::input::BuildingKind;

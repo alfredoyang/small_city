@@ -13,7 +13,7 @@
 //!   tick_world(&mut World)
 //!                 |
 //!                 v
-//!   same deterministic systems as Game::tick
+//!   shared deterministic simulation helpers
 //!     power -> stats -> local effects
 //!     -> citizens/population/economy/business
 //!                 |
@@ -369,7 +369,7 @@ impl ImportedResourceCache {
 ///
 /// The ECS `World` stays private inside this core wrapper. Runtime and worker
 /// code should interact through these methods and owned regional resource
-/// summaries, while UI code continues to use `Game` and UI-safe view models.
+/// summaries, while UI code continues to use regional facades and UI-safe view models.
 pub struct RegionState {
     id: RegionId,
     world: World,
@@ -392,12 +392,12 @@ impl RegionState {
         self.id
     }
 
-    /// Advances only this region's local simulation using the same order as `Game::tick`.
+    /// Advances only this region's local simulation using the shared tick order.
     pub fn tick_local(&mut self) -> CommandResult {
         tick_world(&mut self.world)
     }
 
-    /// Applies one player build command through the same systems as `Game`.
+    /// Applies one player build command through the core systems.
     pub fn build(&mut self, x: usize, y: usize, kind: BuildingKind) -> CommandResult {
         let result = build::build(&mut self.world, x, y, kind);
         refresh_derived_state_for_world(&mut self.world);
@@ -409,7 +409,7 @@ impl RegionState {
         build::preview_build(&self.world, x, y, kind)
     }
 
-    /// Removes one occupied cell through the same systems as `Game`.
+    /// Removes one occupied cell through the core systems.
     pub fn bulldoze(&mut self, x: usize, y: usize) -> CommandResult {
         let result = bulldoze::bulldoze(&mut self.world, x, y);
         if result.success {
@@ -418,7 +418,7 @@ impl RegionState {
         result
     }
 
-    /// Replaces one occupied cell through the same systems as `Game`.
+    /// Replaces one occupied cell through the core systems.
     pub fn replace(&mut self, x: usize, y: usize, kind: BuildingKind) -> CommandResult {
         let result = replace::replace(&mut self.world, x, y, kind);
         if result.success {
@@ -427,7 +427,7 @@ impl RegionState {
         result
     }
 
-    /// Upgrades one supported occupied cell through the same systems as `Game`.
+    /// Upgrades one supported occupied cell through the core systems.
     pub fn upgrade(&mut self, x: usize, y: usize) -> CommandResult {
         let result = upgrade::upgrade(&mut self.world, x, y);
         if result.success {

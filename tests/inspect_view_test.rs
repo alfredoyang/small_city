@@ -1,6 +1,8 @@
 //! Integration tests for InspectView data and ASCII inspect formatting.
 
-use small_city::core::game::Game;
+mod common;
+
+use common::Game;
 use small_city::interface::input::BuildingKind;
 use small_city::interface::view::InspectDetailsView;
 use small_city::ui::ascii::format_inspect;

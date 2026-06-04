@@ -1,9 +1,9 @@
-//! UI-safe command result and event types returned by the public Game API.
+//! UI-safe command result and event types returned by player-facing facades.
 
 use crate::interface::input::BuildingKind;
 use crate::interface::view::GameTimeView;
 
-/// UI-safe result returned by Game API commands.
+/// UI-safe result returned by player-facing commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
     pub success: bool,
@@ -157,7 +157,7 @@ impl GameEventView {
     }
 }
 
-/// Event vocabulary emitted by the Game API after commands.
+/// Event vocabulary emitted by player-facing commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GameEventView {
     Built {

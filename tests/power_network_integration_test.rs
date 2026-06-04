@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use small_city::core::game::Game;
+mod common;
+
+use common::Game;
 use small_city::interface::input::{BuildingKind, MapOverlayInput};
 use small_city::interface::view::{CellView, GameView, InspectDetailsView};
 

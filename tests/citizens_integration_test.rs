@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
-use small_city::core::game::Game;
+mod common;
+
+use common::Game;
 use small_city::interface::input::BuildingKind;
 use small_city::interface::view::InspectDetailsView;
 

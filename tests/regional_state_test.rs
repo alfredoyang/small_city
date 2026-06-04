@@ -1,6 +1,8 @@
 //! Integration tests for the region-owned state wrapper.
 
-use small_city::core::game::Game;
+mod common;
+
+use common::Game;
 use small_city::core::regions::{
     ImportDecision, ImportedResource, ImportedResourceResult, RegionId, RegionState, ResourceId,
     ResourceKind,

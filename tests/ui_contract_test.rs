@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use small_city::core::game::Game;
+mod common;
+
+use common::{Game, write_legacy_single_city_save};
 use small_city::core::regional_game::RegionalGame;
 use small_city::core::regions::{RegionId, RegionState};
 use small_city::interface::input::{BuildingKind, MapOverlayInput, UiCommand, parse_command};
@@ -279,9 +281,7 @@ fn regional_ui_driver_load_uses_loaded_selected_region() {
 #[test]
 fn regional_ui_driver_load_accepts_legacy_single_city_save() {
     let path = save_path("regional-ui-legacy-save");
-    let mut legacy = Game::new(3, 3);
-    assert!(legacy.build(1, 1, BuildingKind::Residential).success);
-    legacy.save_to_file(&path).unwrap();
+    write_legacy_single_city_save(&path, 3, 3, &[(1, 1, BuildingKind::Residential)]).unwrap();
     let mut driver =
         CityDriver::new(CityLaunchMode::RegionalMultiRegion).expect("regional UI driver");
 
@@ -322,6 +322,14 @@ fn city_driver_has_only_regional_backend_in_production_code() {
     assert!(!source.contains("SingleCity"));
     assert!(!source.contains("crate::core::game"));
     assert!(source.contains("RegionalMultiRegion(Box<RegionalGame>)"));
+}
+
+#[test]
+fn production_core_no_longer_exports_old_game_facade() {
+    let source = std::fs::read_to_string("src/core/mod.rs").expect("core module source");
+
+    assert!(!source.contains("pub mod game"));
+    assert!(!std::path::Path::new("src/core/game.rs").exists());
 }
 
 #[test]

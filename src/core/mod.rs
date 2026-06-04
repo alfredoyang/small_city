@@ -2,7 +2,6 @@
 
 pub mod components;
 pub mod entity;
-pub mod game;
 pub mod grid;
 pub mod regional_game;
 pub mod regional_game_runner;

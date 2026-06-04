@@ -1,6 +1,8 @@
 //! Parity tests proving a single-region facade matches the single-city game view.
 
-use small_city::core::game::Game;
+mod common;
+
+use common::Game;
 use small_city::core::regional_game::{RegionalGame, RegionalGameView};
 use small_city::core::regions::{RegionId, RegionState};
 use small_city::interface::events::GameEventView;

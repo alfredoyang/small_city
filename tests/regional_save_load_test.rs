@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use small_city::core::game::Game;
+mod common;
+
+use common::write_legacy_single_city_save;
 use small_city::core::regional_game::{
     RegionalGame, RegionalGameSaveError, RegionalGameSaveFailure,
 };
@@ -108,16 +110,26 @@ fn saved_regional_game_can_continue_after_safe_point_restart() {
 #[test]
 fn regional_loader_accepts_existing_single_city_save() {
     let path = save_path("single-city-compatible");
-    let mut game = Game::new(3, 3);
-    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
-    assert!(game.build(1, 0, BuildingKind::Road).success);
-    game.save_to_file(&path).unwrap();
+    write_legacy_single_city_save(
+        &path,
+        3,
+        3,
+        &[(0, 0, BuildingKind::PowerPlant), (1, 0, BuildingKind::Road)],
+    )
+    .unwrap();
 
     let loaded = RegionalGame::load_from_file(&path).unwrap();
     let converted_view = loaded.selected_region_view().unwrap();
 
     assert_eq!(loaded.selected_region().unwrap(), RegionId(1));
-    assert_eq!(converted_view, game.view());
+    assert_eq!(
+        cell_building(&converted_view, 0, 0),
+        Some(BuildingKind::PowerPlant)
+    );
+    assert_eq!(
+        cell_building(&converted_view, 1, 0),
+        Some(BuildingKind::Road)
+    );
     remove_save_file(path);
 }
 
@@ -125,11 +137,17 @@ fn regional_loader_accepts_existing_single_city_save() {
 fn converted_single_city_save_can_continue_and_roundtrip_as_regional_save() {
     let legacy_path = save_path("single-city-continues");
     let regional_path = save_path("converted-regional-roundtrip");
-    let mut legacy = Game::new(4, 3);
-    assert!(legacy.build(0, 0, BuildingKind::PowerPlant).success);
-    assert!(legacy.build(1, 0, BuildingKind::Road).success);
-    assert!(legacy.build(1, 1, BuildingKind::Residential).success);
-    legacy.save_to_file(&legacy_path).unwrap();
+    write_legacy_single_city_save(
+        &legacy_path,
+        4,
+        3,
+        &[
+            (0, 0, BuildingKind::PowerPlant),
+            (1, 0, BuildingKind::Road),
+            (1, 1, BuildingKind::Residential),
+        ],
+    )
+    .unwrap();
 
     let converted = RegionalGame::load_from_file(&legacy_path).unwrap();
     let before_turn = converted.selected_region_view().unwrap().status.turn;

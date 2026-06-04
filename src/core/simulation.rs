@@ -1,8 +1,8 @@
 //! Shared deterministic simulation helpers for core facades and regional state.
 //!
 //! This module owns world-level simulation ordering that is shared by the
-//! single-city `Game` facade and regional `RegionState`. It remains crate-local
-//! so UI code cannot receive or manipulate ECS `World` storage directly.
+//! regional `RegionState`. It remains crate-local so UI code cannot receive or
+//! manipulate ECS `World` storage directly.
 
 use crate::core::resources::{GameTime, is_new_day, is_new_week};
 use crate::core::systems::{
@@ -135,5 +135,50 @@ fn game_time_view(time: GameTime) -> GameTimeView {
         day: time.day_of_week(),
         hour: time.hour_of_day(),
         label: time.label(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{refresh_derived_state_for_world, tick_world};
+    use crate::core::systems::citizens;
+    use crate::core::world::World;
+
+    #[test]
+    fn citizen_happiness_decay_happens_on_daily_boundary_not_hourly() {
+        let (mut world, residential) = world_with_one_citizen();
+
+        for _ in 0..23 {
+            assert!(tick_world(&mut world).success);
+        }
+        assert_eq!(citizen_happiness_decay(&world), 0);
+        assert_eq!(
+            citizens::average_happiness_for_home(&world, residential),
+            Some(50)
+        );
+
+        assert!(tick_world(&mut world).success);
+
+        let average_happiness =
+            citizens::average_happiness_for_home(&world, residential).expect("happiness");
+        assert_eq!(citizen_happiness_decay(&world), 1);
+        assert!(average_happiness < 50);
+    }
+
+    fn world_with_one_citizen() -> (World, crate::core::entity::Entity) {
+        let mut world = World::new(1, 1);
+        let residential = world.spawn();
+        citizens::spawn_for_home(&mut world, residential, 1);
+        refresh_derived_state_for_world(&mut world);
+        (world, residential)
+    }
+
+    fn citizen_happiness_decay(world: &World) -> i32 {
+        world
+            .citizens
+            .values()
+            .next()
+            .expect("citizen")
+            .happiness_decay
     }
 }

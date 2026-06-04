@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Building kind is shared by UI input, Game API calls, and core building components.
+/// Building kind is shared by UI input, facade commands, and core building components.
 /// It lives in the interface layer so UI code never needs to import ECS component modules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BuildingKind {

@@ -1,6 +1,8 @@
 //! Integration tests for road connectivity requirements on growth and effective jobs.
 
-use small_city::core::game::Game;
+mod common;
+
+use common::Game;
 use small_city::interface::input::BuildingKind;
 
 fn advance_one_week(game: &mut Game) {

@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use small_city::core::game::{Game, GameError};
+mod common;
+
+use common::{Game, GameError};
 use small_city::interface::input::BuildingKind;
 
 fn advance_one_day(game: &mut Game) {
