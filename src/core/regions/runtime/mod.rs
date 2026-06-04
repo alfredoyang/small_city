@@ -8,7 +8,7 @@ pub mod continuation;
 
 use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionCommandResponse, RegionSnapshotResponse,
-    RegionViewSnapshot, UiRequestId,
+    RegionTickResponse, RegionViewSnapshot, UiRequestId,
 };
 use crate::core::regions::handle::{RegionEventReceiver, RegionHandle, mailbox};
 use crate::core::regions::runtime::continuation::{CallerContinuation, NeighborRequest};
@@ -22,7 +22,7 @@ use crate::interface::input::MapOverlayInput;
 /// Event owned by one region runtime inbox.
 pub enum RegionEvent {
     /// Advance this region's local deterministic simulation by one tick.
-    Tick,
+    Tick { request_id: UiRequestId },
     /// Build an owned UI-safe snapshot through the region event loop.
     BuildSnapshot {
         request_id: UiRequestId,
@@ -99,6 +99,7 @@ pub enum OutboundMessage {
         result: ImportedResourceResult,
     },
     RegionCommandCompleted(RegionCommandResponse),
+    RegionTickCompleted(RegionTickResponse),
     RegionSnapshotReady(RegionSnapshotResponse),
     RegionExportsChanged(RegionalExportChange),
     RuntimeError(RegionRuntimeError),
@@ -188,9 +189,12 @@ impl RegionRuntime {
 
     fn process_event(&mut self, event: RegionEvent) -> Vec<OutboundMessage> {
         match event {
-            RegionEvent::Tick => {
-                self.state.tick_local();
-                self.export_change_messages()
+            RegionEvent::Tick { request_id } => {
+                let mut outbound = vec![OutboundMessage::RegionTickCompleted(
+                    self.run_tick(request_id),
+                )];
+                outbound.extend(self.export_change_messages());
+                outbound
             }
             RegionEvent::BuildSnapshot {
                 request_id,
@@ -345,6 +349,14 @@ impl RegionRuntime {
             request_id,
             region_id: self.region_id(),
             reply,
+        }
+    }
+
+    fn run_tick(&mut self, request_id: UiRequestId) -> RegionTickResponse {
+        RegionTickResponse {
+            request_id,
+            region_id: self.region_id(),
+            result: self.state.tick_local(),
         }
     }
 

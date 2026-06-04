@@ -1,5 +1,6 @@
 //! Integration tests for moving region runtimes between workers at safe points.
 
+use small_city::core::regional_game::UiRequestId;
 use small_city::core::regions::runtime::{RegionEvent, RegionRuntime};
 use small_city::core::regions::worker::{RegionWorker, WorkerId};
 use small_city::core::regions::{RegionId, RegionState};
@@ -26,7 +27,7 @@ fn only_new_owner_processes_moved_runtime_events() {
     let mut target_worker = RegionWorker::new(WorkerId(4));
 
     source_worker
-        .push_event(region_id, RegionEvent::Tick)
+        .push_event(region_id, tick(1))
         .expect("source owns region before move");
     let runtime = source_worker
         .remove_region(region_id)
@@ -57,7 +58,7 @@ fn existing_send_handle_still_delivers_to_moved_runtime() {
         .expect("runtime should be removable");
     target_worker.add_region(runtime).unwrap();
 
-    handle.send(RegionEvent::Tick);
+    handle.send(tick(2));
     let summary = target_worker.process_region_events(1);
 
     assert!(source_worker.region(region_id).is_none());
@@ -73,7 +74,7 @@ fn failed_reassignment_returns_runtime_with_queued_events() {
     let mut target_worker = worker_with_regions(WorkerId(8), &[region_id]);
 
     source_worker
-        .push_event(region_id, RegionEvent::Tick)
+        .push_event(region_id, tick(3))
         .expect("source owns region before move");
     let moved_runtime = source_worker
         .remove_region(region_id)
@@ -101,6 +102,12 @@ fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
             .unwrap();
     }
     worker
+}
+
+fn tick(request_id: u64) -> RegionEvent {
+    RegionEvent::Tick {
+        request_id: UiRequestId(request_id),
+    }
 }
 
 fn turn(worker: &RegionWorker, region_id: RegionId) -> u32 {

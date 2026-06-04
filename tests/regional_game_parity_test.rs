@@ -3,6 +3,7 @@
 use small_city::core::game::Game;
 use small_city::core::regional_game::{RegionalGame, RegionalGameView};
 use small_city::core::regions::{RegionId, RegionState};
+use small_city::interface::events::GameEventView;
 use small_city::interface::input::{BuildingKind, MapOverlayInput};
 use small_city::interface::view::GameView;
 
@@ -64,6 +65,45 @@ fn single_region_facade_overlay_views_match_game() {
     }
 }
 
+#[test]
+fn single_region_facade_tick_summary_matches_game_for_visible_metrics() {
+    let mut game = Game::new(5, 4);
+    let regional = RegionalGame::from_regions(vec![RegionState::new(REGION_ID, 5, 4)]).unwrap();
+
+    for (x, y, kind) in [
+        (0, 1, BuildingKind::Road),
+        (1, 1, BuildingKind::Road),
+        (2, 1, BuildingKind::Road),
+        (0, 0, BuildingKind::PowerPlant),
+        (1, 0, BuildingKind::Residential),
+        (2, 0, BuildingKind::Commercial),
+        (3, 1, BuildingKind::Industrial),
+    ] {
+        assert_eq!(
+            game.build(x, y, kind),
+            regional.build(REGION_ID, x, y, kind).unwrap()
+        );
+    }
+
+    let game_tick = game.tick();
+    let regional_tick = regional.tick_region(REGION_ID).unwrap();
+
+    assert_eq!(regional_tick, game_tick);
+    assert!(matches!(
+        regional_tick.event,
+        GameEventView::TickSummary {
+            turn: 1,
+            population: _,
+            money: _,
+            happiness: _,
+            pollution: _,
+            powered_buildings: _,
+            economy: _,
+            ..
+        }
+    ));
+}
+
 fn script() -> Vec<ScriptStep> {
     let mut steps = vec![
         ScriptStep::Build(0, 1, BuildingKind::Road),
@@ -122,8 +162,7 @@ fn apply_step_with_result_assertions(game: &mut Game, regional: &RegionalGame, s
             );
         }
         ScriptStep::Tick => {
-            assert!(game.tick().success);
-            regional.tick_region(REGION_ID).unwrap();
+            assert_eq!(game.tick(), regional.tick_region(REGION_ID).unwrap());
         }
     }
 }

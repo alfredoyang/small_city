@@ -16,6 +16,7 @@ use crate::core::regions::threaded::{
 };
 use crate::core::regions::worker::{RegionWorker, WorkerId, WorkerRoutingError};
 use crate::core::regions::{RegionId, RegionState};
+use crate::interface::events::CommandResult;
 use crate::interface::input::MapOverlayInput;
 use crate::interface::view::InspectView;
 
@@ -42,6 +43,10 @@ pub enum RegionalGameRunnerError {
         region_id: RegionId,
     },
     SnapshotReplyMissing {
+        request_id: UiRequestId,
+        region_id: RegionId,
+    },
+    TickReplyMissing {
         request_id: UiRequestId,
         region_id: RegionId,
     },
@@ -99,7 +104,11 @@ impl RegionalGameRunner {
         Ok(runner)
     }
 
-    pub fn tick_region(&self, region_id: RegionId) -> Result<(), RegionalGameRunnerError> {
+    pub fn tick_region(
+        &self,
+        request_id: UiRequestId,
+        region_id: RegionId,
+    ) -> Result<CommandResult, RegionalGameRunnerError> {
         let handle = self
             .handle_for(region_id)
             .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })?;
@@ -108,16 +117,8 @@ impl RegionalGameRunner {
             .operation_lock
             .lock()
             .expect("regional runner operation lock poisoned");
-        handle.send(crate::core::regions::runtime::RegionEvent::Tick);
-        // RegionWorker scheduling is fair across every owned runtime. This sends
-        // Tick to one region, then gives all regions one chance to drain already
-        // queued work; callers that need target-only processing will need a
-        // narrower worker command in a later patch.
-        self.worker
-            .process_region_events(1)
-            .map_err(RegionalGameRunnerError::from)?;
-        self.process_worker_until_drained()?;
-        Ok(())
+        handle.send(crate::core::regions::runtime::RegionEvent::Tick { request_id });
+        self.wait_for_tick_reply(request_id, region_id)
     }
 
     pub fn run_region_command(
@@ -245,6 +246,9 @@ impl RegionalGameRunner {
         request_id: UiRequestId,
         region_id: RegionId,
     ) -> Result<RegionCommandReply, RegionalGameRunnerError> {
+        // Worker passes can surface replies from older queued events or other
+        // regions. Match on request ID and region so this synchronous facade call
+        // receives exactly the command reply it enqueued.
         for _ in 0..MAX_REPLY_PASSES {
             let summary = self.process_one_reply_pass()?;
             if let Some(reply) = summary
@@ -263,11 +267,39 @@ impl RegionalGameRunner {
         })
     }
 
+    fn wait_for_tick_reply(
+        &self,
+        request_id: UiRequestId,
+        region_id: RegionId,
+    ) -> Result<CommandResult, RegionalGameRunnerError> {
+        // Ticks use the same correlation rule as commands and snapshots. This is
+        // important once more than one tick can be queued for the same region.
+        for _ in 0..MAX_REPLY_PASSES {
+            let summary = self.process_one_reply_pass()?;
+            if let Some(reply) = summary
+                .tick_replies
+                .into_iter()
+                .find(|reply| reply.request_id == request_id && reply.region_id == region_id)
+            {
+                self.process_worker_until_drained()?;
+                return Ok(reply.result);
+            }
+        }
+
+        Err(RegionalGameRunnerError::TickReplyMissing {
+            request_id,
+            region_id,
+        })
+    }
+
     fn wait_for_snapshot_reply(
         &self,
         request_id: UiRequestId,
         region_id: RegionId,
     ) -> Result<RegionViewSnapshot, RegionalGameRunnerError> {
+        // Snapshot replies are also correlated because view requests can sit
+        // behind earlier commands, ticks, or snapshot requests in the region
+        // inbox.
         for _ in 0..MAX_REPLY_PASSES {
             let summary = self.process_one_reply_pass()?;
             if let Some(reply) = summary
@@ -344,7 +376,7 @@ mod tests {
     #[test]
     fn command_request_waits_behind_already_queued_region_event() {
         let region_id = RegionId(11);
-        let (runner, _handle) = runner_with_preloaded_event(region_id, RegionEvent::Tick);
+        let (runner, _handle) = runner_with_preloaded_event(region_id, tick(100));
 
         let reply = runner
             .run_region_command(
@@ -369,7 +401,7 @@ mod tests {
     #[test]
     fn snapshot_request_waits_behind_already_queued_region_event() {
         let region_id = RegionId(12);
-        let (runner, _handle) = runner_with_preloaded_event(region_id, RegionEvent::Tick);
+        let (runner, _handle) = runner_with_preloaded_event(region_id, tick(200));
 
         let reply = runner
             .request_region_snapshot(UiRequestId(2), region_id)
@@ -379,6 +411,31 @@ mod tests {
 
         assert_eq!(snapshot.view.status.turn, 1);
         runner.shutdown().unwrap();
+    }
+
+    #[test]
+    fn tick_request_waits_behind_already_queued_region_event() {
+        let region_id = RegionId(13);
+        let (runner, _handle) = runner_with_preloaded_event(region_id, tick(300));
+
+        let result = runner
+            .tick_region(UiRequestId(301), region_id)
+            .expect("tick reply should arrive after older queued work drains");
+
+        assert!(result.success);
+        let reply = runner
+            .request_region_snapshot(UiRequestId(302), region_id)
+            .unwrap();
+        let UiReply::RegionSnapshotReady { snapshot, .. } = reply;
+
+        assert_eq!(snapshot.view.status.turn, 2);
+        runner.shutdown().unwrap();
+    }
+
+    fn tick(request_id: u64) -> RegionEvent {
+        RegionEvent::Tick {
+            request_id: UiRequestId(request_id),
+        }
     }
 
     fn runner_with_preloaded_event(

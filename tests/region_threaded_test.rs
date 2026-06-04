@@ -1,5 +1,6 @@
 //! Integration tests for the optional threaded region worker runner.
 
+use small_city::core::regional_game::UiRequestId;
 use small_city::core::regions::continuation::{CallerContinuation, NeighborRequest};
 use small_city::core::regions::runtime::{ImportedResourcePayload, RegionEvent, RegionRuntime};
 use small_city::core::regions::threaded::{ThreadedRegionWorker, ThreadedWorkerShutdown};
@@ -15,7 +16,7 @@ fn threaded_worker_processes_tick_request_and_returns_summary() {
     let handle = worker.handle_for(region_id).expect("region handle");
     let threaded = ThreadedRegionWorker::start(worker);
 
-    handle.send(RegionEvent::Tick);
+    handle.send(tick(1));
     let summary = threaded.process_region_events(1).unwrap();
     let shutdown = threaded
         .shutdown(ThreadedWorkerShutdown::RejectPending)
@@ -23,6 +24,7 @@ fn threaded_worker_processes_tick_request_and_returns_summary() {
 
     assert_eq!(summary.processed_regions, 1);
     assert!(summary.routing_errors.is_empty());
+    assert_eq!(summary.tick_replies.len(), 1);
     assert_eq!(turn(&shutdown.worker, region_id), 1);
 }
 
@@ -36,7 +38,7 @@ fn region_handle_can_deliver_event_to_worker_thread() {
     let threaded_a = ThreadedRegionWorker::start(worker_a);
     let threaded_b = ThreadedRegionWorker::start(worker_b);
 
-    region_b_handle.send(RegionEvent::Tick);
+    region_b_handle.send(tick(2));
     let summary_b = threaded_b.process_region_events(1).unwrap();
     let shutdown_a = threaded_a
         .shutdown(ThreadedWorkerShutdown::RejectPending)
@@ -58,7 +60,7 @@ fn shutdown_can_reject_pending_work_deterministically() {
     let handle = worker.handle_for(region_id).expect("region handle");
     let threaded = ThreadedRegionWorker::start(worker);
 
-    handle.send(RegionEvent::Tick);
+    handle.send(tick(3));
     let shutdown = threaded
         .shutdown(ThreadedWorkerShutdown::RejectPending)
         .unwrap();
@@ -76,8 +78,8 @@ fn shutdown_can_drain_one_bounded_pass_deterministically() {
     let handle = worker.handle_for(region_id).expect("region handle");
     let threaded = ThreadedRegionWorker::start(worker);
 
-    handle.send(RegionEvent::Tick);
-    handle.send(RegionEvent::Tick);
+    handle.send(tick(4));
+    handle.send(tick(5));
     let shutdown = threaded
         .shutdown(ThreadedWorkerShutdown::DrainOnce {
             max_events_per_region: 1,
@@ -125,6 +127,12 @@ fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
             .unwrap();
     }
     worker
+}
+
+fn tick(request_id: u64) -> RegionEvent {
+    RegionEvent::Tick {
+        request_id: UiRequestId(request_id),
+    }
 }
 
 fn turn(worker: &RegionWorker, region_id: RegionId) -> u32 {

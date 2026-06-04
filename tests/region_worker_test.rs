@@ -12,13 +12,28 @@ use small_city::interface::input::BuildingKind;
 #[test]
 fn one_worker_processes_events_for_multiple_regions() {
     let mut worker = worker_with_regions(WorkerId(1), &[RegionId(1), RegionId(2)]);
-    worker.push_event(RegionId(1), RegionEvent::Tick).unwrap();
-    worker.push_event(RegionId(2), RegionEvent::Tick).unwrap();
+    worker
+        .push_event(
+            RegionId(1),
+            RegionEvent::Tick {
+                request_id: UiRequestId(1),
+            },
+        )
+        .unwrap();
+    worker
+        .push_event(
+            RegionId(2),
+            RegionEvent::Tick {
+                request_id: UiRequestId(2),
+            },
+        )
+        .unwrap();
 
     let summary = worker.process_region_events(1);
 
     assert!(summary.routing_errors.is_empty());
     assert_eq!(summary.processed_regions, 2);
+    assert_eq!(summary.tick_replies.len(), 2);
     assert_eq!(turn(&worker, RegionId(1)), 1);
     assert_eq!(turn(&worker, RegionId(2)), 1);
 }
@@ -26,10 +41,10 @@ fn one_worker_processes_events_for_multiple_regions() {
 #[test]
 fn busy_region_cannot_starve_another_region_when_event_limit_is_set() {
     let mut worker = worker_with_regions(WorkerId(2), &[RegionId(3), RegionId(4)]);
-    worker.push_event(RegionId(3), RegionEvent::Tick).unwrap();
-    worker.push_event(RegionId(3), RegionEvent::Tick).unwrap();
-    worker.push_event(RegionId(3), RegionEvent::Tick).unwrap();
-    worker.push_event(RegionId(4), RegionEvent::Tick).unwrap();
+    worker.push_event(RegionId(3), tick(3)).unwrap();
+    worker.push_event(RegionId(3), tick(4)).unwrap();
+    worker.push_event(RegionId(3), tick(5)).unwrap();
+    worker.push_event(RegionId(4), tick(6)).unwrap();
 
     let summary = worker.process_region_events(1);
 
@@ -137,8 +152,8 @@ fn add_region_rejects_duplicate_region_id() {
 #[test]
 fn process_region_events_with_zero_event_limit_reports_no_processed_regions() {
     let mut worker = worker_with_regions(WorkerId(6), &[RegionId(10), RegionId(11)]);
-    worker.push_event(RegionId(10), RegionEvent::Tick).unwrap();
-    worker.push_event(RegionId(11), RegionEvent::Tick).unwrap();
+    worker.push_event(RegionId(10), tick(10)).unwrap();
+    worker.push_event(RegionId(11), tick(11)).unwrap();
 
     let summary = worker.process_region_events(0);
 
@@ -242,6 +257,12 @@ fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
             .unwrap();
     }
     worker
+}
+
+fn tick(request_id: u64) -> RegionEvent {
+    RegionEvent::Tick {
+        request_id: UiRequestId(request_id),
+    }
 }
 
 fn request(

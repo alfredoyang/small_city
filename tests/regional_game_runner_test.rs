@@ -8,7 +8,7 @@ use small_city::core::regions::{RegionId, RegionState};
 fn runner_starts_one_threaded_worker_and_processes_regional_tick() {
     let runner = RegionalGameRunner::start(vec![RegionState::new(RegionId(1), 2, 2)]).unwrap();
 
-    runner.tick_region(RegionId(1)).unwrap();
+    let tick_result = runner.tick_region(UiRequestId(9), RegionId(1)).unwrap();
     let reply = runner
         .request_region_snapshot(UiRequestId(10), RegionId(1))
         .unwrap();
@@ -19,6 +19,8 @@ fn runner_starts_one_threaded_worker_and_processes_regional_tick() {
         snapshot,
     } = reply;
 
+    assert!(tick_result.success);
+    assert_eq!(tick_result.events.len(), 1);
     assert_eq!(request_id, UiRequestId(10));
     assert_eq!(region_id, RegionId(1));
     assert_eq!(snapshot.view.status.turn, 1);
@@ -50,7 +52,7 @@ fn runner_returns_owned_snapshot_for_requested_region() {
 fn runner_shutdown_recovers_authoritative_region_state() {
     let runner = RegionalGameRunner::start(vec![RegionState::new(RegionId(4), 2, 2)]).unwrap();
 
-    runner.tick_region(RegionId(4)).unwrap();
+    runner.tick_region(UiRequestId(21), RegionId(4)).unwrap();
     let recovered = runner.shutdown().unwrap();
     let snapshot = recovered.region_snapshot(RegionId(4)).unwrap();
 
@@ -63,7 +65,7 @@ fn unknown_region_requests_return_deterministic_errors() {
     let runner = RegionalGameRunner::start(vec![RegionState::new(RegionId(5), 2, 2)]).unwrap();
 
     let tick_error = runner
-        .tick_region(RegionId(99))
+        .tick_region(UiRequestId(31), RegionId(99))
         .expect_err("unknown tick region should fail");
     let snapshot_error = runner
         .request_region_snapshot(UiRequestId(30), RegionId(99))
@@ -114,7 +116,7 @@ fn ui_facing_code_can_use_runner_without_worker_or_runtime_types() {
 
     let runner = RegionalGameRunner::start(vec![RegionState::new(RegionId(7), 2, 2)]).unwrap();
 
-    runner.tick_region(RegionId(7)).unwrap();
+    runner.tick_region(UiRequestId(41), RegionId(7)).unwrap();
 
     assert_eq!(request_turn_snapshot(&runner, RegionId(7)).unwrap(), 1);
     runner.shutdown().unwrap();

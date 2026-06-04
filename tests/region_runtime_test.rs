@@ -9,16 +9,28 @@ use small_city::core::regions::{
     ImportDecision, ImportedResource, ImportedResourceResult, RegionId, RegionState, ResourceId,
     ResourceKind,
 };
+use small_city::interface::events::GameEventView;
 use small_city::interface::input::BuildingKind;
 
 #[test]
 fn local_tick_is_processed_through_runtime() {
     let mut runtime = RegionRuntime::new(RegionState::new(RegionId(1), 3, 2));
-    runtime.push_event(RegionEvent::Tick);
+    runtime.push_event(RegionEvent::Tick {
+        request_id: UiRequestId(10),
+    });
 
     let outbound = runtime.process_next_event();
 
-    assert!(outbound.is_empty());
+    let [OutboundMessage::RegionTickCompleted(reply)] = outbound.as_slice() else {
+        panic!("expected one tick reply");
+    };
+    assert_eq!(reply.request_id, UiRequestId(10));
+    assert_eq!(reply.region_id, RegionId(1));
+    assert!(reply.result.success);
+    assert!(matches!(
+        &reply.result.event,
+        GameEventView::TickSummary { turn: 1, .. }
+    ));
     assert_eq!(runtime.state().view().status.turn, 1);
     assert_eq!(runtime.pending_event_count(), 0);
 }
@@ -50,12 +62,20 @@ fn events_are_processed_in_insertion_order() {
 #[test]
 fn process_some_events_respects_max_events() {
     let mut runtime = RegionRuntime::new(RegionState::new(RegionId(3), 3, 2));
-    runtime.push_event(RegionEvent::Tick);
-    runtime.push_event(RegionEvent::Tick);
+    runtime.push_event(RegionEvent::Tick {
+        request_id: UiRequestId(20),
+    });
+    runtime.push_event(RegionEvent::Tick {
+        request_id: UiRequestId(21),
+    });
 
     let outbound = runtime.process_some_events(1);
 
-    assert!(outbound.is_empty());
+    assert!(outbound.iter().any(|message| matches!(
+        message,
+        OutboundMessage::RegionTickCompleted(reply)
+            if reply.request_id == UiRequestId(20) && reply.region_id == RegionId(3)
+    )));
     assert_eq!(runtime.state().view().status.turn, 1);
     assert_eq!(runtime.pending_event_count(), 1);
 }
@@ -225,6 +245,9 @@ fn decisions(outbound: &[OutboundMessage]) -> Vec<ImportDecision> {
             OutboundMessage::RegionCommandCompleted(reply) => {
                 panic!("unexpected command reply: {reply:?}")
             }
+            OutboundMessage::RegionTickCompleted(reply) => {
+                panic!("unexpected tick reply: {reply:?}")
+            }
             OutboundMessage::RegionSnapshotReady(reply) => {
                 panic!("unexpected snapshot reply: {reply:?}")
             }
@@ -262,6 +285,9 @@ fn take_continuation(
         OutboundMessage::ReturnImportedResourceContinuation { continuation, .. } => continuation,
         OutboundMessage::RegionCommandCompleted(reply) => {
             panic!("unexpected command reply: {reply:?}")
+        }
+        OutboundMessage::RegionTickCompleted(reply) => {
+            panic!("unexpected tick reply: {reply:?}")
         }
         OutboundMessage::RegionSnapshotReady(reply) => {
             panic!("unexpected snapshot reply: {reply:?}")

@@ -24,7 +24,7 @@ pub use crate::core::regional_types::{
     UiRequestId,
 };
 use crate::core::regions::{RegionId, RegionState, RegionStateSaveRecord};
-use crate::interface::events::{CommandResult, GameEventView};
+use crate::interface::events::CommandResult;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{BuildPreviewView, GameView, InspectView};
 
@@ -44,6 +44,10 @@ pub enum RegionalGameError {
         region_id: RegionId,
     },
     CommandReplyMissing {
+        request_id: UiRequestId,
+        region_id: RegionId,
+    },
+    TickReplyMissing {
         request_id: UiRequestId,
         region_id: RegionId,
     },
@@ -260,9 +264,10 @@ impl RegionalGame {
         self.inspect_region(self.selected_region_or_first()?, x, y)
     }
 
-    pub fn tick_region(&self, region_id: RegionId) -> Result<(), RegionalGameError> {
+    pub fn tick_region(&self, region_id: RegionId) -> Result<CommandResult, RegionalGameError> {
+        let request_id = self.next_request_id();
         self.runner
-            .tick_region(region_id)
+            .tick_region(request_id, region_id)
             .map_err(RegionalGameError::from)
     }
 
@@ -275,13 +280,7 @@ impl RegionalGame {
 
     pub fn tick_selected_region(&self) -> Result<CommandResult, RegionalGameError> {
         let region_id = self.selected_region_or_first()?;
-        self.tick_region(region_id)?;
-        // TODO: Preserve tick-result parity with `Game::tick` by routing the real
-        // `RegionState::tick_local` CommandResult back through the runtime instead
-        // of fabricating a minimal TurnAdvanced event from a follow-up snapshot.
-        Ok(CommandResult::success(GameEventView::TurnAdvanced {
-            turn: self.selected_region_view()?.status.turn,
-        }))
+        self.tick_region(region_id)
     }
 
     pub fn build(
@@ -543,6 +542,13 @@ impl From<RegionalGameRunnerError> for RegionalGameError {
                 request_id,
                 region_id,
             } => Self::CommandReplyMissing {
+                request_id,
+                region_id,
+            },
+            RegionalGameRunnerError::TickReplyMissing {
+                request_id,
+                region_id,
+            } => Self::TickReplyMissing {
                 request_id,
                 region_id,
             },

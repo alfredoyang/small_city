@@ -1,5 +1,6 @@
 //! Integration tests for deterministic regional worker load decisions.
 
+use small_city::core::regional_game::UiRequestId;
 use small_city::core::regions::load_manager::{LoadManager, RegionMove, WorkerLoad};
 use small_city::core::regions::runtime::{RegionEvent, RegionRuntime};
 use small_city::core::regions::worker::{RegionWorker, WorkerId};
@@ -84,9 +85,9 @@ fn worker_load_counts_regions_and_queued_events_without_processing_state() {
         .add_region(RegionRuntime::new(RegionState::new(RegionId(71), 2, 2)))
         .unwrap();
 
-    worker.push_event(RegionId(70), RegionEvent::Tick).unwrap();
-    worker.push_event(RegionId(71), RegionEvent::Tick).unwrap();
-    worker.push_event(RegionId(71), RegionEvent::Tick).unwrap();
+    worker.push_event(RegionId(70), tick(70)).unwrap();
+    worker.push_event(RegionId(71), tick(71)).unwrap();
+    worker.push_event(RegionId(71), tick(72)).unwrap();
 
     assert_eq!(
         worker.load(),
@@ -114,4 +115,10 @@ fn optional_frame_time_can_drive_load_decision() {
 
 fn load(worker_id: WorkerId, region_ids: &[RegionId], queued_events: usize) -> WorkerLoad {
     WorkerLoad::new(worker_id, region_ids.to_vec(), queued_events)
+}
+
+fn tick(request_id: u64) -> RegionEvent {
+    RegionEvent::Tick {
+        request_id: UiRequestId(request_id),
+    }
 }

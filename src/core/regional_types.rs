@@ -11,7 +11,12 @@ use crate::interface::view::BuildPreviewView;
 use crate::interface::view::GameView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-/// Stable request identity for UI-to-region snapshot requests.
+/// Stable request identity for UI-to-region event replies.
+///
+/// Regional work is queued and processed asynchronously by worker passes, while
+/// facade APIs still present synchronous calls. The runner matches replies by
+/// both this ID and `RegionId` so an older queued event for the same region
+/// cannot be mistaken for the request currently being awaited.
 pub struct UiRequestId(pub u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +43,14 @@ pub struct RegionSnapshotResponse {
     pub request_id: UiRequestId,
     pub region_id: RegionId,
     pub snapshot: RegionViewSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Correlated regional tick reply produced by a runtime event.
+pub struct RegionTickResponse {
+    pub request_id: UiRequestId,
+    pub region_id: RegionId,
+    pub result: CommandResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

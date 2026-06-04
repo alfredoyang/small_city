@@ -213,6 +213,9 @@ fn returned_continuation(
         OutboundMessage::RegionCommandCompleted(reply) => {
             panic!("unexpected command reply: {reply:?}")
         }
+        OutboundMessage::RegionTickCompleted(reply) => {
+            panic!("unexpected tick reply: {reply:?}")
+        }
         OutboundMessage::RegionSnapshotReady(reply) => {
             panic!("unexpected snapshot reply: {reply:?}")
         }
@@ -230,6 +233,7 @@ fn runtime_errors(outbound: &[OutboundMessage]) -> Vec<RegionRuntimeError> {
             OutboundMessage::RuntimeError(error) => Some(*error),
             OutboundMessage::ReturnImportedResourceContinuation { .. } => None,
             OutboundMessage::RegionCommandCompleted(_) => None,
+            OutboundMessage::RegionTickCompleted(_) => None,
             OutboundMessage::RegionSnapshotReady(_) => None,
             OutboundMessage::RegionExportsChanged(_) => None,
         })

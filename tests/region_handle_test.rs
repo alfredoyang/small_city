@@ -1,5 +1,6 @@
 //! Integration tests for stable in-process region handles.
 
+use small_city::core::regional_game::UiRequestId;
 use small_city::core::regions::continuation::{CallerContinuation, NeighborRequest};
 use small_city::core::regions::runtime::{
     ImportedResourcePayload, OutboundMessage, RegionEvent, RegionRuntime,
@@ -15,10 +16,10 @@ fn region_can_send_event_through_neighbor_handle() {
     let mut target = RegionRuntime::new(RegionState::new(RegionId(2), 2, 2));
     let target_handle = target.handle();
 
-    source.send_to_region(&target_handle, RegionEvent::Tick);
+    source.send_to_region(&target_handle, tick(1));
 
     assert_eq!(target.pending_event_count(), 1);
-    assert!(target.process_next_event().is_empty());
+    assert_eq!(target.process_next_event().len(), 1);
     assert_eq!(target.state().view().status.turn, 1);
     assert_eq!(source.state().view().status.turn, 0);
 }
@@ -29,11 +30,11 @@ fn sender_handle_can_be_cloned_without_cloning_receiver() {
     let first_sender = target.handle();
     let second_sender = first_sender.clone();
 
-    first_sender.send(RegionEvent::Tick);
-    second_sender.send(RegionEvent::Tick);
+    first_sender.send(tick(2));
+    second_sender.send(tick(3));
 
     assert_eq!(target.pending_event_count(), 2);
-    assert!(target.process_some_events(2).is_empty());
+    assert_eq!(target.process_some_events(2).len(), 2);
     assert_eq!(target.state().view().status.turn, 2);
 }
 
@@ -43,10 +44,10 @@ fn receiver_remains_owned_by_target_runtime_after_runtime_moves() {
     let handle = target.handle();
 
     let mut moved_target = target;
-    handle.send(RegionEvent::Tick);
+    handle.send(tick(4));
 
     assert_eq!(moved_target.pending_event_count(), 1);
-    assert!(moved_target.process_next_event().is_empty());
+    assert_eq!(moved_target.process_next_event().len(), 1);
     assert_eq!(moved_target.state().view().status.turn, 1);
 }
 
@@ -113,6 +114,12 @@ fn request(
             region.tick_local();
             region.apply_neighbor_import_result(result);
         }),
+    }
+}
+
+fn tick(request_id: u64) -> RegionEvent {
+    RegionEvent::Tick {
+        request_id: UiRequestId(request_id),
     }
 }
 
