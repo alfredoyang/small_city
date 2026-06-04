@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::interface::events::{EconomyBreakdownView, GameEventView};
 use small_city::interface::view::InspectDetailsView;
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ use small_city::interface::input::{BuildingKind, MapOverlayInput};
 
 #[test]
 fn powered_residential_and_commercial_city_grows_over_one_week() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
 
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
@@ -47,7 +47,7 @@ fn powered_residential_and_commercial_city_grows_over_one_week() {
 
 #[test]
 fn upgraded_powered_city_remains_stable_over_one_week() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
 
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
@@ -90,7 +90,7 @@ fn upgraded_powered_city_remains_stable_over_one_week() {
 #[test]
 fn replace_bulldoze_save_load_scenario_continues_for_two_weeks() {
     let path = save_path("long-scenario");
-    let mut game = Game::new(12, 12);
+    let mut game = SingleRegionTestGame::new(12, 12);
 
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     for x in 0..=6 {
@@ -109,7 +109,7 @@ fn replace_bulldoze_save_load_scenario_continues_for_two_weeks() {
     assert!(game.upgrade(1, 0).success);
 
     game.save_to_file(&path).expect("save long scenario");
-    let mut loaded = Game::load_from_file(&path).expect("load long scenario");
+    let mut loaded = SingleRegionTestGame::load_from_file(&path).expect("load long scenario");
     std::fs::remove_file(&path).expect("remove long scenario save");
 
     let loaded_starting_money = loaded.view().status.money;
@@ -143,7 +143,7 @@ fn replace_bulldoze_save_load_scenario_continues_for_two_weeks() {
 #[test]
 fn connected_economy_loop_runs_over_many_turns_after_upgrade_and_save_load() {
     let path = save_path("long-economy-loop");
-    let mut game = Game::new(12, 12);
+    let mut game = SingleRegionTestGame::new(12, 12);
 
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     for x in 0..=6 {
@@ -190,7 +190,8 @@ fn connected_economy_loop_runs_over_many_turns_after_upgrade_and_save_load() {
 
     game.save_to_file(&path)
         .expect("save long economy scenario");
-    let mut loaded = Game::load_from_file(&path).expect("load long economy scenario");
+    let mut loaded =
+        SingleRegionTestGame::load_from_file(&path).expect("load long economy scenario");
     std::fs::remove_file(&path).expect("remove long economy save");
 
     let loaded_starting_money = loaded.view().status.money;
@@ -232,7 +233,7 @@ fn connected_economy_loop_runs_over_many_turns_after_upgrade_and_save_load() {
 
 #[test]
 fn stable_starter_city_stays_in_sane_ranges_and_locks_reinvestment_pacing() {
-    let mut game = Game::new(12, 12);
+    let mut game = SingleRegionTestGame::new(12, 12);
 
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     for x in 0..=7 {
@@ -300,7 +301,7 @@ fn stable_starter_city_stays_in_sane_ranges_and_locks_reinvestment_pacing() {
 
 #[test]
 fn overbuilt_maintenance_pressure_city_blocks_reinvestment_without_demand() {
-    let mut game = Game::new(12, 12);
+    let mut game = SingleRegionTestGame::new(12, 12);
 
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     for x in 0..=7 {
@@ -359,7 +360,7 @@ fn overbuilt_maintenance_pressure_city_blocks_reinvestment_without_demand() {
 
 #[test]
 fn polluted_industrial_city_locks_fast_industrial_reinvestment_pacing() {
-    let mut game = Game::new(12, 12);
+    let mut game = SingleRegionTestGame::new(12, 12);
 
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     for x in 0..=8 {
@@ -429,13 +430,13 @@ fn polluted_industrial_city_locks_fast_industrial_reinvestment_pacing() {
     assert!(economy.manufacturing_tax > 0);
 }
 
-fn advance_one_week(game: &mut Game) -> EconomyTotals {
+fn advance_one_week(game: &mut SingleRegionTestGame) -> EconomyTotals {
     // Phase A moved population to weekly boundaries and economy to daily
     // boundaries, so scenario tests collect a full week of hourly ticks.
     advance_weeks(game, 1)
 }
 
-fn advance_weeks(game: &mut Game, weeks: u32) -> EconomyTotals {
+fn advance_weeks(game: &mut SingleRegionTestGame, weeks: u32) -> EconomyTotals {
     let mut economy_total = EconomyTotals::default();
     for _ in 0..24 * 7 * weeks {
         let result = game.tick();
@@ -530,7 +531,7 @@ fn save_path(name: &str) -> PathBuf {
     ))
 }
 
-fn residential_rent(game: &Game, x: usize, y: usize) -> i32 {
+fn residential_rent(game: &SingleRegionTestGame, x: usize, y: usize) -> i32 {
     match game.inspect(x, y).details.expect("inspect details") {
         InspectDetailsView::Residential {
             rent_per_citizen, ..
@@ -539,7 +540,7 @@ fn residential_rent(game: &Game, x: usize, y: usize) -> i32 {
     }
 }
 
-fn commercial_sales_tax(game: &Game, x: usize, y: usize) -> i32 {
+fn commercial_sales_tax(game: &SingleRegionTestGame, x: usize, y: usize) -> i32 {
     match game.inspect(x, y).details.expect("inspect details") {
         InspectDetailsView::Commercial {
             sales_tax_per_shopper,
@@ -549,7 +550,7 @@ fn commercial_sales_tax(game: &Game, x: usize, y: usize) -> i32 {
     }
 }
 
-fn residential_average_happiness(game: &Game, x: usize, y: usize) -> Option<i32> {
+fn residential_average_happiness(game: &SingleRegionTestGame, x: usize, y: usize) -> Option<i32> {
     match game.inspect(x, y).details.expect("inspect details") {
         InspectDetailsView::Residential {
             average_happiness, ..
@@ -558,7 +559,7 @@ fn residential_average_happiness(game: &Game, x: usize, y: usize) -> Option<i32>
     }
 }
 
-fn building_upgrade_level(game: &Game, x: usize, y: usize) -> u8 {
+fn building_upgrade_level(game: &SingleRegionTestGame, x: usize, y: usize) -> u8 {
     match game.inspect(x, y).details.expect("inspect details") {
         InspectDetailsView::Residential { upgrade_level, .. }
         | InspectDetailsView::Commercial { upgrade_level, .. }
@@ -569,7 +570,7 @@ fn building_upgrade_level(game: &Game, x: usize, y: usize) -> u8 {
     }
 }
 
-fn building_maintenance(game: &Game, x: usize, y: usize) -> i32 {
+fn building_maintenance(game: &SingleRegionTestGame, x: usize, y: usize) -> i32 {
     match game.inspect(x, y).details.expect("inspect details") {
         InspectDetailsView::Residential {
             maintenance_cost, ..

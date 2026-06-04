@@ -5,7 +5,7 @@ use std::thread;
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::core::regional_game::{RegionCommand, RegionCommandReply, RegionalGame};
 use small_city::core::regional_types::UiRequestId;
 use small_city::core::regions::runtime::{OutboundMessage, RegionEvent, RegionRuntime};
@@ -57,7 +57,7 @@ fn preview_build_returns_owned_data_without_mutating_region() {
 fn bulldoze_replace_and_upgrade_match_game_command_results() {
     let region_id = RegionId(4);
     let regional = RegionalGame::from_regions(vec![RegionState::new(region_id, 4, 4)]).unwrap();
-    let mut single = Game::new(4, 4);
+    let mut single = SingleRegionTestGame::new(4, 4);
 
     assert_eq!(
         regional
@@ -128,7 +128,7 @@ fn command_payloads_and_replies_are_owned() {
 fn commands_and_ticks_process_in_call_order() {
     let region_id = RegionId(6);
     let regional = RegionalGame::from_regions(vec![RegionState::new(region_id, 3, 3)]).unwrap();
-    let mut single = Game::new(3, 3);
+    let mut single = SingleRegionTestGame::new(3, 3);
 
     assert_eq!(
         regional.build(region_id, 1, 1, BuildingKind::Road).unwrap(),

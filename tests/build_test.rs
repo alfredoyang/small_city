@@ -2,12 +2,12 @@
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::interface::input::BuildingKind;
 
 #[test]
 fn building_cost_is_deducted_correctly() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
 
     let result = game.build(1, 1, BuildingKind::Residential);
 
@@ -17,7 +17,7 @@ fn building_cost_is_deducted_correctly() {
 
 #[test]
 fn cannot_build_outside_the_map() {
-    let mut game = Game::new(2, 2);
+    let mut game = SingleRegionTestGame::new(2, 2);
 
     let result = game.build(2, 0, BuildingKind::Road);
 
@@ -27,7 +27,7 @@ fn cannot_build_outside_the_map() {
 
 #[test]
 fn cannot_build_on_occupied_cell() {
-    let mut game = Game::new(2, 2);
+    let mut game = SingleRegionTestGame::new(2, 2);
     assert!(game.build(0, 0, BuildingKind::Road).success);
 
     let result = game.build(0, 0, BuildingKind::Residential);
@@ -38,7 +38,7 @@ fn cannot_build_on_occupied_cell() {
 
 #[test]
 fn cannot_build_without_enough_money() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     for x in 0..5 {
         assert!(game.build(x, 0, BuildingKind::PowerPlant).success);
     }
@@ -51,7 +51,7 @@ fn cannot_build_without_enough_money() {
 
 #[test]
 fn valid_build_preview_explains_success() {
-    let game = Game::new(2, 2);
+    let game = SingleRegionTestGame::new(2, 2);
 
     let preview = game.preview_build(0, 0, BuildingKind::Residential);
 
@@ -65,7 +65,7 @@ fn valid_build_preview_explains_success() {
 
 #[test]
 fn build_preview_rejects_occupied_cell() {
-    let mut game = Game::new(2, 2);
+    let mut game = SingleRegionTestGame::new(2, 2);
     assert!(game.build(0, 0, BuildingKind::Road).success);
 
     let preview = game.preview_build(0, 0, BuildingKind::Residential);
@@ -76,7 +76,7 @@ fn build_preview_rejects_occupied_cell() {
 
 #[test]
 fn build_preview_rejects_insufficient_money() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     for x in 0..5 {
         assert!(game.build(x, 0, BuildingKind::PowerPlant).success);
     }
@@ -89,7 +89,7 @@ fn build_preview_rejects_insufficient_money() {
 
 #[test]
 fn build_preview_rejects_out_of_bounds_cell() {
-    let game = Game::new(2, 2);
+    let game = SingleRegionTestGame::new(2, 2);
 
     let preview = game.preview_build(2, 0, BuildingKind::Road);
 

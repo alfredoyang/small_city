@@ -5,10 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
 
-use common::{Game, GameError};
+use common::{SingleRegionTestGame, SingleRegionTestGameError};
 use small_city::interface::input::BuildingKind;
 
-fn advance_one_day(game: &mut Game) {
+fn advance_one_day(game: &mut SingleRegionTestGame) {
     // Phase A moved economy collection to daily boundaries, so money-changing
     // save/load continuation checks advance to the next in-game day.
     for _ in 0..24 {
@@ -16,7 +16,7 @@ fn advance_one_day(game: &mut Game) {
     }
 }
 
-fn advance_one_week(game: &mut Game) {
+fn advance_one_week(game: &mut SingleRegionTestGame) {
     // Phase A moved population growth to weekly boundaries, so the saved full
     // city fixture advances one in-game week before asserting residents exist.
     for _ in 0..24 * 7 {
@@ -27,7 +27,7 @@ fn advance_one_week(game: &mut Game) {
 #[test]
 fn saving_a_game_creates_a_file() {
     let path = save_path("creates-file");
-    let game = Game::new(4, 3);
+    let game = SingleRegionTestGame::new(4, 3);
 
     game.save_to_file(&path).expect("save succeeds");
 
@@ -41,7 +41,7 @@ fn save_load_roundtrip_restores_city_state_visible_through_game_view() {
     let game = full_city_game();
     game.save_to_file(&path).expect("save succeeds");
 
-    let loaded = Game::load_from_file(&path).expect("load succeeds");
+    let loaded = SingleRegionTestGame::load_from_file(&path).expect("load succeeds");
     let original_view = game.view();
     let loaded_view = loaded.view();
 
@@ -100,7 +100,7 @@ fn loaded_game_can_tick_again() {
     let game = full_city_game();
     game.save_to_file(&path).expect("save succeeds");
 
-    let mut loaded = Game::load_from_file(&path).expect("load succeeds");
+    let mut loaded = SingleRegionTestGame::load_from_file(&path).expect("load succeeds");
     let before = loaded.view();
 
     advance_one_day(&mut loaded);
@@ -119,7 +119,7 @@ fn loaded_game_view_has_width_times_height_cells() {
     let game = full_city_game();
     game.save_to_file(&path).expect("save succeeds");
 
-    let loaded = Game::load_from_file(&path).expect("load succeeds");
+    let loaded = SingleRegionTestGame::load_from_file(&path).expect("load succeeds");
     let view = loaded.view();
 
     assert_eq!(view.map.cells.len(), view.map.width * view.map.height);
@@ -129,20 +129,20 @@ fn loaded_game_view_has_width_times_height_cells() {
 #[test]
 fn invalid_file_path_returns_error() {
     let path = save_path("missing-directory").join("save.json");
-    let game = Game::new(2, 2);
+    let game = SingleRegionTestGame::new(2, 2);
 
     let result = game.save_to_file(path);
 
-    assert!(matches!(result, Err(GameError::Io(_))));
+    assert!(matches!(result, Err(SingleRegionTestGameError::Io(_))));
 }
 
 #[test]
 fn missing_save_file_returns_error() {
     let path = save_path("missing-file");
 
-    let result = Game::load_from_file(path);
+    let result = SingleRegionTestGame::load_from_file(path);
 
-    assert!(matches!(result, Err(GameError::Io(_))));
+    assert!(matches!(result, Err(SingleRegionTestGameError::Io(_))));
 }
 
 #[test]
@@ -150,14 +150,17 @@ fn invalid_json_returns_error() {
     let path = save_path("invalid-json");
     std::fs::write(&path, "not valid json").expect("write invalid save file");
 
-    let result = Game::load_from_file(&path);
+    let result = SingleRegionTestGame::load_from_file(&path);
 
-    assert!(matches!(result, Err(GameError::SaveFormat(_))));
+    assert!(matches!(
+        result,
+        Err(SingleRegionTestGameError::SaveFormat(_))
+    ));
     remove_save_file(path);
 }
 
-fn full_city_game() -> Game {
-    let mut game = Game::new(7, 5);
+fn full_city_game() -> SingleRegionTestGame {
+    let mut game = SingleRegionTestGame::new(7, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
@@ -172,7 +175,7 @@ fn full_city_game() -> Game {
     game
 }
 
-fn building_count(game: &Game) -> usize {
+fn building_count(game: &SingleRegionTestGame) -> usize {
     game.view()
         .map
         .cells

@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::core::resources::GameTime;
 use small_city::interface::events::{EconomyBreakdownView, GameEventView, MetricChange};
 use small_city::interface::input::BuildingKind;
@@ -10,7 +10,7 @@ use small_city::interface::view::{GameTimeView, InspectDetailsView};
 
 #[test]
 fn workplace_without_citizen_workers_pays_no_tax_but_still_has_maintenance() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Industrial).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
@@ -24,7 +24,7 @@ fn workplace_without_citizen_workers_pays_no_tax_but_still_has_maintenance() {
 
 #[test]
 fn unproductive_buildings_still_have_maintenance_costs() {
-    let mut game = Game::new(5, 5);
+    let mut game = SingleRegionTestGame::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Park).success);
     assert_eq!(game.view().status.money, 74);
@@ -36,7 +36,7 @@ fn unproductive_buildings_still_have_maintenance_costs() {
 
 #[test]
 fn build_options_expose_maintenance_costs_to_ui() {
-    let game = Game::new(2, 2);
+    let game = SingleRegionTestGame::new(2, 2);
     let view = game.view();
 
     let power_plant = view
@@ -56,7 +56,7 @@ fn build_options_expose_maintenance_costs_to_ui() {
 
 #[test]
 fn tick_event_exposes_economy_breakdown() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Industrial).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
@@ -120,7 +120,7 @@ fn tick_event_exposes_economy_breakdown() {
 
 #[test]
 fn citizen_salary_rent_and_shopping_create_city_tax_income() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
@@ -162,7 +162,7 @@ fn citizen_salary_rent_and_shopping_create_city_tax_income() {
 
 #[test]
 fn commercial_without_shoppers_pays_no_sales_tax() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Commercial).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
@@ -191,7 +191,7 @@ fn commercial_without_shoppers_pays_no_sales_tax() {
 
 #[test]
 fn profitable_industrial_auto_upgrades_from_business_cash() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Industrial).success);
     for x in 2..=5 {
@@ -241,7 +241,7 @@ fn profitable_industrial_auto_upgrades_from_business_cash() {
 
 #[test]
 fn profitable_commercial_auto_upgrades_from_shopping_profit() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     for x in 1..=5 {
         assert!(game.build(x, 0, BuildingKind::Residential).success);
@@ -282,7 +282,7 @@ fn profitable_commercial_auto_upgrades_from_shopping_profit() {
 
 #[test]
 fn unprofitable_commercial_tracks_blocked_business_progress() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Commercial).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
@@ -318,7 +318,7 @@ fn unprofitable_commercial_tracks_blocked_business_progress() {
 
 #[test]
 fn profitable_industrial_waits_when_demand_is_low() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Industrial).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
@@ -352,7 +352,7 @@ fn profitable_industrial_waits_when_demand_is_low() {
 
 #[test]
 fn disconnected_commercial_does_not_receive_shoppers_or_pay_sales_tax() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(5, 0, BuildingKind::Industrial).success);
@@ -375,7 +375,7 @@ fn disconnected_commercial_does_not_receive_shoppers_or_pay_sales_tax() {
 
 #[test]
 fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
@@ -477,7 +477,7 @@ fn citizen_unable_to_pay_rent_gets_lower_happiness() {
 
 #[test]
 fn level_two_building_has_higher_maintenance_than_level_one() {
-    let mut game = Game::new(5, 5);
+    let mut game = SingleRegionTestGame::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
 
     let level_one = power_plant_maintenance(&game, 0, 0);
@@ -500,7 +500,7 @@ fn commercial_in_higher_land_value_area_pays_more_sales_tax() {
 
 #[test]
 fn industrial_goods_fill_commercial_storage_and_surplus_exports() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(5, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Industrial).success);
@@ -523,7 +523,7 @@ fn industrial_goods_fill_commercial_storage_and_surplus_exports() {
 
 #[test]
 fn commercial_imports_goods_when_local_storage_is_empty() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
@@ -546,7 +546,7 @@ fn commercial_imports_goods_when_local_storage_is_empty() {
 
 #[test]
 fn citizens_prefer_nearby_reachable_jobs() {
-    let mut game = Game::new(8, 4);
+    let mut game = SingleRegionTestGame::new(8, 4);
     assert!(game.build(7, 1, BuildingKind::PowerPlant).success);
     assert!(game.build(0, 0, BuildingKind::Industrial).success);
     assert!(game.build(5, 0, BuildingKind::Commercial).success);
@@ -574,7 +574,7 @@ fn nearby_commercial_gives_better_shopping_happiness_than_far_commercial() {
 
 #[test]
 fn far_export_access_lowers_export_and_manufacturing_margin() {
-    let mut game = Game::new(14, 4);
+    let mut game = SingleRegionTestGame::new(14, 4);
     assert!(game.build(11, 2, BuildingKind::PowerPlant).success);
     assert!(game.build(10, 1, BuildingKind::Industrial).success);
     for x in 0..=10 {
@@ -605,7 +605,7 @@ fn save_load_preserves_land_value_rent_behavior() {
     let before = residential_rent(&game, 1, 0);
     game.save_to_file(&path).expect("save city");
 
-    let mut loaded = Game::load_from_file(&path).expect("load city");
+    let mut loaded = SingleRegionTestGame::load_from_file(&path).expect("load city");
     let _ = std::fs::remove_file(&path);
     let after = residential_rent(&loaded, 1, 0);
 
@@ -633,7 +633,9 @@ fn expected_time(total_hours: u64) -> GameTimeView {
     }
 }
 
-fn advance_one_day(game: &mut Game) -> small_city::interface::events::CommandResult {
+fn advance_one_day(
+    game: &mut SingleRegionTestGame,
+) -> small_city::interface::events::CommandResult {
     // Phase A time cadence moved economy from every tick to the daily boundary.
     let mut result = game.tick();
     for _ in 1..24 {
@@ -642,7 +644,9 @@ fn advance_one_day(game: &mut Game) -> small_city::interface::events::CommandRes
     result
 }
 
-fn advance_one_week(game: &mut Game) -> small_city::interface::events::CommandResult {
+fn advance_one_week(
+    game: &mut SingleRegionTestGame,
+) -> small_city::interface::events::CommandResult {
     // Phase A time cadence moved population growth from every tick to the weekly boundary.
     let mut result = game.tick();
     for _ in 1..24 * 7 {
@@ -651,8 +655,8 @@ fn advance_one_week(game: &mut Game) -> small_city::interface::events::CommandRe
     result
 }
 
-fn powered_residential_city(with_park: bool) -> Game {
-    let mut game = Game::new(10, 10);
+fn powered_residential_city(with_park: bool) -> SingleRegionTestGame {
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
@@ -677,7 +681,7 @@ fn commercial_tax_city(with_park: bool) -> EconomyBreakdownView {
 }
 
 fn shopping_happiness_city(commercial_x: usize) -> i32 {
-    let mut game = Game::new(20, 4);
+    let mut game = SingleRegionTestGame::new(20, 4);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(
@@ -694,7 +698,7 @@ fn shopping_happiness_city(commercial_x: usize) -> i32 {
 }
 
 fn imported_goods_sold_after_two_ticks(far_from_edge: bool) -> i32 {
-    let mut game = Game::new(20, 4);
+    let mut game = SingleRegionTestGame::new(20, 4);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     if far_from_edge {
         assert!(game.build(10, 0, BuildingKind::Commercial).success);
@@ -714,7 +718,7 @@ fn imported_goods_sold_after_two_ticks(far_from_edge: bool) -> i32 {
     tick_economy(&advance_one_day(&mut game).event).imported_goods_sold
 }
 
-fn residential_rent(game: &Game, x: usize, y: usize) -> i32 {
+fn residential_rent(game: &SingleRegionTestGame, x: usize, y: usize) -> i32 {
     match game.inspect(x, y).details.expect("inspect details") {
         InspectDetailsView::Residential {
             rent_per_citizen, ..
@@ -723,7 +727,7 @@ fn residential_rent(game: &Game, x: usize, y: usize) -> i32 {
     }
 }
 
-fn residential_average_happiness(game: &Game, x: usize, y: usize) -> Option<i32> {
+fn residential_average_happiness(game: &SingleRegionTestGame, x: usize, y: usize) -> Option<i32> {
     match game.inspect(x, y).details.expect("inspect details") {
         InspectDetailsView::Residential {
             average_happiness, ..
@@ -732,7 +736,7 @@ fn residential_average_happiness(game: &Game, x: usize, y: usize) -> Option<i32>
     }
 }
 
-fn power_plant_maintenance(game: &Game, x: usize, y: usize) -> i32 {
+fn power_plant_maintenance(game: &SingleRegionTestGame, x: usize, y: usize) -> i32 {
     match game.inspect(x, y).details.expect("inspect details") {
         InspectDetailsView::PowerPlant {
             maintenance_cost, ..
@@ -741,7 +745,7 @@ fn power_plant_maintenance(game: &Game, x: usize, y: usize) -> i32 {
     }
 }
 
-fn commercial_goods(game: &Game, x: usize, y: usize) -> (i32, i32) {
+fn commercial_goods(game: &SingleRegionTestGame, x: usize, y: usize) -> (i32, i32) {
     match game.inspect(x, y).details.expect("inspect details") {
         InspectDetailsView::Commercial {
             goods_stored,

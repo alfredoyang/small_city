@@ -2,10 +2,10 @@
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::interface::input::BuildingKind;
 
-fn advance_one_week(game: &mut Game) {
+fn advance_one_week(game: &mut SingleRegionTestGame) {
     // Phase A moved population growth to weekly boundaries, so growth tests
     // advance through one in-game week before asserting population changes.
     for _ in 0..24 * 7 {
@@ -15,7 +15,7 @@ fn advance_one_week(game: &mut Game) {
 
 #[test]
 fn residential_without_adjacent_road_does_not_grow() {
-    let mut game = Game::new(5, 5);
+    let mut game = SingleRegionTestGame::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(0, 1, BuildingKind::Residential).success);
     assert!(game.build(1, 0, BuildingKind::Industrial).success);
@@ -30,7 +30,7 @@ fn residential_without_adjacent_road_does_not_grow() {
 
 #[test]
 fn residential_with_adjacent_road_grows() {
-    let mut game = Game::new(5, 5);
+    let mut game = SingleRegionTestGame::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Road).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);
@@ -46,7 +46,7 @@ fn residential_with_adjacent_road_grows() {
 
 #[test]
 fn commercial_without_road_does_not_provide_effective_jobs() {
-    let mut game = Game::new(5, 5);
+    let mut game = SingleRegionTestGame::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Commercial).success);
 
@@ -64,7 +64,7 @@ fn commercial_without_road_does_not_provide_effective_jobs() {
 
 #[test]
 fn industrial_with_road_provides_effective_jobs() {
-    let mut game = Game::new(5, 5);
+    let mut game = SingleRegionTestGame::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Industrial).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);

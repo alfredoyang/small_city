@@ -603,7 +603,7 @@ fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
             continue;
         }
 
-        // Non-modal keys are normalized into actions before mutating UI state or calling Game APIs.
+        // Non-modal keys are normalized into actions before mutating UI state or calling facades.
         let action = map_key_event(key);
         if runtime.apply_action(action, Instant::now()) == TuiFlow::Quit {
             return Ok(());

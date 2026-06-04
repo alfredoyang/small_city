@@ -1,17 +1,17 @@
-//! Integration tests for road-network power behavior across Game API and views.
+//! Integration tests for road-network power behavior across facade and views.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::interface::input::{BuildingKind, MapOverlayInput};
 use small_city::interface::view::{CellView, GameView, InspectDetailsView};
 
 #[test]
 fn connected_road_network_powers_consumers() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     for x in 0..4 {
         assert!(game.build(x, 1, BuildingKind::Road).success);
@@ -41,7 +41,7 @@ fn connected_road_network_powers_consumers() {
 
 #[test]
 fn nearby_building_without_road_network_is_not_powered() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
@@ -56,7 +56,7 @@ fn nearby_building_without_road_network_is_not_powered() {
 
 #[test]
 fn disconnected_road_network_does_not_receive_power() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
     assert!(game.build(5, 5, BuildingKind::Road).success);
@@ -74,7 +74,7 @@ fn disconnected_road_network_does_not_receive_power() {
 
 #[test]
 fn power_capacity_limits_consumers() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     for x in 0..6 {
         assert!(game.build(x, 1, BuildingKind::Road).success);
@@ -101,7 +101,7 @@ fn power_capacity_limits_consumers() {
 
 #[test]
 fn multiple_power_plants_on_same_network_combine_capacity() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(0, 2, BuildingKind::PowerPlant).success);
     for x in 0..5 {
@@ -125,7 +125,7 @@ fn multiple_power_plants_on_same_network_combine_capacity() {
 #[test]
 fn save_load_preserves_power_network_behavior() {
     let path = save_path("power-network");
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     for x in 0..4 {
         assert!(game.build(x, 1, BuildingKind::Road).success);
@@ -136,7 +136,7 @@ fn save_load_preserves_power_network_behavior() {
     game.tick();
     game.save_to_file(&path).expect("save succeeds");
 
-    let mut loaded = Game::load_from_file(&path).expect("load succeeds");
+    let mut loaded = SingleRegionTestGame::load_from_file(&path).expect("load succeeds");
     advance_one_week(&mut loaded);
 
     let view = loaded.view();
@@ -162,7 +162,7 @@ fn cell(view: &GameView, x: usize, y: usize) -> &CellView {
     &view.map.cells[y * view.map.width + x]
 }
 
-fn inspect_powered(game: &Game, x: usize, y: usize) -> Option<bool> {
+fn inspect_powered(game: &SingleRegionTestGame, x: usize, y: usize) -> Option<bool> {
     match game.inspect(x, y).details {
         Some(InspectDetailsView::Residential { powered, .. })
         | Some(InspectDetailsView::Commercial { powered, .. })
@@ -179,7 +179,7 @@ fn all_consumers_powered(view: &GameView) -> bool {
         .all(|powered| powered)
 }
 
-fn advance_one_week(game: &mut Game) {
+fn advance_one_week(game: &mut SingleRegionTestGame) {
     // Phase A time cadence moved population growth from every tick to the weekly boundary.
     for _ in 0..24 * 7 {
         assert!(game.tick().success);

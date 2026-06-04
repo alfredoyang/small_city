@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::core::regions::{
     ImportDecision, ImportedResource, ImportedResourceResult, RegionId, RegionState, ResourceId,
     ResourceKind,
@@ -10,7 +10,7 @@ use small_city::core::regions::{
 
 #[test]
 fn region_tick_local_matches_game_tick_for_same_empty_city() {
-    let mut game = Game::new(4, 3);
+    let mut game = SingleRegionTestGame::new(4, 3);
     let mut region = RegionState::new(RegionId(10), 4, 3);
 
     let game_result = game.tick();

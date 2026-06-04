@@ -1,16 +1,16 @@
-//! Integration tests for public Game API tick events and basic simulation effects.
+//! Integration tests for regional facade tick events and basic simulation effects.
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::core::resources::GameTime;
 use small_city::interface::events::{EconomyBreakdownView, GameEventView, MetricChange};
 use small_city::interface::input::BuildingKind;
 use small_city::interface::view::{GameTimeView, InspectDetailsView};
 
 #[test]
-fn default_game_uses_larger_distance_friendly_map() {
-    let view = Game::default().view();
+fn default_single_region_test_game_uses_larger_distance_friendly_map() {
+    let view = SingleRegionTestGame::default().view();
 
     assert_eq!(view.map.width, 20);
     assert_eq!(view.map.height, 15);
@@ -19,7 +19,7 @@ fn default_game_uses_larger_distance_friendly_map() {
 
 #[test]
 fn industrial_creates_pollution() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::Industrial).success);
 
     game.tick();
@@ -29,7 +29,7 @@ fn industrial_creates_pollution() {
 
 #[test]
 fn park_reduces_pollution_effect() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::Industrial).success);
     assert!(game.build(1, 0, BuildingKind::Park).success);
 
@@ -40,7 +40,7 @@ fn park_reduces_pollution_effect() {
 
 #[test]
 fn happiness_includes_park_bonus() {
-    let mut high_happiness = Game::new(10, 10);
+    let mut high_happiness = SingleRegionTestGame::new(10, 10);
     for x in 0..10 {
         assert!(high_happiness.build(x, 0, BuildingKind::Park).success);
     }
@@ -50,7 +50,7 @@ fn happiness_includes_park_bonus() {
 
 #[test]
 fn tick_advances_turn_deterministically() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
 
     game.tick();
     game.tick();
@@ -65,7 +65,7 @@ fn tick_advances_turn_deterministically() {
 
 #[test]
 fn tick_returns_structured_summary_events() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
@@ -147,7 +147,7 @@ fn tick_returns_structured_summary_events() {
 
 #[test]
 fn tick_summary_message_includes_metric_changes() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
@@ -175,7 +175,7 @@ fn tick_summary_message_includes_metric_changes() {
 
 #[test]
 fn business_reinvestment_can_raise_industrial_to_level_three_and_emit_event() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Industrial).success);
     for x in 2..=5 {
@@ -237,7 +237,9 @@ fn expected_time(total_hours: u64) -> GameTimeView {
     }
 }
 
-fn advance_one_week(game: &mut Game) -> small_city::interface::events::CommandResult {
+fn advance_one_week(
+    game: &mut SingleRegionTestGame,
+) -> small_city::interface::events::CommandResult {
     // Phase A time cadence moved population growth from every tick to the weekly boundary.
     let mut result = game.tick();
     for _ in 1..24 * 7 {

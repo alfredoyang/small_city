@@ -2,14 +2,14 @@
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::interface::input::BuildingKind;
 use small_city::interface::view::InspectDetailsView;
 use small_city::ui::ascii::format_inspect;
 
 #[test]
 fn inspect_empty_cell_shows_buildable_status() {
-    let game = Game::new(2, 2);
+    let game = SingleRegionTestGame::new(2, 2);
     let inspect = game.inspect(1, 1);
 
     assert_eq!(
@@ -24,7 +24,7 @@ fn inspect_empty_cell_shows_buildable_status() {
 
 #[test]
 fn inspect_residential_shows_powered_state_and_population() {
-    let mut game = Game::new(4, 4);
+    let mut game = SingleRegionTestGame::new(4, 4);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
@@ -57,7 +57,7 @@ fn inspect_residential_shows_powered_state_and_population() {
 
 #[test]
 fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
-    let mut game = Game::new(5, 5);
+    let mut game = SingleRegionTestGame::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Commercial).success);
     assert!(game.build(2, 0, BuildingKind::Industrial).success);
@@ -125,7 +125,7 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
 
 #[test]
 fn inspect_road_shows_building_type() {
-    let mut game = Game::new(2, 2);
+    let mut game = SingleRegionTestGame::new(2, 2);
     assert!(game.build(0, 0, BuildingKind::Road).success);
 
     let inspect = game.inspect(0, 0);
@@ -136,7 +136,7 @@ fn inspect_road_shows_building_type() {
 
 #[test]
 fn inspect_power_plant_and_park_show_special_effects() {
-    let mut game = Game::new(5, 5);
+    let mut game = SingleRegionTestGame::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Park).success);
 
@@ -174,7 +174,7 @@ fn inspect_power_plant_and_park_show_special_effects() {
 
 #[test]
 fn inspect_out_of_bounds_formats_without_cell_data() {
-    let game = Game::new(2, 2);
+    let game = SingleRegionTestGame::new(2, 2);
     let inspect = game.inspect(5, 5);
 
     assert_eq!(inspect.details, None);
@@ -183,7 +183,7 @@ fn inspect_out_of_bounds_formats_without_cell_data() {
 
 #[test]
 fn inspect_explains_missing_adjacent_road() {
-    let mut game = Game::new(3, 3);
+    let mut game = SingleRegionTestGame::new(3, 3);
     assert!(game.build(1, 1, BuildingKind::Residential).success);
 
     let inspect = game.inspect(1, 1);
@@ -197,7 +197,7 @@ fn inspect_explains_missing_adjacent_road() {
 
 #[test]
 fn inspect_explains_unpowered_road_network() {
-    let mut game = Game::new(4, 4);
+    let mut game = SingleRegionTestGame::new(4, 4);
     assert!(game.build(1, 1, BuildingKind::Road).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
 
@@ -213,7 +213,7 @@ fn inspect_explains_unpowered_road_network() {
 
 #[test]
 fn inspect_explains_insufficient_power_capacity() {
-    let mut game = Game::new(8, 4);
+    let mut game = SingleRegionTestGame::new(8, 4);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     for x in 0..6 {
         assert!(game.build(x, 1, BuildingKind::Road).success);
@@ -235,7 +235,7 @@ fn inspect_explains_insufficient_power_capacity() {
 
 #[test]
 fn inspect_explains_no_available_jobs_for_residential_growth() {
-    let mut game = Game::new(4, 4);
+    let mut game = SingleRegionTestGame::new(4, 4);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);
@@ -253,7 +253,7 @@ fn inspect_explains_no_available_jobs_for_residential_growth() {
 
 #[test]
 fn inspect_exposes_road_network_distance_notes() {
-    let mut game = Game::new(6, 4);
+    let mut game = SingleRegionTestGame::new(6, 4);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(4, 0, BuildingKind::Commercial).success);
     for x in 1..=4 {
@@ -276,7 +276,7 @@ fn inspect_exposes_road_network_distance_notes() {
 
 #[test]
 fn inspect_explains_local_pollution_and_happiness_effects() {
-    let mut game = Game::new(3, 3);
+    let mut game = SingleRegionTestGame::new(3, 3);
     assert!(game.build(0, 0, BuildingKind::Industrial).success);
     assert!(game.build(1, 0, BuildingKind::Park).success);
 

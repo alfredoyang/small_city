@@ -2,12 +2,12 @@
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::interface::input::BuildingKind;
 
 #[test]
 fn replace_occupied_cell_succeeds_and_deducts_new_building_cost() {
-    let mut game = Game::new(4, 4);
+    let mut game = SingleRegionTestGame::new(4, 4);
     assert!(game.build(1, 1, BuildingKind::Residential).success);
     let before = game.view().status.money;
 
@@ -26,7 +26,7 @@ fn replace_occupied_cell_succeeds_and_deducts_new_building_cost() {
 
 #[test]
 fn replace_empty_cell_fails() {
-    let mut game = Game::new(4, 4);
+    let mut game = SingleRegionTestGame::new(4, 4);
 
     let result = game.replace(1, 1, BuildingKind::Commercial);
 
@@ -36,7 +36,7 @@ fn replace_empty_cell_fails() {
 
 #[test]
 fn replace_same_type_fails() {
-    let mut game = Game::new(4, 4);
+    let mut game = SingleRegionTestGame::new(4, 4);
     assert!(game.build(1, 1, BuildingKind::Residential).success);
 
     let result = game.replace(1, 1, BuildingKind::Residential);
@@ -47,7 +47,7 @@ fn replace_same_type_fails() {
 
 #[test]
 fn replace_refreshes_derived_state() {
-    let mut game = Game::new(5, 5);
+    let mut game = SingleRegionTestGame::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);
@@ -65,7 +65,7 @@ fn replace_refreshes_derived_state() {
 
 #[test]
 fn upgrade_residential_increases_capacity() {
-    let mut game = Game::new(4, 4);
+    let mut game = SingleRegionTestGame::new(4, 4);
     assert!(game.build(1, 1, BuildingKind::Residential).success);
     let before_money = game.view().status.money;
 
@@ -80,7 +80,7 @@ fn upgrade_residential_increases_capacity() {
 
 #[test]
 fn manual_upgrade_fails_without_enough_money_and_keeps_state() {
-    let mut game = Game::new(4, 4);
+    let mut game = SingleRegionTestGame::new(4, 4);
     assert!(game.build(0, 0, BuildingKind::Residential).success);
     for (x, y) in [(1, 0), (2, 0), (3, 0), (0, 1)] {
         assert!(game.build(x, y, BuildingKind::PowerPlant).success);
@@ -102,7 +102,7 @@ fn manual_upgrade_fails_without_enough_money_and_keeps_state() {
 
 #[test]
 fn upgrade_power_plant_increases_capacity() {
-    let mut game = Game::new(4, 4);
+    let mut game = SingleRegionTestGame::new(4, 4);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
 
     let result = game.upgrade(0, 0);
@@ -113,7 +113,7 @@ fn upgrade_power_plant_increases_capacity() {
 
 #[test]
 fn upgrade_park_increases_happiness_effect() {
-    let mut game = Game::new(4, 4);
+    let mut game = SingleRegionTestGame::new(4, 4);
     assert!(game.build(0, 0, BuildingKind::Park).success);
 
     let result = game.upgrade(0, 0);
@@ -124,7 +124,7 @@ fn upgrade_park_increases_happiness_effect() {
 
 #[test]
 fn unsupported_or_max_upgrade_fails() {
-    let mut game = Game::new(4, 4);
+    let mut game = SingleRegionTestGame::new(4, 4);
     assert!(game.build(0, 0, BuildingKind::Road).success);
     assert!(!game.upgrade(0, 0).success);
 

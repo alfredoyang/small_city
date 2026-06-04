@@ -2,12 +2,12 @@
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::interface::input::BuildingKind;
 
 #[test]
 fn bulldoze_occupied_cell_succeeds() {
-    let mut game = Game::new(3, 3);
+    let mut game = SingleRegionTestGame::new(3, 3);
     assert!(game.build(1, 1, BuildingKind::Residential).success);
 
     let result = game.bulldoze(1, 1);
@@ -18,7 +18,7 @@ fn bulldoze_occupied_cell_succeeds() {
 
 #[test]
 fn bulldoze_empty_cell_fails() {
-    let mut game = Game::new(3, 3);
+    let mut game = SingleRegionTestGame::new(3, 3);
 
     let result = game.bulldoze(1, 1);
 
@@ -28,7 +28,7 @@ fn bulldoze_empty_cell_fails() {
 
 #[test]
 fn bulldoze_removes_the_building_from_game_view() {
-    let mut game = Game::new(3, 3);
+    let mut game = SingleRegionTestGame::new(3, 3);
     assert!(game.build(1, 1, BuildingKind::Residential).success);
 
     assert!(game.bulldoze(1, 1).success);
@@ -40,7 +40,7 @@ fn bulldoze_removes_the_building_from_game_view() {
 
 #[test]
 fn bulldoze_deducts_money() {
-    let mut game = Game::new(3, 3);
+    let mut game = SingleRegionTestGame::new(3, 3);
     assert!(game.build(1, 1, BuildingKind::Residential).success);
     let before = game.view().status.money;
 
@@ -51,7 +51,7 @@ fn bulldoze_deducts_money() {
 
 #[test]
 fn bulldozing_a_road_can_affect_road_connectivity() {
-    let mut game = Game::new(4, 4);
+    let mut game = SingleRegionTestGame::new(4, 4);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Industrial).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
@@ -68,7 +68,7 @@ fn bulldozing_a_road_can_affect_road_connectivity() {
 
 #[test]
 fn simulation_can_continue_after_bulldoze() {
-    let mut game = Game::new(4, 4);
+    let mut game = SingleRegionTestGame::new(4, 4);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Industrial).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);

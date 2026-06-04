@@ -1,9 +1,9 @@
 //! Test-only facade for exercising single-region behavior through `RegionalGame`.
 //!
-//! Patch 23 removes the production `Game` facade. Many existing scenario tests
-//! still read more clearly with single-city method names, so this helper keeps
-//! that ergonomic surface in tests while delegating every operation to the
-//! regional facade.
+//! Patch 23 removes the production single-city facade. Many existing scenario
+//! tests still read more clearly with compact single-region method names, so
+//! this helper keeps that ergonomic surface in tests while delegating every
+//! operation to the regional facade.
 
 #![allow(dead_code)]
 
@@ -23,14 +23,14 @@ const TEST_REGION_ID: RegionId = RegionId(1);
 const DEFAULT_MAP_WIDTH: usize = 20;
 const DEFAULT_MAP_HEIGHT: usize = 15;
 
-pub type GameError = RegionalGameSaveError;
+pub type SingleRegionTestGameError = RegionalGameSaveError;
 
 #[derive(Debug)]
-pub struct Game {
+pub struct SingleRegionTestGame {
     inner: Mutex<Option<RegionalGame>>,
 }
 
-impl Game {
+impl SingleRegionTestGame {
     pub fn new(width: usize, height: usize) -> Self {
         Self {
             inner: Mutex::new(Some(
@@ -93,7 +93,7 @@ impl Game {
         })
     }
 
-    pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<(), GameError> {
+    pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<(), SingleRegionTestGameError> {
         let mut guard = self.inner.lock().expect("test game lock");
         let game = guard.take().expect("test game exists");
 
@@ -110,7 +110,7 @@ impl Game {
         }
     }
 
-    pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, GameError> {
+    pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, SingleRegionTestGameError> {
         Ok(Self {
             inner: Mutex::new(Some(RegionalGame::load_from_file(path)?)),
         })
@@ -122,7 +122,7 @@ impl Game {
     }
 }
 
-impl Default for Game {
+impl Default for SingleRegionTestGame {
     fn default() -> Self {
         Self::new(DEFAULT_MAP_WIDTH, DEFAULT_MAP_HEIGHT)
     }

@@ -2,12 +2,12 @@
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::interface::input::BuildingKind;
 
 #[test]
 fn residential_population_grows_faster_when_residential_demand_is_high() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(3, 0, BuildingKind::Commercial).success);
@@ -27,7 +27,7 @@ fn residential_population_grows_faster_when_residential_demand_is_high() {
 
 #[test]
 fn residential_population_grows_normally_when_residential_demand_is_medium() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
@@ -41,7 +41,7 @@ fn residential_population_grows_normally_when_residential_demand_is_medium() {
     assert_eq!(cell.population, Some(1));
 }
 
-fn advance_one_week(game: &mut Game) {
+fn advance_one_week(game: &mut SingleRegionTestGame) {
     // Phase A time cadence moved population growth from every tick to the weekly boundary.
     for _ in 0..24 * 7 {
         assert!(game.tick().success);

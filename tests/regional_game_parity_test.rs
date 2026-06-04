@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::core::regional_game::{RegionalGame, RegionalGameView};
 use small_city::core::regions::{RegionId, RegionState};
 use small_city::interface::events::GameEventView;
@@ -23,7 +23,7 @@ enum ScriptStep {
 
 #[test]
 fn single_region_facade_matches_game_view_after_each_script_step() {
-    let mut game = Game::new(6, 5);
+    let mut game = SingleRegionTestGame::new(6, 5);
     let regional = RegionalGame::from_regions(vec![RegionState::new(REGION_ID, 6, 5)]).unwrap();
 
     assert_views_match("initial state", &game.view(), &regional.view().unwrap());
@@ -49,7 +49,7 @@ fn single_region_facade_matches_game_view_after_each_script_step() {
 
 #[test]
 fn single_region_facade_overlay_views_match_game() {
-    let mut game = Game::new(6, 5);
+    let mut game = SingleRegionTestGame::new(6, 5);
     let regional = RegionalGame::from_regions(vec![RegionState::new(REGION_ID, 6, 5)]).unwrap();
 
     for step in script() {
@@ -69,7 +69,7 @@ fn single_region_facade_overlay_views_match_game() {
 
 #[test]
 fn single_region_facade_tick_summary_matches_game_for_visible_metrics() {
-    let mut game = Game::new(5, 4);
+    let mut game = SingleRegionTestGame::new(5, 4);
     let regional = RegionalGame::from_regions(vec![RegionState::new(REGION_ID, 5, 4)]).unwrap();
 
     for (x, y, kind) in [
@@ -131,7 +131,11 @@ fn script() -> Vec<ScriptStep> {
     steps
 }
 
-fn apply_step_with_result_assertions(game: &mut Game, regional: &RegionalGame, step: ScriptStep) {
+fn apply_step_with_result_assertions(
+    game: &mut SingleRegionTestGame,
+    regional: &RegionalGame,
+    step: ScriptStep,
+) {
     match step {
         ScriptStep::Build(x, y, kind) => {
             assert_eq!(
@@ -170,7 +174,7 @@ fn apply_step_with_result_assertions(game: &mut Game, regional: &RegionalGame, s
 }
 
 fn apply_step_without_result_assertions(
-    game: &mut Game,
+    game: &mut SingleRegionTestGame,
     regional: &RegionalGame,
     step: ScriptStep,
 ) {
@@ -223,7 +227,7 @@ fn assert_views_match(context: &str, game_view: &GameView, regional_view: &Regio
     );
 }
 
-fn assert_inspect_views_match(context: &str, game: &Game, regional: &RegionalGame) {
+fn assert_inspect_views_match(context: &str, game: &SingleRegionTestGame, regional: &RegionalGame) {
     for (x, y) in [(0, 0), (1, 1), (2, 0), (4, 1), (5, 4)] {
         assert_eq!(
             regional.inspect_region(REGION_ID, x, y).unwrap(),

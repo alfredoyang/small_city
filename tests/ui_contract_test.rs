@@ -1,11 +1,11 @@
-//! UI boundary contract tests ensuring the ASCII UI uses public view models and Game APIs.
+//! UI boundary contract tests ensuring the ASCII UI uses public view models and facades.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
 
-use common::{Game, write_legacy_single_city_save};
+use common::{SingleRegionTestGame, write_legacy_single_city_save};
 use small_city::core::regional_game::RegionalGame;
 use small_city::core::regions::{RegionId, RegionState};
 use small_city::interface::input::{BuildingKind, MapOverlayInput, UiCommand, parse_command};
@@ -14,7 +14,7 @@ use small_city::ui::city_driver::{CityDriver, CityLaunchMode};
 
 #[test]
 fn game_view_contains_width_times_height_cells() {
-    let game = Game::new(4, 3);
+    let game = SingleRegionTestGame::new(4, 3);
     let view = game.view();
 
     assert_eq!(view.map.cells.len(), 12);
@@ -22,7 +22,7 @@ fn game_view_contains_width_times_height_cells() {
 
 #[test]
 fn map_overlays_return_width_times_height_cells() {
-    let game = Game::new(4, 3);
+    let game = SingleRegionTestGame::new(4, 3);
 
     for overlay in [
         MapOverlayInput::Normal,
@@ -41,7 +41,7 @@ fn map_overlays_return_width_times_height_cells() {
 
 #[test]
 fn power_overlay_shows_powered_road_network() {
-    let mut game = Game::new(7, 7);
+    let mut game = SingleRegionTestGame::new(7, 7);
     assert!(game.build(3, 3, BuildingKind::PowerPlant).success);
     assert!(game.build(3, 2, BuildingKind::Road).success);
     assert!(game.build(3, 1, BuildingKind::Road).success);
@@ -59,7 +59,7 @@ fn power_overlay_shows_powered_road_network() {
 
 #[test]
 fn empty_cells_are_buildable() {
-    let game = Game::new(2, 2);
+    let game = SingleRegionTestGame::new(2, 2);
     let cell = game.inspect(1, 1).cell.expect("cell");
 
     assert!(cell.buildable);
@@ -67,7 +67,7 @@ fn empty_cells_are_buildable() {
 
 #[test]
 fn occupied_cells_are_not_buildable() {
-    let mut game = Game::new(2, 2);
+    let mut game = SingleRegionTestGame::new(2, 2);
     assert!(game.build(1, 1, BuildingKind::Road).success);
     let cell = game.inspect(1, 1).cell.expect("cell");
 
@@ -76,7 +76,7 @@ fn occupied_cells_are_not_buildable() {
 
 #[test]
 fn residential_cell_view_includes_population_data() {
-    let mut game = Game::new(2, 2);
+    let mut game = SingleRegionTestGame::new(2, 2);
     assert!(game.build(1, 1, BuildingKind::Residential).success);
     let cell = game.inspect(1, 1).cell.expect("cell");
 
@@ -86,7 +86,7 @@ fn residential_cell_view_includes_population_data() {
 
 #[test]
 fn cell_view_includes_road_connected_status_for_non_road_buildings() {
-    let mut game = Game::new(3, 3);
+    let mut game = SingleRegionTestGame::new(3, 3);
     assert!(game.build(1, 1, BuildingKind::Residential).success);
     assert!(game.build(1, 2, BuildingKind::Road).success);
 
@@ -97,7 +97,7 @@ fn cell_view_includes_road_connected_status_for_non_road_buildings() {
 
 #[test]
 fn city_status_view_includes_demand_data() {
-    let game = Game::new(2, 2);
+    let game = SingleRegionTestGame::new(2, 2);
     let demand = game.view().status.demand;
 
     assert_eq!(
@@ -110,7 +110,7 @@ fn city_status_view_includes_demand_data() {
 
 #[test]
 fn ui_contract_returns_game_view_not_world() {
-    let game = Game::new(2, 2);
+    let game = SingleRegionTestGame::new(2, 2);
     let _: GameView = game.view();
 }
 
@@ -186,7 +186,7 @@ fn tui_does_not_import_ecs_internals() {
 }
 
 #[test]
-fn ascii_ui_save_load_uses_game_api_only() {
+fn ascii_ui_save_load_uses_facade_only() {
     let source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii ui source");
 
     assert!(source.contains("game.save_to_file"));
@@ -200,7 +200,7 @@ fn ascii_ui_save_load_uses_game_api_only() {
 }
 
 #[test]
-fn ascii_ui_replace_and_upgrade_use_game_api_only() {
+fn ascii_ui_replace_and_upgrade_use_facade_only() {
     let source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii ui source");
 
     assert!(source.contains(".replace("));

@@ -2,10 +2,10 @@
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::interface::input::BuildingKind;
 
-fn advance_one_week(game: &mut Game) {
+fn advance_one_week(game: &mut SingleRegionTestGame) {
     // Phase A moved population growth to weekly boundaries, so population tests
     // advance through one in-game week before asserting growth.
     for _ in 0..24 * 7 {
@@ -15,7 +15,7 @@ fn advance_one_week(game: &mut Game) {
 
 #[test]
 fn residential_next_to_powered_road_network_becomes_powered() {
-    let mut game = Game::new(5, 5);
+    let mut game = SingleRegionTestGame::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);
@@ -31,7 +31,7 @@ fn residential_next_to_powered_road_network_becomes_powered() {
 
 #[test]
 fn residential_inside_old_radius_without_road_network_is_not_powered() {
-    let mut game = Game::new(5, 5);
+    let mut game = SingleRegionTestGame::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
 
@@ -45,7 +45,7 @@ fn residential_inside_old_radius_without_road_network_is_not_powered() {
 
 #[test]
 fn power_plant_not_adjacent_to_road_supplies_no_consumers() {
-    let mut game = Game::new(5, 5);
+    let mut game = SingleRegionTestGame::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(2, 1, BuildingKind::Road).success);
     assert!(game.build(2, 0, BuildingKind::Residential).success);
@@ -65,7 +65,7 @@ fn power_plant_not_adjacent_to_road_supplies_no_consumers() {
 
 #[test]
 fn disconnected_road_networks_do_not_share_power() {
-    let mut game = Game::new(6, 5);
+    let mut game = SingleRegionTestGame::new(6, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
     assert!(game.build(4, 1, BuildingKind::Road).success);
@@ -81,7 +81,7 @@ fn disconnected_road_networks_do_not_share_power() {
 
 #[test]
 fn multiple_power_plants_on_same_network_combine_capacity() {
-    let mut game = Game::new(8, 4);
+    let mut game = SingleRegionTestGame::new(8, 4);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(0, 2, BuildingKind::PowerPlant).success);
     for x in 0..5 {
@@ -108,7 +108,7 @@ fn multiple_power_plants_on_same_network_combine_capacity() {
 
 #[test]
 fn over_capacity_network_powers_consumers_by_position_order() {
-    let mut game = Game::new(7, 4);
+    let mut game = SingleRegionTestGame::new(7, 4);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     for x in 0..6 {
         assert!(game.build(x, 1, BuildingKind::Road).success);
@@ -140,7 +140,7 @@ fn over_capacity_network_powers_consumers_by_position_order() {
 
 #[test]
 fn population_only_grows_when_powered_by_network() {
-    let mut game = Game::new(5, 5);
+    let mut game = SingleRegionTestGame::new(5, 5);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(0, 1, BuildingKind::Road).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);

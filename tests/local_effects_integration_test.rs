@@ -4,12 +4,12 @@ use std::path::PathBuf;
 
 mod common;
 
-use common::Game;
+use common::SingleRegionTestGame;
 use small_city::interface::input::{BuildingKind, MapOverlayInput};
 
 #[test]
 fn parks_improve_nearby_desirability() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(2, 2, BuildingKind::Park).success);
 
     let near = game.inspect(2, 1).local_effects.expect("near effects");
@@ -21,7 +21,7 @@ fn parks_improve_nearby_desirability() {
 
 #[test]
 fn industrial_lowers_nearby_desirability() {
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(2, 2, BuildingKind::Industrial).success);
 
     let near = game.inspect(2, 1).local_effects.expect("near effects");
@@ -34,11 +34,11 @@ fn industrial_lowers_nearby_desirability() {
 
 #[test]
 fn residential_near_park_grows_better_than_residential_near_industrial() {
-    let mut park_city = Game::new(10, 10);
+    let mut park_city = SingleRegionTestGame::new(10, 10);
     build_powered_high_job_city(&mut park_city, 3, 0);
     assert!(park_city.build(3, 2, BuildingKind::Park).success);
 
-    let mut industrial_city = Game::new(10, 10);
+    let mut industrial_city = SingleRegionTestGame::new(10, 10);
     build_powered_high_job_city(&mut industrial_city, 3, 0);
     assert!(
         industrial_city
@@ -68,7 +68,7 @@ fn residential_near_park_grows_better_than_residential_near_industrial() {
 
 #[test]
 fn land_value_overlay_returns_width_times_height_cells() {
-    let game = Game::new(4, 3);
+    let game = SingleRegionTestGame::new(4, 3);
 
     let land_value = game.view_with_overlay(MapOverlayInput::LandValue);
     let desirability = game.view_with_overlay(MapOverlayInput::Desirability);
@@ -86,13 +86,13 @@ fn land_value_overlay_returns_width_times_height_cells() {
 #[test]
 fn save_load_preserves_behavior_after_derived_effects_are_refreshed() {
     let path = temp_save_path("small_city_v03_local_effects_roundtrip.json");
-    let mut game = Game::new(10, 10);
+    let mut game = SingleRegionTestGame::new(10, 10);
     build_powered_high_job_city(&mut game, 3, 0);
     assert!(game.build(3, 2, BuildingKind::Park).success);
     advance_one_week(&mut game);
     game.save_to_file(&path).expect("save city");
 
-    let mut loaded = Game::load_from_file(&path).expect("load city");
+    let mut loaded = SingleRegionTestGame::load_from_file(&path).expect("load city");
     let _ = std::fs::remove_file(&path);
 
     let before = loaded
@@ -112,7 +112,7 @@ fn save_load_preserves_behavior_after_derived_effects_are_refreshed() {
 
 #[test]
 fn long_city_growth_favors_high_desirability_residential_over_low_desirability() {
-    let mut game = Game::new(12, 8);
+    let mut game = SingleRegionTestGame::new(12, 8);
     build_two_neighborhood_city(&mut game);
 
     let park_side = game.inspect(2, 0).local_effects.expect("park-side effects");
@@ -159,7 +159,7 @@ fn long_city_growth_favors_high_desirability_residential_over_low_desirability()
 #[test]
 fn long_layout_mutations_refresh_local_effects_and_continue_after_save_load() {
     let path = temp_save_path("small_city_v03_long_local_effects_roundtrip.json");
-    let mut game = Game::new(10, 8);
+    let mut game = SingleRegionTestGame::new(10, 8);
     build_industrial_blocked_city(&mut game);
 
     let blocked_effects = game
@@ -187,7 +187,8 @@ fn long_layout_mutations_refresh_local_effects_and_continue_after_save_load() {
 
     game.save_to_file(&path)
         .expect("save mutated local effects city");
-    let mut loaded = Game::load_from_file(&path).expect("load mutated local effects city");
+    let mut loaded =
+        SingleRegionTestGame::load_from_file(&path).expect("load mutated local effects city");
     let _ = std::fs::remove_file(&path);
 
     let loaded_effects = loaded
@@ -208,7 +209,11 @@ fn long_layout_mutations_refresh_local_effects_and_continue_after_save_load() {
     );
 }
 
-fn build_powered_high_job_city(game: &mut Game, residential_x: usize, residential_y: usize) {
+fn build_powered_high_job_city(
+    game: &mut SingleRegionTestGame,
+    residential_x: usize,
+    residential_y: usize,
+) {
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(
         game.build(residential_x, residential_y, BuildingKind::Residential)
@@ -222,11 +227,11 @@ fn build_powered_high_job_city(game: &mut Game, residential_x: usize, residentia
     }
 }
 
-fn advance_one_week(game: &mut Game) {
+fn advance_one_week(game: &mut SingleRegionTestGame) {
     advance_weeks(game, 1);
 }
 
-fn advance_weeks(game: &mut Game, weeks: usize) {
+fn advance_weeks(game: &mut SingleRegionTestGame, weeks: usize) {
     // Phase A time cadence moved population growth from every tick to the
     // weekly boundary, so growth assertions advance by explicit weeks.
     for _ in 0..24 * 7 * weeks {
@@ -234,7 +239,7 @@ fn advance_weeks(game: &mut Game, weeks: usize) {
     }
 }
 
-fn build_two_neighborhood_city(game: &mut Game) {
+fn build_two_neighborhood_city(game: &mut SingleRegionTestGame) {
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     for x in 0..=9 {
         assert!(game.build(x, 1, BuildingKind::Road).success);
@@ -248,7 +253,7 @@ fn build_two_neighborhood_city(game: &mut Game) {
     assert!(game.build(7, 0, BuildingKind::Industrial).success);
 }
 
-fn build_industrial_blocked_city(game: &mut Game) {
+fn build_industrial_blocked_city(game: &mut SingleRegionTestGame) {
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     for x in 0..=5 {
         assert!(game.build(x, 1, BuildingKind::Road).success);
