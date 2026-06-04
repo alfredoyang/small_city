@@ -11,7 +11,7 @@ Inside one region, behavior can remain deterministic and single-threaded:
 - The region owns its local ECS world.
 - Local systems update in a fixed order.
 - Local citizens, buildings, roads, money, power, and other authoritative state belong to that region.
-- The UI still reads through the `Game` API and view models, not directly from ECS internals.
+- The UI reads through a facade and view models, not directly from ECS internals.
 
 Between regions, behavior can be eventually consistent:
 

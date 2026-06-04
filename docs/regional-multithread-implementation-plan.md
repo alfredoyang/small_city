@@ -1,8 +1,9 @@
 # Regional Multithread Implementation Plan
 
 This document turns the regional threading design notes into a small,
-human-reviewable implementation sequence. It is a plan only; it does not change
-the current single-region game behavior.
+human-reviewable implementation sequence. Earlier patch descriptions preserve
+the historical migration context; the current UI path now runs through the
+regional facade by default.
 
 Related design notes:
 
@@ -13,7 +14,7 @@ Related design notes:
 
 ## Guiding Rules
 
-- Keep the current `Game` API as the public boundary.
+- Keep `RegionalGame` and UI-safe view models as the public boundary.
 - Do not expose `World` to UI, worker, or coordinator code.
 - Keep each region authoritative over its own local simulation state.
 - Keep local simulation deterministic: stable event order, fixed system order,
@@ -29,9 +30,9 @@ Related design notes:
 The final shape should be:
 
 ```text
-Game API
-  owns current single-city behavior
-  later owns or delegates to a regional simulation facade
+RegionalGame facade
+  owns/delegates to the regional runner
+  exposes UI-safe commands, snapshots, inspect results, and save/load
 
 RegionRuntime
   owns one RegionState
@@ -102,8 +103,8 @@ Review focus:
 
 ## Patch 2: Region State Wrapper
 
-Goal: introduce a region-owned state wrapper while preserving the existing
-single-city `Game` API.
+Goal: introduce a region-owned state wrapper while preserving the then-existing
+single-city facade during migration.
 
 Likely files:
 
@@ -121,16 +122,16 @@ Implementation:
   - `view`
   - `inspect`
 - Move the current deterministic tick sequence behind a reusable internal helper
-  so `Game::tick` and `RegionState::tick_local` use the same order.
+  so the facade tick path and `RegionState::tick_local` use the same order.
 - Keep `World` private to core internals.
 - Do not change UI code.
 
 Tests:
 
-- `RegionState::tick_local` advances the same deterministic state as
-  `Game::tick` for a simple city
+- `RegionState::tick_local` advances the same deterministic state as the facade
+  tick path for a simple city
 - imported offer processing does not expose or mutate another region's state
-- `Game::view` and `Game::inspect` still use UI-safe view models
+- facade view and inspect operations still use UI-safe view models
 
 Review focus:
 
@@ -325,7 +326,7 @@ Implementation:
 - Spawn worker threads that each own one `RegionWorker`.
 - Keep `RegionHandle` as the only cross-thread send surface.
 - Keep message types `Send + 'static`.
-- Do not connect this to the default `Game` API yet unless there is a separate
+- Do not connect this to the UI-facing facade yet unless there is a separate
   reviewed mission for a regional game facade.
 
 Tests:
@@ -539,7 +540,7 @@ and roughly five files or 400 lines per patch.
 
 Sequencing rationale: the command path (Patch 12) must come first because every
 later step depends on a player being able to act on a region. View parity
-(Patch 13) proves the regional path matches `Game` before any UI sees it.
+(Patch 13) proves the regional path matches the prior single-city behavior.
 Save/load (Patch 14) protects player progress. Only then is it safe to point the
 UI at the facade (Patch 15) and make a second region reachable in play
 (Patch 16).
@@ -547,7 +548,7 @@ UI at the facade (Patch 15) and make a second region reachable in play
 ## Patch 12: Regional Command Path
 
 Goal: let a player act on one region through the facade with the same command
-surface the single-city `Game` already exposes. This is the missing player-action
+surface the game already exposes. This is the missing player-action
 layer and the first step toward real gameplay.
 
 Likely files:
@@ -560,7 +561,7 @@ Likely files:
 
 Implementation:
 
-- Add `RegionState` command methods that mirror `Game`: `build`, `preview_build`,
+- Add `RegionState` command methods for `build`, `preview_build`,
   `bulldoze`, `replace`, `upgrade`. Reuse the existing core systems; do not fork
   building logic.
 - Add an owned `RegionCommand` request type in `regional_types` covering build,
@@ -584,7 +585,7 @@ Tests:
 - a build command applied to a region changes only that region's view
 - preview returns owned data and does not mutate the region
 - bulldoze, replace, and upgrade route through the facade and produce the same
-  `CommandResult` shape as `Game`
+  `CommandResult` shape as the prior facade
 - a command for an unknown region returns a deterministic error
 - command payloads and replies are owned and expose no ECS internals
 - commands and ticks on one region are processed in a deterministic order
@@ -599,7 +600,7 @@ Review focus:
 ## Patch 13: Regional View Parity
 
 Goal: prove that driving a single region through the regional path produces the
-same player-visible state as the single-city `Game`, before any UI migration.
+same player-visible state as the prior single-city path, before any UI migration.
 
 Likely files:
 
@@ -609,7 +610,7 @@ Likely files:
 Implementation:
 
 - Add a deterministic scripted sequence of commands and ticks.
-- Run it through `Game` and through a single-region `RegionalGame`.
+- Run it through the prior single-city facade and through a single-region `RegionalGame`.
 - Compare resulting `GameView` values turn for turn and after each command.
 - Add `view_with_overlay` parity once the overlay path exists on the facade. If
   overlays are not yet exposed, add the facade overlay method here as a small,
@@ -617,15 +618,15 @@ Implementation:
 
 Tests:
 
-- identical command and tick scripts yield identical views from `Game` and the
-  single-region facade
+- identical command and tick scripts yield identical views from the prior path
+  and the single-region facade
 - divergence anywhere in the script fails loudly with the first differing turn
 - overlay views match when overlays are exposed
 
 Review focus:
 
 - The parity test is strict and deterministic.
-- Any facade additions stay minimal and do not change `Game` behavior.
+- Any facade additions stay minimal and do not change existing behavior.
 
 ## Patch 14: Regional Save And Load
 
@@ -663,7 +664,7 @@ Review focus:
 
 ## Patch 15: UI On The Regional Facade Behind A Flag
 
-Goal: let the terminal UI run on the regional facade without removing the working
+Goal: let the terminal UI run on the regional facade without removing the then-working
 single-city path, so the migration is reversible.
 
 Likely files:
@@ -675,25 +676,25 @@ Likely files:
 Implementation:
 
 - Add a launch mode, for example `cargo run -- regional`, that drives a
-  single-region `RegionalGame`. Keep `cargo run` on `Game` as the default and the
-  fallback.
+  single-region `RegionalGame`. At this historical step, keep `cargo run` on the
+  old default path as the fallback.
 - Render only from view models. The UI must not import worker, runtime, or
   `World` types.
 - Map existing UI inputs to facade commands and snapshot requests.
 - Do not flip the default to regional and do not add a second player-visible
-  region in this patch.
+  region in this historical patch.
 
 Tests:
 
 - a UI boundary test drives the regional mode through facade commands and view
   snapshots only
 - the UI builds no dependency on ECS, worker, or runtime types
-- the default `Game` path is unchanged
+- the default path is unchanged
 
 Review focus:
 
 - UI talks only to `RegionalGame`.
-- The single-city path still works and remains the default.
+- The old path still works at this migration step.
 - Every new public view path has a boundary test.
 
 ## Patch 16: Multi-Region Play
@@ -717,7 +718,8 @@ Implementation:
 - Surface cross-region imported resources in the view models so their effect is
   visible, reusing the propagation already built in Patches 1 and 4.
 - Only after this path is stable, consider flipping the default launch mode to
-  regional in a separate reviewed change.
+  regional in a separate reviewed change. That later removal is tracked in
+  `docs/remove-old-single-thread-architecture-plan.md`.
 
 Tests:
 

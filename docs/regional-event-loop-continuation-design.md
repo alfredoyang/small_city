@@ -23,7 +23,7 @@ This is a design note only. It does not change the current single-region game.
 - Messages contain owned data, IDs, and compact resource summaries.
 - Messages do not contain references to `World`, entities from another region,
   or UI state.
-- The UI still uses only the public `Game` API and view models.
+- The UI uses only public facades and view models.
 - Cross-region imported resources are treated as rebuildable cache, not
   permanent authoritative state.
 

@@ -1,10 +1,14 @@
 # Remove Old Single-Thread Architecture Plan
 
-This plan retires the old UI-facing single-city `Game` execution path after the
+This completed plan retires the old UI-facing single-city `Game` execution path after the
 regional runtime is ready to become the default. The goal is not to delete the
 deterministic simulation systems. Those systems remain the core rules. The goal
 is to remove the duplicate frontend/backend path where UI can still drive
 `Game` directly instead of the regional facade.
+
+Status: complete. The production `Game` facade has been removed, terminal UIs
+run through `CityDriver` backed by `RegionalGame`, and legacy single-city saves
+load through the regional loader.
 
 ## Goals
 
@@ -26,20 +30,15 @@ is to remove the duplicate frontend/backend path where UI can still drive
 - Do not change regional imported resources from visibility-only cache into full
   economy inputs in this cleanup.
 
-## Current Blockers
+## Resolved Blockers
 
-- Default launch still uses the old single-city path.
-- `CityDriver` still owns both `SingleCity(Box<Game>)` and
-  `RegionalMultiRegion(Box<RegionalGame>)`.
-- `RegionalGame::tick_selected_region` fabricates a minimal turn-advanced result
-  instead of returning the real tick `CommandResult`.
-- Single-city save/load still uses `Game::load_from_file` in the UI driver.
-- The regional path still imports shared simulation helpers from
-  `src/core/game.rs`: `RegionState::tick_local` uses `tick_world`, and region
-  command methods use `refresh_derived_state_for_world`. Deleting or heavily
-  shrinking `game.rs` is blocked until those helpers move into a neutral core
-  module.
-- Many tests still use `Game` as the primary behavior surface.
+- Default launch uses the regional path.
+- `CityDriver` owns one regional backend path.
+- Regional ticks return real `CommandResult` data from the region runtime.
+- Save/load uses `RegionalGame::load_from_file`, including legacy single-city
+  conversion.
+- Shared simulation helpers live in `src/core/simulation.rs`.
+- Production `src/core/game.rs` has been removed.
 
 ## Patch 18: Regional Tick Result Parity
 
@@ -291,14 +290,18 @@ Review focus:
 - Docs match actual launch behavior.
 - Removed docs are truly stale, not still useful design rationale.
 
+Status: complete. README launch and architecture sections now describe the
+regional facade as the default path, and this plan records the completed removal
+state.
+
 ## Final Removal Checklist
 
-- `cargo run` launches the regional path by default.
-- ASCII and ratatui frontends share one regional driver path.
-- UI modules do not import `Game`, ECS, worker, or runtime internals.
-- Regional tick returns real `CommandResult` data.
-- Existing single-city saves load through the regional path.
-- Multi-region saves still round trip.
-- Parity tests cover the single-region regional path against the old behavior
-  until `Game` is retired or re-scoped.
-- `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` pass.
+- [x] `cargo run` launches the regional path by default.
+- [x] ASCII and ratatui frontends share one regional driver path.
+- [x] UI modules do not import `Game`, ECS, worker, or runtime internals.
+- [x] Regional tick returns real `CommandResult` data.
+- [x] Existing single-city saves load through the regional path.
+- [x] Multi-region saves still round trip.
+- [x] Production `Game` has been removed; remaining single-region behavioral
+  coverage uses the regional facade or test-only wrappers over it.
+- [x] `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` pass.
