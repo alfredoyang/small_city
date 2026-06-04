@@ -106,16 +106,65 @@ fn saved_regional_game_can_continue_after_safe_point_restart() {
 }
 
 #[test]
-fn existing_single_city_saves_remain_loadable() {
+fn regional_loader_accepts_existing_single_city_save() {
     let path = save_path("single-city-compatible");
     let mut game = Game::new(3, 3);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Road).success);
     game.save_to_file(&path).unwrap();
 
-    let loaded = Game::load_from_file(&path).unwrap();
+    let loaded = RegionalGame::load_from_file(&path).unwrap();
+    let converted_view = loaded.selected_region_view().unwrap();
 
-    assert_eq!(loaded.view(), game.view());
+    assert_eq!(loaded.selected_region().unwrap(), RegionId(1));
+    assert_eq!(converted_view, game.view());
+    remove_save_file(path);
+}
+
+#[test]
+fn converted_single_city_save_can_continue_and_roundtrip_as_regional_save() {
+    let legacy_path = save_path("single-city-continues");
+    let regional_path = save_path("converted-regional-roundtrip");
+    let mut legacy = Game::new(4, 3);
+    assert!(legacy.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(legacy.build(1, 0, BuildingKind::Road).success);
+    assert!(legacy.build(1, 1, BuildingKind::Residential).success);
+    legacy.save_to_file(&legacy_path).unwrap();
+
+    let converted = RegionalGame::load_from_file(&legacy_path).unwrap();
+    let before_turn = converted.selected_region_view().unwrap().status.turn;
+
+    assert!(
+        converted
+            .build(RegionId(1), 2, 1, BuildingKind::Commercial)
+            .unwrap()
+            .success
+    );
+    converted.tick_region(RegionId(1)).unwrap();
+    let after_continue = converted.selected_region_view().unwrap();
+
+    assert_eq!(after_continue.status.turn, before_turn + 1);
+    assert_eq!(
+        cell_building(&after_continue, 2, 1),
+        Some(BuildingKind::Commercial)
+    );
+
+    converted.save_to_file(&regional_path).unwrap();
+    let reloaded = RegionalGame::load_from_file(&regional_path).unwrap();
+
+    assert_eq!(reloaded.selected_region_view().unwrap(), after_continue);
+    remove_save_file(legacy_path);
+    remove_save_file(regional_path);
+}
+
+#[test]
+fn regional_loader_reports_invalid_save_format_deterministically() {
+    let path = save_path("regional-invalid-json");
+    std::fs::write(&path, "not valid json").expect("write invalid save file");
+
+    let result = RegionalGame::load_from_file(&path);
+
+    assert!(matches!(result, Err(RegionalGameSaveError::SaveFormat(_))));
     remove_save_file(path);
 }
 

@@ -498,9 +498,8 @@ impl RegionalGame {
     }
 
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, RegionalGameSaveError> {
-        let file = File::open(path)?;
-        let save = serde_json::from_reader(file)?;
-        Self::from_save(save).map_err(RegionalGameSaveError::from)
+        let bytes = std::fs::read(path)?;
+        Self::from_save_bytes(&bytes)
     }
 
     fn from_save(save: RegionalGameSave) -> Result<Self, RegionalGameError> {
@@ -512,6 +511,25 @@ impl RegionalGame {
         let mut game = Self::from_regions(regions)?;
         game.selected_region = save.selected_region;
         Ok(game)
+    }
+
+    fn from_save_bytes(bytes: &[u8]) -> Result<Self, RegionalGameSaveError> {
+        match serde_json::from_slice::<RegionalGameSave>(bytes) {
+            Ok(save) => Self::from_save(save).map_err(RegionalGameSaveError::from),
+            Err(regional_error) => match Self::from_legacy_world_bytes(bytes) {
+                Ok(game) => Ok(game),
+                Err(RegionalGameSaveError::SaveFormat(_)) => {
+                    Err(RegionalGameSaveError::SaveFormat(regional_error))
+                }
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+    fn from_legacy_world_bytes(bytes: &[u8]) -> Result<Self, RegionalGameSaveError> {
+        let region = RegionState::from_legacy_world_bytes(DEFAULT_SINGLE_REGION_ID, bytes)
+            .map_err(RegionalGameSaveError::SaveFormat)?;
+        Self::from_regions(vec![region]).map_err(RegionalGameSaveError::from)
     }
 
     fn recover_save_failure(

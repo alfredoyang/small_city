@@ -560,12 +560,23 @@ impl RegionState {
     }
 
     pub(crate) fn from_save_record(record: RegionStateSaveRecord) -> Self {
-        let mut world = record.world;
+        Self::from_world(record.id, record.world)
+    }
+
+    pub(crate) fn from_legacy_world_bytes(
+        id: RegionId,
+        bytes: &[u8],
+    ) -> Result<Self, serde_json::Error> {
+        let world = serde_json::from_slice(bytes)?;
+        Ok(Self::from_world(id, world))
+    }
+
+    pub(crate) fn from_world(id: RegionId, mut world: World) -> Self {
         world.rebuild_entity_records();
         refresh_derived_state_for_world(&mut world);
 
         let mut state = Self {
-            id: record.id,
+            id,
             world,
             imported_resources: ImportedResourceCache::new(),
             neighbor_import_results: Vec::new(),
