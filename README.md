@@ -73,6 +73,7 @@ Space                   pause/resume automatic ticks in TUI
 -                       decrease TUI run speed down to 1x
 V                       cycle overlay in ASCII UI
 O                       cycle overlay in TUI
+T                       cycle tile theme in TUI
 H                       open help screen in TUI
 S                       prompt for save filename
 L                       prompt for load filename
@@ -93,7 +94,8 @@ T power plant
 P park
 ```
 
-Ratatui TUI map tiles use an ASCII-2 theme by default. Every map cell is a fixed two-character tile:
+Ratatui TUI map tiles use the Unicode theme by default when the terminal locale supports UTF-8,
+falling back to ASCII-2 otherwise. Every map cell is a fixed two-character tile:
 
 ```text
 .. empty

@@ -1,5 +1,6 @@
 //! Panel-based ratatui terminal frontend built only from facade view models.
 
+use std::env;
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
@@ -55,7 +56,7 @@ impl Default for TuiState {
             cursor_y: 0,
             selected_build: BuildingKind::Residential,
             current_overlay: MapOverlayInput::Normal,
-            tile_theme: TileTheme::AsciiDetailed,
+            tile_theme: default_tile_theme(),
             message: "Tiny City Builder".to_string(),
             region_label: "Region: single city".to_string(),
             is_running: false,
@@ -108,14 +109,38 @@ impl RunSpeed {
 
 /// UI-only map theme. It converts safe interface view models into fixed-width terminal tiles.
 ///
-/// `AsciiDetailed` is the default because every tile is exactly two ASCII characters, which keeps
-/// map rows aligned across terminals. `AsciiCompact` preserves the older one-character language
-/// inside a two-character tile. `Unicode` remains optional and is not the default.
+/// `Unicode` is selected by default when the locale advertises UTF-8 support. Otherwise,
+/// `AsciiDetailed` keeps every tile to exactly two ASCII characters so map rows stay aligned on
+/// constrained terminals. `AsciiCompact` preserves the older one-character language inside a
+/// two-character tile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TileTheme {
     AsciiCompact,
     AsciiDetailed,
     Unicode,
+}
+
+fn default_tile_theme() -> TileTheme {
+    if locale_supports_unicode(current_terminal_locale().as_deref()) {
+        TileTheme::Unicode
+    } else {
+        TileTheme::AsciiDetailed
+    }
+}
+
+fn current_terminal_locale() -> Option<String> {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
+}
+
+fn locale_supports_unicode(locale: Option<&str>) -> bool {
+    let Some(locale) = locale else {
+        return false;
+    };
+    let locale = locale.to_ascii_lowercase();
+
+    locale.contains("utf-8") || locale.contains("utf8")
 }
 
 impl TileTheme {
@@ -296,6 +321,15 @@ impl TuiState {
             MapOverlayInput::Desirability => MapOverlayInput::Normal,
         };
         self.message = format!("Overlay: {}", overlay_label(self.current_overlay));
+    }
+
+    fn cycle_tile_theme(&mut self) {
+        self.tile_theme = match self.tile_theme {
+            TileTheme::AsciiDetailed => TileTheme::AsciiCompact,
+            TileTheme::AsciiCompact => TileTheme::Unicode,
+            TileTheme::Unicode => TileTheme::AsciiDetailed,
+        };
+        self.message = format!("Tile theme: {}", self.tile_theme.label());
     }
 
     fn toggle_run(&mut self) {
@@ -491,6 +525,7 @@ impl TuiRuntime {
             }
             TuiAction::ToggleHelp => self.state.show_help = !self.state.show_help,
             TuiAction::CycleOverlay => self.state.cycle_overlay(),
+            TuiAction::CycleTheme => self.state.cycle_tile_theme(),
             TuiAction::PreviousRegion => {
                 self.state.message = self.game.select_previous_region();
                 self.state.region_label = self.game.region_label();
@@ -934,7 +969,7 @@ fn render_messages(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         simulation_status_line(state),
         Line::from(format_message(&state.message)),
         Line::from(
-            "Space pause/resume | +/- speed | WASD/Arrows move | 1-6 tools | N next | O overlay | [ ] region | H help | Q quit",
+            "Space pause/resume | +/- speed | WASD/Arrows move | 1-6 tools | N next | O overlay | T theme | [ ] region | H help | Q quit",
         ),
     ];
 
@@ -974,7 +1009,10 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  H             Close Help"),
         Line::from("  Q             Quit"),
         Line::from("  Enter at save/load prompt uses city1"),
-        Line::from(format!("  Tile themes   {}", tile_theme_labels())),
+        Line::from(format!(
+            "  T             Cycle tile theme: {}",
+            tile_theme_labels()
+        )),
         Line::from(""),
         help_section("Overlays"),
         Line::from("  O Cycle Overlay"),
@@ -1538,11 +1576,40 @@ mod tests {
     }
 
     #[test]
+    fn tile_theme_cycles_in_display_order() {
+        let mut state = TuiState {
+            tile_theme: TileTheme::AsciiDetailed,
+            ..TuiState::default()
+        };
+
+        state.cycle_tile_theme();
+        assert_eq!(state.tile_theme, TileTheme::AsciiCompact);
+        assert_eq!(state.message, "Tile theme: ASCII Compact");
+
+        state.cycle_tile_theme();
+        assert_eq!(state.tile_theme, TileTheme::Unicode);
+        assert_eq!(state.message, "Tile theme: Unicode");
+
+        state.cycle_tile_theme();
+        assert_eq!(state.tile_theme, TileTheme::AsciiDetailed);
+        assert_eq!(state.message, "Tile theme: ASCII-2");
+    }
+
+    #[test]
+    fn default_theme_uses_unicode_when_locale_supports_utf8() {
+        assert!(locale_supports_unicode(Some("en_US.UTF-8")));
+        assert!(locale_supports_unicode(Some("C.UTF8")));
+        assert!(!locale_supports_unicode(Some("C")));
+        assert!(!locale_supports_unicode(Some("POSIX")));
+        assert!(!locale_supports_unicode(None));
+    }
+
+    #[test]
     fn run_state_defaults_to_paused_and_toggles() {
         let mut state = TuiState::default();
 
         assert!(!state.is_running);
-        assert_eq!(state.tile_theme, TileTheme::AsciiDetailed);
+        assert_eq!(state.tile_theme, default_tile_theme());
         assert_eq!(state.run_speed, RunSpeed::One);
         state.toggle_run();
         assert!(state.is_running);
@@ -2039,6 +2106,23 @@ mod tests {
     }
 
     #[test]
+    fn apply_action_cycles_tile_theme() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.state.tile_theme = TileTheme::AsciiDetailed;
+        runtime.mark_clean();
+
+        assert_eq!(
+            runtime.apply_action(TuiAction::CycleTheme, now),
+            TuiFlow::Continue
+        );
+
+        assert_eq!(runtime.state.tile_theme, TileTheme::AsciiCompact);
+        assert_eq!(runtime.state.message, "Tile theme: ASCII Compact");
+        assert!(runtime.dirty);
+    }
+
+    #[test]
     fn runtime_applies_due_auto_tick_when_running() {
         let now = Instant::now();
         let mut runtime = TuiRuntime::new(now);
@@ -2208,6 +2292,7 @@ mod tests {
         assert!(output.contains("Help"));
         assert!(output.contains("Space         Pause / resume automatic ticks | +/- speed"));
         assert!(output.contains("O Cycle Overlay"));
+        assert!(output.contains("T             Cycle tile theme"));
         assert!(output.contains("Overlay order: Normal -> Power -> Pollution"));
         assert!(output.contains("Normal: .. Empty"));
         assert!(output.contains("Desirability: ! Bad"));
