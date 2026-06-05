@@ -96,6 +96,84 @@ fn cell_view_includes_road_connected_status_for_non_road_buildings() {
 }
 
 #[test]
+fn horizontal_roads_expose_east_west_road_links() {
+    let mut game = SingleRegionTestGame::new(4, 2);
+    assert!(game.build(0, 0, BuildingKind::Road).success);
+    assert!(game.build(1, 0, BuildingKind::Road).success);
+    assert!(game.build(2, 0, BuildingKind::Road).success);
+    let view = game.view();
+
+    assert_eq!(
+        cell(&view, 1, 0).road_links,
+        road_links(false, true, false, true)
+    );
+    assert_eq!(
+        cell(&view, 0, 0).road_links,
+        road_links(false, true, false, false)
+    );
+    assert_eq!(
+        cell(&view, 2, 0).road_links,
+        road_links(false, false, false, true)
+    );
+}
+
+#[test]
+fn corner_road_exposes_perpendicular_links() {
+    let mut game = SingleRegionTestGame::new(3, 3);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 2, BuildingKind::Road).success);
+    let view = game.view();
+
+    assert_eq!(
+        cell(&view, 1, 1).road_links,
+        road_links(false, true, true, false)
+    );
+}
+
+#[test]
+fn intersection_road_exposes_all_four_links() {
+    let mut game = SingleRegionTestGame::new(3, 3);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 0, BuildingKind::Road).success);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 2, BuildingKind::Road).success);
+    assert!(game.build(0, 1, BuildingKind::Road).success);
+    let view = game.view();
+
+    assert_eq!(
+        cell(&view, 1, 1).road_links,
+        road_links(true, true, true, true)
+    );
+}
+
+#[test]
+fn non_road_cells_and_map_edges_do_not_report_invalid_road_links() {
+    let mut game = SingleRegionTestGame::new(3, 3);
+    assert!(game.build(0, 0, BuildingKind::Road).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(2, 2, BuildingKind::Road).success);
+    let view = game.view();
+
+    assert_eq!(
+        cell(&view, 0, 0).road_links,
+        road_links(false, false, false, false)
+    );
+    assert_eq!(
+        cell(&view, 1, 0).road_links,
+        road_links(false, false, false, false)
+    );
+    assert_eq!(
+        cell(&view, 0, 1).road_links,
+        road_links(false, false, false, false)
+    );
+    assert_eq!(
+        cell(&view, 2, 2).road_links,
+        road_links(false, false, false, false)
+    );
+}
+
+#[test]
 fn city_status_view_includes_demand_data() {
     let game = SingleRegionTestGame::new(2, 2);
     let demand = game.view().status.demand;
@@ -369,4 +447,22 @@ fn save_path(name: &str) -> PathBuf {
 
 fn remove_save_file(path: PathBuf) {
     std::fs::remove_file(path).expect("remove save file");
+}
+
+fn cell(view: &GameView, x: usize, y: usize) -> &small_city::interface::view::CellView {
+    &view.map.cells[y * view.map.width + x]
+}
+
+fn road_links(
+    north: bool,
+    east: bool,
+    south: bool,
+    west: bool,
+) -> small_city::interface::view::RoadLinks {
+    small_city::interface::view::RoadLinks {
+        north,
+        east,
+        south,
+        west,
+    }
 }

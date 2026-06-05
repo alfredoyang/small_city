@@ -7,7 +7,7 @@ use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
     BuildOptionView, CellView, CityDemand, CityStatusView, DemandLevel, GameTimeView, GameView,
-    InspectDetailsView, InspectView, LocalEffectsView, MapView, PowerStatusView,
+    InspectDetailsView, InspectView, LocalEffectsView, MapView, PowerStatusView, RoadLinks,
 };
 
 /// Converts the private ECS World into the only render model the UI may consume.
@@ -522,6 +522,7 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
             powered: None,
             power_demand: None,
             road_connected: None,
+            road_links: RoadLinks::default(),
             upgrade_level: None,
             local_effects: local_effects_view(world, x, y),
         };
@@ -555,9 +556,34 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
             (kind != BuildingKind::Road)
                 .then(|| road_connectivity::is_road_connected(world, entity))
         }),
+        road_links: road_links(world, x, y, building),
         upgrade_level: (upgrade_level > 0).then_some(upgrade_level),
         local_effects: local_effects_view(world, x, y),
     }
+}
+
+fn road_links(world: &World, x: usize, y: usize, building: Option<BuildingKind>) -> RoadLinks {
+    if building != Some(BuildingKind::Road) {
+        return RoadLinks::default();
+    }
+
+    RoadLinks {
+        north: y
+            .checked_sub(1)
+            .is_some_and(|north| is_road_at(world, x, north)),
+        east: is_road_at(world, x.saturating_add(1), y),
+        south: is_road_at(world, x, y.saturating_add(1)),
+        west: x
+            .checked_sub(1)
+            .is_some_and(|west| is_road_at(world, west, y)),
+    }
+}
+
+fn is_road_at(world: &World, x: usize, y: usize) -> bool {
+    world
+        .grid
+        .get(x, y)
+        .is_some_and(|entity| road_connectivity::is_road_entity(world, entity))
 }
 
 fn local_effects_view(world: &World, x: usize, y: usize) -> LocalEffectsView {

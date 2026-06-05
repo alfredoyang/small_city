@@ -32,8 +32,18 @@ pub struct CellView {
     pub powered: Option<bool>,
     pub power_demand: Option<i32>,
     pub road_connected: Option<bool>,
+    pub road_links: RoadLinks,
     pub upgrade_level: Option<u8>,
     pub local_effects: LocalEffectsView,
+}
+
+/// Orthogonal road neighbors for a road cell, exposed as derived UI-safe data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RoadLinks {
+    pub north: bool,
+    pub east: bool,
+    pub south: bool,
+    pub west: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

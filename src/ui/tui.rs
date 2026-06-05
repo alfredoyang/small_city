@@ -1898,6 +1898,7 @@ mod tests {
             powered,
             power_demand: powered.map(|_| 1),
             road_connected,
+            road_links: crate::interface::view::RoadLinks::default(),
             upgrade_level,
             local_effects: crate::interface::view::LocalEffectsView {
                 land_value: effect_value,
