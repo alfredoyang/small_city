@@ -1311,18 +1311,54 @@ fn intensity_style(value: i32, kind: IntensityKind) -> Style {
 }
 
 fn cell_base_style(cell: &CellView) -> Style {
-    let mut style = match cell.building {
-        Some(kind) => building_style(kind),
-        None => empty_style(),
+    let Some(kind) = cell.building else {
+        return empty_style();
     };
 
     if matches!(cell.road_connected, Some(false))
         || (matches!(cell.powered, Some(false)) && cell.power_demand.unwrap_or_default() > 0)
     {
-        style = problem_style();
+        return problem_style();
+    }
+
+    let mut style = building_style(kind);
+    if let Some(modifier) = zone_activity_modifier(cell, kind) {
+        style = style.add_modifier(modifier);
     }
 
     style
+}
+
+fn zone_activity_modifier(cell: &CellView, kind: BuildingKind) -> Option<Modifier> {
+    let score = match kind {
+        BuildingKind::Residential => residential_activity_score(cell)?,
+        BuildingKind::Commercial | BuildingKind::Industrial => {
+            commercial_industrial_activity_score(cell)
+        }
+        BuildingKind::Road | BuildingKind::PowerPlant | BuildingKind::Park => return None,
+    };
+
+    match score {
+        i32::MIN..=2 => Some(Modifier::DIM),
+        7..=i32::MAX => Some(Modifier::BOLD),
+        _ => None,
+    }
+}
+
+fn residential_activity_score(cell: &CellView) -> Option<i32> {
+    let population = cell.population?;
+    let max_population = cell.max_population?;
+    if max_population <= 0 {
+        return None;
+    }
+
+    Some((population.clamp(0, max_population) * 10) / max_population)
+}
+
+fn commercial_industrial_activity_score(cell: &CellView) -> i32 {
+    // Core local effects clamp land value to 0..9; normalize it to the same 0..10 score used by
+    // residential occupancy before applying shared style thresholds.
+    (cell.local_effects.land_value.clamp(0, 9) * 10) / 9
 }
 
 fn empty_style() -> Style {
@@ -1699,6 +1735,132 @@ mod tests {
             ),
             " "
         );
+    }
+
+    #[test]
+    fn normal_overlay_styles_residential_activity_intensity() {
+        let low_activity = residential_cell_with_population(1, 10);
+        let high_activity = residential_cell_with_population(9, 10);
+
+        let low_glyph = TileTheme::AsciiDetailed.tile_for_cell(
+            &low_activity,
+            MapOverlayInput::Normal,
+            false,
+            PreviewState::None,
+        );
+        let high_glyph = TileTheme::AsciiDetailed.tile_for_cell(
+            &high_activity,
+            MapOverlayInput::Normal,
+            false,
+            PreviewState::None,
+        );
+        let population_overlay_glyph = TileTheme::AsciiDetailed.tile_for_cell(
+            &high_activity,
+            MapOverlayInput::Population,
+            false,
+            PreviewState::None,
+        );
+
+        assert!(low_glyph.style.add_modifier.contains(Modifier::DIM));
+        assert!(high_glyph.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(low_glyph.style.fg, high_glyph.style.fg);
+        assert!(
+            !population_overlay_glyph
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn normal_overlay_styles_commercial_and_industrial_activity_intensity() {
+        let low_commercial = zone_cell_with_land_value(BuildingKind::Commercial, 'C', 1);
+        let high_commercial = zone_cell_with_land_value(BuildingKind::Commercial, 'C', 8);
+        let high_industrial = zone_cell_with_land_value(BuildingKind::Industrial, 'I', 8);
+
+        let low_commercial_glyph = TileTheme::AsciiDetailed.tile_for_cell(
+            &low_commercial,
+            MapOverlayInput::Normal,
+            false,
+            PreviewState::None,
+        );
+        let high_commercial_glyph = TileTheme::AsciiDetailed.tile_for_cell(
+            &high_commercial,
+            MapOverlayInput::Normal,
+            false,
+            PreviewState::None,
+        );
+        let high_industrial_glyph = TileTheme::AsciiDetailed.tile_for_cell(
+            &high_industrial,
+            MapOverlayInput::Normal,
+            false,
+            PreviewState::None,
+        );
+        let land_value_overlay_glyph = TileTheme::AsciiDetailed.tile_for_cell(
+            &high_commercial,
+            MapOverlayInput::LandValue,
+            false,
+            PreviewState::None,
+        );
+
+        assert!(
+            low_commercial_glyph
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            high_commercial_glyph
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            high_industrial_glyph
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(high_commercial_glyph.style.fg, Some(Color::Yellow));
+        assert_eq!(high_industrial_glyph.style.fg, Some(Color::Magenta));
+        assert!(
+            !land_value_overlay_glyph
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn normal_overlay_keeps_non_zone_building_styles_unchanged() {
+        for (kind, symbol) in [
+            (BuildingKind::Road, '='),
+            (BuildingKind::PowerPlant, 'P'),
+            (BuildingKind::Park, 'P'),
+        ] {
+            let cell = zone_cell_with_land_value(kind, symbol, 9);
+            let glyph = TileTheme::AsciiDetailed.tile_for_cell(
+                &cell,
+                MapOverlayInput::Normal,
+                false,
+                PreviewState::None,
+            );
+
+            assert_eq!(glyph.style, building_style(kind));
+        }
+    }
+
+    #[test]
+    fn normal_overlay_keeps_empty_cell_style_unchanged() {
+        let empty = themed_cell(None, '.', None, None, None, 9);
+        let glyph = TileTheme::AsciiDetailed.tile_for_cell(
+            &empty,
+            MapOverlayInput::Normal,
+            false,
+            PreviewState::None,
+        );
+
+        assert_eq!(glyph.style, empty_style());
     }
 
     #[test]
@@ -2127,6 +2289,19 @@ mod tests {
             south,
             west,
         };
+        cell
+    }
+
+    fn residential_cell_with_population(population: i32, max_population: i32) -> CellView {
+        let mut cell = themed_cell(Some(BuildingKind::Residential), 'R', Some(1), None, None, 0);
+        cell.population = Some(population);
+        cell.max_population = Some(max_population);
+        cell
+    }
+
+    fn zone_cell_with_land_value(kind: BuildingKind, symbol: char, land_value: i32) -> CellView {
+        let mut cell = themed_cell(Some(kind), symbol, Some(1), None, None, 0);
+        cell.local_effects.land_value = land_value;
         cell
     }
 
