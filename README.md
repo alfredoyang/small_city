@@ -114,6 +114,11 @@ In the Unicode theme, roads use two-column box-drawing tiles such as `──`, `
 and `┼─` so connected road networks read as continuous lines. Press `T` to cycle between
 ASCII-2, ASCII Compact, and Unicode.
 
+Unicode building tiles keep the type letter and use block shading for the second column:
+`R░` to `R█` shows residential occupancy, while `C░`/`C▒`/`C▓` and similar tiles show
+commercial, industrial, power plant, and park levels. Problem markers such as `R-` and `C!`
+still take precedence.
+
 Power overlay symbols:
 
 ```text

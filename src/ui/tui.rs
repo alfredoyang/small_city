@@ -1323,11 +1323,8 @@ fn ascii_detailed_normal_tile(cell: &CellView) -> String {
         return "..".to_string();
     };
 
-    if matches!(cell.road_connected, Some(false)) {
-        return format!("{}!", tile_type(cell));
-    }
-    if matches!(cell.powered, Some(false)) && cell.power_demand.unwrap_or_default() > 0 {
-        return format!("{}-", tile_type(cell));
+    if let Some(marker) = building_problem_marker(cell) {
+        return format!("{}{}", tile_type(cell), marker);
     }
 
     match kind {
@@ -1345,10 +1342,15 @@ fn unicode_normal_tile(cell: &CellView) -> String {
         return unicode_road_tile(cell);
     }
 
-    match ascii_detailed_normal_tile(cell).as_str() {
-        ".." => "..".to_string(),
-        tile => tile.to_string(),
+    let Some(kind) = cell.building else {
+        return "..".to_string();
+    };
+
+    if building_problem_marker(cell).is_some() {
+        return ascii_detailed_normal_tile(cell);
     }
+
+    format!("{}{}", tile_type(cell), unicode_building_shade(cell, kind))
 }
 
 fn unicode_road_tile(cell: &CellView) -> String {
@@ -1384,6 +1386,50 @@ fn unicode_road_tile(cell: &CellView) -> String {
 
 fn any_road_link(links: crate::interface::view::RoadLinks) -> bool {
     links.north || links.east || links.south || links.west
+}
+
+fn building_problem_marker(cell: &CellView) -> Option<char> {
+    if matches!(cell.road_connected, Some(false)) {
+        Some('!')
+    } else if matches!(cell.powered, Some(false)) && cell.power_demand.unwrap_or_default() > 0 {
+        Some('-')
+    } else {
+        None
+    }
+}
+
+fn unicode_building_shade(cell: &CellView, kind: BuildingKind) -> char {
+    match kind {
+        BuildingKind::Residential => unicode_residential_occupancy_shade(cell),
+        BuildingKind::Commercial
+        | BuildingKind::Industrial
+        | BuildingKind::PowerPlant
+        | BuildingKind::Park => unicode_level_shade(cell.upgrade_level.unwrap_or(1)),
+        BuildingKind::Road => '░',
+    }
+}
+
+fn unicode_residential_occupancy_shade(cell: &CellView) -> char {
+    let population = cell.population.unwrap_or_default().max(0) as i64;
+    let max_population = cell.max_population.unwrap_or_default().max(0) as i64;
+
+    if population == 0 || max_population == 0 {
+        '░'
+    } else if population >= max_population {
+        '█'
+    } else if population * 2 < max_population {
+        '▒'
+    } else {
+        '▓'
+    }
+}
+
+fn unicode_level_shade(level: u8) -> char {
+    match level {
+        0 | 1 => '░',
+        2 => '▒',
+        _ => '▓',
+    }
 }
 
 fn tile_type(cell: &CellView) -> char {
@@ -1920,7 +1966,7 @@ mod tests {
             );
 
             assert_eq!(glyph.tile.chars().count(), 2);
-            assert!(glyph.tile.chars().all(is_allowed_road_tile_char));
+            assert!(glyph.tile.chars().all(is_allowed_unicode_road_char));
         }
     }
 
@@ -1940,6 +1986,172 @@ mod tests {
                 .tile,
             "=."
         );
+    }
+
+    #[test]
+    fn unicode_residential_tiles_show_occupancy_buckets() {
+        let cases = [
+            (residential_cell_with_population(0, 10), "R░"),
+            (residential_cell_with_population(1, 10), "R▒"),
+            (residential_cell_with_population(5, 10), "R▓"),
+            (residential_cell_with_population(10, 10), "R█"),
+        ];
+
+        for (cell, expected) in cases {
+            let glyph = TileTheme::Unicode.tile_for_cell(
+                &cell,
+                MapOverlayInput::Normal,
+                false,
+                PreviewState::None,
+            );
+
+            assert_eq!(glyph.tile, expected);
+        }
+    }
+
+    #[test]
+    fn unicode_non_residential_buildings_show_level_buckets() {
+        let cases = [
+            (
+                themed_cell(Some(BuildingKind::Commercial), 'C', Some(1), None, None, 0),
+                "C░",
+            ),
+            (
+                themed_cell(Some(BuildingKind::Commercial), 'C', Some(2), None, None, 0),
+                "C▒",
+            ),
+            (
+                themed_cell(Some(BuildingKind::Commercial), 'C', Some(3), None, None, 0),
+                "C▓",
+            ),
+            (
+                themed_cell(Some(BuildingKind::Industrial), 'I', Some(3), None, None, 0),
+                "I▓",
+            ),
+            (
+                themed_cell(Some(BuildingKind::PowerPlant), 'P', Some(2), None, None, 0),
+                "T▒",
+            ),
+            (
+                themed_cell(Some(BuildingKind::Park), 'P', Some(2), None, None, 0),
+                "P▒",
+            ),
+        ];
+
+        for (cell, expected) in cases {
+            let glyph = TileTheme::Unicode.tile_for_cell(
+                &cell,
+                MapOverlayInput::Normal,
+                false,
+                PreviewState::None,
+            );
+
+            assert_eq!(glyph.tile, expected);
+        }
+    }
+
+    #[test]
+    fn unicode_building_problem_tiles_take_precedence_over_shades() {
+        let unpowered = themed_cell(
+            Some(BuildingKind::Residential),
+            'R',
+            Some(1),
+            Some(false),
+            None,
+            9,
+        );
+        let disconnected = themed_cell(
+            Some(BuildingKind::Commercial),
+            'C',
+            Some(3),
+            Some(true),
+            Some(false),
+            9,
+        );
+
+        assert_eq!(
+            TileTheme::Unicode
+                .tile_for_cell(
+                    &unpowered,
+                    MapOverlayInput::Normal,
+                    false,
+                    PreviewState::None
+                )
+                .tile,
+            "R-"
+        );
+        assert_eq!(
+            TileTheme::Unicode
+                .tile_for_cell(
+                    &disconnected,
+                    MapOverlayInput::Normal,
+                    false,
+                    PreviewState::None
+                )
+                .tile,
+            "C!"
+        );
+    }
+
+    #[test]
+    fn unicode_building_tiles_are_two_allowed_width_safe_characters() {
+        let cells = [
+            residential_cell_with_population(0, 10),
+            residential_cell_with_population(1, 10),
+            residential_cell_with_population(5, 10),
+            residential_cell_with_population(10, 10),
+            themed_cell(Some(BuildingKind::Commercial), 'C', Some(1), None, None, 0),
+            themed_cell(Some(BuildingKind::Commercial), 'C', Some(2), None, None, 0),
+            themed_cell(Some(BuildingKind::Industrial), 'I', Some(3), None, None, 0),
+            themed_cell(Some(BuildingKind::PowerPlant), 'P', Some(2), None, None, 0),
+            themed_cell(Some(BuildingKind::Park), 'P', Some(2), None, None, 0),
+        ];
+
+        for cell in cells {
+            let glyph = TileTheme::Unicode.tile_for_cell(
+                &cell,
+                MapOverlayInput::Normal,
+                false,
+                PreviewState::None,
+            );
+
+            assert_eq!(glyph.tile.chars().count(), 2);
+            assert!(glyph.tile.chars().all(is_allowed_unicode_tile_char));
+        }
+    }
+
+    #[test]
+    fn ascii_detailed_building_tiles_are_unchanged() {
+        let cases = [
+            (residential_cell_with_population(10, 10), "R1"),
+            (
+                themed_cell(Some(BuildingKind::Commercial), 'C', Some(2), None, None, 0),
+                "C2",
+            ),
+            (
+                themed_cell(Some(BuildingKind::Industrial), 'I', Some(3), None, None, 0),
+                "I3",
+            ),
+            (
+                themed_cell(Some(BuildingKind::PowerPlant), 'P', Some(2), None, None, 0),
+                "T2",
+            ),
+            (
+                themed_cell(Some(BuildingKind::Park), 'P', Some(2), None, None, 0),
+                "P2",
+            ),
+        ];
+
+        for (cell, expected) in cases {
+            let glyph = TileTheme::AsciiDetailed.tile_for_cell(
+                &cell,
+                MapOverlayInput::Normal,
+                false,
+                PreviewState::None,
+            );
+
+            assert_eq!(glyph.tile, expected);
+        }
     }
 
     #[test]
@@ -2581,7 +2793,28 @@ mod tests {
         cell
     }
 
-    fn is_allowed_road_tile_char(value: char) -> bool {
+    fn is_allowed_unicode_tile_char(value: char) -> bool {
+        value.is_ascii()
+            || matches!(
+                value,
+                '─' | '│'
+                    | '┌'
+                    | '┐'
+                    | '└'
+                    | '┘'
+                    | '├'
+                    | '┤'
+                    | '┬'
+                    | '┴'
+                    | '┼'
+                    | '░'
+                    | '▒'
+                    | '▓'
+                    | '█'
+            )
+    }
+
+    fn is_allowed_unicode_road_char(value: char) -> bool {
         matches!(
             value,
             ' ' | '─' | '│' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼'
