@@ -171,6 +171,60 @@ exceed the visible panel. When implemented:
 - Render only the visible window of cells.
 - Add tests for cursor-follow and clamping at all four edges.
 
+## Patch M5: Building Tile Glyphs
+
+Goal: make buildings render more graphically in the `Unicode` theme. Keep the
+type letter, but replace the level digit with a width-1 Block Element second
+glyph that shows residential occupancy and other kinds' level, so a thriving
+district visibly fills in. ASCII themes and grid alignment are unchanged.
+
+Context: M2 upgraded only roads. Buildings in the `Unicode` theme still fall
+through to `ascii_detailed_normal_tile`, so they render as `R1`/`C1`/`I1`
+letter-and-digit tiles. This patch gives the second column meaning.
+
+Likely files:
+
+- `src/ui/tui.rs` (Unicode building tile, width-safety test, mapping tests)
+
+Implementation:
+
+- Only the `Unicode` theme changes. `AsciiDetailed` and `AsciiCompact` keep
+  their `R1`/`R.` tiles, so ASCII and non-UTF-8 terminals are unaffected.
+- First column stays the type letter (`R C I T P`); color continues to come from
+  `building_style`. Roads keep the M2 line-art; empty cells keep `..`.
+- Second column is a Block Element from U+2580–U+259F (`░ ▒ ▓ █`). That block is
+  East Asian Width "Neutral" = **width 1**, so the two-display-column tile
+  invariant holds. Do not use `■ ▲ ● ◆ ★`, card suits, or emoji; they are
+  ambiguous-width or width-2 and would desync rows.
+- Residential second glyph = occupancy from `population` / `max_population`:
+  empty `░`, low `▒`, high `▓`, full `█`.
+- Commercial, industrial, power plant, and park second glyph = building level
+  from `upgrade_level`: level 1 `░`, level 2 `▒`, level 3 `▓`.
+- Preserve problem-state precedence exactly as today: an unpowered building
+  renders `<letter>-` and a disconnected building renders `<letter>!`, before
+  any shade is applied, so a problem is never hidden behind a block.
+- No view-model change: `upgrade_level`, `population`, and `max_population` are
+  already on `CellView`.
+- Extend the width-safety allowed-character set with `░ ▒ ▓ █`.
+
+Tests:
+
+- residential occupancy buckets map to `░ / ▒ / ▓ / █`
+- commercial, industrial, power plant, and park levels map to `░ / ▒ / ▓`
+- unpowered and no-road buildings still render `-` / `!` and take precedence
+  over the shade
+- width-safety: every building tile is exactly two chars drawn from
+  {ASCII, box-drawing, block elements}, with no `unicode-width` dependency
+- `AsciiDetailed` building tiles are unchanged (`R1`, `C1`, ...)
+
+Review focus:
+
+- Building glyphs are confined to the `Unicode` theme; default behavior is
+  unchanged.
+- Every tile stays exactly two display columns; block elements are width-1.
+- Problem indicators are never hidden by a shade.
+- No new view-model field and no new dependency.
+
 ## Design Appendix: Mask To Tile
 
 Rule: left char is the box glyph for `{up:N, down:S, left:W, right:E}`; right
@@ -243,10 +297,67 @@ makes corners and junctions look doubled and horizontal continuity slightly
 worse. The node-in-left-column scheme above is preferred for cleaner straights,
 corners, and intersections.
 
+## Design Appendix: Building Tile Glyphs
+
+Second-glyph palette (Block Elements, all width-1): `░` light, `▒` medium,
+`▓` dense, `█` full. The first glyph stays the type letter; color stays from
+`building_style`.
+
+Residential — second glyph by occupancy `population / max_population`:
+
+```text
+ratio      tile
+-------    ----
+0          R░
+0 < r<0.5  R▒
+0.5<=r<1   R▓
+r == 1     R█
+```
+
+Commercial / industrial / power plant / park — second glyph by `upgrade_level`:
+
+```text
+level   commercial  industrial  power  park
+-----   ----------  ----------  -----  ----
+1       C░          I░          T░     P░
+2       C▒          I▒          T▒     P▒
+3       C▓          I▓          (—)    (—)
+```
+
+Problem states keep precedence over the shade:
+
+```text
+R-   unpowered (powered = false, demand > 0)
+R!   no road connection
+```
+
+Eyeball preview — a mixed block (`T` power L2, `P` park L1, `C` commercial L3,
+two residentials, `I` industrial L2, a bottom road run), with the left
+residential empty and the right one full:
+
+```text
+T▒ P░ C▓
+R░ R█ I▒
+────────
+```
+
+The only data-driven difference for residential is the second glyph: an empty
+home stays `R░` while a full one becomes a solid `R█` that visibly lights up.
+
+Design choice: residential uses occupancy and the other kinds use level. Level
+1-versus-2 matters less to a player than whether a district is thriving, so the
+solid `█` "full" signal is reserved for residential occupancy. An all-level
+variant (every kind shaded by level) was considered but is less informative.
+
+Caveat: the `░ ▒ ▓` shades are subtle at small terminal fonts. They remain
+distinguishable, and the full `█` block gives the clearest signal, which is why
+residential occupancy uses the full range.
+
 ## Guardrails
 
-- Box-drawing glyphs are width-1; do not introduce emoji, CJK, or ambiguous-width
-  symbols into any tile.
+- Map glyphs must be width-1. Use only ASCII, box-drawing (U+2500–U+257F), and
+  block elements (U+2580–U+259F). Do not introduce emoji, CJK, or
+  ambiguous-width symbols (`■ ▲ ● ◆ ★`, arrows) into any tile.
 - Line-art lives only in the `Unicode` theme; the default `AsciiDetailed` theme
   and the ASCII fallback are unchanged.
 - No new external dependencies. Width safety is enforced by restricting the glyph
