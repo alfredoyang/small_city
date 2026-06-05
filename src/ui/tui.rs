@@ -38,6 +38,8 @@ const MIN_TUI_HEIGHT: u16 = 30;
 struct TuiState {
     cursor_x: usize,
     cursor_y: usize,
+    viewport_x: usize,
+    viewport_y: usize,
     selected_build: BuildingKind,
     current_overlay: MapOverlayInput,
     tile_theme: TileTheme,
@@ -54,6 +56,8 @@ impl Default for TuiState {
         Self {
             cursor_x: 0,
             cursor_y: 0,
+            viewport_x: 0,
+            viewport_y: 0,
             selected_build: BuildingKind::Residential,
             current_overlay: MapOverlayInput::Normal,
             tile_theme: default_tile_theme(),
@@ -304,11 +308,34 @@ impl TuiState {
     fn clamp_cursor(&mut self, view: &GameView) {
         self.cursor_x = self.cursor_x.min(view.map.width.saturating_sub(1));
         self.cursor_y = self.cursor_y.min(view.map.height.saturating_sub(1));
+        self.viewport_x = self.viewport_x.min(view.map.width.saturating_sub(1));
+        self.viewport_y = self.viewport_y.min(view.map.height.saturating_sub(1));
     }
 
     fn reset_cursor(&mut self) {
         self.cursor_x = 0;
         self.cursor_y = 0;
+        self.viewport_x = 0;
+        self.viewport_y = 0;
+    }
+
+    fn follow_cursor_in_map_viewport(&mut self, view: &GameView, area: Rect) {
+        let gap = map_cell_gap(area, view);
+        let visible_columns = visible_map_columns(area, gap, view);
+        let visible_rows = visible_map_rows(area, view, self.tile_theme, self.current_overlay);
+
+        self.viewport_x = follow_axis(
+            self.cursor_x,
+            self.viewport_x,
+            visible_columns,
+            view.map.width,
+        );
+        self.viewport_y = follow_axis(
+            self.cursor_y,
+            self.viewport_y,
+            visible_rows,
+            view.map.height,
+        );
     }
 
     fn cycle_overlay(&mut self) {
@@ -618,7 +645,7 @@ fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
 
             // ratatui redraws the whole frame into an off-screen buffer and then flushes the diff
             // to the terminal. The closure receives a `Frame` that all render functions write into.
-            terminal.draw(|frame| render(frame, &view, &inspect, &preview, &runtime.state))?;
+            terminal.draw(|frame| render(frame, &view, &inspect, &preview, &mut runtime.state))?;
             runtime.mark_clean();
         }
 
@@ -659,7 +686,7 @@ fn render(
     view: &GameView,
     inspect: &InspectView,
     preview: &BuildPreviewView,
-    state: &TuiState,
+    state: &mut TuiState,
 ) {
     let root = frame.area();
     if terminal_is_too_small(root) {
@@ -685,6 +712,10 @@ fn render(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(vertical[1]);
+
+    // The map viewport depends on the panel `Rect`, which is only known during draw. Keep that
+    // layout-derived scroll state in `TuiState` so cursor movement can follow the visible window.
+    state.follow_cursor_in_map_viewport(view, top[0]);
 
     render_map(frame, top[0], view, preview, state);
     render_selected_cell(frame, top[1], inspect);
@@ -743,24 +774,32 @@ fn render_map(
     state: &TuiState,
 ) {
     let mut lines = Vec::new();
-    lines.push(Line::from(format!(
-        "Overlay: {} | Theme: {} | {}",
-        overlay_label(state.current_overlay),
-        state.tile_theme.label(),
-        state.tile_theme.legend(state.current_overlay)
+    lines.push(Line::from(map_overlay_header(
+        state.tile_theme,
+        state.current_overlay,
     )));
 
     let gap = map_cell_gap(area, view);
+    let visible_columns = visible_map_columns(area, gap, view);
+    let visible_rows = visible_map_rows(area, view, state.tile_theme, state.current_overlay);
+    let end_x = state
+        .viewport_x
+        .saturating_add(visible_columns)
+        .min(view.map.width);
+    let end_y = state
+        .viewport_y
+        .saturating_add(visible_rows)
+        .min(view.map.height);
     let cell_width = 2 + gap.len();
     let mut header = vec![Span::raw("   ")];
-    for x in 0..view.map.width {
+    for x in state.viewport_x..end_x {
         header.push(Span::raw(format!("{x:^cell_width$}")));
     }
     lines.push(Line::from(header));
 
-    for y in 0..view.map.height {
+    for y in state.viewport_y..end_y {
         let mut row = vec![Span::raw(format!("{y:>2} "))];
-        for x in 0..view.map.width {
+        for x in state.viewport_x..end_x {
             let index = y * view.map.width + x;
             let cell = &view.map.cells[index];
             let is_cursor = x == state.cursor_x && y == state.cursor_y;
@@ -775,7 +814,7 @@ fn render_map(
             // tile so cursor highlighting never changes map width.
             row.push(Span::styled(glyph.tile, glyph.style));
             if !gap.is_empty() {
-                let next_cell = (x + 1 < view.map.width).then(|| &view.map.cells[index + 1]);
+                let next_cell = (x + 1 < end_x).then(|| &view.map.cells[index + 1]);
                 row.push(Span::raw(map_gap_after_cell(
                     gap,
                     state.tile_theme,
@@ -796,6 +835,69 @@ fn render_map(
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn visible_map_columns(area: Rect, gap: &'static str, view: &GameView) -> usize {
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let label_width = 3;
+    // Count a possible trailing gap in every tile slot. This can leave one extra column unused,
+    // but it prevents the map row from overflowing the panel.
+    let cell_width = 2 + gap.len();
+    inner_width
+        .saturating_sub(label_width)
+        .checked_div(cell_width)
+        .unwrap_or(0)
+        .max(1)
+        .min(view.map.width)
+}
+
+fn visible_map_rows(
+    area: Rect,
+    view: &GameView,
+    theme: TileTheme,
+    overlay: MapOverlayInput,
+) -> usize {
+    let inner_height = usize::from(area.height.saturating_sub(2));
+    let inner_width = usize::from(area.width.saturating_sub(2)).max(1);
+    // Ratatui wraps the header by display width and word boundaries. This estimate is intentionally
+    // simple; if it is short by a row on a narrow terminal, the Paragraph clips the extra map line.
+    let overlay_rows = map_overlay_header(theme, overlay)
+        .chars()
+        .count()
+        .div_ceil(inner_width)
+        .max(1);
+    let overlay_and_header_rows = overlay_rows + 1;
+    inner_height
+        .saturating_sub(overlay_and_header_rows)
+        .max(1)
+        .min(view.map.height)
+}
+
+fn map_overlay_header(theme: TileTheme, overlay: MapOverlayInput) -> String {
+    format!(
+        "Overlay: {} | Theme: {} | {}",
+        overlay_label(overlay),
+        theme.label(),
+        theme.legend(overlay)
+    )
+}
+
+fn follow_axis(cursor: usize, viewport: usize, visible: usize, total: usize) -> usize {
+    if total == 0 || visible == 0 || visible >= total {
+        return 0;
+    }
+
+    let max_viewport = total - visible;
+    if cursor < viewport {
+        cursor.min(max_viewport)
+    } else if cursor >= viewport + visible {
+        cursor
+            .saturating_add(1)
+            .saturating_sub(visible)
+            .min(max_viewport)
+    } else {
+        viewport.min(max_viewport)
+    }
 }
 
 fn render_selected_cell(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView) {
@@ -1623,6 +1725,73 @@ mod tests {
     }
 
     #[test]
+    fn map_viewport_follows_cursor_to_right_and_bottom_edges() {
+        let view = viewport_test_view(10, 10);
+        let area = Rect::new(0, 0, 16, 8);
+        let visible_columns = visible_map_columns(area, map_cell_gap(area, &view), &view);
+        let visible_rows =
+            visible_map_rows(area, &view, TileTheme::Unicode, MapOverlayInput::Normal);
+        let mut state = TuiState {
+            cursor_x: 9,
+            cursor_y: 9,
+            tile_theme: TileTheme::Unicode,
+            ..TuiState::default()
+        };
+
+        state.follow_cursor_in_map_viewport(&view, area);
+
+        assert_eq!(
+            (state.viewport_x, state.viewport_y),
+            (
+                view.map.width - visible_columns,
+                view.map.height - visible_rows
+            )
+        );
+    }
+
+    #[test]
+    fn map_viewport_follows_cursor_back_to_left_and_top_edges() {
+        let view = viewport_test_view(10, 10);
+        let area = Rect::new(0, 0, 16, 8);
+        let mut state = TuiState {
+            cursor_x: 1,
+            cursor_y: 1,
+            viewport_x: 5,
+            viewport_y: 6,
+            tile_theme: TileTheme::Unicode,
+            ..TuiState::default()
+        };
+
+        state.follow_cursor_in_map_viewport(&view, area);
+
+        assert_eq!((state.viewport_x, state.viewport_y), (1, 1));
+
+        state.cursor_x = 0;
+        state.cursor_y = 0;
+        state.follow_cursor_in_map_viewport(&view, area);
+
+        assert_eq!((state.viewport_x, state.viewport_y), (0, 0));
+    }
+
+    #[test]
+    fn map_viewport_clamps_when_map_fits() {
+        let view = viewport_test_view(3, 3);
+        let area = Rect::new(0, 0, 80, 20);
+        let mut state = TuiState {
+            cursor_x: 2,
+            cursor_y: 2,
+            viewport_x: 9,
+            viewport_y: 9,
+            tile_theme: TileTheme::Unicode,
+            ..TuiState::default()
+        };
+
+        state.follow_cursor_in_map_viewport(&view, area);
+
+        assert_eq!((state.viewport_x, state.viewport_y), (0, 0));
+    }
+
+    #[test]
     fn run_speed_increase_and_decrease_are_clamped() {
         let now = Instant::now();
         let mut runtime = TuiRuntime::new(now);
@@ -2280,6 +2449,21 @@ mod tests {
     }
 
     #[test]
+    fn large_map_render_uses_cursor_following_viewport() {
+        let game = RegionalGame::single_region(40, 30).expect("regional test game");
+        let state = TuiState {
+            cursor_x: 39,
+            cursor_y: 29,
+            ..TuiState::default()
+        };
+
+        let output = render_test_screen_with_size(&game, state, 100, 30);
+
+        assert!(output.contains("│29 "));
+        assert!(!output.contains("│ 0 "));
+    }
+
+    #[test]
     fn help_panel_contains_overlay_order_and_legends() {
         let game = RegionalGame::single_region(10, 10).expect("regional test game");
         let state = TuiState {
@@ -2397,6 +2581,13 @@ mod tests {
         )
     }
 
+    fn viewport_test_view(width: usize, height: usize) -> GameView {
+        RegionalGame::single_region(width, height)
+            .expect("regional viewport test game")
+            .selected_region_view()
+            .expect("viewport test view")
+    }
+
     fn render_test_screen(game: &RegionalGame, state: TuiState) -> String {
         render_test_screen_with_size(game, state, 120, 36)
     }
@@ -2440,7 +2631,7 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| render(frame, &view, &inspect, &preview, &state))
+            .draw(|frame| render(frame, &view, &inspect, &preview, &mut state))
             .expect("render TUI frame");
         terminal
     }
