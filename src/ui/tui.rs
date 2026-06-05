@@ -736,11 +736,18 @@ fn render_map(
                 is_cursor,
                 preview_state,
             );
-            // Each tile is exactly two ASCII characters. The optional gap is outside the styled
+            // Each tile is exactly two display columns. The optional gap is outside the styled
             // tile so cursor highlighting never changes map width.
             row.push(Span::styled(glyph.tile, glyph.style));
             if !gap.is_empty() {
-                row.push(Span::raw(gap));
+                let next_cell = (x + 1 < view.map.width).then(|| &view.map.cells[index + 1]);
+                row.push(Span::raw(map_gap_after_cell(
+                    gap,
+                    state.tile_theme,
+                    state.current_overlay,
+                    cell,
+                    next_cell,
+                )));
             }
         }
         lines.push(Line::from(row));
@@ -1126,6 +1133,32 @@ fn map_cell_gap(area: Rect, view: &GameView) -> &'static str {
     }
 }
 
+fn map_gap_after_cell(
+    base_gap: &'static str,
+    theme: TileTheme,
+    overlay: MapOverlayInput,
+    cell: &CellView,
+    next_cell: Option<&CellView>,
+) -> &'static str {
+    if base_gap.is_empty() || theme != TileTheme::Unicode || overlay != MapOverlayInput::Normal {
+        return base_gap;
+    }
+
+    let Some(next_cell) = next_cell else {
+        return base_gap;
+    };
+
+    if cell.building == Some(BuildingKind::Road)
+        && next_cell.building == Some(BuildingKind::Road)
+        && cell.road_links.east
+        && next_cell.road_links.west
+    {
+        "─"
+    } else {
+        base_gap
+    }
+}
+
 fn preview_state_for_cell(
     x: usize,
     y: usize,
@@ -1166,11 +1199,49 @@ fn ascii_detailed_normal_tile(cell: &CellView) -> String {
 }
 
 fn unicode_normal_tile(cell: &CellView) -> String {
+    if cell.building == Some(BuildingKind::Road) {
+        return unicode_road_tile(cell);
+    }
+
     match ascii_detailed_normal_tile(cell).as_str() {
         ".." => "..".to_string(),
-        "==" => "==".to_string(),
         tile => tile.to_string(),
     }
+}
+
+fn unicode_road_tile(cell: &CellView) -> String {
+    let links = cell.road_links;
+    let left = match (links.north, links.east, links.south, links.west) {
+        (false, false, false, false) => '─',
+        (true, false, false, false) | (false, false, true, false) => '│',
+        (false, true, false, false) | (false, false, false, true) | (false, true, false, true) => {
+            '─'
+        }
+        (true, true, false, false) => '└',
+        (true, false, false, true) => '┘',
+        (false, true, true, false) => '┌',
+        (false, false, true, true) => '┐',
+        (true, true, false, true) => '┴',
+        (false, true, true, true) => '┬',
+        (true, true, true, false) => '├',
+        (true, false, true, true) => '┤',
+        (true, false, true, false) => '│',
+        (true, true, true, true) => '┼',
+    };
+    let right = if links.east || !any_road_link(links) {
+        '─'
+    } else {
+        ' '
+    };
+
+    let mut tile = String::with_capacity(6);
+    tile.push(left);
+    tile.push(right);
+    tile
+}
+
+fn any_road_link(links: crate::interface::view::RoadLinks) -> bool {
+    links.north || links.east || links.south || links.west
 }
 
 fn tile_type(cell: &CellView) -> char {
@@ -1406,6 +1477,7 @@ mod tests {
     use super::*;
     use crate::core::regional_game::RegionalGame;
     use crate::core::regions::RegionId;
+    use crate::interface::view::RoadLinks;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
 
@@ -1517,6 +1589,144 @@ mod tests {
                 .tile,
             ".."
         );
+    }
+
+    #[test]
+    fn unicode_theme_maps_road_links_to_line_art_tiles() {
+        let cases = [
+            (road_cell(false, false, false, false), "──"),
+            (road_cell(true, false, false, false), "│ "),
+            (road_cell(false, true, false, false), "──"),
+            (road_cell(false, false, true, false), "│ "),
+            (road_cell(false, false, false, true), "─ "),
+            (road_cell(true, false, true, false), "│ "),
+            (road_cell(false, true, false, true), "──"),
+            (road_cell(true, true, false, false), "└─"),
+            (road_cell(true, false, false, true), "┘ "),
+            (road_cell(false, true, true, false), "┌─"),
+            (road_cell(false, false, true, true), "┐ "),
+            (road_cell(true, true, false, true), "┴─"),
+            (road_cell(false, true, true, true), "┬─"),
+            (road_cell(true, true, true, false), "├─"),
+            (road_cell(true, false, true, true), "┤ "),
+            (road_cell(true, true, true, true), "┼─"),
+        ];
+
+        for (cell, expected) in cases {
+            let glyph = TileTheme::Unicode.tile_for_cell(
+                &cell,
+                MapOverlayInput::Normal,
+                false,
+                PreviewState::None,
+            );
+
+            assert_eq!(glyph.tile, expected);
+        }
+    }
+
+    #[test]
+    fn unicode_road_tiles_are_two_allowed_width_safe_characters() {
+        for mask in 0..16 {
+            let cell = road_cell(
+                mask & 0b1000 != 0,
+                mask & 0b0100 != 0,
+                mask & 0b0010 != 0,
+                mask & 0b0001 != 0,
+            );
+            let glyph = TileTheme::Unicode.tile_for_cell(
+                &cell,
+                MapOverlayInput::Normal,
+                false,
+                PreviewState::None,
+            );
+
+            assert_eq!(glyph.tile.chars().count(), 2);
+            assert!(glyph.tile.chars().all(is_allowed_road_tile_char));
+        }
+    }
+
+    #[test]
+    fn ascii_themes_keep_plain_road_tiles() {
+        let road = road_cell(true, true, true, true);
+
+        assert_eq!(
+            TileTheme::AsciiDetailed
+                .tile_for_cell(&road, MapOverlayInput::Normal, false, PreviewState::None)
+                .tile,
+            "=="
+        );
+        assert_eq!(
+            TileTheme::AsciiCompact
+                .tile_for_cell(&road, MapOverlayInput::Normal, false, PreviewState::None)
+                .tile,
+            "=."
+        );
+    }
+
+    #[test]
+    fn unicode_gap_suppression_joins_horizontal_road_cells() {
+        let left = road_cell(false, true, false, false);
+        let right = road_cell(false, false, false, true);
+        let disconnected = road_cell(false, false, false, false);
+
+        assert_eq!(
+            map_gap_after_cell(
+                " ",
+                TileTheme::Unicode,
+                MapOverlayInput::Normal,
+                &left,
+                Some(&right)
+            ),
+            "─"
+        );
+        assert_eq!(
+            map_gap_after_cell(
+                " ",
+                TileTheme::AsciiDetailed,
+                MapOverlayInput::Normal,
+                &left,
+                Some(&right)
+            ),
+            " "
+        );
+        assert_eq!(
+            map_gap_after_cell(
+                " ",
+                TileTheme::Unicode,
+                MapOverlayInput::Normal,
+                &left,
+                Some(&disconnected)
+            ),
+            " "
+        );
+    }
+
+    #[test]
+    fn unicode_theme_renders_aligned_connected_road_network() {
+        let game = RegionalGame::single_region(3, 3).expect("regional test game");
+        for (x, y) in [
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (0, 1),
+            (2, 1),
+            (0, 2),
+            (1, 2),
+            (2, 2),
+        ] {
+            game.build(RegionId(1), x, y, BuildingKind::Road)
+                .expect("build road");
+        }
+        let state = TuiState {
+            tile_theme: TileTheme::Unicode,
+            ..TuiState::default()
+        };
+
+        let output = render_test_screen(&game, state);
+
+        assert!(output.contains("0 ┌─────┐"));
+        assert!(output.contains("1 │  .. │"));
+        assert!(output.contains("2 └─────┘"));
     }
 
     #[test]
@@ -1907,6 +2117,24 @@ mod tests {
                 desirability: effect_value,
             },
         }
+    }
+
+    fn road_cell(north: bool, east: bool, south: bool, west: bool) -> CellView {
+        let mut cell = themed_cell(Some(BuildingKind::Road), '=', None, None, None, 0);
+        cell.road_links = RoadLinks {
+            north,
+            east,
+            south,
+            west,
+        };
+        cell
+    }
+
+    fn is_allowed_road_tile_char(value: char) -> bool {
+        matches!(
+            value,
+            ' ' | '─' | '│' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼'
+        )
     }
 
     fn render_test_screen(game: &RegionalGame, state: TuiState) -> String {
