@@ -60,7 +60,7 @@ impl Default for TuiState {
             viewport_y: 0,
             selected_build: BuildingKind::Residential,
             current_overlay: MapOverlayInput::Normal,
-            tile_theme: default_tile_theme(),
+            tile_theme: TileTheme::AsciiDetailed,
             message: "Tiny City Builder".to_string(),
             region_label: "Region: single city".to_string(),
             is_running: false,
@@ -113,10 +113,11 @@ impl RunSpeed {
 
 /// UI-only map theme. It converts safe interface view models into fixed-width terminal tiles.
 ///
-/// `Unicode` is selected by default when the locale advertises UTF-8 support. Otherwise,
+/// The live TUI selects `Unicode` on startup when the locale advertises UTF-8 support. Otherwise,
 /// `AsciiDetailed` keeps every tile to exactly two ASCII characters so map rows stay aligned on
-/// constrained terminals. `AsciiCompact` preserves the older one-character language inside a
-/// two-character tile.
+/// constrained terminals. `TuiState::default()` stays deterministic for tests and starts at
+/// `AsciiDetailed`. `AsciiCompact` preserves the older one-character language inside a two-character
+/// tile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TileTheme {
     AsciiCompact,
@@ -618,6 +619,7 @@ fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let mut runtime = TuiRuntime::with_mode(Instant::now(), mode)
         .map_err(|error| io::Error::other(error.to_string()))?;
+    runtime.state.tile_theme = default_tile_theme();
 
     loop {
         runtime.apply_due_auto_tick(Instant::now());
@@ -1707,11 +1709,16 @@ mod tests {
     }
 
     #[test]
+    fn tui_state_default_uses_deterministic_ascii_theme() {
+        assert_eq!(TuiState::default().tile_theme, TileTheme::AsciiDetailed);
+    }
+
+    #[test]
     fn run_state_defaults_to_paused_and_toggles() {
         let mut state = TuiState::default();
 
         assert!(!state.is_running);
-        assert_eq!(state.tile_theme, default_tile_theme());
+        assert_eq!(state.tile_theme, TileTheme::AsciiDetailed);
         assert_eq!(state.run_speed, RunSpeed::One);
         state.toggle_run();
         assert!(state.is_running);

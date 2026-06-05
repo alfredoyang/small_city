@@ -110,6 +110,10 @@ R- unpowered residential
 R! blocked residential
 ```
 
+In the Unicode theme, roads use two-column box-drawing tiles such as `──`, `│─`, `┌─`,
+and `┼─` so connected road networks read as continuous lines. Press `T` to cycle between
+ASCII-2, ASCII Compact, and Unicode.
+
 Power overlay symbols:
 
 ```text
