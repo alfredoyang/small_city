@@ -109,8 +109,8 @@ fn build_growth_city(game: &mut SingleRegionTestGame, residential_x: usize, resi
 }
 
 fn advance_one_week(game: &mut SingleRegionTestGame) {
-    // Phase A time cadence moved population growth from every tick to the
-    // weekly boundary, so citizen growth tests advance through one full week.
+    // These integration checks advance a full week so daily population growth
+    // and economy passes can settle before assertions.
     for _ in 0..24 * 7 {
         assert!(game.tick().success);
     }

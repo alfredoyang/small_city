@@ -79,7 +79,7 @@ fn tick_returns_structured_summary_events() {
     let result = advance_one_week(&mut game);
 
     assert!(result.success);
-    assert_eq!(result.events.len(), 2);
+    assert_eq!(result.events.len(), 3);
     assert_eq!(result.event, result.events[0]);
     assert_eq!(
         result.events[0],
@@ -87,16 +87,16 @@ fn tick_returns_structured_summary_events() {
             turn: 168,
             time: expected_time(168),
             population: MetricChange {
-                before: 0,
-                after: 2
+                before: 5,
+                after: 5
             },
             money: MetricChange {
-                before: 63,
-                after: 77
+                before: 219,
+                after: 252
             },
             happiness: MetricChange {
-                before: 52,
-                after: 56
+                before: 84,
+                after: 85
             },
             // The profitable industrial can auto-upgrade at the weekly boundary,
             // increasing its pollution source after the economy event is applied.
@@ -116,26 +116,35 @@ fn tick_returns_structured_summary_events() {
             // verify that local industrial output reaches commercial storage and
             // contributes manufacturing tax to the same public event the UI uses.
             economy: EconomyBreakdownView {
-                salaries_paid: 6,
-                workplace_tax: 2,
-                rent_income: 4,
-                commercial_sales_tax: 4,
-                shoppers_served: 2,
+                salaries_paid: 18,
+                workplace_tax: 8,
+                rent_income: 15,
+                commercial_sales_tax: 9,
+                shoppers_served: 3,
                 local_goods_produced: 4,
-                local_goods_stored: 0,
-                local_goods_sold: 2,
+                local_goods_stored: 3,
+                local_goods_sold: 3,
                 imported_goods_sold: 0,
-                exported_goods: 4,
+                exported_goods: 1,
                 manufacturing_tax: 4,
-                export_tax: 4,
+                export_tax: 1,
                 rent_failures: 0,
                 maintenance_cost: 4,
-                net: 14
+                net: 33
             },
         }
     );
     assert_eq!(
         result.events[1],
+        GameEventView::BusinessAutoUpgraded {
+            x: 2,
+            y: 0,
+            kind: BuildingKind::Commercial,
+            level: 2
+        }
+    );
+    assert_eq!(
+        result.events[2],
         GameEventView::BusinessAutoUpgraded {
             x: 3,
             y: 0,
@@ -159,17 +168,18 @@ fn tick_summary_message_includes_metric_changes() {
 
     let message = advance_one_week(&mut game).message();
 
-    assert!(message.contains("population 1 (+1)"));
+    assert!(message.contains("population 5 (+0)"));
     assert!(message.contains("Year 1, Month 1, Week 2, Day 1, 00:00"));
-    assert!(message.contains("money 84 (+9)"));
+    assert!(message.contains("money 244 (+34)"));
     assert!(message.contains("powered buildings 3 (+0)"));
     // The message expectation changed because tick feedback now explains goods
     // production, local/imported sales, export flow, and related taxes.
     assert!(
         message.contains(
-            "Economy: salaries paid 3, workplace tax +1, rent +2, sales tax +1, shoppers 1, local goods produced 4, stored 0, sold 1, imported 0, exported 4, manufacturing tax +4, export tax +4, rent failures 0, maintenance -3, net +9"
+            "Economy: salaries paid 18, workplace tax +8, rent +15, sales tax +9, shoppers 3, local goods produced 4, stored 3, sold 3, imported 0, exported 1, manufacturing tax +4, export tax +1, rent failures 0, maintenance -3, net +34"
         )
     );
+    assert!(message.contains("Commercial at (2, 0) upgraded to level 2 from reinvestment"));
     assert!(message.contains("Industrial at (3, 0) upgraded to level 2 from reinvestment"));
 }
 
@@ -240,7 +250,7 @@ fn expected_time(total_hours: u64) -> GameTimeView {
 fn advance_one_week(
     game: &mut SingleRegionTestGame,
 ) -> small_city::interface::events::CommandResult {
-    // Phase A time cadence moved population growth from every tick to the weekly boundary.
+    // Population grows daily while business reinvestment still runs at the weekly boundary.
     let mut result = game.tick();
     for _ in 1..24 * 7 {
         result = game.tick();

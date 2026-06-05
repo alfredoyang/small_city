@@ -5,10 +5,9 @@ mod common;
 use common::SingleRegionTestGame;
 use small_city::interface::input::BuildingKind;
 
-fn advance_one_week(game: &mut SingleRegionTestGame) {
-    // Phase A moved population growth to weekly boundaries, so population tests
-    // advance through one in-game week before asserting growth.
-    for _ in 0..24 * 7 {
+fn advance_one_day(game: &mut SingleRegionTestGame) {
+    // Population growth runs at daily boundaries, so population tests advance one in-game day.
+    for _ in 0..24 {
         game.tick();
     }
 }
@@ -148,7 +147,7 @@ fn population_only_grows_when_powered_by_network() {
     assert!(game.build(2, 1, BuildingKind::Road).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
 
-    advance_one_week(&mut game);
+    advance_one_day(&mut game);
 
     assert_eq!(
         game.inspect(1, 0)

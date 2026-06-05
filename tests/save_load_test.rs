@@ -17,8 +17,8 @@ fn advance_one_day(game: &mut SingleRegionTestGame) {
 }
 
 fn advance_one_week(game: &mut SingleRegionTestGame) {
-    // Phase A moved population growth to weekly boundaries, so the saved full
-    // city fixture advances one in-game week before asserting residents exist.
+    // The saved full-city fixture advances a week so daily population growth,
+    // economy, and weekly business cadence all have time to affect the city.
     for _ in 0..24 * 7 {
         game.tick();
     }

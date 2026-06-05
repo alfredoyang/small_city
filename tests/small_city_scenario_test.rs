@@ -250,8 +250,8 @@ fn stable_starter_city_stays_in_sane_ranges_and_locks_reinvestment_pacing() {
     let first_week = advance_one_week(&mut game);
     assert_eq!(
         building_upgrade_level(&game, 4, 0),
-        1,
-        "commercial should not auto-upgrade in the first starter-city week"
+        2,
+        "daily population growth should let commercial reach level 2 in the first starter-city week"
     );
     assert_eq!(
         building_upgrade_level(&game, 5, 0),
@@ -261,8 +261,8 @@ fn stable_starter_city_stays_in_sane_ranges_and_locks_reinvestment_pacing() {
     let second_week = advance_one_week(&mut game);
     assert_eq!(
         building_upgrade_level(&game, 4, 0),
-        2,
-        "commercial should reach level 2 after demand and shopping cash build up"
+        3,
+        "commercial should reach the current reinvestment cap after two starter-city weeks"
     );
     assert_eq!(
         building_upgrade_level(&game, 5, 0),
@@ -273,7 +273,7 @@ fn stable_starter_city_stays_in_sane_ranges_and_locks_reinvestment_pacing() {
     assert_eq!(
         building_upgrade_level(&game, 4, 0),
         3,
-        "commercial should reach the current reinvestment cap after three starter-city weeks"
+        "commercial should stay at the current reinvestment cap after three starter-city weeks"
     );
     assert_eq!(building_upgrade_level(&game, 5, 0), 3);
     let economy = first_week.plus(second_week).plus(third_week);
@@ -283,7 +283,7 @@ fn stable_starter_city_stays_in_sane_ranges_and_locks_reinvestment_pacing() {
     assert_eq!(view.status.money, starting_money + economy.net);
     // Current v0.4 goods export and manufacturing taxes make even a compact
     // starter city strongly profitable, so this uses a deliberately broad cap.
-    assert_in_range("money", view.status.money, 20, 1_000);
+    assert_in_range("money", view.status.money, 20, 1_500);
     assert_in_range("population", view.status.population, 3, 20);
     assert_in_range("jobs", view.status.jobs, 5, 12);
     assert_in_range("unemployment", view.status.unemployment, 0, 5);
@@ -431,8 +431,8 @@ fn polluted_industrial_city_locks_fast_industrial_reinvestment_pacing() {
 }
 
 fn advance_one_week(game: &mut SingleRegionTestGame) -> EconomyTotals {
-    // Phase A moved population to weekly boundaries and economy to daily
-    // boundaries, so scenario tests collect a full week of hourly ticks.
+    // Population and economy both run at daily boundaries; scenario tests still
+    // collect full weeks to cover business reinvestment and longer budget pressure.
     advance_weeks(game, 1)
 }
 

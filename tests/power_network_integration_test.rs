@@ -29,7 +29,7 @@ fn connected_road_network_powers_consumers() {
     assert_eq!(cell(&power_overlay, 1, 0).symbol, '+');
     assert_eq!(cell(&power_overlay, 2, 0).symbol, '+');
 
-    advance_one_week(&mut game);
+    advance_one_day(&mut game);
 
     let residential = game.inspect(1, 0);
     assert_eq!(
@@ -137,7 +137,7 @@ fn save_load_preserves_power_network_behavior() {
     game.save_to_file(&path).expect("save succeeds");
 
     let mut loaded = SingleRegionTestGame::load_from_file(&path).expect("load succeeds");
-    advance_one_week(&mut loaded);
+    advance_one_day(&mut loaded);
 
     let view = loaded.view();
     assert_eq!(view.map.cells.len(), view.map.width * view.map.height);
@@ -179,9 +179,9 @@ fn all_consumers_powered(view: &GameView) -> bool {
         .all(|powered| powered)
 }
 
-fn advance_one_week(game: &mut SingleRegionTestGame) {
-    // Phase A time cadence moved population growth from every tick to the weekly boundary.
-    for _ in 0..24 * 7 {
+fn advance_one_day(game: &mut SingleRegionTestGame) {
+    // Population growth runs at daily boundaries.
+    for _ in 0..24 {
         assert!(game.tick().success);
     }
 }

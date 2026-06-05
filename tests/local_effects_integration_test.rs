@@ -232,8 +232,8 @@ fn advance_one_week(game: &mut SingleRegionTestGame) {
 }
 
 fn advance_weeks(game: &mut SingleRegionTestGame, weeks: usize) {
-    // Phase A time cadence moved population growth from every tick to the
-    // weekly boundary, so growth assertions advance by explicit weeks.
+    // These longer growth assertions use explicit weeks to cover repeated daily
+    // population/economy passes and weekly business cadence.
     for _ in 0..24 * 7 * weeks {
         assert!(game.tick().success);
     }

@@ -24,7 +24,7 @@ pub(crate) fn tick_world(world: &mut World) -> CommandResult {
     if is_new_day(before_time, after_time) {
         citizens::apply_daily_happiness_decay(world);
     }
-    if is_new_week(before_time, after_time) {
+    if is_new_day(before_time, after_time) {
         population::run(world);
     }
     citizens::update_happiness(world);
@@ -142,7 +142,9 @@ fn game_time_view(time: GameTime) -> GameTimeView {
 mod tests {
     use super::{refresh_derived_state_for_world, tick_world};
     use crate::core::systems::citizens;
+    use crate::core::systems::placement;
     use crate::core::world::World;
+    use crate::interface::input::BuildingKind;
 
     #[test]
     fn citizen_happiness_decay_happens_on_daily_boundary_not_hourly() {
@@ -163,6 +165,25 @@ mod tests {
             citizens::average_happiness_for_home(&world, residential).expect("happiness");
         assert_eq!(citizen_happiness_decay(&world), 1);
         assert!(average_happiness < 50);
+    }
+
+    #[test]
+    fn population_growth_happens_on_daily_boundary_not_hourly() {
+        let mut world = World::new(5, 3);
+        placement::place_building(&mut world, 0, 0, BuildingKind::PowerPlant);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Residential);
+        placement::place_building(&mut world, 2, 0, BuildingKind::Commercial);
+        for x in 0..=2 {
+            placement::place_building(&mut world, x, 1, BuildingKind::Road);
+        }
+
+        for _ in 0..23 {
+            assert!(tick_world(&mut world).success);
+        }
+        assert_eq!(world.stats.population, 0);
+
+        assert!(tick_world(&mut world).success);
+        assert_eq!(world.stats.population, 1);
     }
 
     fn world_with_one_citizen() -> (World, crate::core::entity::Entity) {
