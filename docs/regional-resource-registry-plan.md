@@ -246,6 +246,66 @@ This reuses the cross-region design notes
 reply data, and stale-generation handling, but sources capacity from the registry
 instead of a parallel computation.
 
+## Patch R5 (Deferred): Persistent, Change-Driven Registry
+
+Goal: stop rebuilding the registry from `World` every tick. Power and job-slot
+results are pure functions of building/provider/consumer topology, which only
+changes on a few events; recompute on those events instead of every hourly tick.
+
+Do this only after R1-R4 are stable, and only if it is worth the added
+invalidation surface. The deciding factors are a profile showing per-tick
+resolution is hot on large/multi-region games, or the cross-region event flow
+making a maintained registry the natural shape anyway.
+
+What is and is not per-tick today:
+
+- `powered` flags and job slots are invariant between topology changes; a plain
+  hourly tick does not change their inputs.
+- Job assignment also depends on citizens and already runs only on the daily
+  economy boundary, not every tick.
+
+Invalidation triggers (the registry must recompute when any of these fire):
+
+- build, bulldoze, replace, upgrade commands (already call
+  `refresh_derived_state_for_world`).
+- business auto-upgrades, which change a building level after `power::run` in the
+  same tick and must mark the registry dirty for the next read.
+- population growth, for job assignment only (new or removed citizens).
+- save load, which rebuilds the registry from authoritative state.
+
+Design:
+
+- Keep the registry as derived state owned by the region. Maintain it across
+  ticks; mark it dirty on the triggers above; recompute lazily on the next read.
+- Recompute remains the same deterministic resolution used in R1/R2; only its
+  frequency changes. No new behavior.
+- Keep `World` private; the registry still exposes only owned summary data.
+
+Hard requirement: behavior must stay identical to full per-tick recompute. A
+missed invalidation is a silent determinism bug, so this patch is gated on a
+**parity-guard test**:
+
+- run a scripted sequence of commands and ticks (including business upgrades,
+  population growth, save/load) twice: once with the change-driven registry and
+  once forcing full recompute every tick.
+- assert identical `powered` flags, job assignments, and `world.stats` at every
+  step. Any divergence fails loudly and points at a missing invalidation
+  trigger.
+
+Tests:
+
+- the parity-guard scripted comparison above
+- each invalidation trigger marks the registry dirty and produces the same result
+  as a forced recompute
+- no invalidation on a plain hourly tick reuses the cached result
+
+Review focus:
+
+- The invalidation trigger set is complete; nothing that changes power or job
+  topology is missed.
+- The change-driven path is byte-identical to full recompute (parity guard).
+- Determinism and `World` privacy are preserved.
+
 ## Guardrails
 
 - Each patch is one mission, stays within roughly five files and 400 changed

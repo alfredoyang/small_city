@@ -14,7 +14,7 @@ pub(crate) fn run(world: &mut World) {
         consumer.source = None;
     }
 
-    let resolution = ResourceRegistry::from_world(world).resolve_local_power();
+    let resolution = ResourceRegistry::for_power(world).resolve_local_power();
     for grant in &resolution.grants {
         if let Some(consumer) = world.power_consumers.get_mut(&grant.consumer) {
             if consumer.demand != grant.amount {

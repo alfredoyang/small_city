@@ -8,6 +8,7 @@
 
 use crate::core::components::{BuildingData, BusinessFinance, Citizen};
 use crate::core::entity::Entity;
+use crate::core::resource_registry::{JobAssignment, ResourceRegistry};
 use crate::core::systems::{road_connectivity, road_network_analysis};
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;
@@ -56,9 +57,11 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
     // road-connected buildings. This keeps employment and shopping deterministic
     // after build, bulldoze, replace, upgrade, save, or load.
     ensure_business_building_data(world);
-    let index = EconomyIndex::from_world(world);
+    let registry = ResourceRegistry::for_jobs(world);
+    let job_resolution = registry.resolve_local_jobs();
+    let index = EconomyIndex::from_world(world, &registry);
     reset_business_periods(world, &index.business_entities);
-    assign_workplaces(world, &index.workplace_slots);
+    apply_workplace_assignments(world, &job_resolution.assignments);
 
     // Industry flow:
     // 1. Productive industrial buildings create local goods.
@@ -214,9 +217,10 @@ struct EconomyIndex {
 }
 
 impl EconomyIndex {
-    fn from_world(world: &World) -> Self {
+    fn from_world(world: &World, registry: &ResourceRegistry) -> Self {
         let mut index = Self::default();
         let mut shopping_commercials = Vec::new();
+        index.workplace_slots = registry.local_job_slots().to_vec();
 
         for (entity, building) in &world.buildings {
             index.maintenance_cost += maintenance_for_building(building.kind, building.level);
@@ -230,10 +234,6 @@ impl EconomyIndex {
 
             if !is_effective_workplace(world, *entity) {
                 continue;
-            }
-
-            for _ in 0..building.kind.jobs_at_level(building.level).max(0) {
-                index.workplace_slots.push(*entity);
             }
 
             match building.kind {
@@ -285,22 +285,10 @@ struct ShoppingOffer {
     slot_index: Option<usize>,
 }
 
-fn assign_workplaces(world: &mut World, workplace_slots: &[Entity]) {
-    let mut workplaces = workplace_slots.to_vec();
-    let mut citizen_entities: Vec<_> = world.citizens.keys().copied().collect();
-    citizen_entities.sort_by_key(|citizen| citizen.0);
-
-    // Citizens take the nearest reachable job slot. Ties use map order through
-    // the pre-sorted slot list, keeping assignment deterministic.
-    for citizen_entity in citizen_entities {
-        let home = world
-            .citizens
-            .get(&citizen_entity)
-            .map(|citizen| citizen.home);
-        let workplace_index = home.and_then(|home| nearest_slot_index(world, home, &workplaces));
-        let workplace = workplace_index.map(|index| workplaces.remove(index));
-        if let Some(citizen) = world.citizens.get_mut(&citizen_entity) {
-            citizen.workplace = workplace;
+fn apply_workplace_assignments(world: &mut World, assignments: &[JobAssignment]) {
+    for assignment in assignments {
+        if let Some(citizen) = world.citizens.get_mut(&assignment.citizen) {
+            citizen.workplace = assignment.workplace;
         }
     }
 }
@@ -736,6 +724,7 @@ pub(crate) fn maintenance_for_building(kind: BuildingKind, level: u8) -> i32 {
 mod tests {
     use super::{EconomyIndex, run};
     use crate::core::entity::Entity;
+    use crate::core::resource_registry::ResourceRegistry;
     use crate::core::systems::{citizens, placement, road_network_analysis};
     use crate::core::world::World;
     use crate::interface::input::BuildingKind;
@@ -753,7 +742,8 @@ mod tests {
         world.power_consumers.get_mut(&commercial).unwrap().powered = true;
         world.power_consumers.get_mut(&industrial).unwrap().powered = true;
 
-        let index = EconomyIndex::from_world(&world);
+        let registry = ResourceRegistry::for_jobs(&world);
+        let index = EconomyIndex::from_world(&world, &registry);
 
         assert_eq!(index.business_entities, vec![commercial, industrial]);
         assert_eq!(index.productive_commercials, vec![commercial]);
