@@ -7,6 +7,7 @@ pub mod regional_game;
 pub mod regional_game_runner;
 pub mod regional_types;
 pub mod regions;
+pub(crate) mod resource_registry;
 pub mod resources;
 pub(crate) mod simulation;
 pub mod systems;

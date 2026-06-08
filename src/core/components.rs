@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::entity::Entity;
 use crate::interface::input::BuildingKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,16 +132,29 @@ pub struct PowerProvider {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Source that granted power to a consumer during the latest power resolution.
+///
+/// This is derived state recomputed by the power system. R1 records only local
+/// providers; later regional power imports can add owned cross-region source IDs
+/// without changing the local request/grant flow.
+pub enum PowerSource {
+    Local(Entity),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Power demand and current powered state for a consuming building.
 ///
 /// Residential, commercial, and industrial buildings use this component. `demand` is the capacity
 /// they require from their road network, and `powered` is reset/recomputed by the power system each
-/// refresh before downstream systems read it for growth, jobs, income, and inspect output.
+/// refresh before downstream systems read it for growth, jobs, income, and inspect output. `source`
+/// records the derived grant source for registry-based local and future cross-region accounting.
 pub struct PowerConsumer {
     #[serde(default)]
     pub powered: bool,
     #[serde(default = "default_power_demand")]
     pub demand: i32,
+    #[serde(default, skip_serializing)]
+    pub source: Option<PowerSource>,
 }
 
 fn default_power_capacity() -> i32 {

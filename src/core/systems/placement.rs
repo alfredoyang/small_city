@@ -37,6 +37,7 @@ fn attach_building_components(
                 PowerConsumer {
                     powered: false,
                     demand: 1,
+                    source: None,
                 },
             );
         }
@@ -46,6 +47,7 @@ fn attach_building_components(
                 PowerConsumer {
                     powered: false,
                     demand: 2,
+                    source: None,
                 },
             );
         }
@@ -55,6 +57,7 @@ fn attach_building_components(
                 PowerConsumer {
                     powered: false,
                     demand: 3,
+                    source: None,
                 },
             );
             world.attach_pollution_source(entity, PollutionSource { amount: 2 });
