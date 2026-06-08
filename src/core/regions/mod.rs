@@ -57,6 +57,7 @@
 //!   No other region's World is touched.
 //! ```
 
+use crate::core::resource_registry::ResourceRegistry;
 use crate::core::simulation::{refresh_derived_state_for_world, tick_world};
 use crate::core::systems::{build, bulldoze, replace, upgrade};
 use crate::core::world::World;
@@ -184,6 +185,16 @@ impl RegionalExportChange {
             source_neighbor: source_region,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Owned region-level spare capacity summary for cross-region planning.
+///
+/// This intentionally contains only aggregate counts. It does not expose ECS
+/// entities, component references, or handles to this region's private `World`.
+pub struct RegionalSpareCapacity {
+    pub power_capacity: i32,
+    pub job_slots: i32,
 }
 
 impl ImportedResource {
@@ -537,6 +548,21 @@ impl RegionState {
 
         exports.sort_by_key(|(resource_kind, _)| *resource_kind);
         exports
+    }
+
+    /// Returns aggregate spare local capacity without exposing ECS storage.
+    ///
+    /// Power spare capacity is the remaining pooled capacity after local power
+    /// grants. Job spare capacity is the unused effective workplace slots after
+    /// local citizens are accounted for.
+    pub fn regional_spare_capacity(&self) -> RegionalSpareCapacity {
+        let power = ResourceRegistry::for_power(&self.world).resolve_local_power();
+        let jobs = ResourceRegistry::for_jobs(&self.world).resolve_local_jobs();
+
+        RegionalSpareCapacity {
+            power_capacity: power.remaining_capacity,
+            job_slots: jobs.remaining_slots,
+        }
     }
 
     /// Rebuilds transient imported cache state from authoritative local data.

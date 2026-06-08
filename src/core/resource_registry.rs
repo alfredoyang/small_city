@@ -92,6 +92,7 @@ pub(crate) struct PowerResolution {
     pub total_capacity: i32,
     pub total_demand: i32,
     pub total_supplied: i32,
+    pub remaining_capacity: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,11 +263,16 @@ impl PowerRegistry {
         }
 
         let total_supplied = grants.iter().map(|grant| grant.amount).sum();
+        let remaining_capacity = networks
+            .iter()
+            .map(|network| network.remaining_capacity)
+            .sum();
         PowerResolution {
             grants,
             total_capacity: self.total_capacity,
             total_demand: self.total_demand,
             total_supplied,
+            remaining_capacity,
         }
     }
 }

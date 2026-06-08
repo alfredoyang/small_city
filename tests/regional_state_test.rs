@@ -4,9 +4,10 @@ mod common;
 
 use common::SingleRegionTestGame;
 use small_city::core::regions::{
-    ImportDecision, ImportedResource, ImportedResourceResult, RegionId, RegionState, ResourceId,
-    ResourceKind,
+    ImportDecision, ImportedResource, ImportedResourceResult, RegionId, RegionState,
+    RegionalSpareCapacity, ResourceId, ResourceKind,
 };
+use small_city::interface::input::BuildingKind;
 
 #[test]
 fn region_tick_local_matches_game_tick_for_same_empty_city() {
@@ -74,6 +75,57 @@ fn applying_neighbor_import_result_records_owned_reply_only() {
 
     assert_eq!(region.neighbor_import_results(), &[result]);
     assert!(region.imported_resources().is_empty());
+}
+
+#[test]
+fn regional_spare_capacity_matches_local_registry_remaining_capacity() {
+    let mut region = RegionState::new(RegionId(5), 5, 3);
+    assert!(region.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(region.build(0, 1, BuildingKind::Road).success);
+    assert!(region.build(1, 1, BuildingKind::Road).success);
+    assert!(region.build(2, 1, BuildingKind::Road).success);
+    assert!(region.build(1, 0, BuildingKind::Commercial).success);
+    assert!(region.build(2, 0, BuildingKind::Industrial).success);
+
+    assert_eq!(
+        region.regional_spare_capacity(),
+        RegionalSpareCapacity {
+            power_capacity: 5,
+            job_slots: 5,
+        }
+    );
+}
+
+#[test]
+fn regional_spare_capacity_keeps_unreachable_jobs_spare() {
+    let mut region = RegionState::new(RegionId(7), 6, 3);
+    assert!(region.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(region.build(0, 1, BuildingKind::Road).success);
+    assert!(region.build(1, 1, BuildingKind::Road).success);
+    assert!(region.build(1, 0, BuildingKind::Residential).success);
+
+    assert!(region.build(5, 0, BuildingKind::PowerPlant).success);
+    assert!(region.build(5, 1, BuildingKind::Road).success);
+    assert!(region.build(4, 1, BuildingKind::Road).success);
+    assert!(region.build(4, 0, BuildingKind::Commercial).success);
+
+    for _ in 0..24 {
+        assert!(region.tick_local().success);
+    }
+
+    assert_eq!(region.view().status.population, 1);
+    assert_eq!(region.regional_spare_capacity().job_slots, 2);
+}
+
+#[test]
+fn regional_spare_capacity_is_owned_summary_without_ecs_identity() {
+    let region = RegionState::new(RegionId(6), 3, 3);
+    let summary = region.regional_spare_capacity();
+
+    let copied = summary;
+    assert_eq!(summary, copied);
+    assert_eq!(summary.power_capacity, 0);
+    assert_eq!(summary.job_slots, 0);
 }
 
 fn resource(
