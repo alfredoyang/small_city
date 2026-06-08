@@ -5,9 +5,10 @@ This plan introduces a shared way to register resource providers and consumers
 eventually, cross-region export read one source of truth instead of each system
 re-deriving road-network adjacency and allocation.
 
-It supersedes the discarded first attempt at cross-region power
-(`regional-cross-region-power-import-plan.md` Patch P1), whose duplication of the
-power allocation was the symptom that motivated this foundation.
+It supersedes a discarded first attempt at cross-region power that recomputed
+export capacity independently of the local power system; that duplication was the
+symptom that motivated this foundation. The registry-based cross-region design
+now lives in `regional-cross-region-power-import-plan.md`.
 
 ## Motivation (current state)
 
@@ -241,10 +242,10 @@ Review focus:
 Goal: re-attempt cross-region power and jobs by reading the registry's spare
 capacity at border links, replacing the discarded standalone derivation.
 
-This reuses the cross-region design notes
-(`regional-cross-region-power-import-plan.md`) for border identity, request and
-reply data, and stale-generation handling, but sources capacity from the registry
-instead of a parallel computation.
+The detailed design is in `regional-cross-region-power-import-plan.md`: border
+identity, request/reply over region-runtime events, stale-generation handling,
+and capacity sourced from the registry spare-capacity query (R3) rather than a
+parallel computation.
 
 ## Patch R5 (Deferred): Persistent, Change-Driven Registry
 
