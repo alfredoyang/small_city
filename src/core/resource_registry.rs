@@ -93,6 +93,14 @@ pub(crate) struct PowerResolution {
     pub total_demand: i32,
     pub total_supplied: i32,
     pub remaining_capacity: i32,
+    pub network_capacities: Vec<PowerNetworkCapacity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Remaining power capacity for one local road network after local grants.
+pub(crate) struct PowerNetworkCapacity {
+    pub road_network: u32,
+    pub remaining_capacity: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +214,7 @@ struct JobsRegistry {
 /// ```
 #[derive(Debug, Clone)]
 struct PowerNetworkPool {
+    road_network: u32,
     roads: HashSet<Entity>,
     remaining_capacity: i32,
     representative_provider: Option<Entity>,
@@ -267,12 +276,20 @@ impl PowerRegistry {
             .iter()
             .map(|network| network.remaining_capacity)
             .sum();
+        let network_capacities = networks
+            .iter()
+            .map(|network| PowerNetworkCapacity {
+                road_network: network.road_network,
+                remaining_capacity: network.remaining_capacity,
+            })
+            .collect();
         PowerResolution {
             grants,
             total_capacity: self.total_capacity,
             total_demand: self.total_demand,
             total_supplied,
             remaining_capacity,
+            network_capacities,
         }
     }
 }
@@ -442,6 +459,7 @@ impl PowerNetworkPool {
             .sum();
 
         Self {
+            road_network: network.id,
             roads: network.roads,
             remaining_capacity,
             // Local power capacity is pooled per road network. The source is a

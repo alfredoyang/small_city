@@ -59,7 +59,7 @@
 
 use crate::core::resource_registry::ResourceRegistry;
 use crate::core::simulation::{refresh_derived_state_for_world, tick_world};
-use crate::core::systems::{build, bulldoze, replace, upgrade};
+use crate::core::systems::{build, bulldoze, replace, road_connectivity, upgrade};
 use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
 use crate::interface::events::CommandResult;
@@ -195,6 +195,93 @@ impl RegionalExportChange {
 pub struct RegionalSpareCapacity {
     pub power_capacity: i32,
     pub job_slots: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Owned summary key for one deterministic road network inside one region.
+pub struct RegionRoadNetworkId {
+    pub region: RegionId,
+    pub road_network: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Region map edge used to identify where local road networks can meet neighbors.
+pub enum BorderEdge {
+    North,
+    South,
+    West,
+    East,
+}
+
+impl BorderEdge {
+    /// Returns the edge that faces this one on an adjacent neighbor region.
+    pub fn complementary_neighbor_edge(self) -> Self {
+        match self {
+            BorderEdge::North => BorderEdge::South,
+            BorderEdge::South => BorderEdge::North,
+            BorderEdge::West => BorderEdge::East,
+            BorderEdge::East => BorderEdge::West,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Owned border-road identity; offset is x for north/south and y for west/east.
+pub struct BorderLinkId {
+    pub edge: BorderEdge,
+    pub offset: usize,
+}
+
+impl BorderLinkId {
+    /// Maps this local link to the matching link a neighbor must expose.
+    pub fn matching_neighbor_link(self) -> Self {
+        Self {
+            edge: self.edge.complementary_neighbor_edge(),
+            offset: self.offset,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// One border link owned by one local road network summary.
+pub struct NetworkBorderLink {
+    pub network: RegionRoadNetworkId,
+    pub link: BorderLinkId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Owned region-topology edge used to decide which border links may match.
+pub struct RegionNeighborLink {
+    pub region: RegionId,
+    pub edge: BorderEdge,
+    pub neighbor: RegionId,
+}
+
+impl RegionNeighborLink {
+    /// Builds one directional topology edge. The component graph unions matched
+    /// road networks symmetrically, but callers should publish both directions
+    /// when they maintain a full regional layout.
+    pub fn new(region: RegionId, edge: BorderEdge, neighbor: RegionId) -> Self {
+        Self {
+            region,
+            edge,
+            neighbor,
+        }
+    }
+
+    pub fn allows_source(self, region: RegionId, edge: BorderEdge) -> bool {
+        self.region == region && self.edge == edge
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Stale-tolerant availability hint published for regional discovery.
+///
+/// Claims still have to be confirmed by the source region runtime.
+pub struct RegionalAvailabilityHint {
+    pub network: RegionRoadNetworkId,
+    pub has_spare_power: bool,
+    pub has_spare_jobs: bool,
 }
 
 impl ImportedResource {
@@ -529,6 +616,31 @@ impl RegionState {
         self.imported_resources.resources()
     }
 
+    /// Returns entity-free border links grouped by local road network.
+    pub fn network_border_links(&self) -> Vec<NetworkBorderLink> {
+        let mut links = Vec::new();
+        for network in road_connectivity::discover_road_networks(&self.world) {
+            let network_id = RegionRoadNetworkId {
+                region: self.id,
+                road_network: network.id,
+            };
+            for road in network.roads {
+                let Some(position) = self.world.positions.get(&road) else {
+                    continue;
+                };
+                links.extend(border_links_for_cell(
+                    network_id,
+                    position.x,
+                    position.y,
+                    self.world.grid.width(),
+                    self.world.grid.height(),
+                ));
+            }
+        }
+        links.sort();
+        links
+    }
+
     /// Derives current local exports from authoritative region state.
     pub fn exported_resource_counts(&self) -> Vec<(ResourceKind, u32)> {
         let mut exports: Vec<(ResourceKind, u32)> = Vec::new();
@@ -563,6 +675,31 @@ impl RegionState {
             power_capacity: power.remaining_capacity,
             job_slots: jobs.remaining_slots,
         }
+    }
+
+    /// Returns stale-tolerant per-network availability hints for discovery.
+    pub fn availability_hints(&self) -> Vec<RegionalAvailabilityHint> {
+        // `network_border_links` and the power registry both use deterministic
+        // road-network discovery over this same world, so their `road_network`
+        // ids are stable summary keys for one discovery snapshot.
+        let power = ResourceRegistry::for_power(&self.world).resolve_local_power();
+        let jobs = ResourceRegistry::for_jobs(&self.world).resolve_local_jobs();
+        let has_spare_jobs = jobs.remaining_slots > 0;
+
+        let mut hints = power
+            .network_capacities
+            .into_iter()
+            .map(|capacity| RegionalAvailabilityHint {
+                network: RegionRoadNetworkId {
+                    region: self.id,
+                    road_network: capacity.road_network,
+                },
+                has_spare_power: capacity.remaining_capacity > 0,
+                has_spare_jobs,
+            })
+            .collect::<Vec<_>>();
+        hints.sort_by_key(|hint| hint.network);
+        hints
     }
 
     /// Rebuilds transient imported cache state from authoritative local data.
@@ -610,6 +747,57 @@ impl RegionState {
         state.rebuild_imported_resource_cache();
         state
     }
+}
+
+fn border_links_for_cell(
+    network: RegionRoadNetworkId,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> Vec<NetworkBorderLink> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let mut links = Vec::new();
+    if y == 0 {
+        links.push(NetworkBorderLink {
+            network,
+            link: BorderLinkId {
+                edge: BorderEdge::North,
+                offset: x,
+            },
+        });
+    }
+    if y == height - 1 {
+        links.push(NetworkBorderLink {
+            network,
+            link: BorderLinkId {
+                edge: BorderEdge::South,
+                offset: x,
+            },
+        });
+    }
+    if x == 0 {
+        links.push(NetworkBorderLink {
+            network,
+            link: BorderLinkId {
+                edge: BorderEdge::West,
+                offset: y,
+            },
+        });
+    }
+    if x == width - 1 {
+        links.push(NetworkBorderLink {
+            network,
+            link: BorderLinkId {
+                edge: BorderEdge::East,
+                offset: y,
+            },
+        });
+    }
+    links
 }
 
 fn exported_resource_kind_for_building(kind: BuildingKind) -> Option<ResourceKind> {

@@ -5,7 +5,8 @@ use small_city::core::regions::continuation::{CallerContinuation, NeighborReques
 use small_city::core::regions::runtime::{ImportedResourcePayload, RegionEvent, RegionRuntime};
 use small_city::core::regions::worker::{RegionWorker, WorkerId, WorkerRoutingError};
 use small_city::core::regions::{
-    ImportedResource, ImportedResourceResult, RegionId, RegionState, ResourceId, ResourceKind,
+    BorderEdge, ImportedResource, ImportedResourceResult, RegionId, RegionNeighborLink,
+    RegionRoadNetworkId, RegionState, ResourceId, ResourceKind,
 };
 use small_city::interface::input::BuildingKind;
 
@@ -249,6 +250,84 @@ fn worker_routes_export_removal_to_neighbor_import_cache() {
     );
 }
 
+#[test]
+fn discovery_joins_complementary_border_road_networks() {
+    let left = region_with_roads(RegionId(16), 2, 1, &[(1, 0)]);
+    let right = region_with_roads(RegionId(17), 2, 1, &[(0, 0)]);
+    let worker = worker_with_region_states(WorkerId(9), vec![left, right]);
+
+    let discovery = worker.cross_region_discovery(&[neighbor(16, BorderEdge::East, 17)]);
+
+    assert_component(
+        &discovery,
+        network(16, 0),
+        &[network(16, 0), network(17, 0)],
+    );
+}
+
+#[test]
+fn discovery_does_not_join_mismatched_border_offsets() {
+    let left = region_with_roads(RegionId(18), 2, 2, &[(1, 0)]);
+    let right = region_with_roads(RegionId(19), 2, 2, &[(0, 1)]);
+    let worker = worker_with_region_states(WorkerId(10), vec![left, right]);
+
+    let discovery = worker.cross_region_discovery(&[neighbor(18, BorderEdge::East, 19)]);
+
+    assert_component(&discovery, network(18, 0), &[network(18, 0)]);
+    assert_component(&discovery, network(19, 0), &[network(19, 0)]);
+}
+
+#[test]
+fn discovery_keeps_one_regions_disconnected_networks_in_separate_components() {
+    let left = region_with_roads(RegionId(20), 2, 5, &[(1, 1)]);
+    let middle = region_with_roads(RegionId(21), 3, 5, &[(0, 1), (2, 3)]);
+    let right = region_with_roads(RegionId(22), 2, 5, &[(0, 3)]);
+    let worker = worker_with_region_states(WorkerId(11), vec![left, middle, right]);
+
+    let discovery = worker.cross_region_discovery(&[
+        neighbor(20, BorderEdge::East, 21),
+        neighbor(21, BorderEdge::East, 22),
+    ]);
+
+    assert_component(
+        &discovery,
+        network(20, 0),
+        &[network(20, 0), network(21, 0)],
+    );
+    assert_component(
+        &discovery,
+        network(21, 1),
+        &[network(21, 1), network(22, 0)],
+    );
+}
+
+#[test]
+fn discovery_publishes_owned_availability_hints() {
+    let mut source = RegionState::new(RegionId(23), 3, 2);
+    assert!(source.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(source.build(0, 1, BuildingKind::Road).success);
+    let worker = worker_with_region_states(WorkerId(12), vec![source]);
+
+    let discovery = worker.cross_region_discovery(&[]);
+
+    assert_eq!(discovery.availability_hints.len(), 1);
+    assert_eq!(discovery.availability_hints[0].network, network(23, 0));
+    assert!(discovery.availability_hints[0].has_spare_power);
+    assert!(!discovery.availability_hints[0].has_spare_jobs);
+}
+
+#[test]
+fn discovery_does_not_join_unrelated_regions_with_matching_border_links() {
+    let left = region_with_roads(RegionId(24), 2, 1, &[(1, 0)]);
+    let right = region_with_roads(RegionId(25), 2, 1, &[(0, 0)]);
+    let worker = worker_with_region_states(WorkerId(13), vec![left, right]);
+
+    let discovery = worker.cross_region_discovery(&[]);
+
+    assert_component(&discovery, network(24, 0), &[network(24, 0)]);
+    assert_component(&discovery, network(25, 0), &[network(25, 0)]);
+}
+
 fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
     let mut worker = RegionWorker::new(id);
     for region_id in regions {
@@ -257,6 +336,46 @@ fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
             .unwrap();
     }
     worker
+}
+
+fn worker_with_region_states(id: WorkerId, regions: Vec<RegionState>) -> RegionWorker {
+    let mut worker = RegionWorker::new(id);
+    for region in regions {
+        worker.add_region(RegionRuntime::new(region)).unwrap();
+    }
+    worker
+}
+
+fn assert_component(
+    discovery: &small_city::core::regions::worker::CrossRegionDiscovery,
+    member: RegionRoadNetworkId,
+    expected: &[RegionRoadNetworkId],
+) {
+    assert_eq!(discovery.component_of(member), Some(expected));
+}
+
+fn region_with_roads(
+    region_id: RegionId,
+    width: usize,
+    height: usize,
+    roads: &[(usize, usize)],
+) -> RegionState {
+    let mut region = RegionState::new(region_id, width, height);
+    for (x, y) in roads {
+        assert!(region.build(*x, *y, BuildingKind::Road).success);
+    }
+    region
+}
+
+fn network(region: u32, road_network: u32) -> RegionRoadNetworkId {
+    RegionRoadNetworkId {
+        region: RegionId(region),
+        road_network,
+    }
+}
+
+fn neighbor(region: u32, edge: BorderEdge, neighbor: u32) -> RegionNeighborLink {
+    RegionNeighborLink::new(RegionId(region), edge, RegionId(neighbor))
 }
 
 fn tick(request_id: u64) -> RegionEvent {

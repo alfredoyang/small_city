@@ -4,8 +4,9 @@ mod common;
 
 use common::SingleRegionTestGame;
 use small_city::core::regions::{
-    ImportDecision, ImportedResource, ImportedResourceResult, RegionId, RegionState,
-    RegionalSpareCapacity, ResourceId, ResourceKind,
+    BorderEdge, BorderLinkId, ImportDecision, ImportedResource, ImportedResourceResult,
+    NetworkBorderLink, RegionId, RegionRoadNetworkId, RegionState, RegionalSpareCapacity,
+    ResourceId, ResourceKind,
 };
 use small_city::interface::input::BuildingKind;
 
@@ -126,6 +127,82 @@ fn regional_spare_capacity_is_owned_summary_without_ecs_identity() {
     assert_eq!(summary, copied);
     assert_eq!(summary.power_capacity, 0);
     assert_eq!(summary.job_slots, 0);
+}
+
+#[test]
+fn edge_road_cells_report_network_border_links() {
+    let mut region = RegionState::new(RegionId(8), 4, 3);
+    assert!(region.build(0, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 1, BuildingKind::Road).success);
+    assert!(region.build(3, 2, BuildingKind::Road).success);
+    assert!(region.build(2, 0, BuildingKind::Residential).success);
+
+    assert_eq!(
+        region.network_border_links(),
+        vec![
+            network_link(8, 0, BorderEdge::North, 0),
+            network_link(8, 0, BorderEdge::West, 0),
+            network_link(8, 2, BorderEdge::South, 3),
+            network_link(8, 2, BorderEdge::East, 2),
+        ]
+    );
+}
+
+#[test]
+fn border_link_matches_complementary_neighbor_link() {
+    assert_eq!(
+        link(BorderEdge::North, 2).matching_neighbor_link(),
+        link(BorderEdge::South, 2)
+    );
+    assert_eq!(
+        link(BorderEdge::East, 1).matching_neighbor_link(),
+        link(BorderEdge::West, 1)
+    );
+}
+
+#[test]
+fn availability_hints_report_spare_registry_capacity_without_ecs_identity() {
+    let mut region = RegionState::new(RegionId(9), 5, 3);
+    assert!(region.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(region.build(0, 1, BuildingKind::Road).success);
+    assert!(region.build(1, 1, BuildingKind::Road).success);
+    assert!(region.build(1, 0, BuildingKind::Commercial).success);
+    assert!(region.build(4, 2, BuildingKind::Road).success);
+
+    let hints = region.availability_hints();
+    let copied = hints.clone();
+
+    assert_eq!(hints, copied);
+    assert_eq!(hints.len(), 2);
+    assert_eq!(hints[0].network, network(9, 0));
+    assert!(hints[0].has_spare_power);
+    assert!(hints[0].has_spare_jobs);
+    assert_eq!(hints[1].network, network(9, 1));
+    assert!(!hints[1].has_spare_power);
+    assert!(hints[1].has_spare_jobs);
+}
+
+fn network(region: u32, road_network: u32) -> RegionRoadNetworkId {
+    RegionRoadNetworkId {
+        region: RegionId(region),
+        road_network,
+    }
+}
+
+fn link(edge: BorderEdge, offset: usize) -> BorderLinkId {
+    BorderLinkId { edge, offset }
+}
+
+fn network_link(
+    region: u32,
+    road_network: u32,
+    edge: BorderEdge,
+    offset: usize,
+) -> NetworkBorderLink {
+    NetworkBorderLink {
+        network: network(region, road_network),
+        link: link(edge, offset),
+    }
 }
 
 fn resource(
