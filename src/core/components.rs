@@ -111,6 +111,13 @@ pub struct Citizen {
     pub age: u32,
     pub home: crate::core::entity::Entity,
     pub workplace: Option<crate::core::entity::Entity>,
+    /// Cross-region workplace assigned when no local slot was reachable.
+    ///
+    /// Derived state recomputed every daily economy boundary, never authoritative
+    /// save data. It holds only owned summary data (region + opaque slot id +
+    /// salary), never a remote ECS entity from the exporting region.
+    #[serde(default, skip_serializing)]
+    pub remote_workplace: Option<RemoteWorkplace>,
     pub happiness: i32,
     #[serde(default)]
     pub happiness_decay: i32,
@@ -119,6 +126,19 @@ pub struct Citizen {
     /// Set by the economy system when rent cannot be paid; happiness reads it as rent stress.
     #[serde(default)]
     pub rent_stress: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Owned reference to a workplace slot exported by another region.
+///
+/// The consuming region stores `slot_id` as an opaque owned id (it never
+/// dereferences it as a local ECS entity). The salary is captured at grant time
+/// so the home region can pay the citizen without reading the producer's `World`.
+/// Workplace tax and business profit accrue to the exporting region instead.
+pub struct RemoteWorkplace {
+    pub region: RegionId,
+    pub slot_id: u32,
+    pub salary: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

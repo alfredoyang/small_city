@@ -82,6 +82,7 @@
 
 pub mod continuation;
 
+use crate::core::entity::Entity;
 use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionCommandResponse, RegionSnapshotResponse,
     RegionTickResponse, RegionViewSnapshot, UiRequestId,
@@ -89,8 +90,9 @@ use crate::core::regional_types::{
 use crate::core::regions::handle::{RegionEventReceiver, RegionHandle, mailbox};
 use crate::core::regions::runtime::continuation::{CallerContinuation, NeighborRequest};
 use crate::core::regions::{
-    ImportedResource, ImportedResourceResult, PendingPowerDemand, PowerExportGrant, RegionId,
-    RegionRoadNetworkId, RegionState, RegionalExport, RegionalExportChange, RegionalTickPowerPhase,
+    ImportedResource, ImportedResourceResult, JobExportGrant, PendingJobDemand, PendingPowerDemand,
+    PowerExportGrant, RegionId, RegionRoadNetworkId, RegionState, RegionalExport,
+    RegionalExportChange, RegionalTickJobPhase, RegionalTickPowerPhase,
 };
 use crate::interface::input::MapOverlayInput;
 
@@ -116,12 +118,18 @@ pub enum RegionEvent {
         continuation: CallerContinuation<ImportedResourceResult>,
         result: ImportedResourceResult,
     },
-    /// Authoritative producer-side export allocation request.
+    /// Authoritative producer-side power export allocation request.
     ProcessPowerExportRequest(PowerExportAllocationRequest),
-    /// Producer-side release for a caller's previous export allocations.
+    /// Producer-side release for a caller's previous power export allocations.
     ReleasePowerExportAllocations(PowerExportAllocationRelease),
-    /// Caller-side export grant result.
+    /// Caller-side power export grant result.
     ApplyPowerExportGrant(PowerExportGrant),
+    /// Authoritative producer-side job-slot export allocation request.
+    ProcessJobExportRequest(JobExportAllocationRequest),
+    /// Producer-side release for a caller's previous job export allocations.
+    ReleaseJobExportAllocations(JobExportAllocationRelease),
+    /// Caller-side job export grant result.
+    ApplyJobExportGrant(JobExportGrant),
     /// Internal event used to publish exports after startup or load.
     RefreshExports,
 }
@@ -186,6 +194,32 @@ pub struct PowerExportAllocationRelease {
     pub request_id: UiRequestId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Consumer request for a producer to export one workplace slot for a job seeker.
+///
+/// Unlike power there is no demand amount: one citizen fills one whole slot.
+pub struct JobExportRequest {
+    pub request_id: UiRequestId,
+    pub caller_region: RegionId,
+    pub caller_network: RegionRoadNetworkId,
+    pub token: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Producer-side job allocation request plus candidates if a stale hint denies it.
+pub struct JobExportAllocationRequest {
+    pub request: JobExportRequest,
+    pub candidates: Vec<RegionRoadNetworkId>,
+    pub candidate_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Producer-side marker that a caller started a new tick job-resolution generation.
+pub struct JobExportAllocationRelease {
+    pub caller_region: RegionId,
+    pub request_id: UiRequestId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Deterministic runtime error returned as outbound routing feedback.
 pub enum RegionRuntimeError {
@@ -215,6 +249,12 @@ pub enum OutboundMessage {
         grant: PowerExportGrant,
     },
     PowerExportAllocationsReleased(PowerExportAllocationRelease),
+    JobExportRequested(JobExportRequest),
+    JobExportRequestCompleted {
+        request: JobExportAllocationRequest,
+        grant: JobExportGrant,
+    },
+    JobExportAllocationsReleased(JobExportAllocationRelease),
     RuntimeError(RegionRuntimeError),
 }
 
@@ -225,6 +265,7 @@ pub struct RegionRuntime {
     exports: Vec<RegionalExport>,
     tick_state: TickState,
     power_export_allocations: Vec<PowerExportAllocation>,
+    job_export_allocations: Vec<JobExportAllocation>,
     handle: RegionHandle,
     receiver: RegionEventReceiver,
 }
@@ -232,32 +273,42 @@ pub struct RegionRuntime {
 #[derive(Debug)]
 /// Explicit tick lifecycle for one region runtime.
 ///
-/// Cross-region power export pauses a tick between local power resolution and the
-/// downstream systems that read `powered`. This enum makes the two legal states
-/// explicit and documents the transitions:
+/// Cross-region export pauses a tick at two points so the importing region resolves
+/// over the event flow before downstream systems read the result. Power resolves
+/// first (it sets `powered`, which jobs and economy then read), then jobs; each is
+/// its own waiting sub-state and is skipped when that resource has no exportable
+/// demand:
 ///
 /// ```text
 /// Idle
-///   -- Tick (no exportable demand) --> finish immediately, stay Idle
-///   -- Tick (exportable demand)    --> WaitingForPowerExports
+///   -- Tick --> WaitingForPowerExports (power demand)
+///            \-> WaitingForJobExports  (no power demand, job demand)
+///            \-> finish immediately, stay Idle (neither)
 /// WaitingForPowerExports
 ///   -- ApplyPowerExportGrant (demands remain) --> WaitingForPowerExports
-///   -- ApplyPowerExportGrant (last demand)    --> finish tick, back to Idle
+///   -- ApplyPowerExportGrant (last demand)    --> enter job phase
+/// WaitingForJobExports
+///   -- ApplyJobExportGrant (demands remain) --> WaitingForJobExports
+///   -- ApplyJobExportGrant (last demand)    --> finish tick, back to Idle
 /// ```
 ///
-/// While `WaitingForPowerExports`, only export control events run (grants,
-/// producer-side requests, releases); a second `Tick` is deferred in the inbox
-/// until the paused tick finishes. A grant that arrives while `Idle`, or one with
-/// an unknown token, leaves the current state unchanged.
+/// While waiting, only export control events run (grants, producer-side requests,
+/// releases for either resource); a second `Tick` is deferred in the inbox until
+/// the paused tick finishes. A grant that arrives while `Idle`, in the wrong phase,
+/// or with an unknown token, leaves the current state unchanged.
 enum TickState {
     Idle,
     WaitingForPowerExports(TickPowerContinuation),
+    WaitingForJobExports(TickJobContinuation),
 }
 
 impl TickState {
     /// Returns true while a tick is paused waiting for export grants.
     fn is_waiting(&self) -> bool {
-        matches!(self, TickState::WaitingForPowerExports(_))
+        matches!(
+            self,
+            TickState::WaitingForPowerExports(_) | TickState::WaitingForJobExports(_)
+        )
     }
 }
 
@@ -269,6 +320,14 @@ struct TickPowerContinuation {
     pending_demands: Vec<PendingPowerDemand>,
 }
 
+#[derive(Debug)]
+/// Paused tick waiting for cross-region job-slot export grants to resolve.
+struct TickJobContinuation {
+    request_id: UiRequestId,
+    phase: RegionalTickJobPhase,
+    pending_demands: Vec<PendingJobDemand>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PowerExportAllocation {
     key: PowerExportAllocationKey,
@@ -278,7 +337,22 @@ struct PowerExportAllocation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JobExportAllocation {
+    key: JobExportAllocationKey,
+    network: RegionRoadNetworkId,
+    workplace: Entity,
+    caller_generation: UiRequestId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PowerExportAllocationKey {
+    caller_region: RegionId,
+    request_id: UiRequestId,
+    token: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JobExportAllocationKey {
     caller_region: RegionId,
     request_id: UiRequestId,
     token: u32,
@@ -294,6 +368,7 @@ impl RegionRuntime {
             exports: Vec::new(),
             tick_state: TickState::Idle,
             power_export_allocations: Vec::new(),
+            job_export_allocations: Vec::new(),
             handle,
             receiver,
         };
@@ -419,6 +494,18 @@ impl RegionRuntime {
                 Vec::new()
             }
             RegionEvent::ApplyPowerExportGrant(grant) => self.apply_power_export_grant(grant),
+            RegionEvent::ProcessJobExportRequest(request) => {
+                let grant = self.process_job_export_request(&request);
+                vec![OutboundMessage::JobExportRequestCompleted { request, grant }]
+            }
+            RegionEvent::ReleaseJobExportAllocations(release) => {
+                self.release_stale_job_export_allocations_for_caller(
+                    release.caller_region,
+                    release.request_id,
+                );
+                Vec::new()
+            }
+            RegionEvent::ApplyJobExportGrant(grant) => self.apply_job_export_grant(grant),
             RegionEvent::RefreshExports => self.export_change_messages(),
         }
     }
@@ -428,9 +515,9 @@ impl RegionRuntime {
             return self.receiver.pop_event();
         }
 
-        // A tick paused for exported power must finish before ordinary gameplay
-        // events run. Export grants are control replies for that paused tick;
-        // producer-side requests must also run, otherwise two regions that
+        // A tick paused for exported power or jobs must finish before ordinary
+        // gameplay events run. Export grants are control replies for that paused
+        // tick; producer-side requests must also run, otherwise two regions that
         // both consume and export on different networks can deadlock each other.
         self.receiver.pop_event_matching(|event| {
             matches!(
@@ -438,6 +525,9 @@ impl RegionRuntime {
                 RegionEvent::ApplyPowerExportGrant(_)
                     | RegionEvent::ProcessPowerExportRequest(_)
                     | RegionEvent::ReleasePowerExportAllocations(_)
+                    | RegionEvent::ApplyJobExportGrant(_)
+                    | RegionEvent::ProcessJobExportRequest(_)
+                    | RegionEvent::ReleaseJobExportAllocations(_)
             )
         })
     }
@@ -453,11 +543,9 @@ impl RegionRuntime {
                 request_id,
             });
         if phase.power_demands.is_empty() {
-            let mut outbound = vec![
-                release,
-                OutboundMessage::RegionTickCompleted(self.finish_tick_phase(request_id, phase)),
-            ];
-            outbound.extend(self.export_change_messages());
+            // No exported power needed; advance straight to the job phase.
+            let mut outbound = vec![release];
+            outbound.extend(self.enter_job_phase(request_id, phase));
             return outbound;
         }
 
@@ -486,15 +574,91 @@ impl RegionRuntime {
         outbound
     }
 
-    fn finish_tick_phase(
+    /// Advances a tick whose power is resolved into the job export phase.
+    ///
+    /// Emits a job allocation release for this caller generation, then either
+    /// finishes the tick immediately (no job seekers need a remote slot) or sends
+    /// one job export request per seeker and pauses in `WaitingForJobExports`.
+    fn enter_job_phase(
         &mut self,
         request_id: UiRequestId,
-        phase: RegionalTickPowerPhase,
+        power_phase: RegionalTickPowerPhase,
+    ) -> Vec<OutboundMessage> {
+        let phase = self.state.continue_tick_to_job_demand_phase(power_phase);
+        if !phase.is_daily() {
+            // Jobs resolve only on a daily boundary; an hourly tick neither makes
+            // nor invalidates job reservations, so it sends no release or requests.
+            let mut outbound = vec![OutboundMessage::RegionTickCompleted(
+                self.finish_job_phase(request_id, phase),
+            )];
+            outbound.extend(self.export_change_messages());
+            return outbound;
+        }
+        let release = OutboundMessage::JobExportAllocationsReleased(JobExportAllocationRelease {
+            caller_region: self.region_id(),
+            request_id,
+        });
+        if phase.job_demands.is_empty() {
+            let mut outbound = vec![
+                release,
+                OutboundMessage::RegionTickCompleted(self.finish_job_phase(request_id, phase)),
+            ];
+            outbound.extend(self.export_change_messages());
+            return outbound;
+        }
+
+        let pending_demands = phase.job_demands.clone();
+        let mut outbound = vec![release];
+        outbound.extend(
+            pending_demands
+                .iter()
+                .map(|demand| {
+                    OutboundMessage::JobExportRequested(JobExportRequest {
+                        request_id,
+                        caller_region: self.region_id(),
+                        caller_network: demand.caller_network,
+                        token: demand.token,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        self.tick_state = TickState::WaitingForJobExports(TickJobContinuation {
+            request_id,
+            phase,
+            pending_demands,
+        });
+        outbound
+    }
+
+    fn finish_job_phase(
+        &mut self,
+        request_id: UiRequestId,
+        phase: RegionalTickJobPhase,
     ) -> RegionTickResponse {
+        // Slots this region reserved for remote workers accrue their workplace tax
+        // to this region in its own economy step.
+        //
+        // Settlement can lag the home region by one daily tick, by design: regions
+        // finish ticks independently with no cross-region economy barrier. A
+        // producer with no local job seekers finishes its own job phase in the same
+        // pass as its Tick -- often before a fresh consumer request reaches it -- so
+        // that day's economy uses the *previous* day's reservations (they persist
+        // until the caller's next-generation release). This is deterministic and
+        // self-correcting in steady state; pairing salary and tax on the same day
+        // would require a global "all exports resolved" barrier before any economy
+        // runs, which is far more synchronization for little gain.
+        let exported_job_slots = self
+            .job_export_allocations
+            .iter()
+            .map(|allocation| allocation.workplace)
+            .collect::<Vec<_>>();
         RegionTickResponse {
             request_id,
             region_id: self.region_id(),
-            result: self.state.finish_tick_power_demand_phase(phase),
+            result: self
+                .state
+                .finish_tick_job_demand_phase(phase, &exported_job_slots),
         }
     }
 
@@ -573,6 +737,85 @@ impl RegionRuntime {
         });
     }
 
+    fn process_job_export_request(
+        &mut self,
+        request: &JobExportAllocationRequest,
+    ) -> JobExportGrant {
+        let producer_network = request.candidates[request.candidate_index];
+        let allocation_key = JobExportAllocationKey {
+            caller_region: request.request.caller_region,
+            request_id: request.request.request_id,
+            token: request.request.token,
+        };
+        self.release_stale_job_export_allocations_for_caller(
+            request.request.caller_region,
+            request.request.request_id,
+        );
+
+        // Producer-owned spare: slots on this network minus those already reserved
+        // by other active allocations (one slot occurrence per reservation). This
+        // key's own reservation, if any, is left in so a retry re-grants a slot.
+        let mut available = self.state.spare_job_slots_on_network(producer_network);
+        for allocation in &self.job_export_allocations {
+            if allocation.key == allocation_key {
+                continue;
+            }
+            if let Some(index) = available
+                .iter()
+                .position(|slot| *slot == allocation.workplace)
+            {
+                available.remove(index);
+            }
+        }
+
+        let Some(workplace) = available.first().copied() else {
+            return JobExportGrant {
+                token: request.request.token,
+                granted: false,
+                source_region: None,
+                slot_id: None,
+                salary: 0,
+            };
+        };
+        let salary = self.state.workplace_salary(workplace);
+
+        if let Some(allocation) = self
+            .job_export_allocations
+            .iter_mut()
+            .find(|allocation| allocation.key == allocation_key)
+        {
+            allocation.network = producer_network;
+            allocation.workplace = workplace;
+            allocation.caller_generation = request.request.request_id;
+        } else {
+            self.job_export_allocations.push(JobExportAllocation {
+                key: allocation_key,
+                network: producer_network,
+                workplace,
+                caller_generation: request.request.request_id,
+            });
+        }
+
+        JobExportGrant {
+            token: request.request.token,
+            granted: true,
+            source_region: Some(self.region_id()),
+            slot_id: Some(workplace.0),
+            salary,
+        }
+    }
+
+    fn release_stale_job_export_allocations_for_caller(
+        &mut self,
+        caller_region: RegionId,
+        caller_generation: UiRequestId,
+    ) {
+        self.job_export_allocations.retain(|allocation| {
+            allocation.key.caller_region != caller_region
+                || allocation.caller_generation == caller_generation
+        });
+    }
+
     fn apply_power_export_grant(&mut self, grant: PowerExportGrant) -> Vec<OutboundMessage> {
         // A grant only applies to a paused tick. Take the continuation out and
         // fall back to `Idle`; an unrelated grant restores the prior state below.
@@ -598,9 +841,38 @@ impl RegionRuntime {
             return Vec::new();
         }
 
-        // Last demand resolved: finish the paused tick and return to `Idle`.
+        // Last power demand resolved: advance to the job export phase.
+        self.enter_job_phase(continuation.request_id, continuation.phase)
+    }
+
+    fn apply_job_export_grant(&mut self, grant: JobExportGrant) -> Vec<OutboundMessage> {
+        // A job grant only applies while waiting for job exports; ignore it
+        // otherwise (idle or still in the power phase).
+        let TickState::WaitingForJobExports(mut continuation) =
+            std::mem::replace(&mut self.tick_state, TickState::Idle)
+        else {
+            return Vec::new();
+        };
+        let Some(position) = continuation
+            .pending_demands
+            .iter()
+            .position(|demand| demand.token == grant.token)
+        else {
+            // Unknown token: keep waiting for the demands this tick still expects.
+            self.tick_state = TickState::WaitingForJobExports(continuation);
+            return Vec::new();
+        };
+
+        let demand = continuation.pending_demands.remove(position);
+        self.state.apply_job_export_grant(demand, grant);
+        if !continuation.pending_demands.is_empty() {
+            self.tick_state = TickState::WaitingForJobExports(continuation);
+            return Vec::new();
+        }
+
+        // Last job demand resolved: finish the paused tick and return to `Idle`.
         let mut outbound = vec![OutboundMessage::RegionTickCompleted(
-            self.finish_tick_phase(continuation.request_id, continuation.phase),
+            self.finish_job_phase(continuation.request_id, continuation.phase),
         )];
         outbound.extend(self.export_change_messages());
         outbound
@@ -903,5 +1175,79 @@ mod tick_state_tests {
 
         assert!(runtime.tick_state.is_waiting());
         assert!(!has_tick_completed(&outbound));
+    }
+
+    #[test]
+    fn job_grant_while_idle_is_ignored() {
+        let mut runtime = consumer_runtime(RegionId(1));
+        assert!(!runtime.tick_state.is_waiting());
+
+        runtime.push_event(RegionEvent::ApplyJobExportGrant(JobExportGrant {
+            token: 0,
+            granted: true,
+            source_region: Some(RegionId(2)),
+            slot_id: Some(0),
+            salary: 4,
+        }));
+        let outbound = runtime.process_next_event();
+
+        assert!(outbound.is_empty());
+        assert!(!runtime.tick_state.is_waiting());
+    }
+
+    #[test]
+    fn daily_tick_with_jobless_seeker_enters_job_wait_state() {
+        // A locally-powered residential whose only workplace sits on a separate,
+        // unreachable road network grows citizens that stay locally jobless. The
+        // first daily tick that produces such a seeker pauses for job exports.
+        let mut runtime = RegionRuntime::new(job_seeker_region(RegionId(1)));
+        while runtime.pending_event_count() > 0 {
+            runtime.process_next_event();
+        }
+
+        let mut requested = false;
+        for request_id in 1..=240u64 {
+            runtime.push_event(RegionEvent::Tick {
+                request_id: UiRequestId(request_id),
+            });
+            let outbound = runtime.process_next_event();
+            if outbound
+                .iter()
+                .any(|message| matches!(message, OutboundMessage::JobExportRequested(_)))
+            {
+                assert!(matches!(
+                    runtime.tick_state,
+                    TickState::WaitingForJobExports(_)
+                ));
+                requested = true;
+                break;
+            }
+            // A completed (or power-only) tick must not be left paused for jobs.
+            assert!(!matches!(
+                runtime.tick_state,
+                TickState::WaitingForJobExports(_)
+            ));
+        }
+        assert!(
+            requested,
+            "a daily tick should eventually pause to import a remote job"
+        );
+    }
+
+    // Residential on a locally-powered border network whose only workplace is on a
+    // disconnected network: jobs are counted (population grows) but unreachable, so
+    // citizens stay locally jobless and seek a remote slot.
+    fn job_seeker_region(region_id: RegionId) -> RegionState {
+        let mut region = RegionState::new(region_id, 6, 3);
+        assert!(region.build(0, 0, BuildingKind::Residential).success);
+        assert!(region.build(0, 1, BuildingKind::Park).success);
+        for x in 1..=5 {
+            assert!(region.build(x, 0, BuildingKind::Road).success);
+        }
+        assert!(region.build(4, 1, BuildingKind::PowerPlant).success);
+        assert!(region.build(3, 2, BuildingKind::Road).success);
+        assert!(region.build(4, 2, BuildingKind::Road).success);
+        assert!(region.build(5, 2, BuildingKind::Industrial).success);
+        region
     }
 }

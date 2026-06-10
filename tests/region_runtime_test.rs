@@ -267,6 +267,15 @@ fn decisions(outbound: &[OutboundMessage]) -> Vec<ImportDecision> {
             OutboundMessage::PowerExportAllocationsReleased(release) => {
                 panic!("unexpected power export allocation release: {release:?}")
             }
+            OutboundMessage::JobExportRequested(request) => {
+                panic!("unexpected job export request: {request:?}")
+            }
+            OutboundMessage::JobExportRequestCompleted { request, grant } => {
+                panic!("unexpected job export request result: {request:?} {grant:?}")
+            }
+            OutboundMessage::JobExportAllocationsReleased(release) => {
+                panic!("unexpected job export allocation release: {release:?}")
+            }
             OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
         })
         .collect()
@@ -316,6 +325,15 @@ fn take_continuation(
         }
         OutboundMessage::PowerExportAllocationsReleased(release) => {
             panic!("unexpected power export allocation release: {release:?}")
+        }
+        OutboundMessage::JobExportRequested(request) => {
+            panic!("unexpected job export request: {request:?}")
+        }
+        OutboundMessage::JobExportRequestCompleted { request, grant } => {
+            panic!("unexpected job export request result: {request:?} {grant:?}")
+        }
+        OutboundMessage::JobExportAllocationsReleased(release) => {
+            panic!("unexpected job export allocation release: {release:?}")
         }
         OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
     }

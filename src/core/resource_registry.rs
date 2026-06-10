@@ -176,6 +176,18 @@ impl ResourceRegistry {
             .workplace_slots
     }
 
+    /// Workplace slot entities left unassigned after local job resolution.
+    ///
+    /// These are the spare slots a region can export to remote workers. Entities
+    /// repeat once per still-open slot in a multi-slot building.
+    pub(crate) fn remaining_job_slots(&self) -> &[Entity] {
+        &self
+            .jobs
+            .as_ref()
+            .expect("jobs registry entry")
+            .remaining_workplaces
+    }
+
     pub(crate) fn local_job_counts(world: &World) -> JobCounts {
         JobsRegistry::counts_from_world(world)
     }
@@ -194,6 +206,7 @@ struct JobsRegistry {
     workplace_slots: Vec<Entity>,
     requests: Vec<JobRequest>,
     assignments: Vec<JobAssignment>,
+    remaining_workplaces: Vec<Entity>,
     remaining_slots: i32,
 }
 
@@ -299,13 +312,15 @@ impl JobsRegistry {
         let workplace_slots = workplace_slots_from_world(world);
         let requests = job_requests_from_world(world);
 
-        let (assignments, remaining_slots) =
+        let (assignments, remaining_workplaces) =
             resolve_job_assignments(world, &requests, &workplace_slots);
+        let remaining_slots = remaining_workplaces.len() as i32;
 
         Self {
             workplace_slots,
             requests,
             assignments,
+            remaining_workplaces,
             remaining_slots,
         }
     }
@@ -393,7 +408,7 @@ fn resolve_job_assignments(
     world: &World,
     requests: &[JobRequest],
     workplace_slots: &[Entity],
-) -> (Vec<JobAssignment>, i32) {
+) -> (Vec<JobAssignment>, Vec<Entity>) {
     let mut remaining_workplaces = workplace_slots.to_vec();
     let mut assignments = Vec::new();
 
@@ -406,7 +421,7 @@ fn resolve_job_assignments(
         });
     }
 
-    (assignments, remaining_workplaces.len() as i32)
+    (assignments, remaining_workplaces)
 }
 
 fn nearest_slot_index(world: &World, from: Entity, slots: &[Entity]) -> Option<usize> {

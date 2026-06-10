@@ -16,6 +16,7 @@ pub(crate) fn spawn_for_home(world: &mut World, residential: Entity, count: i32)
                 age: 0,
                 home: residential,
                 workplace: None,
+                remote_workplace: None,
                 happiness: 50,
                 happiness_decay: 0,
                 money: 0,

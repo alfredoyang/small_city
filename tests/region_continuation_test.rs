@@ -231,6 +231,15 @@ fn returned_continuation(
         OutboundMessage::PowerExportAllocationsReleased(release) => {
             panic!("unexpected power export allocation release: {release:?}")
         }
+        OutboundMessage::JobExportRequested(request) => {
+            panic!("unexpected job export request: {request:?}")
+        }
+        OutboundMessage::JobExportRequestCompleted { request, grant } => {
+            panic!("unexpected job export request result: {request:?} {grant:?}")
+        }
+        OutboundMessage::JobExportAllocationsReleased(release) => {
+            panic!("unexpected job export allocation release: {release:?}")
+        }
         OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
     }
 }
@@ -248,6 +257,9 @@ fn runtime_errors(outbound: &[OutboundMessage]) -> Vec<RegionRuntimeError> {
             OutboundMessage::PowerExportRequested(_) => None,
             OutboundMessage::PowerExportRequestCompleted { .. } => None,
             OutboundMessage::PowerExportAllocationsReleased(_) => None,
+            OutboundMessage::JobExportRequested(_) => None,
+            OutboundMessage::JobExportRequestCompleted { .. } => None,
+            OutboundMessage::JobExportAllocationsReleased(_) => None,
         })
         .collect()
 }

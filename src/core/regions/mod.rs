@@ -57,12 +57,12 @@
 //!   No other region's World is touched.
 //! ```
 
-use crate::core::components::PowerSource;
+use crate::core::components::{PowerSource, RemoteWorkplace};
 use crate::core::entity::Entity;
 use crate::core::resource_registry::ResourceRegistry;
 use crate::core::simulation::{
-    TickPowerPhase, begin_tick_power_phase, finish_tick_after_power_phase,
-    refresh_derived_state_for_world, tick_world,
+    TickJobPhase, TickPowerPhase, begin_tick_power_phase, continue_to_job_phase,
+    finish_tick_after_job_phase, refresh_derived_state_for_world, tick_world,
 };
 use crate::core::systems::{build, bulldoze, replace, road_connectivity, upgrade};
 use crate::core::world::World;
@@ -298,11 +298,33 @@ pub(crate) struct PendingPowerDemand {
     pub caller_network: RegionRoadNetworkId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Caller-local job seeker that may need a producer-exported workplace slot.
+pub(crate) struct PendingJobDemand {
+    pub token: u32,
+    pub citizen: Entity,
+    pub caller_network: RegionRoadNetworkId,
+}
+
 #[derive(Debug)]
 /// Paused tick state after local power and before downstream systems.
 pub(crate) struct RegionalTickPowerPhase {
     phase: TickPowerPhase,
     pub power_demands: Vec<PendingPowerDemand>,
+}
+
+#[derive(Debug)]
+/// Paused tick state after local job assignment and before the daily economy.
+pub(crate) struct RegionalTickJobPhase {
+    phase: TickJobPhase,
+    pub job_demands: Vec<PendingJobDemand>,
+}
+
+impl RegionalTickJobPhase {
+    /// Whether this tick crosses a daily boundary (when jobs/economy resolve).
+    pub(crate) fn is_daily(&self) -> bool {
+        self.phase.is_daily()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +333,20 @@ pub struct PowerExportGrant {
     pub token: u32,
     pub granted: bool,
     pub source_region: Option<RegionId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result of an authoritative producer-owned job-slot export allocation request.
+///
+/// Unlike power, the grant carries identity: the producer's `slot_id` (an opaque
+/// owned id, not a remote ECS entity to the consumer) and the `salary` the home
+/// region pays the worker. Workplace tax accrues to the exporting region instead.
+pub struct JobExportGrant {
+    pub token: u32,
+    pub granted: bool,
+    pub source_region: Option<RegionId>,
+    pub slot_id: Option<u32>,
+    pub salary: i32,
 }
 
 impl ImportedResource {
@@ -645,6 +681,34 @@ impl RegionState {
         self.imported_resources.resources()
     }
 
+    /// Number of local citizens currently working in another region (CR3 import).
+    pub fn imported_job_count(&self) -> usize {
+        self.world
+            .citizens
+            .values()
+            .filter(|citizen| citizen.remote_workplace.is_some())
+            .count()
+    }
+
+    /// Owned `(source region, slot id)` pairs for citizens working remotely.
+    ///
+    /// This is owned summary data: the slot id is an opaque `u32`, never a remote
+    /// ECS entity. Useful for CR4 visibility and for verifying cross-region jobs.
+    pub fn imported_job_slots(&self) -> Vec<(RegionId, u32)> {
+        let mut slots = self
+            .world
+            .citizens
+            .values()
+            .filter_map(|citizen| {
+                citizen
+                    .remote_workplace
+                    .map(|remote| (remote.region, remote.slot_id))
+            })
+            .collect::<Vec<_>>();
+        slots.sort();
+        slots
+    }
+
     /// Returns entity-free border links grouped by local road network.
     pub fn network_border_links(&self) -> Vec<NetworkBorderLink> {
         let mut links = Vec::new();
@@ -757,11 +821,36 @@ impl RegionState {
         }
     }
 
-    pub(crate) fn finish_tick_power_demand_phase(
+    /// Advances from the resolved power phase into the local job assignment phase.
+    ///
+    /// Runs the post-power systems and (on a daily boundary) local job assignment,
+    /// then collects the job seekers that found no reachable local slot so the
+    /// runtime can request remote workplace slots before the economy settles.
+    pub(crate) fn continue_tick_to_job_demand_phase(
         &mut self,
-        phase: RegionalTickPowerPhase,
+        power_phase: RegionalTickPowerPhase,
+    ) -> RegionalTickJobPhase {
+        let phase = continue_to_job_phase(&mut self.world, power_phase.phase);
+        // Jobs (and the economy) resolve only on a daily boundary, so cross-region
+        // job export is sought only then; hourly ticks carry no job demands.
+        let job_demands = if phase.is_daily() {
+            self.pending_job_demands()
+        } else {
+            Vec::new()
+        };
+        RegionalTickJobPhase { phase, job_demands }
+    }
+
+    /// Finishes the tick after job exports resolve.
+    ///
+    /// `exported_job_slots` are this region's workplace entities reserved for
+    /// remote workers; the economy accrues their workplace tax to this region.
+    pub(crate) fn finish_tick_job_demand_phase(
+        &mut self,
+        phase: RegionalTickJobPhase,
+        exported_job_slots: &[Entity],
     ) -> CommandResult {
-        finish_tick_after_power_phase(&mut self.world, phase.phase)
+        finish_tick_after_job_phase(&mut self.world, phase.phase, exported_job_slots)
     }
 
     pub(crate) fn apply_power_export_grant(
@@ -791,6 +880,83 @@ impl RegionState {
         self.world.stats.power.total_power_shortage = (self.world.stats.power.total_power_demand
             - self.world.stats.power.total_power_supplied)
             .max(0);
+    }
+
+    /// Records a granted remote workplace on the still-jobless caller citizen.
+    ///
+    /// The consumer stores only owned summary data (region + opaque slot id +
+    /// salary); the exporting region keeps the slot's workplace tax. A citizen that
+    /// gained a local job since the request, or an already-remote one, is skipped.
+    ///
+    /// The salary is captured here at grant time and paid even if the producer's
+    /// slot stops being effective before its economy runs (producer-side tax is
+    /// guarded by `is_effective_workplace`, so it would not collect). The window is
+    /// one tick with no intervening world mutation, so this minor producer/consumer
+    /// asymmetry is harmless.
+    pub(crate) fn apply_job_export_grant(
+        &mut self,
+        demand: PendingJobDemand,
+        grant: JobExportGrant,
+    ) {
+        if !grant.granted {
+            return;
+        }
+        let (Some(source_region), Some(slot_id)) = (grant.source_region, grant.slot_id) else {
+            return;
+        };
+        let Some(citizen) = self.world.citizens.get_mut(&demand.citizen) else {
+            return;
+        };
+        if citizen.workplace.is_some() || citizen.remote_workplace.is_some() {
+            return;
+        }
+        citizen.remote_workplace = Some(RemoteWorkplace {
+            region: source_region,
+            slot_id,
+            salary: grant.salary,
+        });
+    }
+
+    /// Returns spare local workplace slot entities reachable from one road network.
+    ///
+    /// These are the slots left unassigned after local job resolution whose
+    /// building connects to `network`. The producer exports from this set; jobs are
+    /// network-scoped across regions exactly like power, so a slot on a different
+    /// local network (a different component) is never offered.
+    pub(crate) fn spare_job_slots_on_network(&self, network: RegionRoadNetworkId) -> Vec<Entity> {
+        if network.region != self.id {
+            return Vec::new();
+        }
+
+        // TODO(CR3 perf): this rebuilds the jobs registry (the full local
+        // assignment) on every export request, and `workplace_salary` re-resolves
+        // per grant -- exactly the per-tick cost the R2 split aimed to avoid. Cache
+        // spare slots per scheduling pass, mirroring TODO(CR2 perf) for power.
+        let Some(roads) = road_connectivity::discover_road_networks(&self.world)
+            .into_iter()
+            .find(|candidate| candidate.id == network.road_network)
+            .map(|candidate| candidate.roads)
+        else {
+            return Vec::new();
+        };
+
+        ResourceRegistry::for_jobs(&self.world)
+            .remaining_job_slots()
+            .iter()
+            .copied()
+            .filter(|slot| {
+                road_connectivity::adjacent_road_entities(&self.world, *slot)
+                    .any(|road| roads.contains(&road))
+            })
+            .collect()
+    }
+
+    /// Salary an exported workplace slot pays its (remote) worker.
+    ///
+    /// Captured at grant time so the home region can pay the citizen without
+    /// reading this region's `World`. Zero if the slot is no longer effective.
+    pub(crate) fn workplace_salary(&self, slot: Entity) -> i32 {
+        crate::core::systems::economy::salary_for_workplace(&self.world, slot).unwrap_or(0)
     }
 
     /// Rebuilds transient imported cache state from authoritative local data.
@@ -890,6 +1056,61 @@ impl RegionState {
                 token: demands.len() as u32,
                 consumer,
                 demand: power_consumer.demand,
+                caller_network,
+            });
+        }
+        demands
+    }
+
+    fn pending_job_demands(&self) -> Vec<PendingJobDemand> {
+        let border_networks = self
+            .network_border_links()
+            .into_iter()
+            .map(|link| link.network)
+            .collect::<Vec<_>>();
+        if border_networks.is_empty() {
+            return Vec::new();
+        }
+
+        let networks = road_connectivity::discover_road_networks(&self.world);
+        let mut citizens = self.world.citizens.keys().copied().collect::<Vec<_>>();
+        citizens.sort_by_key(|citizen| citizen.0);
+
+        let mut demands = Vec::new();
+        for citizen in citizens {
+            let Some(citizen_data) = self.world.citizens.get(&citizen) else {
+                continue;
+            };
+            // Only a citizen left without any local or remote workplace seeks one.
+            if citizen_data.workplace.is_some() || citizen_data.remote_workplace.is_some() {
+                continue;
+            }
+            let home = citizen_data.home;
+            // A citizen reaches remote slots through the border road network its
+            // home connects to, mirroring the power consumer's caller network.
+            let Some(caller_network) = networks
+                .iter()
+                .filter(|network| {
+                    border_networks.contains(&RegionRoadNetworkId {
+                        region: self.id,
+                        road_network: network.id,
+                    })
+                })
+                .find(|network| {
+                    road_connectivity::adjacent_road_entities(&self.world, home)
+                        .any(|road| network.roads.contains(&road))
+                })
+                .map(|network| RegionRoadNetworkId {
+                    region: self.id,
+                    road_network: network.id,
+                })
+            else {
+                continue;
+            };
+
+            demands.push(PendingJobDemand {
+                token: demands.len() as u32,
+                citizen,
                 caller_network,
             });
         }

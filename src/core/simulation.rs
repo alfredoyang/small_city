@@ -25,6 +25,27 @@ pub(crate) struct TickPowerPhase {
     after_time: GameTime,
 }
 
+#[derive(Debug, Clone, Copy)]
+/// Paused tick state after local job assignment and before the daily economy.
+///
+/// Regional runtimes pause here to import (remote) workplace slots for citizens
+/// left without a reachable local slot, then call `finish_tick_after_job_phase`
+/// once job export grants apply.
+pub(crate) struct TickJobPhase {
+    before: TickSummarySnapshot,
+    before_time: GameTime,
+    after_time: GameTime,
+    is_daily: bool,
+}
+
+impl TickJobPhase {
+    /// Whether this tick crosses a daily boundary, when jobs and the economy
+    /// resolve. Cross-region job export only engages on daily ticks.
+    pub(crate) fn is_daily(&self) -> bool {
+        self.is_daily
+    }
+}
+
 /// Starts one tick and resolves local power before downstream systems read it.
 ///
 /// Regional runtimes can pause after this phase to request producer-exported
@@ -43,22 +64,56 @@ pub(crate) fn begin_tick_power_phase(world: &mut World) -> TickPowerPhase {
     }
 }
 
+/// Chains the job phase for the synchronous (single-region) tick path.
+///
+/// Regional runtimes call `continue_to_job_phase` and `finish_tick_after_job_phase`
+/// separately so they can pause between them for cross-region job exports.
 pub(crate) fn finish_tick_after_power_phase(
     world: &mut World,
     phase: TickPowerPhase,
 ) -> CommandResult {
+    let job_phase = continue_to_job_phase(world, phase);
+    finish_tick_after_job_phase(world, job_phase, &[])
+}
+
+/// Runs the post-power systems and, on a daily boundary, local job assignment.
+///
+/// Local assignment happens here (before the economy settles salaries/taxes) so a
+/// citizen left without a reachable local slot becomes a candidate for an imported
+/// remote workplace during the cross-region job export phase.
+pub(crate) fn continue_to_job_phase(world: &mut World, phase: TickPowerPhase) -> TickJobPhase {
+    let is_daily = is_new_day(phase.before_time, phase.after_time);
     stats::run(world);
     local_effects::run(world);
-    if is_new_day(phase.before_time, phase.after_time) {
+    if is_daily {
         citizens::apply_daily_happiness_decay(world);
     }
-    if is_new_day(phase.before_time, phase.after_time) {
+    if is_daily {
         population::run(world);
     }
     citizens::update_happiness(world);
     local_effects::run(world);
-    let economy = if is_new_day(phase.before_time, phase.after_time) {
-        economy::run(world)
+    if is_daily {
+        economy::assign_local_jobs(world);
+    }
+
+    TickJobPhase {
+        before: phase.before,
+        before_time: phase.before_time,
+        after_time: phase.after_time,
+        is_daily,
+    }
+}
+
+/// Settles the daily economy (using `exported_job_slots` for producer-owned tax),
+/// then finishes the tick: weekly growth, stats refresh, pollution, happiness.
+pub(crate) fn finish_tick_after_job_phase(
+    world: &mut World,
+    phase: TickJobPhase,
+    exported_job_slots: &[crate::core::entity::Entity],
+) -> CommandResult {
+    let economy = if phase.is_daily {
+        economy::run(world, exported_job_slots)
     } else {
         economy::EconomyBreakdown::default()
     };

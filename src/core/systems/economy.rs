@@ -52,16 +52,35 @@ pub(crate) struct EconomyBreakdown {
     pub net: i32,
 }
 
-pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
+/// Resolves and applies local workplace assignments for the daily economy.
+///
+/// This runs before any cross-region job export phase so a citizen left without
+/// a reachable local slot becomes a candidate for an imported (remote) workplace.
+/// It also clears any prior remote-workplace assignment so it is recomputed each
+/// day from authoritative state.
+pub(crate) fn assign_local_jobs(world: &mut World) {
+    for citizen in world.citizens.values_mut() {
+        citizen.remote_workplace = None;
+    }
+    let job_resolution = ResourceRegistry::for_jobs(world).resolve_local_jobs();
+    apply_workplace_assignments(world, &job_resolution.assignments);
+}
+
+/// Runs the daily economy after job assignment (local in `assign_local_jobs`,
+/// remote in the cross-region job export phase) has already written each
+/// citizen's `workplace` / `remote_workplace`.
+///
+/// `exported_job_slots` lists this region's workplace entities reserved for
+/// remote workers in other regions. The exporting region owns those slots, so it
+/// accrues their workplace tax here; the home region only pays salary and rent.
+pub(crate) fn run(world: &mut World, exported_job_slots: &[Entity]) -> EconomyBreakdown {
     // Workplaces and shops are recalculated every tick from powered,
     // road-connected buildings. This keeps employment and shopping deterministic
     // after build, bulldoze, replace, upgrade, save, or load.
     ensure_business_building_data(world);
     let registry = ResourceRegistry::for_jobs(world);
-    let job_resolution = registry.resolve_local_jobs();
     let index = EconomyIndex::from_world(world, &registry);
     reset_business_periods(world, &index.business_entities);
-    apply_workplace_assignments(world, &job_resolution.assignments);
 
     // Industry flow:
     // 1. Productive industrial buildings create local goods.
@@ -97,17 +116,24 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
         // Salary/tax come from the assigned workplace; rent comes from the
         // citizen's home land value and building level; shopping tax comes from
         // the next available commercial shopping slot.
-        let (home, workplace) = world
+        let (home, workplace, remote_workplace) = world
             .citizens
             .get(&citizen_entity)
-            .map(|citizen| (citizen.home, citizen.workplace))
-            .unwrap_or((Entity(u32::MAX), None));
-        let salary = workplace
-            .and_then(|workplace| {
-                salary_for_workplace(world, workplace)
-                    .map(|salary| (salary, workplace_tax_for_workplace(world, workplace)))
-            })
-            .unwrap_or((0, 0));
+            .map(|citizen| (citizen.home, citizen.workplace, citizen.remote_workplace))
+            .unwrap_or((Entity(u32::MAX), None, None));
+        // A remote workplace pays the citizen salary captured at grant time but
+        // collects no local workplace tax: that tax accrues to the exporting
+        // region instead (see `exported_job_slots` below).
+        let salary = if let Some(remote) = remote_workplace {
+            (remote.salary, 0)
+        } else {
+            workplace
+                .and_then(|workplace| {
+                    salary_for_workplace(world, workplace)
+                        .map(|salary| (salary, workplace_tax_for_workplace(world, workplace)))
+                })
+                .unwrap_or((0, 0))
+        };
         let rent = rent_per_citizen(world, home);
         let shopping = next_shopping_offer(world, home, &shopping_slots);
 
@@ -173,6 +199,17 @@ pub(crate) fn run(world: &mut World) -> EconomyBreakdown {
         }
         if let Some((commercial, profit)) = business_profit_from_sale {
             record_business_profit(world, commercial, profit);
+        }
+    }
+
+    // Slots this region exports to remote workers are owned here, so their
+    // workplace tax accrues to this city even though the worker lives elsewhere.
+    // Business profit in this model is goods/sales-based, not per-worker (a local
+    // worker generates none either), so the producer simply keeps its building's
+    // own profit. A reserved slot must still be an effective workplace to pay out.
+    for slot in exported_job_slots {
+        if is_effective_workplace(world, *slot) {
+            workplace_tax += workplace_tax_for_workplace(world, *slot);
         }
     }
 
@@ -372,7 +409,7 @@ fn commercial_shopper_capacity(world: &World, commercial: Entity) -> i32 {
         .unwrap_or(COMMERCIAL_SHOPPER_CAPACITY)
 }
 
-fn salary_for_workplace(world: &World, workplace: Entity) -> Option<i32> {
+pub(crate) fn salary_for_workplace(world: &World, workplace: Entity) -> Option<i32> {
     let building = world.buildings.get(&workplace)?;
     if !is_effective_workplace(world, workplace) {
         return None;
@@ -758,7 +795,7 @@ mod tests {
         let (mut world, citizen) = shopping_recovery_world(false, true);
         let before_happiness = citizen_happiness(&world, citizen);
 
-        let economy = run(&mut world);
+        let economy = run(&mut world, &[]);
 
         assert_eq!(economy.shoppers_served, 1);
         assert_eq!(economy.imported_goods_sold, 1);
@@ -771,8 +808,8 @@ mod tests {
         let (mut local_world, local_citizen) = shopping_recovery_world(true, true);
         let (mut imported_world, imported_citizen) = shopping_recovery_world(false, true);
 
-        let local_economy = run(&mut local_world);
-        let imported_economy = run(&mut imported_world);
+        let local_economy = run(&mut local_world, &[]);
+        let imported_economy = run(&mut imported_world, &[]);
 
         assert_eq!(local_economy.local_goods_sold, 1);
         assert_eq!(imported_economy.imported_goods_sold, 1);
@@ -784,7 +821,7 @@ mod tests {
     fn disconnected_citizen_does_not_recover_happiness_decay() {
         let (mut world, citizen) = shopping_recovery_world(false, false);
 
-        let economy = run(&mut world);
+        let economy = run(&mut world, &[]);
 
         assert_eq!(economy.shoppers_served, 0);
         assert_eq!(citizen_decay(&world, citizen), 10);
@@ -798,7 +835,10 @@ mod tests {
         for _ in 0..5 {
             citizens::apply_daily_happiness_decay(&mut world);
             citizens::update_happiness(&mut world);
-            let economy = run(&mut world);
+            // The daily tick assigns local jobs before the economy settles; mirror
+            // that here so the citizen earns the salary it spends on shopping.
+            super::assign_local_jobs(&mut world);
+            let economy = run(&mut world, &[]);
             assert_eq!(economy.shoppers_served, 1);
         }
 

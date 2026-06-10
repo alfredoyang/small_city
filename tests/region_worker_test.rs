@@ -544,6 +544,113 @@ fn same_pass_release_is_routed_before_another_caller_power_request() {
     assert!(cell_powered(&worker, RegionId(46), 0, 0));
 }
 
+#[test]
+fn cross_region_job_export_employs_jobless_citizen() {
+    let consumer = job_seeker_region(RegionId(60));
+    let producer = job_slot_producer_region(RegionId(61));
+    let mut worker = worker_with_region_states(WorkerId(40), vec![consumer, producer]);
+    worker.set_region_topology(vec![neighbor(60, BorderEdge::East, 61)]);
+
+    run_job_growth_days(&mut worker, RegionId(60), RegionId(61), 10);
+
+    let imported = imported_job_count(&worker, RegionId(60));
+    assert!(
+        imported >= 1,
+        "a jobless citizen should import a remote job"
+    );
+    // The recorded reference is owned data pointing at the producer region.
+    let slots = worker
+        .region(RegionId(60))
+        .expect("consumer")
+        .state()
+        .imported_job_slots();
+    assert!(
+        slots
+            .iter()
+            .all(|(region, _slot_id)| *region == RegionId(61))
+    );
+}
+
+#[test]
+fn cross_region_job_export_does_not_cross_separate_components() {
+    let consumer = job_seeker_region(RegionId(62));
+    let producer = job_slot_producer_region(RegionId(63));
+    // No topology: the regions are in separate components (the trap).
+    let mut worker = worker_with_region_states(WorkerId(41), vec![consumer, producer]);
+
+    run_job_growth_days(&mut worker, RegionId(62), RegionId(63), 10);
+
+    assert_eq!(imported_job_count(&worker, RegionId(62)), 0);
+}
+
+#[test]
+fn cross_region_job_export_reservation_prevents_double_spend() {
+    // The producer has two spare commercial slots; the consumer grows three
+    // jobless citizens. Only two may import a job: no slot is granted twice.
+    let consumer = job_seeker_region(RegionId(64));
+    let producer = limited_job_slot_producer_region(RegionId(65));
+    let mut worker = worker_with_region_states(WorkerId(42), vec![consumer, producer]);
+    worker.set_region_topology(vec![neighbor(64, BorderEdge::East, 65)]);
+
+    run_job_growth_days(&mut worker, RegionId(64), RegionId(65), 12);
+
+    assert_eq!(imported_job_count(&worker, RegionId(64)), 2);
+}
+
+#[test]
+fn cross_region_job_export_tax_accrues_to_exporter_without_remote_entity() {
+    // Same producer run twice: once connected (exports a job) and once isolated
+    // (no export). The connected producer must end richer by the exported job's
+    // workplace tax, and the consumer stores only an owned slot reference.
+    let mut connected = worker_with_region_states(
+        WorkerId(43),
+        vec![
+            job_seeker_region(RegionId(66)),
+            job_slot_producer_region(RegionId(67)),
+        ],
+    );
+    connected.set_region_topology(vec![neighbor(66, BorderEdge::East, 67)]);
+    run_job_growth_days(&mut connected, RegionId(66), RegionId(67), 10);
+
+    let mut isolated = worker_with_region_states(
+        WorkerId(44),
+        vec![
+            job_seeker_region(RegionId(66)),
+            job_slot_producer_region(RegionId(67)),
+        ],
+    );
+    run_job_growth_days(&mut isolated, RegionId(66), RegionId(67), 10);
+
+    assert!(imported_job_count(&connected, RegionId(66)) >= 1);
+    assert_eq!(imported_job_count(&isolated, RegionId(66)), 0);
+    assert!(
+        region_money(&connected, RegionId(67)) > region_money(&isolated, RegionId(67)),
+        "exported job workplace tax should accrue to the producer region"
+    );
+}
+
+#[test]
+fn tick_short_on_power_and_jobs_resolves_both_phases() {
+    // The consumer imports power (its residential network has no local plant) and,
+    // once powered, grows citizens that are locally jobless and import a job. Both
+    // export phases must resolve in the same daily ticks.
+    let consumer = power_and_job_seeker_region(RegionId(68));
+    let producer = power_and_job_producer_region(RegionId(69));
+    let mut worker = worker_with_region_states(WorkerId(45), vec![consumer, producer]);
+    worker.set_region_topology(vec![neighbor(68, BorderEdge::East, 69)]);
+
+    run_job_growth_days(&mut worker, RegionId(68), RegionId(69), 14);
+
+    assert!(
+        cell_powered(&worker, RegionId(68), 0, 0),
+        "residential should be powered by imported power"
+    );
+    assert!(
+        imported_job_count(&worker, RegionId(68)) >= 1,
+        "a jobless citizen should import a remote job in the same run"
+    );
+}
+
 fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
     let mut worker = RegionWorker::new(id);
     for region_id in regions {
@@ -600,6 +707,107 @@ fn one_spare_power_producer_region(region_id: RegionId) -> RegionState {
     assert!(region.build(2, 1, BuildingKind::Industrial).success);
     assert!(region.build(3, 1, BuildingKind::Industrial).success);
     region
+}
+
+// A residential on a locally-powered border network whose only local workplace
+// sits on a SEPARATE (unreachable) road network. Jobs are counted so population
+// grows, but those citizens cannot reach a local slot and seek a remote one east.
+fn job_seeker_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 6, 3);
+    assert!(region.build(0, 0, BuildingKind::Residential).success);
+    assert!(region.build(0, 1, BuildingKind::Park).success);
+    for x in 1..=5 {
+        assert!(region.build(x, 0, BuildingKind::Road).success);
+    }
+    // One plant powers both networks (adjacent to a road in each).
+    assert!(region.build(4, 1, BuildingKind::PowerPlant).success);
+    assert!(region.build(3, 2, BuildingKind::Road).success);
+    assert!(region.build(4, 2, BuildingKind::Road).success);
+    assert!(region.build(5, 2, BuildingKind::Industrial).success);
+    region
+}
+
+// Producer with three spare industrial slots reachable from the west border.
+fn job_slot_producer_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 2, 2);
+    assert!(region.build(0, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 0, BuildingKind::Road).success);
+    assert!(region.build(0, 1, BuildingKind::Industrial).success);
+    assert!(region.build(1, 1, BuildingKind::PowerPlant).success);
+    region
+}
+
+// Producer with only two spare commercial slots, for the double-spend test.
+fn limited_job_slot_producer_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 2, 2);
+    assert!(region.build(0, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 0, BuildingKind::Road).success);
+    assert!(region.build(0, 1, BuildingKind::Commercial).success);
+    assert!(region.build(1, 1, BuildingKind::PowerPlant).success);
+    region
+}
+
+// Like `job_seeker_region` but its residential network has NO local plant, so it
+// must import power before it can grow the citizens that then import jobs.
+fn power_and_job_seeker_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 6, 3);
+    assert!(region.build(0, 0, BuildingKind::Residential).success);
+    assert!(region.build(0, 1, BuildingKind::Park).success);
+    for x in 1..=5 {
+        assert!(region.build(x, 0, BuildingKind::Road).success);
+    }
+    // The job-count network on row 2 is powered locally; the residential network
+    // on row 0 has no plant and imports power from the east neighbor.
+    assert!(region.build(1, 2, BuildingKind::Industrial).success);
+    assert!(region.build(2, 2, BuildingKind::Road).success);
+    assert!(region.build(3, 2, BuildingKind::Road).success);
+    assert!(region.build(4, 2, BuildingKind::PowerPlant).success);
+    region
+}
+
+// Producer that exports both spare power and spare job slots from the west border.
+fn power_and_job_producer_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 2, 2);
+    assert!(region.build(0, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 0, BuildingKind::Road).success);
+    assert!(region.build(0, 1, BuildingKind::Industrial).success);
+    assert!(region.build(1, 1, BuildingKind::PowerPlant).success);
+    region
+}
+
+fn run_job_growth_days(
+    worker: &mut RegionWorker,
+    consumer: RegionId,
+    producer: RegionId,
+    days: u64,
+) {
+    // Twenty-four hourly ticks per day cross the daily boundary where population
+    // grows and jobs (local then remote) resolve.
+    for request_id in 1..=(days * 24) {
+        worker.push_event(consumer, tick(request_id)).unwrap();
+        worker
+            .push_event(producer, tick(request_id + 100_000))
+            .unwrap();
+        drain_worker(worker);
+    }
+}
+
+fn imported_job_count(worker: &RegionWorker, region_id: RegionId) -> usize {
+    worker
+        .region(region_id)
+        .expect("region")
+        .state()
+        .imported_job_count()
+}
+
+fn region_money(worker: &RegionWorker, region_id: RegionId) -> i32 {
+    worker
+        .region(region_id)
+        .expect("region")
+        .state()
+        .view()
+        .status
+        .money
 }
 
 fn cell_powered(worker: &RegionWorker, region_id: RegionId, x: usize, y: usize) -> bool {
