@@ -223,31 +223,47 @@ pub enum OutboundMessage {
 pub struct RegionRuntime {
     state: RegionState,
     exports: Vec<RegionalExport>,
-    // TODO(next patch): Replace this ad hoc pending tick with an explicit tick
-    // state machine, for example `TickState::Idle` and
-    // `TickState::WaitingForPowerExports(TickPowerContinuation)`.
-    //
-    // The state machine should document the legal transitions:
-    //
-    // ```text
-    // Idle
-    //   -- Tick --> WaitingForPowerExports or finish immediately
-    // WaitingForPowerExports
-    //   -- ApplyPowerExportGrant --> WaitingForPowerExports or finish tick -> Idle
-    // ```
-    //
-    // Add tests for the important transitions: entering wait state, returning
-    // to idle after the last grant, rejecting/deferring a second tick while
-    // waiting, ignoring a grant while idle, and preserving same-pass allocation
-    // release ordering.
-    pending_tick: Option<PendingRegionalTick>,
+    tick_state: TickState,
     power_export_allocations: Vec<PowerExportAllocation>,
     handle: RegionHandle,
     receiver: RegionEventReceiver,
 }
 
 #[derive(Debug)]
-struct PendingRegionalTick {
+/// Explicit tick lifecycle for one region runtime.
+///
+/// Cross-region power export pauses a tick between local power resolution and the
+/// downstream systems that read `powered`. This enum makes the two legal states
+/// explicit and documents the transitions:
+///
+/// ```text
+/// Idle
+///   -- Tick (no exportable demand) --> finish immediately, stay Idle
+///   -- Tick (exportable demand)    --> WaitingForPowerExports
+/// WaitingForPowerExports
+///   -- ApplyPowerExportGrant (demands remain) --> WaitingForPowerExports
+///   -- ApplyPowerExportGrant (last demand)    --> finish tick, back to Idle
+/// ```
+///
+/// While `WaitingForPowerExports`, only export control events run (grants,
+/// producer-side requests, releases); a second `Tick` is deferred in the inbox
+/// until the paused tick finishes. A grant that arrives while `Idle`, or one with
+/// an unknown token, leaves the current state unchanged.
+enum TickState {
+    Idle,
+    WaitingForPowerExports(TickPowerContinuation),
+}
+
+impl TickState {
+    /// Returns true while a tick is paused waiting for export grants.
+    fn is_waiting(&self) -> bool {
+        matches!(self, TickState::WaitingForPowerExports(_))
+    }
+}
+
+#[derive(Debug)]
+/// Paused tick waiting for cross-region power export grants to resolve.
+struct TickPowerContinuation {
     request_id: UiRequestId,
     phase: RegionalTickPowerPhase,
     pending_demands: Vec<PendingPowerDemand>,
@@ -276,7 +292,7 @@ impl RegionRuntime {
         let mut runtime = Self {
             state,
             exports: Vec::new(),
-            pending_tick: None,
+            tick_state: TickState::Idle,
             power_export_allocations: Vec::new(),
             handle,
             receiver,
@@ -408,7 +424,7 @@ impl RegionRuntime {
     }
 
     fn pop_next_runnable_event(&mut self) -> Option<RegionEvent> {
-        if self.pending_tick.is_none() {
+        if !self.tick_state.is_waiting() {
             return self.receiver.pop_event();
         }
 
@@ -462,7 +478,7 @@ impl RegionRuntime {
                 .collect::<Vec<_>>(),
         );
 
-        self.pending_tick = Some(PendingRegionalTick {
+        self.tick_state = TickState::WaitingForPowerExports(TickPowerContinuation {
             request_id,
             phase,
             pending_demands,
@@ -558,27 +574,33 @@ impl RegionRuntime {
     }
 
     fn apply_power_export_grant(&mut self, grant: PowerExportGrant) -> Vec<OutboundMessage> {
-        let Some(mut pending_tick) = self.pending_tick.take() else {
+        // A grant only applies to a paused tick. Take the continuation out and
+        // fall back to `Idle`; an unrelated grant restores the prior state below.
+        let TickState::WaitingForPowerExports(mut continuation) =
+            std::mem::replace(&mut self.tick_state, TickState::Idle)
+        else {
             return Vec::new();
         };
-        let Some(position) = pending_tick
+        let Some(position) = continuation
             .pending_demands
             .iter()
             .position(|demand| demand.token == grant.token)
         else {
-            self.pending_tick = Some(pending_tick);
+            // Unknown token: keep waiting for the demands this tick still expects.
+            self.tick_state = TickState::WaitingForPowerExports(continuation);
             return Vec::new();
         };
 
-        let demand = pending_tick.pending_demands.remove(position);
+        let demand = continuation.pending_demands.remove(position);
         self.state.apply_power_export_grant(demand, grant);
-        if !pending_tick.pending_demands.is_empty() {
-            self.pending_tick = Some(pending_tick);
+        if !continuation.pending_demands.is_empty() {
+            self.tick_state = TickState::WaitingForPowerExports(continuation);
             return Vec::new();
         }
 
+        // Last demand resolved: finish the paused tick and return to `Idle`.
         let mut outbound = vec![OutboundMessage::RegionTickCompleted(
-            self.finish_tick_phase(pending_tick.request_id, pending_tick.phase),
+            self.finish_tick_phase(continuation.request_id, continuation.phase),
         )];
         outbound.extend(self.export_change_messages());
         outbound
@@ -715,4 +737,171 @@ fn command_can_mutate_exports(command: RegionCommand) -> bool {
             | RegionCommand::Replace { .. }
             | RegionCommand::Upgrade { .. }
     )
+}
+
+#[cfg(test)]
+mod tick_state_tests {
+    //! Unit tests for the `TickState` lifecycle: entering and leaving the paused
+    //! `WaitingForPowerExports` state through the runtime event loop.
+
+    use super::*;
+    use crate::core::regions::RegionState;
+    use crate::interface::input::BuildingKind;
+
+    // A residential consumer next to a border road has no local power and one
+    // exportable demand, so ticking it pauses the tick for power exports.
+    fn consumer_runtime(region_id: RegionId) -> RegionRuntime {
+        let mut region = RegionState::new(region_id, 2, 2);
+        assert!(region.build(0, 0, BuildingKind::Residential).success);
+        assert!(region.build(1, 0, BuildingKind::Road).success);
+        let mut runtime = RegionRuntime::new(region);
+        // A region with exports enqueues a startup RefreshExports event; drain it
+        // so each test observes a clean idle inbox before driving ticks.
+        while runtime.pending_event_count() > 0 {
+            runtime.process_next_event();
+        }
+        runtime
+    }
+
+    fn export_requests(outbound: &[OutboundMessage]) -> Vec<&PowerExportRequest> {
+        outbound
+            .iter()
+            .filter_map(|message| match message {
+                OutboundMessage::PowerExportRequested(request) => Some(request),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has_tick_completed(outbound: &[OutboundMessage]) -> bool {
+        outbound
+            .iter()
+            .any(|message| matches!(message, OutboundMessage::RegionTickCompleted(_)))
+    }
+
+    #[test]
+    fn tick_with_exportable_demand_enters_waiting_state() {
+        let mut runtime = consumer_runtime(RegionId(1));
+        runtime.push_event(RegionEvent::Tick {
+            request_id: UiRequestId(1),
+        });
+
+        let outbound = runtime.process_next_event();
+
+        assert!(runtime.tick_state.is_waiting());
+        assert!(!has_tick_completed(&outbound));
+        assert_eq!(export_requests(&outbound).len(), 1);
+    }
+
+    #[test]
+    fn tick_without_exportable_demand_finishes_immediately() {
+        let mut runtime = RegionRuntime::new(RegionState::new(RegionId(1), 2, 2));
+        runtime.push_event(RegionEvent::Tick {
+            request_id: UiRequestId(1),
+        });
+
+        let outbound = runtime.process_next_event();
+
+        assert!(!runtime.tick_state.is_waiting());
+        assert!(has_tick_completed(&outbound));
+    }
+
+    #[test]
+    fn last_grant_finishes_tick_and_returns_to_idle() {
+        let mut runtime = consumer_runtime(RegionId(1));
+        runtime.push_event(RegionEvent::Tick {
+            request_id: UiRequestId(7),
+        });
+        let started = runtime.process_next_event();
+        let token = export_requests(&started)[0].token;
+        assert!(runtime.tick_state.is_waiting());
+
+        runtime.push_event(RegionEvent::ApplyPowerExportGrant(PowerExportGrant {
+            token,
+            granted: true,
+            source_region: Some(RegionId(2)),
+        }));
+        let outbound = runtime.process_next_event();
+
+        assert!(!runtime.tick_state.is_waiting());
+        let completed = outbound
+            .iter()
+            .find_map(|message| match message {
+                OutboundMessage::RegionTickCompleted(reply) => Some(reply),
+                _ => None,
+            })
+            .expect("tick should finish after the last grant resolves");
+        assert_eq!(completed.request_id, UiRequestId(7));
+    }
+
+    #[test]
+    fn second_tick_is_deferred_while_waiting() {
+        let mut runtime = consumer_runtime(RegionId(1));
+        runtime.push_event(RegionEvent::Tick {
+            request_id: UiRequestId(1),
+        });
+        let started = runtime.process_next_event();
+        let token = export_requests(&started)[0].token;
+        runtime.push_event(RegionEvent::Tick {
+            request_id: UiRequestId(2),
+        });
+
+        // The queued second tick is not runnable while the first is paused.
+        let deferred = runtime.process_next_event();
+        assert!(deferred.is_empty());
+        assert!(runtime.tick_state.is_waiting());
+        assert_eq!(runtime.pending_event_count(), 1);
+
+        // Resolving the grant finishes the first tick and frees the runtime.
+        runtime.push_event(RegionEvent::ApplyPowerExportGrant(PowerExportGrant {
+            token,
+            granted: false,
+            source_region: None,
+        }));
+        let finished_first = runtime.process_next_event();
+        assert!(has_tick_completed(&finished_first));
+        assert!(!runtime.tick_state.is_waiting());
+
+        // The deferred second tick now runs; the still-short consumer pauses again.
+        let started_second = runtime.process_next_event();
+        assert!(!has_tick_completed(&started_second));
+        assert!(runtime.tick_state.is_waiting());
+    }
+
+    #[test]
+    fn grant_while_idle_is_ignored() {
+        let mut runtime = consumer_runtime(RegionId(1));
+        assert!(!runtime.tick_state.is_waiting());
+
+        runtime.push_event(RegionEvent::ApplyPowerExportGrant(PowerExportGrant {
+            token: 0,
+            granted: true,
+            source_region: Some(RegionId(2)),
+        }));
+        let outbound = runtime.process_next_event();
+
+        assert!(outbound.is_empty());
+        assert!(!runtime.tick_state.is_waiting());
+    }
+
+    #[test]
+    fn unknown_grant_token_keeps_waiting() {
+        let mut runtime = consumer_runtime(RegionId(1));
+        runtime.push_event(RegionEvent::Tick {
+            request_id: UiRequestId(1),
+        });
+        let started = runtime.process_next_event();
+        let token = export_requests(&started)[0].token;
+        assert!(runtime.tick_state.is_waiting());
+
+        runtime.push_event(RegionEvent::ApplyPowerExportGrant(PowerExportGrant {
+            token: token.wrapping_add(99),
+            granted: true,
+            source_region: Some(RegionId(2)),
+        }));
+        let outbound = runtime.process_next_event();
+
+        assert!(runtime.tick_state.is_waiting());
+        assert!(!has_tick_completed(&outbound));
+    }
 }
