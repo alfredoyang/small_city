@@ -15,7 +15,7 @@ use crate::core::regions::threaded::{
     ThreadedRegionWorker, ThreadedWorkerError, ThreadedWorkerShutdown,
 };
 use crate::core::regions::worker::{RegionWorker, WorkerId, WorkerRoutingError};
-use crate::core::regions::{RegionId, RegionState};
+use crate::core::regions::{RegionId, RegionNeighborLink, RegionState};
 use crate::interface::events::CommandResult;
 use crate::interface::input::MapOverlayInput;
 use crate::interface::view::InspectView;
@@ -72,7 +72,15 @@ pub struct RegionalGameRunner {
 
 impl RegionalGameRunner {
     pub fn start(regions: Vec<RegionState>) -> Result<Self, RegionalGameRunnerError> {
+        Self::start_with_topology(regions, Vec::new())
+    }
+
+    pub fn start_with_topology(
+        regions: Vec<RegionState>,
+        topology: Vec<RegionNeighborLink>,
+    ) -> Result<Self, RegionalGameRunnerError> {
         let mut worker = RegionWorker::new(INITIAL_WORKER_ID);
+        worker.set_region_topology(topology);
         let mut handles = Vec::new();
 
         for region in regions {

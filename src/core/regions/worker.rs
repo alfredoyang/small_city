@@ -10,11 +10,12 @@ use crate::core::regional_types::{
 use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::load_manager::WorkerLoad;
 use crate::core::regions::runtime::{
-    OutboundMessage, RegionEvent, RegionRuntime, RegionRuntimeError,
+    OutboundMessage, PowerExportAllocationRelease, PowerExportAllocationRequest,
+    PowerExportRequest, RegionEvent, RegionRuntime, RegionRuntimeError,
 };
 use crate::core::regions::{
-    BorderEdge, NetworkBorderLink, RegionId, RegionNeighborLink, RegionRoadNetworkId,
-    RegionalAvailabilityHint, RegionalExportChange,
+    BorderEdge, NetworkBorderLink, PowerExportGrant, RegionId, RegionNeighborLink,
+    RegionRoadNetworkId, RegionalAvailabilityHint, RegionalExportChange,
 };
 use std::collections::HashMap;
 
@@ -64,7 +65,7 @@ pub struct WorkerRunSummary {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-/// Owned discovery snapshot used before authoritative cross-region claims.
+/// Owned discovery snapshot used before authoritative cross-region requests.
 ///
 /// Components are keyed by `(region, road-network)`, not just by region.
 pub struct CrossRegionDiscovery {
@@ -86,6 +87,7 @@ impl CrossRegionDiscovery {
 pub struct RegionWorker {
     id: WorkerId,
     regions: Vec<RegionRuntime>,
+    topology: Vec<RegionNeighborLink>,
 }
 
 impl RegionWorker {
@@ -93,6 +95,7 @@ impl RegionWorker {
         Self {
             id,
             regions: Vec::new(),
+            topology: Vec::new(),
         }
     }
 
@@ -148,7 +151,15 @@ impl RegionWorker {
         WorkerLoad::new(self.id, region_ids, queued_events)
     }
 
-    /// Builds discovery data only; no claim events or reservations happen here.
+    pub fn set_region_topology(&mut self, topology: Vec<RegionNeighborLink>) {
+        self.topology = topology;
+    }
+
+    /// Builds discovery data only; availability hints are not allocations.
+    ///
+    /// The worker uses this component graph and stale-tolerant hints only to
+    /// route export requests. The producer runtime remains authoritative for
+    /// granting or denying export allocation.
     pub fn cross_region_discovery(&self, topology: &[RegionNeighborLink]) -> CrossRegionDiscovery {
         let links = self
             .regions
@@ -214,7 +225,16 @@ impl RegionWorker {
         let mut tick_replies = Vec::new();
         let mut snapshot_replies = Vec::new();
 
-        for (source_region, message) in outbound {
+        // Allocation releases are causal cleanup for the next export cycle.
+        // Route them before new requests so runtime traversal order cannot make
+        // a producer deny a fresh caller with capacity allocated by an older
+        // caller generation in the same worker pass.
+        let (release_outbound, other_outbound): (Vec<_>, Vec<_>) =
+            outbound.into_iter().partition(|(_, message)| {
+                matches!(message, OutboundMessage::PowerExportAllocationsReleased(_))
+            });
+
+        for (source_region, message) in release_outbound.into_iter().chain(other_outbound) {
             match self.route_outbound(source_region, message) {
                 Ok(WorkerRoutedMessage::CommandReply(reply)) => command_replies.push(reply),
                 Ok(WorkerRoutedMessage::TickReply(reply)) => tick_replies.push(reply),
@@ -266,6 +286,18 @@ impl RegionWorker {
                 self.route_export_change(change)?;
                 Ok(WorkerRoutedMessage::None)
             }
+            OutboundMessage::PowerExportRequested(request) => {
+                self.route_power_export_request(request)?;
+                Ok(WorkerRoutedMessage::None)
+            }
+            OutboundMessage::PowerExportRequestCompleted { request, grant } => {
+                self.route_power_export_request_result(request, grant)?;
+                Ok(WorkerRoutedMessage::None)
+            }
+            OutboundMessage::PowerExportAllocationsReleased(release) => {
+                self.route_power_export_allocation_release(release)?;
+                Ok(WorkerRoutedMessage::None)
+            }
             OutboundMessage::RuntimeError(error) => Err(WorkerRoutingError::RuntimeError {
                 source_region,
                 error,
@@ -315,6 +347,118 @@ impl RegionWorker {
         }
 
         Ok(())
+    }
+
+    fn route_power_export_request(
+        &mut self,
+        request: PowerExportRequest,
+    ) -> Result<(), WorkerRoutingError> {
+        // TODO(CR2 perf): cache cross-region discovery for one scheduling pass
+        // instead of rebuilding the component graph for every export request.
+        let discovery = self.cross_region_discovery(&self.topology);
+        let candidates = discovery
+            .component_of(request.caller_network)
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .filter(|network| network.region != request.caller_region)
+            .filter(|network| {
+                discovery
+                    .availability_hints
+                    .iter()
+                    .any(|hint| hint.network == *network && hint.has_spare_power)
+            })
+            .collect::<Vec<_>>();
+
+        if candidates.is_empty() {
+            self.deny_power_export_request(&request)?;
+            return Ok(());
+        }
+
+        let target_region = candidates[0].region;
+        if self.region(target_region).is_none() {
+            self.deny_power_export_request(&request)?;
+            return Ok(());
+        }
+
+        self.push_event(
+            target_region,
+            RegionEvent::ProcessPowerExportRequest(PowerExportAllocationRequest {
+                request,
+                candidates,
+                candidate_index: 0,
+            }),
+        )
+    }
+
+    fn route_power_export_request_result(
+        &mut self,
+        mut request: PowerExportAllocationRequest,
+        grant: PowerExportGrant,
+    ) -> Result<(), WorkerRoutingError> {
+        if grant.granted {
+            return self.push_event(
+                request.request.caller_region,
+                RegionEvent::ApplyPowerExportGrant(grant),
+            );
+        }
+
+        request.candidate_index += 1;
+        if request.candidate_index >= request.candidates.len() {
+            return self.push_event(
+                request.request.caller_region,
+                RegionEvent::ApplyPowerExportGrant(grant),
+            );
+        }
+
+        let target_region = request.candidates[request.candidate_index].region;
+        if self.region(target_region).is_none() {
+            self.deny_power_export_request(&request.request)?;
+            return Ok(());
+        }
+
+        self.push_event(
+            target_region,
+            RegionEvent::ProcessPowerExportRequest(request),
+        )
+    }
+
+    fn route_power_export_allocation_release(
+        &mut self,
+        release: PowerExportAllocationRelease,
+    ) -> Result<(), WorkerRoutingError> {
+        // TODO(CR2 scale): this broadcasts to every owned region today. Track
+        // which producer regions actually accepted export allocations for a
+        // caller so release messages can be narrowed to those producers.
+        let target_regions = self
+            .regions
+            .iter()
+            .map(RegionRuntime::region_id)
+            .filter(|region_id| *region_id != release.caller_region)
+            .collect::<Vec<_>>();
+
+        for target_region in target_regions {
+            self.push_event(
+                target_region,
+                RegionEvent::ReleasePowerExportAllocations(release),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn deny_power_export_request(
+        &mut self,
+        request: &PowerExportRequest,
+    ) -> Result<(), WorkerRoutingError> {
+        self.push_event(
+            request.caller_region,
+            RegionEvent::ApplyPowerExportGrant(PowerExportGrant {
+                token: request.token,
+                granted: false,
+                source_region: None,
+            }),
+        )
     }
 }
 
@@ -462,5 +606,56 @@ impl UnionFind {
         }
         components.sort_by_key(|component| component[0]);
         components
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::regional_types::UiRequestId;
+    use crate::core::regions::RegionState;
+
+    #[test]
+    fn missing_power_request_candidate_denies_caller_instead_of_routing_error() {
+        let mut worker = RegionWorker::new(WorkerId(99));
+        worker
+            .add_region(RegionRuntime::new(RegionState::new(RegionId(1), 2, 2)))
+            .unwrap();
+        let request = PowerExportAllocationRequest {
+            request: PowerExportRequest {
+                request_id: UiRequestId(1),
+                caller_region: RegionId(1),
+                caller_network: network(1, 0),
+                token: 7,
+                demand: 1,
+            },
+            candidates: vec![network(2, 0), network(3, 0)],
+            candidate_index: 0,
+        };
+
+        let result = worker.route_power_export_request_result(
+            request,
+            PowerExportGrant {
+                token: 7,
+                granted: false,
+                source_region: None,
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            worker
+                .region(RegionId(1))
+                .expect("caller region")
+                .pending_event_count(),
+            1
+        );
+    }
+
+    fn network(region: u32, road_network: u32) -> RegionRoadNetworkId {
+        RegionRoadNetworkId {
+            region: RegionId(region),
+            road_network,
+        }
     }
 }

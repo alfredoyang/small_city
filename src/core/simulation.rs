@@ -14,27 +14,55 @@ use crate::interface::events::{CommandResult, EconomyBreakdownView, GameEventVie
 use crate::interface::view::GameTimeView;
 
 pub(crate) fn tick_world(world: &mut World) -> CommandResult {
+    let phase = begin_tick_power_phase(world);
+    finish_tick_after_power_phase(world, phase)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TickPowerPhase {
+    before: TickSummarySnapshot,
+    before_time: GameTime,
+    after_time: GameTime,
+}
+
+/// Starts one tick and resolves local power before downstream systems read it.
+///
+/// Regional runtimes can pause after this phase to request producer-exported
+/// power, then call `finish_tick_after_power_phase` once export grants apply.
+pub(crate) fn begin_tick_power_phase(world: &mut World) -> TickPowerPhase {
     let before = TickSummarySnapshot::from_world(world);
     let before_time = world.resources.time;
     world.resources.time.advance_hours(1);
     let after_time = world.resources.time;
     power::run(world);
+
+    TickPowerPhase {
+        before,
+        before_time,
+        after_time,
+    }
+}
+
+pub(crate) fn finish_tick_after_power_phase(
+    world: &mut World,
+    phase: TickPowerPhase,
+) -> CommandResult {
     stats::run(world);
     local_effects::run(world);
-    if is_new_day(before_time, after_time) {
+    if is_new_day(phase.before_time, phase.after_time) {
         citizens::apply_daily_happiness_decay(world);
     }
-    if is_new_day(before_time, after_time) {
+    if is_new_day(phase.before_time, phase.after_time) {
         population::run(world);
     }
     citizens::update_happiness(world);
     local_effects::run(world);
-    let economy = if is_new_day(before_time, after_time) {
+    let economy = if is_new_day(phase.before_time, phase.after_time) {
         economy::run(world)
     } else {
         economy::EconomyBreakdown::default()
     };
-    let business_upgrades = if is_new_week(before_time, after_time) {
+    let business_upgrades = if is_new_week(phase.before_time, phase.after_time) {
         business_growth::run(world).upgrades
     } else {
         Vec::new()
@@ -48,12 +76,12 @@ pub(crate) fn tick_world(world: &mut World) -> CommandResult {
     let tick_summary = GameEventView::TickSummary {
         turn: world.resources.turn,
         time: game_time_view(world.resources.time),
-        population: metric_change(before.population, after.population),
-        money: metric_change(before.money, after.money),
-        happiness: metric_change(before.happiness, after.happiness),
-        pollution: metric_change(before.pollution, after.pollution),
-        unemployment: metric_change(before.unemployment, after.unemployment),
-        powered_buildings: metric_change(before.powered_buildings, after.powered_buildings),
+        population: metric_change(phase.before.population, after.population),
+        money: metric_change(phase.before.money, after.money),
+        happiness: metric_change(phase.before.happiness, after.happiness),
+        pollution: metric_change(phase.before.pollution, after.pollution),
+        unemployment: metric_change(phase.before.unemployment, after.unemployment),
+        powered_buildings: metric_change(phase.before.powered_buildings, after.powered_buildings),
         economy: EconomyBreakdownView {
             salaries_paid: economy.salaries_paid,
             workplace_tax: economy.workplace_tax,

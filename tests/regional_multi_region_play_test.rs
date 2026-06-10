@@ -68,6 +68,51 @@ fn selected_region_switching_changes_composed_view_deterministically() {
 }
 
 #[test]
+fn two_region_default_wires_topology_for_cross_region_power_export() {
+    let game = RegionalGame::two_region_default(3, 2).unwrap();
+
+    assert!(
+        game.build(RegionId(1), 2, 0, BuildingKind::Road)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(1), 2, 1, BuildingKind::PowerPlant)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(2), 0, 0, BuildingKind::Road)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(2), 1, 0, BuildingKind::Residential)
+            .unwrap()
+            .success
+    );
+
+    assert!(game.tick_region(RegionId(2)).unwrap().success);
+
+    let view = game
+        .view()
+        .unwrap()
+        .regions
+        .into_iter()
+        .find(|snapshot| snapshot.region_id == RegionId(2))
+        .expect("region 2 snapshot")
+        .view;
+    let powered = view
+        .map
+        .cells
+        .iter()
+        .find(|cell| cell.x == 1 && cell.y == 0)
+        .and_then(|cell| cell.powered)
+        .unwrap_or(false);
+    assert!(powered);
+}
+
+#[test]
 fn cross_region_imported_resource_is_visible_through_inspect_view() {
     let game = RegionalGame::two_region_default(3, 3).unwrap();
 

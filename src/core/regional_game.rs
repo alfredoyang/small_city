@@ -23,7 +23,9 @@ pub use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionViewSnapshot, RegionalGameView, UiReply, UiRequest,
     UiRequestId,
 };
-use crate::core::regions::{RegionId, RegionState, RegionStateSaveRecord};
+use crate::core::regions::{
+    BorderEdge, RegionId, RegionNeighborLink, RegionState, RegionStateSaveRecord,
+};
 use crate::interface::events::CommandResult;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{BuildPreviewView, GameView, InspectView};
@@ -56,6 +58,11 @@ pub enum RegionalGameError {
         region_id: RegionId,
     },
     NoSelectedRegion,
+    InvalidLayout {
+        rows: usize,
+        columns: usize,
+        region_count: usize,
+    },
     WorkerRoutingFailed,
     RegionAttachFailed,
     WorkerStopped,
@@ -137,9 +144,48 @@ impl std::error::Error for RegionalGameSaveFailure {
 
 #[derive(Debug, Serialize, Deserialize)]
 /// Serialized regional game state containing only authoritative region data.
+///
+/// Topology is saved indirectly: `regions` are ordered row-major and `layout`
+/// stores the grid shape. At load/start time, adjacent grid cells derive
+/// `RegionNeighborLink` edges for the worker.
 struct RegionalGameSave {
     selected_region: Option<RegionId>,
     regions: Vec<RegionStateSaveRecord>,
+    layout: RegionalLayoutSave,
+}
+
+#[derive(Debug, Deserialize)]
+/// Save reader that can infer layout for saves written before layout existed.
+struct RegionalGameSaveWire {
+    selected_region: Option<RegionId>,
+    regions: Vec<RegionStateSaveRecord>,
+    #[serde(default)]
+    layout: Option<RegionalLayoutSave>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Compact row-major regional map shape saved instead of explicit topology.
+///
+/// A `rows x columns` layout maps save order onto the in-game regional grid:
+///
+/// ```text
+/// 2 rows x 3 columns
+///
+/// index:   [0] -- [1] -- [2]
+///           |      |      |
+///          [3] -- [4] -- [5]
+///
+/// saved regions: [R0, R1, R2, R3, R4, R5]
+///
+/// derived topology:
+///   R0 East <-> R1 West     R0 South <-> R3 North
+///   R1 East <-> R2 West     R1 South <-> R4 North
+///   R3 East <-> R4 West     R2 South <-> R5 North
+///   R4 East <-> R5 West
+/// ```
+struct RegionalLayoutSave {
+    rows: usize,
+    columns: usize,
 }
 
 #[derive(Debug)]
@@ -147,6 +193,7 @@ struct RegionalGameSave {
 pub struct RegionalGame {
     runner: RegionalGameRunner,
     region_ids: Vec<RegionId>,
+    layout: RegionalLayoutSave,
     selected_region: Option<RegionId>,
     next_request_id: AtomicU64,
 }
@@ -161,13 +208,27 @@ impl RegionalGame {
     }
 
     pub fn from_regions(regions: Vec<RegionState>) -> Result<Self, RegionalGameError> {
+        // TODO(regional layout): when a public multi-row constructor is added,
+        // route it through `from_regions_with_layout` so callers do not get the
+        // default single-row `1 x N` topology.
+        let layout = infer_layout_for_region_count(regions.len());
+        Self::from_regions_with_layout(regions, layout)
+    }
+
+    fn from_regions_with_layout(
+        regions: Vec<RegionState>,
+        layout: RegionalLayoutSave,
+    ) -> Result<Self, RegionalGameError> {
         let region_ids = regions.iter().map(RegionState::id).collect::<Vec<_>>();
+        validate_layout(region_ids.len(), layout)?;
+        let topology = derive_topology(&region_ids, layout);
         let selected_region = region_ids.first().copied();
-        let runner = RegionalGameRunner::start(regions)?;
+        let runner = RegionalGameRunner::start_with_topology(regions, topology)?;
 
         let game = Self {
             runner,
             region_ids,
+            layout,
             selected_region,
             next_request_id: AtomicU64::new(1),
         };
@@ -176,10 +237,18 @@ impl RegionalGame {
     }
 
     pub fn two_region_default(width: usize, height: usize) -> Result<Self, RegionalGameError> {
-        Self::from_regions(vec![
-            RegionState::new(RegionId(1), width, height),
-            RegionState::new(RegionId(2), width, height),
-        ])
+        let left = RegionId(1);
+        let right = RegionId(2);
+        Self::from_regions_with_layout(
+            vec![
+                RegionState::new(left, width, height),
+                RegionState::new(right, width, height),
+            ],
+            RegionalLayoutSave {
+                rows: 1,
+                columns: 2,
+            },
+        )
     }
 
     pub fn select_next_region(&mut self) -> Result<RegionId, RegionalGameError> {
@@ -471,6 +540,7 @@ impl RegionalGame {
     pub fn save_to_file(self, path: impl AsRef<Path>) -> Result<Self, RegionalGameSaveFailure> {
         let selected_region = self.selected_region;
         let region_ids = self.region_ids.clone();
+        let layout = self.layout;
         let recovered = self
             .shutdown()
             .map_err(|error| RegionalGameSaveFailure::Unrecoverable(error.into()))?;
@@ -481,6 +551,7 @@ impl RegionalGame {
                 .into_iter()
                 .map(RegionState::into_save_record)
                 .collect(),
+            layout,
         };
 
         let file = match File::create(path) {
@@ -508,14 +579,14 @@ impl RegionalGame {
             .into_iter()
             .map(RegionState::from_save_record)
             .collect::<Vec<_>>();
-        let mut game = Self::from_regions(regions)?;
+        let mut game = Self::from_regions_with_layout(regions, save.layout)?;
         game.selected_region = save.selected_region;
         Ok(game)
     }
 
     fn from_save_bytes(bytes: &[u8]) -> Result<Self, RegionalGameSaveError> {
-        match serde_json::from_slice::<RegionalGameSave>(bytes) {
-            Ok(save) => Self::from_save(save).map_err(RegionalGameSaveError::from),
+        match serde_json::from_slice::<RegionalGameSaveWire>(bytes) {
+            Ok(save) => Self::from_save(save.into_current()).map_err(RegionalGameSaveError::from),
             Err(regional_error) => match Self::from_legacy_world_bytes(bytes) {
                 Ok(game) => Ok(game),
                 Err(RegionalGameSaveError::SaveFormat(_)) => {
@@ -544,6 +615,81 @@ impl RegionalGame {
             error,
         })
     }
+}
+
+impl RegionalGameSaveWire {
+    fn into_current(self) -> RegionalGameSave {
+        let layout = self
+            .layout
+            .unwrap_or_else(|| infer_layout_for_region_count(self.regions.len()));
+        RegionalGameSave {
+            selected_region: self.selected_region,
+            regions: self.regions,
+            layout,
+        }
+    }
+}
+
+fn infer_layout_for_region_count(region_count: usize) -> RegionalLayoutSave {
+    match region_count {
+        0 => RegionalLayoutSave {
+            rows: 0,
+            columns: 0,
+        },
+        1 => RegionalLayoutSave {
+            rows: 1,
+            columns: 1,
+        },
+        count => RegionalLayoutSave {
+            rows: 1,
+            columns: count,
+        },
+    }
+}
+
+fn validate_layout(
+    region_count: usize,
+    layout: RegionalLayoutSave,
+) -> Result<(), RegionalGameError> {
+    let valid_empty = region_count == 0 && layout.rows == 0 && layout.columns == 0;
+    let valid_grid = layout.rows > 0
+        && layout.columns > 0
+        && layout.rows.checked_mul(layout.columns) == Some(region_count);
+
+    if valid_empty || valid_grid {
+        Ok(())
+    } else {
+        Err(RegionalGameError::InvalidLayout {
+            rows: layout.rows,
+            columns: layout.columns,
+            region_count,
+        })
+    }
+}
+
+fn derive_topology(region_ids: &[RegionId], layout: RegionalLayoutSave) -> Vec<RegionNeighborLink> {
+    let mut topology = Vec::new();
+
+    for row in 0..layout.rows {
+        for column in 0..layout.columns {
+            let index = row * layout.columns + column;
+            let region = region_ids[index];
+
+            if column + 1 < layout.columns {
+                let east = region_ids[index + 1];
+                topology.push(RegionNeighborLink::new(region, BorderEdge::East, east));
+                topology.push(RegionNeighborLink::new(east, BorderEdge::West, region));
+            }
+
+            if row + 1 < layout.rows {
+                let south = region_ids[index + layout.columns];
+                topology.push(RegionNeighborLink::new(region, BorderEdge::South, south));
+                topology.push(RegionNeighborLink::new(south, BorderEdge::North, region));
+            }
+        }
+    }
+
+    topology
 }
 
 impl From<RegionalGameRunnerError> for RegionalGameError {
@@ -624,5 +770,65 @@ mod tests {
 
         assert_eq!(imported_park.id.generation, 3);
         assert_eq!(imported_park.remaining_capacity, 1);
+    }
+
+    #[test]
+    fn derives_row_major_topology_from_layout() {
+        let region_ids = [
+            RegionId(10),
+            RegionId(11),
+            RegionId(12),
+            RegionId(13),
+            RegionId(14),
+            RegionId(15),
+        ];
+
+        let topology = derive_topology(
+            &region_ids,
+            RegionalLayoutSave {
+                rows: 2,
+                columns: 3,
+            },
+        );
+
+        assert_eq!(
+            topology,
+            vec![
+                RegionNeighborLink::new(RegionId(10), BorderEdge::East, RegionId(11)),
+                RegionNeighborLink::new(RegionId(11), BorderEdge::West, RegionId(10)),
+                RegionNeighborLink::new(RegionId(10), BorderEdge::South, RegionId(13)),
+                RegionNeighborLink::new(RegionId(13), BorderEdge::North, RegionId(10)),
+                RegionNeighborLink::new(RegionId(11), BorderEdge::East, RegionId(12)),
+                RegionNeighborLink::new(RegionId(12), BorderEdge::West, RegionId(11)),
+                RegionNeighborLink::new(RegionId(11), BorderEdge::South, RegionId(14)),
+                RegionNeighborLink::new(RegionId(14), BorderEdge::North, RegionId(11)),
+                RegionNeighborLink::new(RegionId(12), BorderEdge::South, RegionId(15)),
+                RegionNeighborLink::new(RegionId(15), BorderEdge::North, RegionId(12)),
+                RegionNeighborLink::new(RegionId(13), BorderEdge::East, RegionId(14)),
+                RegionNeighborLink::new(RegionId(14), BorderEdge::West, RegionId(13)),
+                RegionNeighborLink::new(RegionId(14), BorderEdge::East, RegionId(15)),
+                RegionNeighborLink::new(RegionId(15), BorderEdge::West, RegionId(14)),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_layout_is_rejected_before_runner_start() {
+        let result = validate_layout(
+            2,
+            RegionalLayoutSave {
+                rows: 2,
+                columns: 2,
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(RegionalGameError::InvalidLayout {
+                rows: 2,
+                columns: 2,
+                region_count: 2,
+            })
+        );
     }
 }

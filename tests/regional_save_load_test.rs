@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod common;
 
 use common::write_legacy_single_city_save;
+use serde_json::Value;
 use small_city::core::regional_game::{
     RegionalGame, RegionalGameSaveError, RegionalGameSaveFailure,
 };
@@ -91,6 +92,40 @@ fn loading_preserves_each_regions_authoritative_state_independently() {
     assert_eq!(cell_building(region_b, 1, 0), Some(BuildingKind::Park));
     assert_eq!(cell_building(region_a, 1, 0), Some(BuildingKind::Road));
     assert_ne!(region_a, region_b);
+    remove_save_file(path);
+}
+
+#[test]
+fn saved_regional_game_stores_layout_not_explicit_topology() {
+    let path = save_path("regional-layout-save-shape");
+    let game = RegionalGame::two_region_default(3, 2).unwrap();
+
+    let restarted = game.save_to_file(&path).unwrap();
+    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+
+    assert_eq!(saved["layout"]["rows"], 1);
+    assert_eq!(saved["layout"]["columns"], 2);
+    assert!(saved.get("topology").is_none());
+
+    assert!(restarted.shutdown().is_ok());
+    remove_save_file(path);
+}
+
+#[test]
+fn old_regional_save_without_layout_infers_row_major_topology() {
+    let path = save_path("regional-layout-migration");
+    let game = RegionalGame::two_region_default(3, 2).unwrap();
+    build_cross_region_power_fixture(&game);
+    game.save_to_file(&path).unwrap();
+
+    let mut saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    saved.as_object_mut().unwrap().remove("layout");
+    std::fs::write(&path, serde_json::to_vec_pretty(&saved).unwrap()).unwrap();
+
+    let loaded = RegionalGame::load_from_file(&path).unwrap();
+    assert!(loaded.tick_region(RegionId(2)).unwrap().success);
+    assert!(region_cell_powered(&loaded, RegionId(2), 1, 0));
+
     remove_save_file(path);
 }
 
@@ -224,6 +259,29 @@ fn regional_game_with_regions_in_order(region_ids: [RegionId; 2]) -> RegionalGam
     game
 }
 
+fn build_cross_region_power_fixture(game: &RegionalGame) {
+    assert!(
+        game.build(RegionId(1), 2, 0, BuildingKind::Road)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(1), 2, 1, BuildingKind::PowerPlant)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(2), 0, 0, BuildingKind::Road)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(2), 1, 0, BuildingKind::Residential)
+            .unwrap()
+            .success
+    );
+}
+
 fn region_view(
     regions: &[small_city::core::regional_game::RegionViewSnapshot],
     region_id: RegionId,
@@ -241,6 +299,17 @@ fn cell_building(view: &GameView, x: usize, y: usize) -> Option<BuildingKind> {
         .iter()
         .find(|cell| cell.x == x && cell.y == y)
         .and_then(|cell| cell.building)
+}
+
+fn region_cell_powered(game: &RegionalGame, region_id: RegionId, x: usize, y: usize) -> bool {
+    let view = game.view().unwrap();
+    region_view(&view.regions, region_id)
+        .map
+        .cells
+        .iter()
+        .find(|cell| cell.x == x && cell.y == y)
+        .and_then(|cell| cell.powered)
+        .unwrap_or(false)
 }
 
 fn turn(game: &RegionalGame, region_id: RegionId) -> u32 {

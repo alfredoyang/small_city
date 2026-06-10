@@ -3,6 +3,82 @@
 //! This module introduces the actor-style shell around `RegionState` without
 //! spawning OS threads or exposing ECS storage. Worker patches can later route
 //! `OutboundMessage` values between runtimes.
+//!
+//! Cross-region power export allocation flow:
+//!
+//! ```text
+//! Region A needs power          Worker routing             Region B has spare power
+//! --------------------          --------------             ------------------------
+//! Tick starts
+//!   |
+//!   v
+//! Run local power
+//!   |
+//!   v
+//! Some consumers still unpowered?
+//!   |
+//!   +-- no --> finish tick normally
+//!   |
+//!   +-- yes
+//!         |
+//!         v
+//!    Pause tick after local power
+//!         |
+//!         v
+//!    Emit allocation release + export request
+//!         |
+//!         v
+//!                              Route releases first
+//!                              Route request by topology
+//!                                      |
+//!                                      v
+//!                                                        Check spare power
+//!                                                        minus active allocations
+//!                                                              |
+//!                                                              v
+//!                                                  grant or deny whole consumer
+//!                                                              |
+//!                                                              v
+//!                              Route grant back to Region A
+//!         |
+//!         v
+//! Apply grant to matching pending consumer
+//!         |
+//!         v
+//! All pending demands resolved?
+//!   |
+//!   +-- no --> stay paused
+//!   |
+//!   +-- yes --> continue population/economy/events --> tick completed
+//! ```
+//!
+//! Export allocations are transient runtime coordination owned by the producer.
+//! They prevent double-spending producer capacity during one scheduling round:
+//!
+//! ```text
+//! Producer Region B spare power = 1
+//!
+//! A request granted:
+//!   allocation (caller=A, request=10, token=0) -> demand 1
+//!
+//! C request in same round:
+//!   available = spare 1 - allocated 1 = 0
+//!   deny C
+//!
+//! Next A tick:
+//!   A emits release(request=11)
+//!   B removes old A allocation before routing new requests
+//! ```
+//!
+//! Topology is the gate for sharing power. Border road networks can only join
+//! when the regional layout says the two edges are neighbors:
+//!
+//! ```text
+//! Region A east border road      Region B west border road
+//!         |                               |
+//!         +-- East:offset 0 matches -----+
+//!                  West:offset 0
+//! ```
 
 pub mod continuation;
 
@@ -13,8 +89,8 @@ use crate::core::regional_types::{
 use crate::core::regions::handle::{RegionEventReceiver, RegionHandle, mailbox};
 use crate::core::regions::runtime::continuation::{CallerContinuation, NeighborRequest};
 use crate::core::regions::{
-    ImportedResource, ImportedResourceResult, RegionId, RegionState, RegionalExport,
-    RegionalExportChange,
+    ImportedResource, ImportedResourceResult, PendingPowerDemand, PowerExportGrant, RegionId,
+    RegionRoadNetworkId, RegionState, RegionalExport, RegionalExportChange, RegionalTickPowerPhase,
 };
 use crate::interface::input::MapOverlayInput;
 
@@ -40,6 +116,12 @@ pub enum RegionEvent {
         continuation: CallerContinuation<ImportedResourceResult>,
         result: ImportedResourceResult,
     },
+    /// Authoritative producer-side export allocation request.
+    ProcessPowerExportRequest(PowerExportAllocationRequest),
+    /// Producer-side release for a caller's previous export allocations.
+    ReleasePowerExportAllocations(PowerExportAllocationRelease),
+    /// Caller-side export grant result.
+    ApplyPowerExportGrant(PowerExportGrant),
     /// Internal event used to publish exports after startup or load.
     RefreshExports,
 }
@@ -79,6 +161,31 @@ pub struct ImportedResourcePayload {
 
 pub type ImportedResourceRequest = NeighborRequest<ImportedResourcePayload, ImportedResourceResult>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Consumer request for a producer to export enough power for one local demand.
+pub struct PowerExportRequest {
+    pub request_id: UiRequestId,
+    pub caller_region: RegionId,
+    pub caller_network: RegionRoadNetworkId,
+    pub token: u32,
+    pub demand: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Producer-side allocation request plus remaining candidates if a stale hint denies it.
+pub struct PowerExportAllocationRequest {
+    pub request: PowerExportRequest,
+    pub candidates: Vec<RegionRoadNetworkId>,
+    pub candidate_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Producer-side marker that a caller started a new tick power-resolution generation.
+pub struct PowerExportAllocationRelease {
+    pub caller_region: RegionId,
+    pub request_id: UiRequestId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Deterministic runtime error returned as outbound routing feedback.
 pub enum RegionRuntimeError {
@@ -102,6 +209,12 @@ pub enum OutboundMessage {
     RegionTickCompleted(RegionTickResponse),
     RegionSnapshotReady(RegionSnapshotResponse),
     RegionExportsChanged(RegionalExportChange),
+    PowerExportRequested(PowerExportRequest),
+    PowerExportRequestCompleted {
+        request: PowerExportAllocationRequest,
+        grant: PowerExportGrant,
+    },
+    PowerExportAllocationsReleased(PowerExportAllocationRelease),
     RuntimeError(RegionRuntimeError),
 }
 
@@ -110,8 +223,49 @@ pub enum OutboundMessage {
 pub struct RegionRuntime {
     state: RegionState,
     exports: Vec<RegionalExport>,
+    // TODO(next patch): Replace this ad hoc pending tick with an explicit tick
+    // state machine, for example `TickState::Idle` and
+    // `TickState::WaitingForPowerExports(TickPowerContinuation)`.
+    //
+    // The state machine should document the legal transitions:
+    //
+    // ```text
+    // Idle
+    //   -- Tick --> WaitingForPowerExports or finish immediately
+    // WaitingForPowerExports
+    //   -- ApplyPowerExportGrant --> WaitingForPowerExports or finish tick -> Idle
+    // ```
+    //
+    // Add tests for the important transitions: entering wait state, returning
+    // to idle after the last grant, rejecting/deferring a second tick while
+    // waiting, ignoring a grant while idle, and preserving same-pass allocation
+    // release ordering.
+    pending_tick: Option<PendingRegionalTick>,
+    power_export_allocations: Vec<PowerExportAllocation>,
     handle: RegionHandle,
     receiver: RegionEventReceiver,
+}
+
+#[derive(Debug)]
+struct PendingRegionalTick {
+    request_id: UiRequestId,
+    phase: RegionalTickPowerPhase,
+    pending_demands: Vec<PendingPowerDemand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PowerExportAllocation {
+    key: PowerExportAllocationKey,
+    network: RegionRoadNetworkId,
+    demand: i32,
+    caller_generation: UiRequestId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PowerExportAllocationKey {
+    caller_region: RegionId,
+    request_id: UiRequestId,
+    token: u32,
 }
 
 impl RegionRuntime {
@@ -122,6 +276,8 @@ impl RegionRuntime {
         let mut runtime = Self {
             state,
             exports: Vec::new(),
+            pending_tick: None,
+            power_export_allocations: Vec::new(),
             handle,
             receiver,
         };
@@ -166,7 +322,7 @@ impl RegionRuntime {
 
     /// Processes the next inbox event, returning messages for external routing.
     pub fn process_next_event(&mut self) -> Vec<OutboundMessage> {
-        let Some(event) = self.receiver.pop_event() else {
+        let Some(event) = self.pop_next_runnable_event() else {
             return Vec::new();
         };
 
@@ -190,11 +346,7 @@ impl RegionRuntime {
     fn process_event(&mut self, event: RegionEvent) -> Vec<OutboundMessage> {
         match event {
             RegionEvent::Tick { request_id } => {
-                let mut outbound = vec![OutboundMessage::RegionTickCompleted(
-                    self.run_tick(request_id),
-                )];
-                outbound.extend(self.export_change_messages());
-                outbound
+                self.start_tick_with_power_export_requests(request_id)
             }
             RegionEvent::BuildSnapshot {
                 request_id,
@@ -239,8 +391,197 @@ impl RegionRuntime {
                 continuation,
                 result,
             } => self.run_imported_resource_continuation(continuation, result),
+            RegionEvent::ProcessPowerExportRequest(request) => {
+                let grant = self.process_power_export_request(&request);
+                vec![OutboundMessage::PowerExportRequestCompleted { request, grant }]
+            }
+            RegionEvent::ReleasePowerExportAllocations(release) => {
+                self.release_stale_power_export_allocations_for_caller(
+                    release.caller_region,
+                    release.request_id,
+                );
+                Vec::new()
+            }
+            RegionEvent::ApplyPowerExportGrant(grant) => self.apply_power_export_grant(grant),
             RegionEvent::RefreshExports => self.export_change_messages(),
         }
+    }
+
+    fn pop_next_runnable_event(&mut self) -> Option<RegionEvent> {
+        if self.pending_tick.is_none() {
+            return self.receiver.pop_event();
+        }
+
+        // A tick paused for exported power must finish before ordinary gameplay
+        // events run. Export grants are control replies for that paused tick;
+        // producer-side requests must also run, otherwise two regions that
+        // both consume and export on different networks can deadlock each other.
+        self.receiver.pop_event_matching(|event| {
+            matches!(
+                event,
+                RegionEvent::ApplyPowerExportGrant(_)
+                    | RegionEvent::ProcessPowerExportRequest(_)
+                    | RegionEvent::ReleasePowerExportAllocations(_)
+            )
+        })
+    }
+
+    fn start_tick_with_power_export_requests(
+        &mut self,
+        request_id: UiRequestId,
+    ) -> Vec<OutboundMessage> {
+        let phase = self.state.begin_tick_power_demand_phase();
+        let release =
+            OutboundMessage::PowerExportAllocationsReleased(PowerExportAllocationRelease {
+                caller_region: self.region_id(),
+                request_id,
+            });
+        if phase.power_demands.is_empty() {
+            let mut outbound = vec![
+                release,
+                OutboundMessage::RegionTickCompleted(self.finish_tick_phase(request_id, phase)),
+            ];
+            outbound.extend(self.export_change_messages());
+            return outbound;
+        }
+
+        let pending_demands = phase.power_demands.clone();
+        let mut outbound = vec![release];
+        outbound.extend(
+            pending_demands
+                .iter()
+                .map(|demand| {
+                    OutboundMessage::PowerExportRequested(PowerExportRequest {
+                        request_id,
+                        caller_region: self.region_id(),
+                        caller_network: demand.caller_network,
+                        token: demand.token,
+                        demand: demand.demand,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        self.pending_tick = Some(PendingRegionalTick {
+            request_id,
+            phase,
+            pending_demands,
+        });
+        outbound
+    }
+
+    fn finish_tick_phase(
+        &mut self,
+        request_id: UiRequestId,
+        phase: RegionalTickPowerPhase,
+    ) -> RegionTickResponse {
+        RegionTickResponse {
+            request_id,
+            region_id: self.region_id(),
+            result: self.state.finish_tick_power_demand_phase(phase),
+        }
+    }
+
+    fn process_power_export_request(
+        &mut self,
+        request: &PowerExportAllocationRequest,
+    ) -> PowerExportGrant {
+        let producer_network = request.candidates[request.candidate_index];
+        let allocation_key = PowerExportAllocationKey {
+            caller_region: request.request.caller_region,
+            request_id: request.request.request_id,
+            token: request.request.token,
+        };
+        self.release_stale_power_export_allocations_for_caller(
+            request.request.caller_region,
+            request.request.request_id,
+        );
+        let active_export_allocations = self
+            .power_export_allocations
+            .iter()
+            .filter(|allocation| {
+                allocation.network == producer_network && allocation.key != allocation_key
+            })
+            .map(|allocation| allocation.demand)
+            .sum::<i32>();
+        // Producer-owned export capacity is authoritative here:
+        // local remaining capacity minus active transient export allocations.
+        let remaining = self
+            .state
+            .power_network_remaining_capacity(producer_network)
+            .saturating_sub(active_export_allocations);
+
+        if remaining < request.request.demand {
+            return PowerExportGrant {
+                token: request.request.token,
+                granted: false,
+                source_region: None,
+            };
+        }
+
+        if let Some(allocation) = self
+            .power_export_allocations
+            .iter_mut()
+            .find(|allocation| allocation.key == allocation_key)
+        {
+            allocation.network = producer_network;
+            allocation.demand = request.request.demand;
+            allocation.caller_generation = request.request.request_id;
+        } else {
+            self.power_export_allocations.push(PowerExportAllocation {
+                key: allocation_key,
+                network: producer_network,
+                demand: request.request.demand,
+                caller_generation: request.request.request_id,
+            });
+        }
+
+        PowerExportGrant {
+            token: request.request.token,
+            granted: true,
+            source_region: Some(self.region_id()),
+        }
+    }
+
+    fn release_stale_power_export_allocations_for_caller(
+        &mut self,
+        caller_region: RegionId,
+        caller_generation: UiRequestId,
+    ) {
+        // TODO(CR2 lifecycle): allocations clear when the caller starts a new
+        // tick generation. Add explicit cleanup when caller regions are
+        // removed, reassigned, or intentionally stop ticking.
+        self.power_export_allocations.retain(|allocation| {
+            allocation.key.caller_region != caller_region
+                || allocation.caller_generation == caller_generation
+        });
+    }
+
+    fn apply_power_export_grant(&mut self, grant: PowerExportGrant) -> Vec<OutboundMessage> {
+        let Some(mut pending_tick) = self.pending_tick.take() else {
+            return Vec::new();
+        };
+        let Some(position) = pending_tick
+            .pending_demands
+            .iter()
+            .position(|demand| demand.token == grant.token)
+        else {
+            self.pending_tick = Some(pending_tick);
+            return Vec::new();
+        };
+
+        let demand = pending_tick.pending_demands.remove(position);
+        self.state.apply_power_export_grant(demand, grant);
+        if !pending_tick.pending_demands.is_empty() {
+            self.pending_tick = Some(pending_tick);
+            return Vec::new();
+        }
+
+        let mut outbound = vec![OutboundMessage::RegionTickCompleted(
+            self.finish_tick_phase(pending_tick.request_id, pending_tick.phase),
+        )];
+        outbound.extend(self.export_change_messages());
+        outbound
     }
 
     fn export_change_messages(&mut self) -> Vec<OutboundMessage> {
@@ -349,14 +690,6 @@ impl RegionRuntime {
             request_id,
             region_id: self.region_id(),
             reply,
-        }
-    }
-
-    fn run_tick(&mut self, request_id: UiRequestId) -> RegionTickResponse {
-        RegionTickResponse {
-            request_id,
-            region_id: self.region_id(),
-            result: self.state.tick_local(),
         }
     }
 

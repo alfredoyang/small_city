@@ -10,13 +10,17 @@ Three phases:
 - **Local registry (R1-R3, done):** power and jobs resolve through a per-region
   registry that records each consumer's source and exposes spare capacity.
 - **Cross-region sharing (R4 = CR1-CR6):** regions share spare over connected
-  roads via a discovery directory plus an authoritative claim over the existing
-  region-runtime event flow.
+  roads via a discovery directory plus authoritative producer-owned export
+  allocation over the existing region-runtime event flow.
 - **Persistent registry (R5, deferred):** recompute on change instead of per tick.
 
 It supersedes a discarded first attempt at cross-region power that recomputed
 export capacity independently of the local power system; that duplication was the
 symptom that motivated this foundation.
+
+For definitions of the types and terms used below (import vs export convention,
+topology, components, export allocations, generations), see
+[regional-terminology.md](regional-terminology.md).
 
 ## Motivation (current state)
 
@@ -63,9 +67,9 @@ its own matching rule. It is not a single generic allocator.
   cross-region road network may share. Connectivity is computed at
   `(region, road-network)` granularity, never region granularity.
 - Cross-region sharing splits into **discovery** (a stale-tolerant component graph
-  plus an availability hint) and **claim** (an authoritative request/grant over
-  the existing region-runtime event flow with producer-side reservation).
-  Determinism lives in the event flow, not the hint.
+  plus an availability hint) and **export allocation** (an authoritative
+  request/grant over the existing region-runtime event flow with producer-owned
+  allocation). Determinism lives in the event flow, not the hint.
 - All `ResourceKind`s use this one registry + discovery model; the earlier
   visibility-only push cache is retired (CR6).
 
@@ -117,16 +121,17 @@ Hard requirements the implementation must hold:
 
 ## Cross-Region Sharing Model (R4)
 
-Cross-region sharing splits into **discovery** and **claim**. Discovery is a
+Cross-region sharing splits into **discovery** and **export allocation**. Discovery is a
 lookup, not a routed search: a stable component graph (which regions share a road
 network) plus a tiny, stale-tolerant **availability hint** per region (does it
 have spare). A locally-short consumer uses these to pick a producer in its own
-component. The **claim** is then an authoritative request over the existing
-cross-region event flow: the producer grants with reservation through its own
-event loop, which is the single source of truth. There is no hop-by-hop forwarding
-and no "which direction" decision, so any topology (line, ring, 5x5 grid) works
-the same. Because the hint is only used to choose whom to ask, it may be stale: a
-wrong guess costs one declined request, never a wrong allocation.
+component. The **export allocation** is then an authoritative request over the
+existing cross-region event flow: the producer grants from its own runtime and
+records transient export allocation, which is the single source of truth. There
+is no hop-by-hop forwarding and no "which direction" decision, so any topology
+(line, ring, 5x5 grid) works the same. Because the hint is only used to choose
+whom to ask, it may be stale: a wrong guess costs one declined request, never a
+wrong allocation.
 
 Two separate pieces; keep them distinct.
 
@@ -167,7 +172,7 @@ region-level union  -> {A, B, C} : A wrongly draws from C
 network-level union -> {A.net, B1}  and  {B2, C.net} : A cannot reach C  (correct)
 ```
 
-Discovery then claim (power; jobs are analogous with slots instead of capacity):
+Discovery then export allocation (power; jobs are analogous with slots instead of capacity):
 
 ```text
 short consumer on (region, net), after local grants:
@@ -175,8 +180,9 @@ short consumer on (region, net), after local grants:
     candidates = regions in component whose hint says "has spare"   [stable order]
     for producer in candidates:
         send an authoritative request over the cross-region event flow
-        producer's event loop grants up to its reserved-remaining spare,
-            reserves the grant, replies        <- source of truth
+        producer's event loop grants if local remaining capacity
+            minus active export allocations can satisfy demand
+        producer records transient export allocation and replies <- source of truth
         on grant: consumer.powered = true; source = Imported { producer.region }
         on a stale "has spare" that is actually empty: try the next candidate
         stop when demand is met
@@ -186,9 +192,10 @@ Concurrency and determinism:
 
 - The hint may be read stale across worker threads; a wrong guess only wastes a
   request the producer declines, so the hint needs no barrier or consistency.
-- The claim is authoritative and deterministic because the producer serializes
-  requests in its own event loop and reserves as it grants. Cross-worker request
-  ordering is the existing event flow's responsibility, not the hint's.
+- Export allocation is authoritative and deterministic because the producer
+  serializes requests in its own event loop and records active allocations as it
+  grants. Cross-worker request ordering is the existing event flow's
+  responsibility, not the hint's.
 
 Save and rebuild: imported resources are rebuildable cache. On load each region
 re-resolves locally, the component graph and hints rebuild, and imports
@@ -209,7 +216,8 @@ regenerate. Nothing imported is saved as authoritative truth.
   hint, request/reply); no remote road, building, citizen, or power entity is
   shared.
 - Confirm exported capacity before the caller marks buildings powered or assigns
-  residents to remote jobs (reservation).
+  residents to remote jobs. For power, producer-owned export allocation prevents
+  double-spend.
 - Make imported resources and their blockers visible through inspect notes and
   tick summaries.
 
@@ -355,14 +363,14 @@ Review focus:
 
 R4 is the cross-region phase. It reads each registry entry's remaining (R3),
 builds the discovery directory described in "Cross-Region Sharing Model" above,
-and resolves the claim over the region-runtime event flow. It lands as the
-sub-patches below.
+and resolves producer-owned export allocation over the region-runtime event flow.
+It lands as the sub-patches below.
 
 ### Patch CR1: Component Graph And Availability Hint
 
 Goal: build the cross-region road-network component graph from border-link
 summaries, and publish a tiny per-region availability hint. Discovery data only;
-no claim and no tick behavior change.
+no export allocation and no tick behavior change.
 
 Likely files:
 
@@ -385,7 +393,7 @@ Implementation:
 - Publish the hint so other workers can read it (a relaxed atomic for a scalar, a
   double-buffer/seqlock for a small struct). The hint may be read stale; the
   component graph and hint are owned summaries with no ECS identity.
-- Do not perform any claim here.
+- Do not perform any export allocation here.
 
 Tests:
 
@@ -400,12 +408,13 @@ Review focus:
 
 - Components are keyed by `(region, road-network)`, not region.
 - The hint is minimal and stale-tolerant; no consistency barrier is required.
-- Discovery data is owned and deterministic; no claim happens in CR1.
+- Discovery data is owned and deterministic; no export allocation happens in CR1.
 
-### Patch CR2: Cross-Region Power Import
+### Patch CR2: Cross-Region Power Export Allocation
 
 Goal: power a locally-short consumer from a producer in its own road component via
-an authoritative request and grant with reservation.
+an authoritative producer-owned export request and grant with transient
+allocation.
 
 Likely files:
 
@@ -421,10 +430,11 @@ Implementation:
   uses the component graph plus the availability hint (CR1) to pick candidate
   producers in its component, in stable order.
 - It sends an authoritative request over the existing cross-region event flow. The
-  producer's event loop grants up to its reserved-remaining spare, reserves the
-  grant, and replies. The consumer sets `powered = true` and
-  `source = Imported { region }`. A stale "has spare" that is actually empty makes
-  the consumer try the next candidate.
+  producer's event loop grants only if local remaining capacity minus active
+  export allocations can satisfy the demand, records a transient export
+  allocation, and replies. The consumer sets `powered = true` and
+  `source = Imported { region }`. A stale "has spare" that is actually empty
+  makes the consumer try the next candidate.
 - Resolve all cross-region power before downstream systems read `powered`.
 
 Tests:
@@ -433,13 +443,14 @@ Tests:
 - a consumer in a different component is not powered by an unreachable producer
   (the trap).
 - two consumers competing for a producer's last unit resolve deterministically
-  with no double-spend (reservation).
-- import resolves before downstream systems read `powered`.
+  with no double-spend (producer export allocation).
+- export allocation resolves before downstream systems read `powered`.
 
 Review focus:
 
 - Sharing follows roads (same component only).
-- Reservation prevents double-spend; resolution order is deterministic.
+- Producer-owned export allocation prevents double-spend; resolution order is
+  deterministic.
 
 ### Patch CR3: Cross-Region Jobs Import
 
@@ -533,8 +544,9 @@ Likely files:
 Implementation:
 
 - Move the building-derived `ResourceKind`s (service, shopping, jobs, park, road
-  access) onto the registry as additional resource entries, discovered and claimed
-  exactly like power and jobs. No resource kind keeps a separate push path.
+  access) onto the registry as additional resource entries, discovered and
+  allocated/requested exactly like power and jobs. No resource kind keeps a
+  separate push path.
 - Remove `RegionState.imported_resources` and `neighbor_import_results`, the
   `ImportedResourceCache` accept/forward machinery, and the runtime/worker
   export-change propagation.
@@ -554,7 +566,7 @@ Tests:
 
 Review focus:
 
-- Exactly one cross-region mechanism (registry + discovery + claim).
+- Exactly one cross-region mechanism (registry + discovery + allocation request).
 - No region stores another region's exported resources.
 - Building-derived resources are not lost; they moved to the registry.
 
@@ -628,8 +640,9 @@ Review focus:
   data without ECS identity.
 - Cross-region components are computed at `(region, road-network)` granularity.
 - The component graph and availability hint hold owned summaries only; the hint is
-  stale-tolerant; claiming is authoritative over the cross-region event flow with
-  producer-side reservation; no region reads another region's `World`.
+  stale-tolerant; export allocation is authoritative over the cross-region event
+  flow with producer-owned transient allocation; no region reads another region's
+  `World`.
 - Connectivity is binary; there is no per-border transit-capacity flow.
 - Capacity comes from the registry spare query, never a parallel re-derivation.
 - Determinism: stable road-network discovery, map-order allocation, stable
@@ -648,7 +661,7 @@ Cross-region (R4):
 
 - Are components keyed by `(region, road-network)`, not region?
 - Does sharing follow roads (same component only)?
-- Does producer reservation prevent double-spend?
+- Does producer-owned export allocation prevent double-spend?
 - Do power and jobs resolve before the downstream systems that read them?
 - Is all cross-boundary data owned and free of remote ECS identity?
 - Is imported state rebuildable, not saved as truth?

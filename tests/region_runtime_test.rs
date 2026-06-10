@@ -21,9 +21,13 @@ fn local_tick_is_processed_through_runtime() {
 
     let outbound = runtime.process_next_event();
 
-    let [OutboundMessage::RegionTickCompleted(reply)] = outbound.as_slice() else {
-        panic!("expected one tick reply");
-    };
+    let reply = outbound
+        .iter()
+        .find_map(|message| match message {
+            OutboundMessage::RegionTickCompleted(reply) => Some(reply),
+            _ => None,
+        })
+        .expect("expected tick reply");
     assert_eq!(reply.request_id, UiRequestId(10));
     assert_eq!(reply.region_id, RegionId(1));
     assert!(reply.result.success);
@@ -254,6 +258,15 @@ fn decisions(outbound: &[OutboundMessage]) -> Vec<ImportDecision> {
             OutboundMessage::RegionExportsChanged(change) => {
                 panic!("unexpected export change: {change:?}")
             }
+            OutboundMessage::PowerExportRequested(request) => {
+                panic!("unexpected power export request: {request:?}")
+            }
+            OutboundMessage::PowerExportRequestCompleted { request, grant } => {
+                panic!("unexpected power export request result: {request:?} {grant:?}")
+            }
+            OutboundMessage::PowerExportAllocationsReleased(release) => {
+                panic!("unexpected power export allocation release: {release:?}")
+            }
             OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
         })
         .collect()
@@ -294,6 +307,15 @@ fn take_continuation(
         }
         OutboundMessage::RegionExportsChanged(change) => {
             panic!("unexpected export change: {change:?}")
+        }
+        OutboundMessage::PowerExportRequested(request) => {
+            panic!("unexpected power export request: {request:?}")
+        }
+        OutboundMessage::PowerExportRequestCompleted { request, grant } => {
+            panic!("unexpected power export request result: {request:?} {grant:?}")
+        }
+        OutboundMessage::PowerExportAllocationsReleased(release) => {
+            panic!("unexpected power export allocation release: {release:?}")
         }
         OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
     }

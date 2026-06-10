@@ -19,7 +19,7 @@ fn region_can_send_event_through_neighbor_handle() {
     source.send_to_region(&target_handle, tick(1));
 
     assert_eq!(target.pending_event_count(), 1);
-    assert_eq!(target.process_next_event().len(), 1);
+    assert_eq!(tick_reply_count(&target.process_next_event()), 1);
     assert_eq!(target.state().view().status.turn, 1);
     assert_eq!(source.state().view().status.turn, 0);
 }
@@ -34,7 +34,7 @@ fn sender_handle_can_be_cloned_without_cloning_receiver() {
     second_sender.send(tick(3));
 
     assert_eq!(target.pending_event_count(), 2);
-    assert_eq!(target.process_some_events(2).len(), 2);
+    assert_eq!(tick_reply_count(&target.process_some_events(2)), 2);
     assert_eq!(target.state().view().status.turn, 2);
 }
 
@@ -47,7 +47,7 @@ fn receiver_remains_owned_by_target_runtime_after_runtime_moves() {
     handle.send(tick(4));
 
     assert_eq!(moved_target.pending_event_count(), 1);
-    assert_eq!(moved_target.process_next_event().len(), 1);
+    assert_eq!(tick_reply_count(&moved_target.process_next_event()), 1);
     assert_eq!(moved_target.state().view().status.turn, 1);
 }
 
@@ -121,6 +121,13 @@ fn tick(request_id: u64) -> RegionEvent {
     RegionEvent::Tick {
         request_id: UiRequestId(request_id),
     }
+}
+
+fn tick_reply_count(outbound: &[OutboundMessage]) -> usize {
+    outbound
+        .iter()
+        .filter(|message| matches!(message, OutboundMessage::RegionTickCompleted(_)))
+        .count()
 }
 
 fn resource(origin_region: u32, resource_kind: ResourceKind, generation: u64) -> ImportedResource {

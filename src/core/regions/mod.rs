@@ -57,8 +57,13 @@
 //!   No other region's World is touched.
 //! ```
 
+use crate::core::components::PowerSource;
+use crate::core::entity::Entity;
 use crate::core::resource_registry::ResourceRegistry;
-use crate::core::simulation::{refresh_derived_state_for_world, tick_world};
+use crate::core::simulation::{
+    TickPowerPhase, begin_tick_power_phase, finish_tick_after_power_phase,
+    refresh_derived_state_for_world, tick_world,
+};
 use crate::core::systems::{build, bulldoze, replace, road_connectivity, upgrade};
 use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
@@ -204,7 +209,7 @@ pub struct RegionRoadNetworkId {
     pub road_network: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 /// Region map edge used to identify where local road networks can meet neighbors.
 pub enum BorderEdge {
     North,
@@ -249,7 +254,7 @@ pub struct NetworkBorderLink {
     pub link: BorderLinkId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 /// Owned region-topology edge used to decide which border links may match.
 pub struct RegionNeighborLink {
     pub region: RegionId,
@@ -282,6 +287,30 @@ pub struct RegionalAvailabilityHint {
     pub network: RegionRoadNetworkId,
     pub has_spare_power: bool,
     pub has_spare_jobs: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Caller-local consumer demand that may need producer-exported power.
+pub(crate) struct PendingPowerDemand {
+    pub token: u32,
+    pub consumer: Entity,
+    pub demand: i32,
+    pub caller_network: RegionRoadNetworkId,
+}
+
+#[derive(Debug)]
+/// Paused tick state after local power and before downstream systems.
+pub(crate) struct RegionalTickPowerPhase {
+    phase: TickPowerPhase,
+    pub power_demands: Vec<PendingPowerDemand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result of an authoritative producer-owned export allocation request.
+pub struct PowerExportGrant {
+    pub token: u32,
+    pub granted: bool,
+    pub source_region: Option<RegionId>,
 }
 
 impl ImportedResource {
@@ -702,6 +731,68 @@ impl RegionState {
         hints
     }
 
+    pub(crate) fn power_network_remaining_capacity(&self, network: RegionRoadNetworkId) -> i32 {
+        if network.region != self.id {
+            return 0;
+        }
+
+        // TODO(CR2 perf): producer export requests re-resolve local power for every
+        // request. Cache per-network remaining capacity for one scheduling pass
+        // once cross-region exports move beyond the first implementation.
+        ResourceRegistry::for_power(&self.world)
+            .resolve_local_power()
+            .network_capacities
+            .into_iter()
+            .find(|capacity| capacity.road_network == network.road_network)
+            .map(|capacity| capacity.remaining_capacity)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn begin_tick_power_demand_phase(&mut self) -> RegionalTickPowerPhase {
+        let phase = begin_tick_power_phase(&mut self.world);
+        let power_demands = self.pending_power_demands();
+        RegionalTickPowerPhase {
+            phase,
+            power_demands,
+        }
+    }
+
+    pub(crate) fn finish_tick_power_demand_phase(
+        &mut self,
+        phase: RegionalTickPowerPhase,
+    ) -> CommandResult {
+        finish_tick_after_power_phase(&mut self.world, phase.phase)
+    }
+
+    pub(crate) fn apply_power_export_grant(
+        &mut self,
+        demand: PendingPowerDemand,
+        grant: PowerExportGrant,
+    ) {
+        if !grant.granted {
+            return;
+        }
+        let Some(source_region) = grant.source_region else {
+            return;
+        };
+        let Some(consumer) = self.world.power_consumers.get_mut(&demand.consumer) else {
+            return;
+        };
+        if consumer.powered || consumer.demand != demand.demand {
+            return;
+        }
+
+        consumer.powered = true;
+        consumer.source = Some(PowerSource::Imported { source_region });
+        // TODO(CR4 visibility): exported power demand is counted as supplied in the
+        // consumer region only. Surface producer export load separately when
+        // regional power trade stats are added.
+        self.world.stats.power.total_power_supplied += demand.demand;
+        self.world.stats.power.total_power_shortage = (self.world.stats.power.total_power_demand
+            - self.world.stats.power.total_power_supplied)
+            .max(0);
+    }
+
     /// Rebuilds transient imported cache state from authoritative local data.
     ///
     /// Regional export generation does not exist yet, so the current
@@ -746,6 +837,63 @@ impl RegionState {
         };
         state.rebuild_imported_resource_cache();
         state
+    }
+
+    fn pending_power_demands(&self) -> Vec<PendingPowerDemand> {
+        let border_networks = self
+            .network_border_links()
+            .into_iter()
+            .map(|link| link.network)
+            .collect::<Vec<_>>();
+        if border_networks.is_empty() {
+            return Vec::new();
+        }
+
+        let networks = road_connectivity::discover_road_networks(&self.world);
+        let mut consumers = self
+            .world
+            .power_consumers
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        road_connectivity::sort_entities_by_position(&self.world, &mut consumers);
+
+        let mut demands = Vec::new();
+        for consumer in consumers {
+            let Some(power_consumer) = self.world.power_consumers.get(&consumer) else {
+                continue;
+            };
+            if power_consumer.powered {
+                continue;
+            }
+            let Some(caller_network) = networks
+                .iter()
+                .filter(|network| {
+                    border_networks.contains(&RegionRoadNetworkId {
+                        region: self.id,
+                        road_network: network.id,
+                    })
+                })
+                .find(|network| {
+                    road_connectivity::adjacent_road_entities(&self.world, consumer)
+                        .any(|road| network.roads.contains(&road))
+                })
+                .map(|network| RegionRoadNetworkId {
+                    region: self.id,
+                    road_network: network.id,
+                })
+            else {
+                continue;
+            };
+
+            demands.push(PendingPowerDemand {
+                token: demands.len() as u32,
+                consumer,
+                demand: power_consumer.demand,
+                caller_network,
+            });
+        }
+        demands
     }
 }
 

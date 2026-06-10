@@ -222,6 +222,15 @@ fn returned_continuation(
         OutboundMessage::RegionExportsChanged(change) => {
             panic!("unexpected export change: {change:?}")
         }
+        OutboundMessage::PowerExportRequested(request) => {
+            panic!("unexpected power export request: {request:?}")
+        }
+        OutboundMessage::PowerExportRequestCompleted { request, grant } => {
+            panic!("unexpected power export request result: {request:?} {grant:?}")
+        }
+        OutboundMessage::PowerExportAllocationsReleased(release) => {
+            panic!("unexpected power export allocation release: {release:?}")
+        }
         OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
     }
 }
@@ -236,6 +245,9 @@ fn runtime_errors(outbound: &[OutboundMessage]) -> Vec<RegionRuntimeError> {
             OutboundMessage::RegionTickCompleted(_) => None,
             OutboundMessage::RegionSnapshotReady(_) => None,
             OutboundMessage::RegionExportsChanged(_) => None,
+            OutboundMessage::PowerExportRequested(_) => None,
+            OutboundMessage::PowerExportRequestCompleted { .. } => None,
+            OutboundMessage::PowerExportAllocationsReleased(_) => None,
         })
         .collect()
 }

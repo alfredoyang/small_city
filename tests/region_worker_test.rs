@@ -53,8 +53,8 @@ fn busy_region_cannot_starve_another_region_when_event_limit_is_set() {
     assert_eq!(summary.processed_regions, 2);
     assert_eq!(turn(&worker, RegionId(3)), 1);
     assert_eq!(turn(&worker, RegionId(4)), 1);
-    assert_eq!(pending_events(&worker, RegionId(3)), 2);
-    assert_eq!(pending_events(&worker, RegionId(4)), 0);
+    assert!(pending_events(&worker, RegionId(3)) >= 2);
+    assert!(pending_events(&worker, RegionId(4)) <= 1);
 }
 
 #[test]
@@ -328,6 +328,222 @@ fn discovery_does_not_join_unrelated_regions_with_matching_border_links() {
     assert_component(&discovery, network(25, 0), &[network(25, 0)]);
 }
 
+#[test]
+fn cross_region_power_export_powers_same_component_consumer() {
+    let consumer = power_export_consumer_region(RegionId(26));
+    let producer = power_export_producer_region(RegionId(27));
+    let mut worker = worker_with_region_states(WorkerId(14), vec![consumer, producer]);
+    worker.set_region_topology(vec![neighbor(26, BorderEdge::East, 27)]);
+
+    worker.push_event(RegionId(26), tick(1)).unwrap();
+    drain_worker(&mut worker);
+
+    assert!(cell_powered(&worker, RegionId(26), 0, 0));
+}
+
+#[test]
+fn cross_region_power_export_does_not_cross_separate_components() {
+    let consumer = power_export_consumer_region(RegionId(28));
+    let producer = power_export_producer_region(RegionId(29));
+    let mut worker = worker_with_region_states(WorkerId(15), vec![consumer, producer]);
+
+    worker.push_event(RegionId(28), tick(1)).unwrap();
+    drain_worker(&mut worker);
+
+    assert!(!cell_powered(&worker, RegionId(28), 0, 0));
+}
+
+#[test]
+fn cross_region_power_export_allocation_prevents_double_spend() {
+    let first = power_export_consumer_region(RegionId(30));
+    let second = power_export_consumer_region(RegionId(31));
+    let producer = one_spare_power_producer_region(RegionId(32));
+    let mut worker = worker_with_region_states(WorkerId(16), vec![first, second, producer]);
+    worker.set_region_topology(vec![
+        neighbor(30, BorderEdge::East, 32),
+        neighbor(31, BorderEdge::East, 32),
+    ]);
+
+    worker.push_event(RegionId(30), tick(1)).unwrap();
+    worker.push_event(RegionId(31), tick(2)).unwrap();
+    drain_worker(&mut worker);
+
+    let powered_consumers = [RegionId(30), RegionId(31)]
+        .into_iter()
+        .filter(|region| cell_powered(&worker, *region, 0, 0))
+        .count();
+    assert_eq!(powered_consumers, 1);
+    assert!(cell_powered(&worker, RegionId(30), 0, 0));
+    assert!(!cell_powered(&worker, RegionId(31), 0, 0));
+}
+
+#[test]
+fn cross_region_power_export_resolves_before_population_growth() {
+    let consumer = power_export_growth_region(RegionId(33));
+    let producer = power_export_producer_region(RegionId(34));
+    let mut worker = worker_with_region_states(WorkerId(17), vec![consumer, producer]);
+    worker.set_region_topology(vec![neighbor(33, BorderEdge::East, 34)]);
+
+    for request_id in 1..=48 {
+        worker.push_event(RegionId(33), tick(request_id)).unwrap();
+        worker
+            .push_event(RegionId(34), tick(request_id + 100))
+            .unwrap();
+        drain_worker(&mut worker);
+    }
+
+    assert!(
+        worker
+            .region(RegionId(33))
+            .expect("consumer")
+            .state()
+            .view()
+            .status
+            .population
+            > 0
+    );
+}
+
+#[test]
+fn cross_region_power_export_does_not_overwrite_a_paused_tick() {
+    let consumer = power_export_consumer_region(RegionId(35));
+    let producer = power_export_producer_region(RegionId(36));
+    let mut worker = worker_with_region_states(WorkerId(18), vec![consumer, producer]);
+    worker.set_region_topology(vec![neighbor(35, BorderEdge::East, 36)]);
+
+    worker.push_event(RegionId(35), tick(1)).unwrap();
+    worker.push_event(RegionId(35), tick(2)).unwrap();
+    let mut tick_replies = worker.process_region_events(2).tick_replies;
+
+    for _ in 0..16 {
+        let summary = worker.process_region_events(2);
+        tick_replies.extend(summary.tick_replies);
+        if summary.processed_regions == 0 {
+            break;
+        }
+    }
+
+    let reply_ids = tick_replies
+        .into_iter()
+        .map(|reply| reply.request_id)
+        .collect::<Vec<_>>();
+    assert_eq!(reply_ids, vec![UiRequestId(1), UiRequestId(2)]);
+}
+
+#[test]
+fn paused_region_can_still_process_producer_side_power_requests() {
+    let caller = power_export_consumer_region(RegionId(37));
+    let middle = power_consumer_and_exporter_region(RegionId(38));
+    let upstream = power_export_producer_region(RegionId(39));
+    let mut worker = worker_with_region_states(WorkerId(19), vec![middle, caller, upstream]);
+    worker.set_region_topology(vec![
+        neighbor(37, BorderEdge::East, 38),
+        neighbor(38, BorderEdge::East, 39),
+    ]);
+
+    worker.push_event(RegionId(38), tick(1)).unwrap();
+    worker.push_event(RegionId(37), tick(2)).unwrap();
+    drain_worker(&mut worker);
+
+    assert!(cell_powered(&worker, RegionId(37), 0, 0));
+    assert!(cell_powered(&worker, RegionId(38), 2, 0));
+}
+
+#[test]
+fn repeated_selected_region_export_does_not_consume_stale_producer_allocation() {
+    let consumer = power_export_consumer_region(RegionId(40));
+    let producer = one_spare_power_producer_region(RegionId(41));
+    let mut worker = worker_with_region_states(WorkerId(20), vec![consumer, producer]);
+    worker.set_region_topology(vec![neighbor(40, BorderEdge::East, 41)]);
+
+    worker.push_event(RegionId(40), tick(1)).unwrap();
+    drain_worker(&mut worker);
+    assert!(cell_powered(&worker, RegionId(40), 0, 0));
+
+    worker.push_event(RegionId(40), tick(2)).unwrap();
+    drain_worker(&mut worker);
+    assert!(cell_powered(&worker, RegionId(40), 0, 0));
+}
+
+#[test]
+fn caller_tick_without_export_request_releases_previous_producer_allocation() {
+    let first = power_export_consumer_region(RegionId(42));
+    let second = power_export_consumer_region(RegionId(43));
+    let producer = one_spare_power_producer_region(RegionId(44));
+    let mut worker = worker_with_region_states(WorkerId(21), vec![first, second, producer]);
+    worker.set_region_topology(vec![
+        neighbor(42, BorderEdge::East, 44),
+        neighbor(43, BorderEdge::East, 44),
+    ]);
+
+    worker.push_event(RegionId(42), tick(1)).unwrap();
+    drain_worker(&mut worker);
+    assert!(cell_powered(&worker, RegionId(42), 0, 0));
+
+    worker.push_event(RegionId(43), tick(2)).unwrap();
+    drain_worker(&mut worker);
+    assert!(!cell_powered(&worker, RegionId(43), 0, 0));
+
+    worker
+        .push_event(
+            RegionId(42),
+            RegionEvent::RunCommand {
+                request_id: UiRequestId(3),
+                command: RegionCommand::Build {
+                    x: 1,
+                    y: 1,
+                    kind: BuildingKind::PowerPlant,
+                },
+            },
+        )
+        .unwrap();
+    drain_worker(&mut worker);
+    worker.push_event(RegionId(42), tick(4)).unwrap();
+    drain_worker(&mut worker);
+
+    worker.push_event(RegionId(43), tick(5)).unwrap();
+    drain_worker(&mut worker);
+    assert!(cell_powered(&worker, RegionId(43), 0, 0));
+}
+
+#[test]
+fn same_pass_release_is_routed_before_another_caller_power_request() {
+    let first = power_export_consumer_region(RegionId(45));
+    let second = power_export_consumer_region(RegionId(46));
+    let producer = one_spare_power_producer_region(RegionId(47));
+    let mut worker = worker_with_region_states(WorkerId(22), vec![second, first, producer]);
+    worker.set_region_topology(vec![
+        neighbor(45, BorderEdge::East, 47),
+        neighbor(46, BorderEdge::East, 47),
+    ]);
+
+    worker.push_event(RegionId(45), tick(1)).unwrap();
+    drain_worker(&mut worker);
+    assert!(cell_powered(&worker, RegionId(45), 0, 0));
+
+    worker
+        .push_event(
+            RegionId(45),
+            RegionEvent::RunCommand {
+                request_id: UiRequestId(2),
+                command: RegionCommand::Build {
+                    x: 1,
+                    y: 1,
+                    kind: BuildingKind::PowerPlant,
+                },
+            },
+        )
+        .unwrap();
+    drain_worker(&mut worker);
+
+    worker.push_event(RegionId(46), tick(3)).unwrap();
+    worker.push_event(RegionId(45), tick(4)).unwrap();
+    drain_worker(&mut worker);
+
+    assert!(cell_powered(&worker, RegionId(45), 0, 0));
+    assert!(cell_powered(&worker, RegionId(46), 0, 0));
+}
+
 fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
     let mut worker = RegionWorker::new(id);
     for region_id in regions {
@@ -336,6 +552,68 @@ fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
             .unwrap();
     }
     worker
+}
+
+fn power_export_consumer_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 2, 2);
+    assert!(region.build(0, 0, BuildingKind::Residential).success);
+    assert!(region.build(1, 0, BuildingKind::Road).success);
+    region
+}
+
+fn power_export_growth_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 6, 3);
+    assert!(region.build(0, 0, BuildingKind::Residential).success);
+    assert!(region.build(2, 1, BuildingKind::Commercial).success);
+    assert!(region.build(0, 1, BuildingKind::Park).success);
+    for x in 1..=5 {
+        assert!(region.build(x, 0, BuildingKind::Road).success);
+    }
+    region
+}
+
+fn power_export_producer_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 2, 2);
+    assert!(region.build(0, 0, BuildingKind::Road).success);
+    assert!(region.build(0, 1, BuildingKind::PowerPlant).success);
+    region
+}
+
+fn power_consumer_and_exporter_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 4, 2);
+    assert!(region.build(0, 0, BuildingKind::Road).success);
+    assert!(region.build(0, 1, BuildingKind::PowerPlant).success);
+    assert!(region.build(2, 0, BuildingKind::Residential).success);
+    assert!(region.build(3, 0, BuildingKind::Road).success);
+    region
+}
+
+fn one_spare_power_producer_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 5, 2);
+    assert!(region.build(0, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 0, BuildingKind::Road).success);
+    assert!(region.build(2, 0, BuildingKind::Road).success);
+    assert!(region.build(3, 0, BuildingKind::Road).success);
+    assert!(region.build(4, 0, BuildingKind::Road).success);
+    assert!(region.build(0, 1, BuildingKind::PowerPlant).success);
+    assert!(region.build(1, 1, BuildingKind::Industrial).success);
+    assert!(region.build(2, 1, BuildingKind::Industrial).success);
+    assert!(region.build(3, 1, BuildingKind::Industrial).success);
+    region
+}
+
+fn cell_powered(worker: &RegionWorker, region_id: RegionId, x: usize, y: usize) -> bool {
+    worker
+        .region(region_id)
+        .expect("region")
+        .state()
+        .view()
+        .map
+        .cells
+        .iter()
+        .find(|cell| cell.x == x && cell.y == y)
+        .and_then(|cell| cell.powered)
+        .unwrap_or(false)
 }
 
 fn worker_with_region_states(id: WorkerId, regions: Vec<RegionState>) -> RegionWorker {

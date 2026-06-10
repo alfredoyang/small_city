@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::core::entity::Entity;
+use crate::core::regions::RegionId;
 use crate::interface::input::BuildingKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,10 +136,11 @@ pub struct PowerProvider {
 /// Source that granted power to a consumer during the latest power resolution.
 ///
 /// This is derived state recomputed by the power system. R1 records only local
-/// providers; later regional power imports can add owned cross-region source IDs
-/// without changing the local request/grant flow.
+/// providers; regional export grants add owned cross-region source IDs without
+/// changing the local request/grant flow.
 pub enum PowerSource {
     Local(Entity),
+    Imported { source_region: RegionId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
