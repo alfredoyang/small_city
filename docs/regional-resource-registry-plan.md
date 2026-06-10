@@ -364,7 +364,10 @@ Review focus:
 R4 is the cross-region phase. It reads each registry entry's remaining (R3),
 builds the discovery directory described in "Cross-Region Sharing Model" above,
 and resolves producer-owned export allocation over the region-runtime event flow.
-It lands as the sub-patches below.
+It lands as the sub-patches below. CR1-CR6 keep their numbers (code TODOs and the
+terminology doc reference them); CR3R is a behavior-preserving refactor that sits
+between CR3 and CR4 and unifies the power/job export transport before CR6 extends
+the model to other resource kinds.
 
 ### Patch CR1: Component Graph And Availability Hint
 
@@ -524,6 +527,67 @@ Review focus:
   decider that owns the slot and its tax/profit.
 - Reservation prevents double-spend; the power and job wait phases compose
   deterministically.
+
+### Patch CR3R: Unify Power And Job Export Transport
+
+Goal: collapse the near-verbatim transport and lifecycle that CR2 (power) and CR3
+(jobs) each carry into one shared mechanism, so a future `ResourceKind` is a small
+impl rather than a third copy. Behavior-preserving refactor — no new behavior. Runs
+after CR3 is committed and before CR6, which moves every other `ResourceKind` onto
+this model and so benefits directly from a single seam.
+
+Scope is deliberately narrow: unify the parts that are genuinely identical, keep
+the parts that genuinely differ explicit (per the "simple, readable Rust over
+clever abstractions" rule). Do not force one mega-abstraction over the whole flow.
+
+Unify (the duplicated transport/lifecycle):
+
+- **Generic worker routing.** Replace the eight `route_power_export_*` /
+  `route_job_export_*` methods (request, result, release, deny) with one generic
+  set over an `ExportResource` trait that supplies only the variable bits: the
+  availability-hint selector (`has_spare_power` vs `has_spare_jobs`), the
+  `RegionEvent` constructors, and the deny grant. Candidate filtering, the
+  missing-target deny, and the release-before-request ordering then live in exactly
+  one place, so a fix can never drift between the two resources.
+- **Generic `ExportAllocations<U>`.** Extract the producer-side reservation
+  bookkeeping into one type parameterized by the reserved unit `U` (`i32` for power,
+  `Entity` for jobs): `release_stale_for_caller`, `reserved_units_excluding(key)`,
+  and `upsert(key, unit, generation)`. Both `power_export_allocations` and
+  `job_export_allocations` become `ExportAllocations<i32>` / `<Entity>`.
+
+Keep resource-specific (genuinely different, leave as two explicit paths):
+
+- Available-capacity computation: scalar remaining capacity (power) vs discrete spare
+  slot set (jobs).
+- Grant payload and the consumer-side `apply_*` on `RegionState`: `powered`/`source`
+  vs `RemoteWorkplace { slot_id, salary }`.
+- Tick-phase placement: power before downstream systems vs jobs after local
+  assignment and daily-gated.
+- Demand discovery: unpowered border consumers vs jobless citizens by home network.
+
+Note on the event enums: `RegionEvent` / `OutboundMessage` variants stay concrete
+(their payloads differ), so the generic routing still builds the right variant
+through the trait's constructor methods. That small glue is unavoidable and cheap;
+do not try to make the event enums themselves generic.
+
+Likely files:
+
+- `src/core/regions/runtime/mod.rs` (the `ExportResource` trait, `ExportAllocations<U>`,
+  generic grant-apply skeleton)
+- `src/core/regions/worker.rs` (generic routing)
+
+Tests:
+
+- No new behavior tests. The existing CR2 and CR3 suites must pass unchanged — that
+  is the proof the consolidation preserves behavior.
+- Optional: a small unit test of `ExportAllocations<U>` (release by generation,
+  reserved-excluding-own-key, upsert) to document the shared mechanics directly.
+
+Review focus:
+
+- Behavior is identical: the diff reads as pure deduplication, not new logic.
+- The trait carries only the variable bits; the resource-specific core stays
+  readable rather than disappearing behind associated types.
 
 ### Patch CR4: Imported-Resource Visibility
 
