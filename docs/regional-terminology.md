@@ -124,6 +124,33 @@ the consumer-local demand list.
 
 ---
 
+## 4b. Cross-region jobs export flow (planned, CR3)
+
+Jobs share the **same producer-owned export model** as power: a jobless citizen is
+the consumer (it *imports* a job), the workplace's region is the producer (it
+*exports* a spare slot) and is the authoritative decider, because it owns the slot
+and accrues the resulting tax and business profit. The type vocabulary mirrors §4
+one-to-one — `JobExportRequest`, `JobExportAllocationRequest`, `JobExportGrant`,
+`JobExportAllocation` (+ `JobExportAllocationKey`), `JobExportAllocationRelease` —
+and reuses CR1 discovery (the same component graph and the `has_spare_jobs` hint)
+and the `caller_generation` release lifecycle.
+
+Four things differ from power and are **not** a blind rename:
+
+1. **The grant carries identity.** `JobExportGrant` returns `{ source_region,
+   slot_id }` so the consumer can record the remote-workplace reference. That
+   reference is owned data (region + slot id), never a remote ECS entity.
+2. **Economic ownership flows to the producer** — the opposite of power's stat
+   quirk (§4 / CR4 note). The exporting region accrues the tax and business profit;
+   the citizen's home region gets salary and rent effects.
+3. **A tick can be short on both power and jobs**, so the `TickState` machine gains
+   a sequential job phase: `WaitingForPowerExports -> WaitingForJobExports -> Idle`,
+   power first because it sets `powered`, which jobs and economy then read.
+4. **No partial grants** — one citizen fills one whole slot, like one building
+   draws its whole demand.
+
+---
+
 ## 5. Runtime and scheduling
 
 How the above moves between regions on the actor-style worker.
@@ -136,12 +163,16 @@ How the above moves between regions on the actor-style worker.
   of work, then route everything they emitted. Reservation **releases are routed
   before requests** in a pass, so a producer frees a caller's stale generation
   before evaluating anyone's fresh request.
-- **paused tick** (`pending_tick`) — a tick that ran local power, found unpowered
-  border consumers, and is waiting for export grants before running downstream
-  systems (population, economy, …). While paused, the runtime only dequeues
-  export control events (`ApplyPowerExportGrant`, `ProcessPowerExportRequest`,
-  `ReleasePowerExportAllocations`) so it can both finish its own tick and serve
-  neighbors — the latter prevents two mutually-importing regions from deadlocking.
+- **`TickState`** — explicit tick lifecycle on each runtime: `Idle` or
+  `WaitingForPowerExports(TickPowerContinuation)` (CR3 adds `WaitingForJobExports`).
+- **paused tick** (`TickState::WaitingForPowerExports`) — a tick that ran local
+  power, found unpowered border consumers, and is waiting for export grants before
+  running downstream systems (population, economy, …). While paused, the runtime
+  only dequeues export control events (`ApplyPowerExportGrant`,
+  `ProcessPowerExportRequest`, `ReleasePowerExportAllocations`) so it can both
+  finish its own tick and serve neighbors — the latter prevents two
+  mutually-importing regions from deadlocking. A second `Tick` is deferred in the
+  inbox until the paused tick finishes.
 - **`RegionEvent`** (inbox) — `Tick`, `ProcessPowerExportRequest`,
   `ReleasePowerExportAllocations`, `ApplyPowerExportGrant`, plus snapshot/command
   and the legacy `ProcessImportedResource` events.

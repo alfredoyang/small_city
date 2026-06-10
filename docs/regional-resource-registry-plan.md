@@ -452,16 +452,29 @@ Review focus:
 - Producer-owned export allocation prevents double-spend; resolution order is
   deterministic.
 
-### Patch CR3: Cross-Region Jobs Import
+### Patch CR3: Cross-Region Jobs Export
 
-Goal: assign a jobless citizen to a spare workplace slot in its road component;
-the exporting region owns the resulting tax and business profit.
+Goal: assign a jobless citizen to a spare workplace slot in its road component
+through a producer-owned export grant, mirroring CR2's power model. The workplace
+(exporting) region owns the slot and the resulting tax and business profit, so it
+is the authoritative decider — a consumer imports a job, a producer exports a slot.
+
+This reuses CR1 discovery (same component graph and the `has_spare_jobs` hint) and
+the CR2 export-allocation lifecycle (`caller_generation` reservations plus the
+unconditional release broadcast). The type vocabulary mirrors CR2 one-to-one:
+
+- `JobExportRequest` / `JobExportAllocationRequest` (carry candidates + index)
+- `JobExportGrant`
+- `JobExportAllocation` (+ `JobExportAllocationKey`)
+- `JobExportAllocationRelease`
 
 Likely files:
 
 - `src/core/systems/economy.rs`
 - `src/core/regions/runtime/mod.rs`
-- `tests/economy_test.rs`, `tests/region_runtime_test.rs`
+- `src/core/regions/mod.rs`, `src/core/regions/worker.rs`
+- `tests/economy_test.rs`, `tests/region_runtime_test.rs`,
+  `tests/region_worker_test.rs`
 
 Implementation:
 
@@ -473,12 +486,44 @@ Implementation:
   worker.
 - Resolve before economy reads salaries, rent, and taxes.
 
+Do not blind-copy CR2 — four things differ from power and must be handled
+deliberately:
+
+1. **The grant carries identity.** A `JobExportGrant` returns `{ source_region,
+   slot_id }`, not just a region, so the consumer can record the remote-workplace
+   reference. Keep the invariant: that reference is owned data (region + slot id),
+   never a remote ECS entity.
+2. **Economic ownership flows to the producer, the opposite of power's stat
+   quirk.** Power counts imported supply in the *consumer* region; here the
+   *exporting* region accrues the tax and business profit, while the citizen's home
+   region gets the salary and rent effects. Resolve before economy reads salaries,
+   rent, and taxes.
+3. **A tick can be short on both power and jobs.** Extend the `TickState` machine
+   with a sequential job phase rather than a combined wait: resolve power first
+   (it sets `powered`, which jobs and economy then read), then resolve jobs, each
+   as its own waiting sub-state. Suggested shape: `Idle ->
+   WaitingForPowerExports -> WaitingForJobExports -> Idle`, skipping either wait
+   when that resource has no exportable demand.
+4. **No partial grants.** One citizen fills one whole slot, like one building draws
+   its whole demand; the all-or-nothing grant from CR2 carries over unchanged.
+
 Tests:
 
 - a jobless citizen takes a same-component spare slot.
-- an unreachable slot is not taken.
+- an unreachable slot is not taken (the component trap, as in CR2).
+- two jobless citizens competing for a producer's last slot resolve
+  deterministically with no double-spend (reservation).
 - exported job tax and profit accrue to the exporting region; no remote ECS entity
   is stored by the consuming region.
+- a tick short on both power and jobs resolves both phases before downstream
+  systems read `powered`, salaries, rent, and taxes.
+
+Review focus:
+
+- Sharing follows roads (same component only); the producer is the authoritative
+  decider that owns the slot and its tax/profit.
+- Reservation prevents double-spend; the power and job wait phases compose
+  deterministically.
 
 ### Patch CR4: Imported-Resource Visibility
 
