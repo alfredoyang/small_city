@@ -9,9 +9,9 @@ Three phases:
 
 - **Local registry (R1-R3, done):** power and jobs resolve through a per-region
   registry that records each consumer's source and exposes spare capacity.
-- **Cross-region sharing (R4 = CR1-CR6):** regions share spare over connected
-  roads via a discovery directory plus authoritative producer-owned export
-  allocation over the existing region-runtime event flow.
+- **Cross-region sharing (R4 = CR1-CR3, CR3R, CR5-CR6):** regions share spare
+  over connected roads via a discovery directory plus authoritative
+  producer-owned export allocation over the existing region-runtime event flow.
 - **Persistent registry (R5, deferred):** recompute on change instead of per tick.
 
 It supersedes a discarded first attempt at cross-region power that recomputed
@@ -359,15 +359,16 @@ Review focus:
 - The query is read-only and rebuildable.
 - No `World` leakage.
 
-## Patch R4: Cross-Region Sharing (CR1-CR6)
+## Patch R4: Cross-Region Sharing (CR1-CR3, CR3R, CR5-CR6)
 
 R4 is the cross-region phase. It reads each registry entry's remaining (R3),
 builds the discovery directory described in "Cross-Region Sharing Model" above,
 and resolves producer-owned export allocation over the region-runtime event flow.
-It lands as the sub-patches below. CR1-CR6 keep their numbers (code TODOs and the
-terminology doc reference them); CR3R is a behavior-preserving refactor that sits
-between CR3 and CR4 and unifies the power/job export transport before CR6 extends
-the model to other resource kinds.
+It lands as the sub-patches below. CR1-CR3 and CR5-CR6 keep their numbers (code
+TODOs and the terminology doc reference them); CR4 was removed from this plan
+because job assignment visibility is a separate UI/view concern. CR3R is a
+behavior-preserving refactor that sits after CR3 and unifies the power/job export
+transport before CR6 extends the model to other resource kinds.
 
 ### Patch CR1: Component Graph And Availability Hint
 
@@ -589,25 +590,10 @@ Review focus:
 - The trait carries only the variable bits; the resource-specific core stays
   readable rather than disappearing behind associated types.
 
-### Patch CR4: Imported-Resource Visibility
-
-Goal: surface imported resources, and their blockers, through view models.
-
-Likely files:
-
-- `src/interface/adapter.rs`, `src/interface/view.rs`
-- `tests/inspect_view_test.rs`
-
-Implementation:
-
-- Inspect notes for "powered by region N" and "works in region N", plus blockers
-  when no same-component spare was available.
-- Tick summary counts for imported power and imported jobs.
-
-Tests:
-
-- inspect exposes imported power and job notes.
-- blockers appear when no same-component spare is available.
+Note: CR4 was removed. Job location visibility now lives in
+[job-assignment-visibility-plan.md](job-assignment-visibility-plan.md), which
+covers both local and remote job assignments. Power-source visibility is not
+planned.
 
 ### Patch CR5: Save And Load Rebuild
 
@@ -634,8 +620,8 @@ Tests:
 
 Goal: remove the earlier push-propagation cache now that every `ResourceKind`
 resolves through the registry + discovery model, leaving one cross-region
-mechanism. Do this only after CR1-CR4 provide the replacement, so the two paths
-never run at once.
+mechanism. Do this only after CR1-CR3 and CR3R provide the replacement path, and
+after CR5 verifies rebuild-on-load behavior, so the two paths never run at once.
 
 Likely files:
 
@@ -644,8 +630,8 @@ Likely files:
 - `src/core/regions/runtime/mod.rs` (remove `RegionalExport` /
   `RegionalExportChange` tracking and `RegionExportsChanged`)
 - `src/core/regions/worker.rs` (remove export-change routing)
-- `src/core/regional_game.rs` (remove export-send paths; drop the generic import
-  inspect note in favor of CR4 source-based notes)
+- `src/core/regional_game.rs` (remove export-send paths and drop the generic
+  import inspect note)
 - `tests/regional_command_test.rs`, `tests/regional_multi_region_play_test.rs`,
   `tests/region_runtime_test.rs`, `tests/region_worker_test.rs`,
   `tests/region_continuation_test.rs`, `tests/regional_save_load_test.rs`
@@ -659,8 +645,9 @@ Implementation:
 - Remove `RegionState.imported_resources` and `neighbor_import_results`, the
   `ImportedResourceCache` accept/forward machinery, and the runtime/worker
   export-change propagation.
-- Replace the old "Imported regional resources: N" inspect note with the
-  source-based notes from CR4.
+- Remove the old "Imported regional resources: N" inspect note. Job assignment
+  location visibility is handled separately by
+  [job-assignment-visibility-plan.md](job-assignment-visibility-plan.md).
 - Save/load: nothing imported is stored, so there is no import cache to rebuild;
   imports regenerate from the registry + discovery path.
 
@@ -670,7 +657,7 @@ Tests:
   exported resources.
 - a building-derived resource (for example service access) is shared cross-region
   through the registry + discovery path, not a push cache.
-- inspect shows source-based import notes; the old generic count is gone.
+- the old generic imported-resource count is gone.
 - multi-region save/load round-trips with imports rebuilt from authoritative state.
 
 Review focus:
