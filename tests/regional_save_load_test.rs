@@ -130,6 +130,60 @@ fn old_regional_save_without_layout_infers_row_major_topology() {
 }
 
 #[test]
+fn save_load_rebuilds_imported_resource_cache_without_saving_it() {
+    let path = save_path("regional-import-cache-rebuild");
+    let game = RegionalGame::two_region_default(3, 3).unwrap();
+    assert!(
+        game.build(RegionId(1), 1, 1, BuildingKind::Park)
+            .unwrap()
+            .success
+    );
+    assert!(has_imported_resource_note(&game, RegionId(2)));
+
+    game.save_to_file(&path).unwrap();
+    let save_text = std::fs::read_to_string(&path).unwrap();
+    assert!(!save_text.contains("imported_resources"));
+    assert!(!save_text.contains("neighbor_import_results"));
+    assert!(!save_text.contains("Imported regional resources"));
+
+    let loaded = RegionalGame::load_from_file(&path).unwrap();
+    assert!(
+        has_imported_resource_note(&loaded, RegionId(2)),
+        "loaded runner should rebuild imported cache from authoritative regional exports"
+    );
+
+    remove_save_file(path);
+}
+
+#[test]
+fn save_load_rebuilds_cross_region_power_export_after_tick_without_saving_grant() {
+    let path = save_path("regional-power-export-rebuild");
+    let game = RegionalGame::two_region_default(3, 2).unwrap();
+    build_cross_region_power_fixture(&game);
+
+    assert!(game.tick_region(RegionId(2)).unwrap().success);
+    assert!(region_cell_powered(&game, RegionId(2), 1, 0));
+
+    game.save_to_file(&path).unwrap();
+    let save_text = std::fs::read_to_string(&path).unwrap();
+    assert!(!save_text.contains("source_region"));
+    assert!(!save_text.contains("\"Imported\""));
+    assert!(
+        !save_text.contains("\"powered\": true"),
+        "powered flags are derived from local/imported allocation and should be rebuilt"
+    );
+
+    let loaded = RegionalGame::load_from_file(&path).unwrap();
+    assert!(loaded.tick_region(RegionId(2)).unwrap().success);
+    assert!(
+        region_cell_powered(&loaded, RegionId(2), 1, 0),
+        "loaded topology and hints should allow the normal tick flow to re-request exported power"
+    );
+
+    remove_save_file(path);
+}
+
+#[test]
 fn saved_regional_game_can_continue_after_safe_point_restart() {
     let path = save_path("regional-continues");
     let game = regional_game_with_distinct_regions();
@@ -310,6 +364,14 @@ fn region_cell_powered(game: &RegionalGame, region_id: RegionId, x: usize, y: us
         .find(|cell| cell.x == x && cell.y == y)
         .and_then(|cell| cell.powered)
         .unwrap_or(false)
+}
+
+fn has_imported_resource_note(game: &RegionalGame, region_id: RegionId) -> bool {
+    game.inspect_region(region_id, 0, 0)
+        .unwrap()
+        .explanations
+        .iter()
+        .any(|note| note.contains("Imported regional resources: 1"))
 }
 
 fn turn(game: &RegionalGame, region_id: RegionId) -> u32 {

@@ -973,10 +973,9 @@ impl RegionState {
     }
 
     pub(crate) fn into_save_record(self) -> RegionStateSaveRecord {
-        RegionStateSaveRecord {
-            id: self.id,
-            world: self.world,
-        }
+        let mut world = self.world;
+        scrub_transient_import_state_for_save(&mut world);
+        RegionStateSaveRecord { id: self.id, world }
     }
 
     pub(crate) fn from_save_record(record: RegionStateSaveRecord) -> Self {
@@ -1115,6 +1114,41 @@ impl RegionState {
             });
         }
         demands
+    }
+}
+
+/// Removes transient cross-region allocation results before saving a region.
+///
+/// ```text
+/// authoritative world buildings/citizens/resources
+///        |
+///        v
+/// scrub transient import results
+///   - powered/source from latest power phase
+///   - remote workplaces from latest daily job phase
+///        |
+///        v
+/// save durable region world only
+///        |
+///        v
+/// load/start derives local registries, topology, hints, and requests exports again
+/// ```
+///
+/// Power and job export grants are runtime coordination, not durable world truth.
+/// The loaded runner recomputes local derived state from buildings/resources, then
+/// future regional ticks rebuild imports through the normal event flow.
+fn scrub_transient_import_state_for_save(world: &mut World) {
+    for consumer in world.power_consumers.values_mut() {
+        consumer.powered = false;
+        // `source` is already skipped by serde, but the save record also feeds
+        // the post-save restarted game. Clear it here so restart and load share
+        // the same "derived state must be rebuilt" boundary.
+        consumer.source = None;
+    }
+    for citizen in world.citizens.values_mut() {
+        // `remote_workplace` is also skipped by serde; clearing it keeps the
+        // recovered in-memory game consistent with a fresh load from disk.
+        citizen.remote_workplace = None;
     }
 }
 
