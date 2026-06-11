@@ -28,9 +28,9 @@ and every request/grant/release type lives on the producer's side and uses
 "export". The only place "import" survives is the consumer's derived
 `PowerSource::Imported`, because from the consumer's view the power *is* imported.
 
-> Legacy exception: `ImportedResource` / `ImportedResourceCache` / `RegionalExport`
-> are the **old** visibility-only push cache (see §6). They predate this
-> convention and are scheduled for removal in patch CR6.
+> Removed legacy exception: `ImportedResource` / `ImportedResourceCache` /
+> `RegionalExport` were the old visibility-only push cache (see §6). They
+> predated this convention and were removed in patch CR6.
 
 ---
 
@@ -124,7 +124,7 @@ the consumer-local demand list.
 
 ---
 
-## 4b. Cross-region jobs export flow (planned, CR3)
+## 4b. Cross-region jobs export flow
 
 Jobs share the **same producer-owned export model** as power: a jobless citizen is
 the consumer (it *imports* a job), the workplace's region is the producer (it
@@ -141,9 +141,9 @@ Four things differ from power and are **not** a blind rename:
    slot_id }` so the consumer can record the remote-workplace reference. That
    reference is owned data (region + slot id), never a remote ECS entity.
 2. **Economic ownership flows to the producer** — the opposite of power's stat
-   quirk (§4 / CR4 note). The exporting region accrues the tax and business profit;
-   the citizen's home region gets salary and rent effects.
-3. **A tick can be short on both power and jobs**, so the `TickState` machine gains
+   quirk (§4). The exporting region accrues the tax and business profit; the
+   citizen's home region gets salary and rent effects.
+3. **A tick can be short on both power and jobs**, so the `TickState` machine has
    a sequential job phase: `WaitingForPowerExports -> WaitingForJobExports -> Idle`,
    power first because it sets `powered`, which jobs and economy then read.
 4. **No partial grants** — one citizen fills one whole slot, like one building
@@ -174,8 +174,9 @@ How the above moves between regions on the actor-style worker.
   mutually-importing regions from deadlocking. A second `Tick` is deferred in the
   inbox until the paused tick finishes.
 - **`RegionEvent`** (inbox) — `Tick`, `ProcessPowerExportRequest`,
-  `ReleasePowerExportAllocations`, `ApplyPowerExportGrant`, plus snapshot/command
-  and the legacy `ProcessImportedResource` events.
+  `ReleasePowerExportAllocations`, `ApplyPowerExportGrant`,
+  `ProcessJobExportRequest`, `ReleaseJobExportAllocations`,
+  `ApplyJobExportGrant`, plus snapshot/command events.
 - **`OutboundMessage`** (routing) — `PowerExportRequested`,
   `PowerExportRequestCompleted`, `PowerExportAllocationsReleased`,
   `RegionTickCompleted`, etc. Named in the passive/perfect tense (the runtime
@@ -187,9 +188,10 @@ How the above moves between regions on the actor-style worker.
 
 ---
 
-## 6. Legacy / transitional (retiring in CR6)
+## 6. Removed legacy push cache (removed in CR6)
 
-Pre-convention push-cache types. Do not build new features on these.
+Pre-convention push-cache types that no longer exist in code. Do not reintroduce
+features on this model.
 
 - **`ImportedResource`** — a copy of a neighbor's resource pushed across the border
   with hop limits and generation-based staleness rejection.
@@ -197,5 +199,7 @@ Pre-convention push-cache types. Do not build new features on these.
 - **`RegionalExport` / `RegionalExportChange`** — a region's published exportable
   resources and change notifications.
 
-These provided *visibility* only (never authoritative grants). Patch CR6 removes
-them once all resource kinds use the registry + discovery + export-grant model.
+These provided *visibility* only (never authoritative grants). Patch CR6 removed
+them after power and jobs had a real registry + discovery + export-grant path.
+Service, shopping, park, road access, and other building-derived resources remain
+deferred until they have concrete gameplay consumers and allocation rules.

@@ -1,12 +1,13 @@
 //! Integration tests for the shared single-threaded region worker.
 
 use small_city::core::regional_types::{RegionCommand, UiRequestId};
-use small_city::core::regions::continuation::{CallerContinuation, NeighborRequest};
-use small_city::core::regions::runtime::{ImportedResourcePayload, RegionEvent, RegionRuntime};
+use small_city::core::regions::runtime::{
+    ExportAllocationRequest, JobExportRequest, PowerExportRequest, RegionEvent, RegionRuntime,
+};
 use small_city::core::regions::worker::{RegionWorker, WorkerId, WorkerRoutingError};
 use small_city::core::regions::{
-    BorderEdge, ImportedResource, ImportedResourceResult, RegionId, RegionNeighborLink,
-    RegionRoadNetworkId, RegionState, ResourceId, ResourceKind,
+    BorderEdge, JobExportGrant, PowerExportGrant, RegionId, RegionNeighborLink,
+    RegionRoadNetworkId, RegionState,
 };
 use small_city::interface::input::BuildingKind;
 
@@ -58,77 +59,6 @@ fn busy_region_cannot_starve_another_region_when_event_limit_is_set() {
 }
 
 #[test]
-fn returned_continuation_is_routed_to_caller_region_inbox() {
-    let caller = RegionId(5);
-    let target = RegionId(6);
-    let mut worker = worker_with_regions(WorkerId(3), &[caller, target]);
-
-    worker
-        .push_event(
-            target,
-            RegionEvent::ProcessImportedResource(request(
-                caller,
-                resource(20, ResourceKind::ShoppingAccess, 1),
-            )),
-        )
-        .unwrap();
-
-    let first_pass = worker.process_region_events(1);
-
-    assert!(first_pass.routing_errors.is_empty());
-    assert_eq!(pending_events(&worker, caller), 1);
-    assert!(
-        worker
-            .region(caller)
-            .expect("caller")
-            .state()
-            .neighbor_import_results()
-            .is_empty()
-    );
-
-    let second_pass = worker.process_region_events(1);
-
-    assert!(second_pass.routing_errors.is_empty());
-    assert_eq!(pending_events(&worker, caller), 0);
-    assert_eq!(
-        worker
-            .region(caller)
-            .expect("caller")
-            .state()
-            .neighbor_import_results()
-            .len(),
-        1
-    );
-}
-
-#[test]
-fn missing_target_region_produces_deterministic_routing_error() {
-    let missing_caller = RegionId(7);
-    let target = RegionId(8);
-    let mut worker = worker_with_regions(WorkerId(4), &[target]);
-
-    worker
-        .push_event(
-            target,
-            RegionEvent::ProcessImportedResource(request(
-                missing_caller,
-                resource(21, ResourceKind::ParkAccess, 1),
-            )),
-        )
-        .unwrap();
-
-    let summary = worker.process_region_events(1);
-
-    assert_eq!(
-        summary.routing_errors,
-        vec![WorkerRoutingError::MissingTargetRegion {
-            target_region: missing_caller,
-        }]
-    );
-    assert_eq!(pending_events(&worker, target), 0);
-}
-
-#[test]
 fn add_region_rejects_duplicate_region_id() {
     let mut worker = RegionWorker::new(WorkerId(5));
 
@@ -164,90 +94,6 @@ fn process_region_events_with_zero_event_limit_reports_no_processed_regions() {
     assert_eq!(turn(&worker, RegionId(11)), 0);
     assert_eq!(pending_events(&worker, RegionId(10)), 1);
     assert_eq!(pending_events(&worker, RegionId(11)), 1);
-}
-
-#[test]
-fn worker_routes_export_change_to_neighbor_import_cache() {
-    let source = RegionId(12);
-    let target = RegionId(13);
-    let mut worker = worker_with_regions(WorkerId(7), &[source, target]);
-
-    worker
-        .push_event(
-            source,
-            RegionEvent::RunCommand {
-                request_id: UiRequestId(1),
-                command: RegionCommand::Build {
-                    x: 1,
-                    y: 1,
-                    kind: BuildingKind::Park,
-                },
-            },
-        )
-        .unwrap();
-
-    drain_worker(&mut worker);
-
-    let imported = worker
-        .region(target)
-        .expect("target")
-        .state()
-        .imported_resources();
-    assert_eq!(imported.len(), 1);
-    assert_eq!(imported[0].id.origin_region, source);
-    assert_eq!(imported[0].id.resource_kind, ResourceKind::ParkAccess);
-    assert_eq!(imported[0].remaining_capacity, 1);
-}
-
-#[test]
-fn worker_routes_export_removal_to_neighbor_import_cache() {
-    let source = RegionId(14);
-    let target = RegionId(15);
-    let mut worker = worker_with_regions(WorkerId(8), &[source, target]);
-
-    worker
-        .push_event(
-            source,
-            RegionEvent::RunCommand {
-                request_id: UiRequestId(1),
-                command: RegionCommand::Build {
-                    x: 1,
-                    y: 1,
-                    kind: BuildingKind::Park,
-                },
-            },
-        )
-        .unwrap();
-    drain_worker(&mut worker);
-    assert_eq!(
-        worker
-            .region(target)
-            .expect("target")
-            .state()
-            .imported_resources()
-            .len(),
-        1
-    );
-
-    worker
-        .push_event(
-            source,
-            RegionEvent::RunCommand {
-                request_id: UiRequestId(2),
-                command: RegionCommand::Bulldoze { x: 1, y: 1 },
-            },
-        )
-        .unwrap();
-    drain_worker(&mut worker);
-
-    assert!(
-        worker
-            .region(target)
-            .expect("target")
-            .state()
-            .imported_resources()
-            .is_empty()
-    );
 }
 
 #[test]
@@ -329,6 +175,75 @@ fn discovery_does_not_join_unrelated_regions_with_matching_border_links() {
 }
 
 #[test]
+fn discovery_reflects_authoritative_road_state_after_build_and_bulldoze() {
+    let left = RegionId(75);
+    let right = RegionId(76);
+    let mut worker = worker_with_region_states(
+        WorkerId(49),
+        vec![RegionState::new(left, 2, 1), RegionState::new(right, 2, 1)],
+    );
+    let topology = vec![neighbor(75, BorderEdge::East, 76)];
+    worker.set_region_topology(topology.clone());
+
+    assert!(
+        worker
+            .cross_region_discovery(&topology)
+            .component_of(network(75, 0))
+            .is_none()
+    );
+
+    worker
+        .push_event(
+            left,
+            RegionEvent::RunCommand {
+                request_id: UiRequestId(1),
+                command: RegionCommand::Build {
+                    x: 1,
+                    y: 0,
+                    kind: BuildingKind::Road,
+                },
+            },
+        )
+        .unwrap();
+    worker
+        .push_event(
+            right,
+            RegionEvent::RunCommand {
+                request_id: UiRequestId(2),
+                command: RegionCommand::Build {
+                    x: 0,
+                    y: 0,
+                    kind: BuildingKind::Road,
+                },
+            },
+        )
+        .unwrap();
+    drain_worker(&mut worker);
+
+    let connected = worker.cross_region_discovery(&topology);
+    assert_component(
+        &connected,
+        network(75, 0),
+        &[network(75, 0), network(76, 0)],
+    );
+
+    worker
+        .push_event(
+            right,
+            RegionEvent::RunCommand {
+                request_id: UiRequestId(3),
+                command: RegionCommand::Bulldoze { x: 0, y: 0 },
+            },
+        )
+        .unwrap();
+    drain_worker(&mut worker);
+
+    let after_bulldoze = worker.cross_region_discovery(&topology);
+    assert_component(&after_bulldoze, network(75, 0), &[network(75, 0)]);
+    assert!(after_bulldoze.component_of(network(76, 0)).is_none());
+}
+
+#[test]
 fn cross_region_power_export_powers_same_component_consumer() {
     let consumer = power_export_consumer_region(RegionId(26));
     let producer = power_export_producer_region(RegionId(27));
@@ -342,6 +257,45 @@ fn cross_region_power_export_powers_same_component_consumer() {
 }
 
 #[test]
+fn power_grant_continuation_runs_in_caller_region() {
+    let caller = RegionId(70);
+    let producer = RegionId(71);
+    let consumer = power_export_consumer_region(caller);
+    let producer_region = power_export_producer_region(producer);
+    let mut worker = worker_with_region_states(WorkerId(46), vec![consumer, producer_region]);
+    worker.set_region_topology(vec![neighbor(70, BorderEdge::East, 71)]);
+
+    worker.push_event(caller, tick(1)).unwrap();
+
+    let request_pass = worker.process_region_events(1);
+    assert!(request_pass.routing_errors.is_empty());
+    assert!(!cell_powered(&worker, caller, 0, 0));
+    assert_eq!(pending_events(&worker, producer), 2);
+
+    let release_pass = worker.process_region_events(1);
+    assert!(release_pass.routing_errors.is_empty());
+    assert!(!cell_powered(&worker, caller, 0, 0));
+    assert_eq!(pending_events(&worker, producer), 1);
+
+    let producer_pass = worker.process_region_events(1);
+    assert!(producer_pass.routing_errors.is_empty());
+    assert!(!cell_powered(&worker, caller, 0, 0));
+    assert_eq!(pending_events(&worker, producer), 0);
+    assert_eq!(pending_events(&worker, caller), 1);
+
+    let apply_pass = worker.process_region_events(1);
+    assert!(apply_pass.routing_errors.is_empty());
+    assert!(cell_powered(&worker, caller, 0, 0));
+    assert_eq!(apply_pass.tick_replies.len(), 1);
+    assert_eq!(turn(&worker, caller), 1);
+    assert_eq!(
+        turn(&worker, producer),
+        0,
+        "producer must not run the caller's paused tick continuation"
+    );
+}
+
+#[test]
 fn cross_region_power_export_does_not_cross_separate_components() {
     let consumer = power_export_consumer_region(RegionId(28));
     let producer = power_export_producer_region(RegionId(29));
@@ -351,6 +305,39 @@ fn cross_region_power_export_does_not_cross_separate_components() {
     drain_worker(&mut worker);
 
     assert!(!cell_powered(&worker, RegionId(28), 0, 0));
+}
+
+#[test]
+fn missing_caller_for_power_grant_result_is_deterministic_routing_error() {
+    let producer = RegionId(72);
+    let mut worker =
+        worker_with_region_states(WorkerId(47), vec![power_export_producer_region(producer)]);
+
+    worker
+        .push_event(
+            producer,
+            RegionEvent::ProcessPowerExportRequest(ExportAllocationRequest {
+                request: PowerExportRequest {
+                    request_id: UiRequestId(1),
+                    caller_region: RegionId(999),
+                    caller_network: network(999, 0),
+                    token: 0,
+                    demand: 1,
+                },
+                candidates: vec![network(72, 0)],
+                candidate_index: 0,
+            }),
+        )
+        .unwrap();
+
+    let summary = worker.process_region_events(1);
+
+    assert_eq!(
+        summary.routing_errors,
+        vec![WorkerRoutingError::MissingTargetRegion {
+            target_region: RegionId(999),
+        }]
+    );
 }
 
 #[test]
@@ -375,6 +362,109 @@ fn cross_region_power_export_allocation_prevents_double_spend() {
     assert_eq!(powered_consumers, 1);
     assert!(cell_powered(&worker, RegionId(30), 0, 0));
     assert!(!cell_powered(&worker, RegionId(31), 0, 0));
+}
+
+#[test]
+fn job_export_request_completed_routes_apply_event_back_to_caller() {
+    let caller = RegionId(73);
+    let producer = RegionId(74);
+    let mut worker = worker_with_region_states(
+        WorkerId(48),
+        vec![
+            job_seeker_region(caller),
+            job_slot_producer_region(producer),
+        ],
+    );
+
+    worker
+        .push_event(
+            producer,
+            RegionEvent::ProcessJobExportRequest(ExportAllocationRequest {
+                request: JobExportRequest {
+                    request_id: UiRequestId(1),
+                    caller_region: caller,
+                    caller_network: network(73, 0),
+                    token: 0,
+                },
+                candidates: vec![network(74, 0)],
+                candidate_index: 0,
+            }),
+        )
+        .unwrap();
+
+    let summary = worker.process_region_events(1);
+
+    assert!(summary.routing_errors.is_empty());
+    assert_eq!(pending_events(&worker, caller), 1);
+    assert_eq!(imported_job_count(&worker, caller), 0);
+}
+
+#[test]
+fn job_grant_continuation_runs_in_caller_region() {
+    let caller = RegionId(77);
+    let producer = RegionId(78);
+    let mut worker = worker_with_region_states(
+        WorkerId(50),
+        vec![
+            job_seeker_region(caller),
+            job_slot_producer_region(producer),
+        ],
+    );
+    worker.set_region_topology(vec![neighbor(77, BorderEdge::East, 78)]);
+
+    for request_id in 1..=240 {
+        worker.push_event(caller, tick(request_id)).unwrap();
+        drain_worker(&mut worker);
+        if imported_job_count(&worker, caller) > 0 {
+            assert_eq!(turn(&worker, caller), request_id as u32);
+            assert_eq!(
+                turn(&worker, producer),
+                0,
+                "producer must not run the caller's job continuation"
+            );
+            assert_eq!(imported_job_count(&worker, producer), 0);
+            return;
+        }
+    }
+
+    panic!("caller never recorded a remote workplace from the job export grant");
+}
+
+#[test]
+fn wrong_region_export_grants_are_ignored_without_mutating_state() {
+    let region = RegionId(79);
+    let mut worker =
+        worker_with_region_states(WorkerId(51), vec![power_export_consumer_region(region)]);
+
+    worker
+        .push_event(
+            region,
+            RegionEvent::ApplyPowerExportGrant(PowerExportGrant {
+                token: 0,
+                granted: true,
+                source_region: Some(RegionId(80)),
+            }),
+        )
+        .unwrap();
+    worker
+        .push_event(
+            region,
+            RegionEvent::ApplyJobExportGrant(JobExportGrant {
+                token: 0,
+                granted: true,
+                source_region: Some(RegionId(80)),
+                slot_id: Some(0),
+                salary: 4,
+            }),
+        )
+        .unwrap();
+
+    let summary = worker.process_region_events(2);
+
+    assert!(summary.routing_errors.is_empty());
+    assert_eq!(turn(&worker, region), 0);
+    assert!(!cell_powered(&worker, region, 0, 0));
+    assert_eq!(imported_job_count(&worker, region), 0);
 }
 
 #[test]
@@ -870,23 +960,6 @@ fn tick(request_id: u64) -> RegionEvent {
     }
 }
 
-fn request(
-    caller_region: RegionId,
-    resource: ImportedResource,
-) -> NeighborRequest<ImportedResourcePayload, ImportedResourceResult> {
-    NeighborRequest {
-        payload: ImportedResourcePayload {
-            resource,
-            local_used_capacity: 0,
-            border_crossing_cost: 1,
-            target_neighbors: Vec::new(),
-        },
-        continuation: CallerContinuation::new(caller_region, |region, result| {
-            region.apply_neighbor_import_result(result);
-        }),
-    }
-}
-
 fn turn(worker: &RegionWorker, region_id: RegionId) -> u32 {
     worker
         .region(region_id)
@@ -912,19 +985,4 @@ fn drain_worker(worker: &mut RegionWorker) {
     }
 
     panic!("worker did not drain");
-}
-
-fn resource(origin_region: u32, resource_kind: ResourceKind, generation: u64) -> ImportedResource {
-    ImportedResource {
-        id: ResourceId {
-            origin_region: RegionId(origin_region),
-            resource_kind,
-            generation,
-        },
-        remaining_capacity: 5,
-        hop_count: 0,
-        max_hops: 2,
-        travel_cost: 0,
-        source_neighbor: RegionId(origin_region),
-    }
 }

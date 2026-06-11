@@ -3,7 +3,8 @@
 This plan introduces a shared way to register resource providers and consumers so
 that local allocation and cross-region sharing read one source of truth instead of
 each system re-deriving road-network adjacency and allocation. Power comes first,
-jobs next, and every other building-derived `ResourceKind` follows the same model.
+jobs next, and future building-derived resources should follow the same model
+once they have concrete consumers and allocation rules.
 
 Three phases:
 
@@ -70,8 +71,10 @@ its own matching rule. It is not a single generic allocator.
   plus an availability hint) and **export allocation** (an authoritative
   request/grant over the existing region-runtime event flow with producer-owned
   allocation). Determinism lives in the event flow, not the hint.
-- All `ResourceKind`s use this one registry + discovery model; the earlier
-  visibility-only push cache is retired (CR6).
+- Power and jobs use this one registry + discovery model. The earlier
+  visibility-only push cache is retired in CR6 because it was never authoritative
+  gameplay state. Other building-derived resources are deferred until they have
+  concrete consumers and allocation rules.
 
 ## Local Power Resolution Protocol
 
@@ -245,15 +248,15 @@ ResourceRegistry            (per region, rebuilt from authoritative state)
     providers : registered workplace slots
     consumers : registered job seekers (citizens)
     effective slots -> assignment result + remaining slots
-  other ResourceKind entries (service, shopping, park, road access, ...)
-    same pattern: registered producers/consumers -> result + remaining
+  future resource entries (service, shopping, park, road access, ...)
+    same pattern once each has concrete consumers and allocation rules
 ```
 
 Each resource keeps its own matching rule; the registry owns registration,
 gating, ordering, and remaining accounting. Power and jobs come first (R1/R2);
-every other `ResourceKind` follows the same shape, and cross-region sharing (R4)
-reads each entry's remaining the same way. This replaces the earlier
-visibility-only push cache, which is retired once the registry path exists (CR6).
+future resource entries should follow the same shape, and cross-region sharing
+(R4) should read each entry's remaining the same way. This replaces the earlier
+visibility-only push cache for resources that have real allocation semantics.
 
 ## Patch R1: Power Onto The Registry (Local, Request/Grant, Parity-Preserving)
 
@@ -368,7 +371,8 @@ It lands as the sub-patches below. CR1-CR3 and CR5-CR6 keep their numbers (code
 TODOs and the terminology doc reference them); CR4 was removed from this plan
 because job assignment visibility is a separate UI/view concern. CR3R is a
 behavior-preserving refactor that sits after CR3 and unifies the power/job export
-transport before CR6 extends the model to other resource kinds.
+transport. Extending the model to other resource kinds is deferred until those
+resources have concrete gameplay consumers.
 
 ### Patch CR1: Component Graph And Availability Hint
 
@@ -532,10 +536,9 @@ Review focus:
 ### Patch CR3R: Unify Power And Job Export Transport
 
 Goal: collapse the near-verbatim transport and lifecycle that CR2 (power) and CR3
-(jobs) each carry into one shared mechanism, so a future `ResourceKind` is a small
-impl rather than a third copy. Behavior-preserving refactor — no new behavior. Runs
-after CR3 is committed and before CR6, which moves every other `ResourceKind` onto
-this model and so benefits directly from a single seam.
+(jobs) each carry into one shared mechanism, so a future resource is a small impl
+rather than a third copy. Behavior-preserving refactor — no new behavior. Runs
+after CR3 is committed; deferred non-power/job resources should use this model.
 
 Scope is deliberately narrow: unify the parts that are genuinely identical, keep
 the parts that genuinely differ explicit (per the "simple, readable Rust over
@@ -618,10 +621,11 @@ Tests:
 
 ### Patch CR6: Retire The Visibility-Only Push Cache
 
-Goal: remove the earlier push-propagation cache now that every `ResourceKind`
-resolves through the registry + discovery model, leaving one cross-region
-mechanism. Do this only after CR1-CR3 and CR3R provide the replacement path, and
-after CR5 verifies rebuild-on-load behavior, so the two paths never run at once.
+Goal: remove the earlier push-propagation cache now that power and jobs resolve
+through the registry + discovery + producer-owned export allocation model. The
+old cache only produced a generic visibility note; it was not authoritative
+gameplay state. Non-power/job building-derived resources are explicitly deferred
+until each has a concrete consumer and allocation rule.
 
 Likely files:
 
@@ -638,33 +642,32 @@ Likely files:
 
 Implementation:
 
-- Move the building-derived `ResourceKind`s (service, shopping, jobs, park, road
-  access) onto the registry as additional resource entries, discovered and
-  allocated/requested exactly like power and jobs. No resource kind keeps a
-  separate push path.
 - Remove `RegionState.imported_resources` and `neighbor_import_results`, the
   `ImportedResourceCache` accept/forward machinery, and the runtime/worker
   export-change propagation.
 - Remove the old "Imported regional resources: N" inspect note. Job assignment
   location visibility is handled separately by
   [job-assignment-visibility-plan.md](job-assignment-visibility-plan.md).
-- Save/load: nothing imported is stored, so there is no import cache to rebuild;
-  imports regenerate from the registry + discovery path.
+- Save/load: nothing imported is stored. Power and job imports regenerate from
+  the registry + discovery path during normal tick allocation.
+- Defer service, shopping, park, road access, and other building-derived resources
+  until they have gameplay consumers. They must use the registry + discovery +
+  export allocation path, not the removed push cache.
 
 Tests:
 
 - the old push-cache types and fields are gone; no region stores another region's
   exported resources.
-- a building-derived resource (for example service access) is shared cross-region
-  through the registry + discovery path, not a push cache.
 - the old generic imported-resource count is gone.
-- multi-region save/load round-trips with imports rebuilt from authoritative state.
+- multi-region save/load round-trips with power/job imports rebuilt from
+  authoritative state through the allocation path.
 
 Review focus:
 
 - Exactly one cross-region mechanism (registry + discovery + allocation request).
 - No region stores another region's exported resources.
-- Building-derived resources are not lost; they moved to the registry.
+- Building-derived resource sharing beyond power/jobs remains deferred and must
+  not reintroduce a visibility-only push cache.
 
 ## Patch R5 (Deferred): Persistent, Change-Driven Registry
 

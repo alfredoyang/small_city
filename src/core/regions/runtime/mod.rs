@@ -80,19 +80,15 @@
 //!                  West:offset 0
 //! ```
 
-pub mod continuation;
-
 use crate::core::entity::Entity;
 use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionCommandResponse, RegionSnapshotResponse,
     RegionTickResponse, RegionViewSnapshot, UiRequestId,
 };
 use crate::core::regions::handle::{RegionEventReceiver, RegionHandle, mailbox};
-use crate::core::regions::runtime::continuation::{CallerContinuation, NeighborRequest};
 use crate::core::regions::{
-    ImportedResource, ImportedResourceResult, JobExportGrant, PendingJobDemand, PendingPowerDemand,
-    PowerExportGrant, RegionId, RegionRoadNetworkId, RegionState, RegionalExport,
-    RegionalExportChange, RegionalTickJobPhase, RegionalTickPowerPhase,
+    JobExportGrant, PendingJobDemand, PendingPowerDemand, PowerExportGrant, RegionId,
+    RegionRoadNetworkId, RegionState, RegionalTickJobPhase, RegionalTickPowerPhase,
 };
 use crate::interface::input::MapOverlayInput;
 
@@ -106,17 +102,10 @@ pub enum RegionEvent {
         request_id: UiRequestId,
         overlay: MapOverlayInput,
     },
-    /// Process an imported resource in this target region.
-    ProcessImportedResource(ImportedResourceRequest),
     /// Run one player command through this region's local event loop.
     RunCommand {
         request_id: UiRequestId,
         command: RegionCommand,
-    },
-    /// Apply a completed neighbor result after it has been routed back here.
-    RunImportedResourceContinuation {
-        continuation: CallerContinuation<ImportedResourceResult>,
-        result: ImportedResourceResult,
     },
     /// Authoritative producer-side power export allocation request.
     ProcessPowerExportRequest(PowerExportAllocationRequest),
@@ -130,44 +119,7 @@ pub enum RegionEvent {
     ReleaseJobExportAllocations(JobExportAllocationRelease),
     /// Caller-side job export grant result.
     ApplyJobExportGrant(JobExportGrant),
-    /// Internal event used to publish exports after startup or load.
-    RefreshExports,
 }
-
-impl RegionEvent {
-    /// Builds target-region imported-resource work with the standard caller reply continuation.
-    pub fn process_imported_resource(
-        caller_region: RegionId,
-        resource: ImportedResource,
-        target_neighbors: Vec<RegionId>,
-    ) -> Self {
-        Self::ProcessImportedResource(NeighborRequest {
-            payload: ImportedResourcePayload {
-                resource,
-                local_used_capacity: 0,
-                border_crossing_cost: 1,
-                target_neighbors,
-            },
-            continuation: CallerContinuation::<ImportedResourceResult>::new(
-                caller_region,
-                |region, result| {
-                    region.apply_neighbor_import_result(result);
-                },
-            ),
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// Owned payload for target-region imported resource work.
-pub struct ImportedResourcePayload {
-    pub resource: ImportedResource,
-    pub local_used_capacity: u32,
-    pub border_crossing_cost: u32,
-    pub target_neighbors: Vec<RegionId>,
-}
-
-pub type ImportedResourceRequest = NeighborRequest<ImportedResourcePayload, ImportedResourceResult>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Consumer request for a producer to export enough power for one local demand.
@@ -265,16 +217,9 @@ pub enum RegionRuntimeError {
 #[derive(Debug)]
 /// Message returned by a runtime for the caller or worker to route.
 pub enum OutboundMessage {
-    /// A completed imported-resource continuation that must be routed to caller.
-    ReturnImportedResourceContinuation {
-        caller_region: RegionId,
-        continuation: CallerContinuation<ImportedResourceResult>,
-        result: ImportedResourceResult,
-    },
     RegionCommandCompleted(RegionCommandResponse),
     RegionTickCompleted(RegionTickResponse),
     RegionSnapshotReady(RegionSnapshotResponse),
-    RegionExportsChanged(RegionalExportChange),
     PowerExportRequested(PowerExportRequest),
     PowerExportRequestCompleted {
         request: PowerExportAllocationRequest,
@@ -294,7 +239,6 @@ pub enum OutboundMessage {
 /// Single-region event loop with deterministic FIFO processing.
 pub struct RegionRuntime {
     state: RegionState,
-    exports: Vec<RegionalExport>,
     tick_state: TickState,
     power_export_allocations: ExportAllocations<i32>,
     job_export_allocations: ExportAllocations<Entity>,
@@ -514,20 +458,14 @@ impl RegionRuntime {
     /// Creates a runtime that owns one region and an empty inbox.
     pub fn new(state: RegionState) -> Self {
         let (handle, receiver) = mailbox(state.id());
-        let has_initial_exports = !state.exported_resource_counts().is_empty();
-        let mut runtime = Self {
+        Self {
             state,
-            exports: Vec::new(),
             tick_state: TickState::Idle,
             power_export_allocations: ExportAllocations::new(),
             job_export_allocations: ExportAllocations::new(),
             handle,
             receiver,
-        };
-        if has_initial_exports {
-            runtime.push_event(RegionEvent::RefreshExports);
         }
-        runtime
     }
 
     pub fn region_id(&self) -> RegionId {
@@ -540,10 +478,6 @@ impl RegionRuntime {
 
     pub(crate) fn into_state(self) -> RegionState {
         self.state
-    }
-
-    pub fn rebuild_imported_resource_cache(&mut self) {
-        self.state.rebuild_imported_resource_cache();
     }
 
     pub fn handle(&self) -> RegionHandle {
@@ -597,41 +531,13 @@ impl RegionRuntime {
                     self.build_snapshot(request_id, overlay),
                 )]
             }
-            RegionEvent::ProcessImportedResource(request) => {
-                let result = self.state.process_imported_resource(
-                    request.payload.resource,
-                    request.payload.local_used_capacity,
-                    request.payload.border_crossing_cost,
-                    &request.payload.target_neighbors,
-                );
-                let caller_region = request.continuation.caller_region();
-
-                vec![OutboundMessage::ReturnImportedResourceContinuation {
-                    caller_region,
-                    continuation: request.continuation,
-                    result,
-                }]
-            }
             RegionEvent::RunCommand {
                 request_id,
                 command,
             } => {
                 let response = self.run_command(request_id, command);
-                let mut outbound = vec![OutboundMessage::RegionCommandCompleted(response.clone())];
-                if command_can_mutate_exports(command)
-                    && matches!(
-                        response.reply,
-                        RegionCommandReply::CommandResult(ref result) if result.success
-                    )
-                {
-                    outbound.extend(self.export_change_messages());
-                }
-                outbound
+                vec![OutboundMessage::RegionCommandCompleted(response)]
             }
-            RegionEvent::RunImportedResourceContinuation {
-                continuation,
-                result,
-            } => self.run_imported_resource_continuation(continuation, result),
             RegionEvent::ProcessPowerExportRequest(request) => {
                 let grant = self.process_power_export_request(&request);
                 vec![OutboundMessage::PowerExportRequestCompleted { request, grant }]
@@ -652,7 +558,6 @@ impl RegionRuntime {
                 Vec::new()
             }
             RegionEvent::ApplyJobExportGrant(grant) => self.apply_job_export_grant(grant),
-            RegionEvent::RefreshExports => self.export_change_messages(),
         }
     }
 
@@ -747,11 +652,9 @@ impl RegionRuntime {
         if !phase.is_daily() {
             // Jobs resolve only on a daily boundary; an hourly tick neither makes
             // nor invalidates job reservations, so it sends no release or requests.
-            let mut outbound = vec![OutboundMessage::RegionTickCompleted(
+            return vec![OutboundMessage::RegionTickCompleted(
                 self.finish_job_phase(request_id, phase),
             )];
-            outbound.extend(self.export_change_messages());
-            return outbound;
         }
         self.reconcile_job_export_allocations(request_id, phase)
     }
@@ -774,12 +677,10 @@ impl RegionRuntime {
             request_id,
         });
         if phase.job_demands.is_empty() {
-            let mut outbound = vec![
+            return vec![
                 release,
                 OutboundMessage::RegionTickCompleted(self.finish_job_phase(request_id, phase)),
             ];
-            outbound.extend(self.export_change_messages());
-            return outbound;
         }
 
         let pending_demands = phase.job_demands.clone();
@@ -984,90 +885,10 @@ impl RegionRuntime {
         }
 
         // Last job demand resolved: finish the paused tick and return to `Idle`.
-        let mut outbound = vec![OutboundMessage::RegionTickCompleted(
-            self.finish_job_phase(continuation.request_id, continuation.phase),
-        )];
-        outbound.extend(self.export_change_messages());
-        outbound
-    }
-
-    fn export_change_messages(&mut self) -> Vec<OutboundMessage> {
-        self.detect_export_change()
-            .map(|change| vec![OutboundMessage::RegionExportsChanged(change)])
-            .unwrap_or_default()
-    }
-
-    fn detect_export_change(&mut self) -> Option<RegionalExportChange> {
-        let current_counts = self.state.exported_resource_counts();
-        let previous_kinds = self
-            .exports
-            .iter()
-            .map(|export| export.resource_kind)
-            .collect::<Vec<_>>();
-        let current_kinds = current_counts
-            .iter()
-            .map(|(resource_kind, _)| *resource_kind)
-            .collect::<Vec<_>>();
-
-        let current = current_counts
-            .into_iter()
-            .map(|(resource_kind, count)| {
-                let generation = self
-                    .exports
-                    .iter()
-                    .find(|previous| previous.resource_kind == resource_kind)
-                    .map(|previous| {
-                        if previous.count == count {
-                            previous.generation
-                        } else {
-                            previous.generation.saturating_add(1)
-                        }
-                    })
-                    .unwrap_or(1);
-                RegionalExport {
-                    region_id: self.region_id(),
-                    resource_kind,
-                    count,
-                    generation,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let removed = previous_kinds
-            .into_iter()
-            .filter(|resource_kind| !current_kinds.contains(resource_kind))
-            .collect::<Vec<_>>();
-
-        if current == self.exports && removed.is_empty() {
-            return None;
-        }
-
-        self.exports = current.clone();
-        Some(RegionalExportChange {
-            source_region: self.region_id(),
-            current,
-            removed,
-        })
-    }
-
-    fn run_imported_resource_continuation(
-        &mut self,
-        continuation: CallerContinuation<ImportedResourceResult>,
-        result: ImportedResourceResult,
-    ) -> Vec<OutboundMessage> {
-        let expected_region = continuation.caller_region();
-        let actual_region = self.region_id();
-        if expected_region != actual_region {
-            return vec![OutboundMessage::RuntimeError(
-                RegionRuntimeError::ContinuationRoutedToWrongRegion {
-                    expected_region,
-                    actual_region,
-                },
-            )];
-        }
-
-        continuation.run(&mut self.state, result);
-        Vec::new()
+        vec![OutboundMessage::RegionTickCompleted(self.finish_job_phase(
+            continuation.request_id,
+            continuation.phase,
+        ))]
     }
 
     fn run_command(
@@ -1114,16 +935,6 @@ impl RegionRuntime {
     }
 }
 
-fn command_can_mutate_exports(command: RegionCommand) -> bool {
-    matches!(
-        command,
-        RegionCommand::Build { .. }
-            | RegionCommand::Bulldoze { .. }
-            | RegionCommand::Replace { .. }
-            | RegionCommand::Upgrade { .. }
-    )
-}
-
 #[cfg(test)]
 mod tick_state_tests {
     //! Unit tests for the `TickState` lifecycle: entering and leaving the paused
@@ -1139,13 +950,7 @@ mod tick_state_tests {
         let mut region = RegionState::new(region_id, 2, 2);
         assert!(region.build(0, 0, BuildingKind::Residential).success);
         assert!(region.build(1, 0, BuildingKind::Road).success);
-        let mut runtime = RegionRuntime::new(region);
-        // A region with exports enqueues a startup RefreshExports event; drain it
-        // so each test observes a clean idle inbox before driving ticks.
-        while runtime.pending_event_count() > 0 {
-            runtime.process_next_event();
-        }
-        runtime
+        RegionRuntime::new(region)
     }
 
     fn export_requests(outbound: &[OutboundMessage]) -> Vec<&PowerExportRequest> {

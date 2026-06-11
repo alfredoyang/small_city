@@ -1,14 +1,8 @@
 //! Integration tests for the single-threaded regional event runtime.
 
 use small_city::core::regional_types::{RegionCommand, RegionCommandReply, UiRequestId};
-use small_city::core::regions::continuation::{CallerContinuation, NeighborRequest};
-use small_city::core::regions::runtime::{
-    ImportedResourcePayload, ImportedResourceRequest, OutboundMessage, RegionEvent, RegionRuntime,
-};
-use small_city::core::regions::{
-    ImportDecision, ImportedResource, ImportedResourceResult, RegionId, RegionState, ResourceId,
-    ResourceKind,
-};
+use small_city::core::regions::runtime::{OutboundMessage, RegionEvent, RegionRuntime};
+use small_city::core::regions::{RegionId, RegionState};
 use small_city::interface::events::GameEventView;
 use small_city::interface::input::BuildingKind;
 
@@ -42,25 +36,20 @@ fn local_tick_is_processed_through_runtime() {
 #[test]
 fn events_are_processed_in_insertion_order() {
     let mut runtime = RegionRuntime::new(RegionState::new(RegionId(2), 2, 2));
-    runtime.push_event(RegionEvent::ProcessImportedResource(request(
-        RegionId(9),
-        resource(7, ResourceKind::Jobs, 2, 5, 0, 3, 0, 9),
-    )));
-    runtime.push_event(RegionEvent::ProcessImportedResource(request(
-        RegionId(9),
-        resource(7, ResourceKind::Jobs, 1, 5, 0, 3, 0, 9),
-    )));
+    runtime.push_event(RegionEvent::Tick {
+        request_id: UiRequestId(30),
+    });
+    runtime.push_event(RegionEvent::Tick {
+        request_id: UiRequestId(31),
+    });
 
     let outbound = runtime.process_some_events(2);
 
     assert_eq!(
-        decisions(&outbound),
-        vec![ImportDecision::Accepted, ImportDecision::RejectedStale]
+        tick_reply_ids(&outbound),
+        vec![UiRequestId(30), UiRequestId(31)]
     );
-    assert_eq!(
-        runtime.state().imported_resources(),
-        &[resource(7, ResourceKind::Jobs, 2, 5, 0, 3, 0, 9)]
-    );
+    assert_eq!(runtime.state().view().status.turn, 2);
 }
 
 #[test]
@@ -85,91 +74,7 @@ fn process_some_events_respects_max_events() {
 }
 
 #[test]
-fn neighbor_import_event_processes_only_target_payload() {
-    let caller = RegionRuntime::new(RegionState::new(RegionId(4), 2, 2));
-    let mut target = RegionRuntime::new(RegionState::new(RegionId(5), 2, 2));
-    let imported_resource = resource(8, ResourceKind::ParkAccess, 1, 9, 0, 3, 2, 4);
-
-    target.push_event(RegionEvent::ProcessImportedResource(NeighborRequest {
-        payload: ImportedResourcePayload {
-            resource: imported_resource,
-            local_used_capacity: 3,
-            border_crossing_cost: 2,
-            target_neighbors: vec![RegionId(4), RegionId(6)],
-        },
-        continuation: record_import_result(caller.region_id()),
-    }));
-
-    let outbound = target.process_next_event();
-
-    assert!(caller.state().imported_resources().is_empty());
-    assert_eq!(target.state().imported_resources(), &[imported_resource]);
-    let [
-        OutboundMessage::ReturnImportedResourceContinuation {
-            caller_region,
-            result,
-            ..
-        },
-    ] = outbound.as_slice()
-    else {
-        panic!("expected one returned imported-resource continuation");
-    };
-    assert_eq!(*caller_region, RegionId(4));
-    assert_eq!(
-        result,
-        &ImportedResourceResult {
-            decision: ImportDecision::Accepted,
-            forwarded_resources: vec![ImportedResource {
-                remaining_capacity: 6,
-                hop_count: 1,
-                travel_cost: 4,
-                source_neighbor: RegionId(5),
-                ..imported_resource
-            }],
-        }
-    );
-}
-
-#[test]
-fn outbound_continuation_message_is_returned_before_caller_mutates() {
-    let mut caller = RegionRuntime::new(RegionState::new(RegionId(10), 2, 2));
-    let mut target = RegionRuntime::new(RegionState::new(RegionId(11), 2, 2));
-    let imported_resource = resource(12, ResourceKind::ShoppingAccess, 1, 7, 0, 2, 0, 10);
-
-    target.push_event(RegionEvent::ProcessImportedResource(request(
-        caller.region_id(),
-        imported_resource,
-    )));
-    let outbound = target.process_next_event();
-
-    assert!(caller.state().neighbor_import_results().is_empty());
-
-    let [
-        OutboundMessage::ReturnImportedResourceContinuation {
-            caller_region,
-            result,
-            ..
-        },
-    ] = outbound.as_slice()
-    else {
-        panic!("expected one returned imported-resource continuation");
-    };
-
-    assert_eq!(*caller_region, caller.region_id());
-    let result = result.clone();
-    let continuation = take_continuation(outbound);
-
-    caller.push_event(RegionEvent::RunImportedResourceContinuation {
-        continuation,
-        result: result.clone(),
-    });
-    assert!(caller.process_next_event().is_empty());
-
-    assert_eq!(caller.state().neighbor_import_results(), &[result.clone()]);
-}
-
-#[test]
-fn successful_build_emits_export_change_from_runtime() {
+fn successful_build_returns_command_reply_from_runtime() {
     let mut runtime = RegionRuntime::new(RegionState::new(RegionId(30), 3, 3));
 
     runtime.push_event(RegionEvent::RunCommand {
@@ -191,27 +96,10 @@ fn successful_build_emits_export_change_from_runtime() {
                     && matches!(reply.reply, RegionCommandReply::CommandResult(ref result) if result.success)
         ))
     );
-    let export_change = outbound
-        .iter()
-        .find_map(|message| match message {
-            OutboundMessage::RegionExportsChanged(change) => Some(change),
-            _ => None,
-        })
-        .expect("build should emit export change");
-
-    assert_eq!(export_change.source_region, RegionId(30));
-    assert!(export_change.removed.is_empty());
-    assert_eq!(export_change.current.len(), 1);
-    assert_eq!(
-        export_change.current[0].resource_kind,
-        ResourceKind::ParkAccess
-    );
-    assert_eq!(export_change.current[0].count, 1);
-    assert_eq!(export_change.current[0].generation, 1);
 }
 
 #[test]
-fn removing_source_building_emits_export_tombstone_from_runtime() {
+fn bulldoze_returns_command_reply_from_runtime() {
     let mut runtime = RegionRuntime::new(RegionState::new(RegionId(31), 3, 3));
 
     runtime.push_event(RegionEvent::RunCommand {
@@ -229,136 +117,20 @@ fn removing_source_building_emits_export_tombstone_from_runtime() {
     });
 
     let outbound = runtime.process_next_event();
-    let export_change = outbound
-        .iter()
-        .find_map(|message| match message {
-            OutboundMessage::RegionExportsChanged(change) => Some(change),
-            _ => None,
-        })
-        .expect("bulldoze should emit export change");
-
-    assert!(export_change.current.is_empty());
-    assert_eq!(export_change.removed, vec![ResourceKind::ParkAccess]);
+    assert!(outbound.iter().any(|message| matches!(
+        message,
+        OutboundMessage::RegionCommandCompleted(reply)
+            if reply.request_id == UiRequestId(2)
+                && matches!(reply.reply, RegionCommandReply::CommandResult(ref result) if result.success)
+    )));
 }
 
-fn decisions(outbound: &[OutboundMessage]) -> Vec<ImportDecision> {
+fn tick_reply_ids(outbound: &[OutboundMessage]) -> Vec<UiRequestId> {
     outbound
         .iter()
-        .map(|message| match message {
-            OutboundMessage::ReturnImportedResourceContinuation { result, .. } => result.decision,
-            OutboundMessage::RegionCommandCompleted(reply) => {
-                panic!("unexpected command reply: {reply:?}")
-            }
-            OutboundMessage::RegionTickCompleted(reply) => {
-                panic!("unexpected tick reply: {reply:?}")
-            }
-            OutboundMessage::RegionSnapshotReady(reply) => {
-                panic!("unexpected snapshot reply: {reply:?}")
-            }
-            OutboundMessage::RegionExportsChanged(change) => {
-                panic!("unexpected export change: {change:?}")
-            }
-            OutboundMessage::PowerExportRequested(request) => {
-                panic!("unexpected power export request: {request:?}")
-            }
-            OutboundMessage::PowerExportRequestCompleted { request, grant } => {
-                panic!("unexpected power export request result: {request:?} {grant:?}")
-            }
-            OutboundMessage::PowerExportAllocationsReleased(release) => {
-                panic!("unexpected power export allocation release: {release:?}")
-            }
-            OutboundMessage::JobExportRequested(request) => {
-                panic!("unexpected job export request: {request:?}")
-            }
-            OutboundMessage::JobExportRequestCompleted { request, grant } => {
-                panic!("unexpected job export request result: {request:?} {grant:?}")
-            }
-            OutboundMessage::JobExportAllocationsReleased(release) => {
-                panic!("unexpected job export allocation release: {release:?}")
-            }
-            OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
+        .filter_map(|message| match message {
+            OutboundMessage::RegionTickCompleted(reply) => Some(reply.request_id),
+            _ => None,
         })
         .collect()
-}
-
-fn request(caller_region: RegionId, resource: ImportedResource) -> ImportedResourceRequest {
-    NeighborRequest {
-        payload: ImportedResourcePayload {
-            resource,
-            local_used_capacity: 0,
-            border_crossing_cost: 1,
-            target_neighbors: Vec::new(),
-        },
-        continuation: record_import_result(caller_region),
-    }
-}
-
-fn record_import_result(caller_region: RegionId) -> CallerContinuation<ImportedResourceResult> {
-    CallerContinuation::new(caller_region, |region, result| {
-        region.apply_neighbor_import_result(result);
-    })
-}
-
-fn take_continuation(
-    mut outbound: Vec<OutboundMessage>,
-) -> CallerContinuation<ImportedResourceResult> {
-    let message = outbound.pop().expect("outbound message");
-    match message {
-        OutboundMessage::ReturnImportedResourceContinuation { continuation, .. } => continuation,
-        OutboundMessage::RegionCommandCompleted(reply) => {
-            panic!("unexpected command reply: {reply:?}")
-        }
-        OutboundMessage::RegionTickCompleted(reply) => {
-            panic!("unexpected tick reply: {reply:?}")
-        }
-        OutboundMessage::RegionSnapshotReady(reply) => {
-            panic!("unexpected snapshot reply: {reply:?}")
-        }
-        OutboundMessage::RegionExportsChanged(change) => {
-            panic!("unexpected export change: {change:?}")
-        }
-        OutboundMessage::PowerExportRequested(request) => {
-            panic!("unexpected power export request: {request:?}")
-        }
-        OutboundMessage::PowerExportRequestCompleted { request, grant } => {
-            panic!("unexpected power export request result: {request:?} {grant:?}")
-        }
-        OutboundMessage::PowerExportAllocationsReleased(release) => {
-            panic!("unexpected power export allocation release: {release:?}")
-        }
-        OutboundMessage::JobExportRequested(request) => {
-            panic!("unexpected job export request: {request:?}")
-        }
-        OutboundMessage::JobExportRequestCompleted { request, grant } => {
-            panic!("unexpected job export request result: {request:?} {grant:?}")
-        }
-        OutboundMessage::JobExportAllocationsReleased(release) => {
-            panic!("unexpected job export allocation release: {release:?}")
-        }
-        OutboundMessage::RuntimeError(error) => panic!("unexpected runtime error: {error:?}"),
-    }
-}
-
-fn resource(
-    origin_region: u32,
-    resource_kind: ResourceKind,
-    generation: u64,
-    remaining_capacity: u32,
-    hop_count: u32,
-    max_hops: u32,
-    travel_cost: u32,
-    source_neighbor: u32,
-) -> ImportedResource {
-    ImportedResource {
-        id: ResourceId {
-            origin_region: RegionId(origin_region),
-            resource_kind,
-            generation,
-        },
-        remaining_capacity,
-        hop_count,
-        max_hops,
-        travel_cost,
-        source_neighbor: RegionId(source_neighbor),
-    }
 }

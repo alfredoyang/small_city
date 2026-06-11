@@ -733,44 +733,6 @@ impl From<RegionalGameRunnerError> for RegionalGameError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::regions::ResourceKind;
-
-    #[test]
-    fn imported_resource_generation_increases_when_export_count_decreases() {
-        let game = RegionalGame::two_region_default(4, 4).unwrap();
-
-        assert!(
-            game.build(RegionId(1), 1, 1, BuildingKind::Park)
-                .unwrap()
-                .success
-        );
-        assert!(
-            game.build(RegionId(1), 2, 1, BuildingKind::Park)
-                .unwrap()
-                .success
-        );
-        assert!(game.bulldoze(RegionId(1), 2, 1).unwrap().success);
-
-        let states = game
-            .shutdown()
-            .unwrap()
-            .into_region_states_in_order(&[RegionId(1), RegionId(2)]);
-        let target = states
-            .iter()
-            .find(|state| state.id() == RegionId(2))
-            .unwrap();
-        let imported_park = target
-            .imported_resources()
-            .iter()
-            .find(|resource| {
-                resource.id.origin_region == RegionId(1)
-                    && resource.id.resource_kind == ResourceKind::ParkAccess
-            })
-            .unwrap();
-
-        assert_eq!(imported_park.id.generation, 3);
-        assert_eq!(imported_park.remaining_capacity, 1);
-    }
 
     #[test]
     fn derives_row_major_topology_from_layout() {

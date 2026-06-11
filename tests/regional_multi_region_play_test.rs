@@ -4,14 +4,13 @@ use small_city::core::regional_game::RegionalGame;
 use small_city::core::regions::RegionId;
 use small_city::interface::input::BuildingKind;
 use small_city::ui::city_driver::{CityDriver, CityLaunchMode};
-use std::fs;
 
-fn has_imported_resource_note(game: &RegionalGame, region_id: RegionId) -> bool {
+fn has_generic_imported_resource_note(game: &RegionalGame, region_id: RegionId) -> bool {
     game.inspect_region(region_id, 0, 0)
         .unwrap()
         .explanations
         .iter()
-        .any(|note| note.contains("Imported regional resources: 1"))
+        .any(|note| note.contains("Imported regional resources"))
 }
 
 #[test]
@@ -113,7 +112,7 @@ fn two_region_default_wires_topology_for_cross_region_power_export() {
 }
 
 #[test]
-fn cross_region_imported_resource_is_visible_through_inspect_view() {
+fn old_generic_imported_resource_note_is_not_shown() {
     let game = RegionalGame::two_region_default(3, 3).unwrap();
 
     assert!(
@@ -122,8 +121,8 @@ fn cross_region_imported_resource_is_visible_through_inspect_view() {
             .success
     );
     assert!(
-        has_imported_resource_note(&game, RegionId(2)),
-        "inspect notes should expose imported regional resources"
+        !has_generic_imported_resource_note(&game, RegionId(2)),
+        "CR6 retires the visibility-only imported-resource cache and note"
     );
 }
 
@@ -138,60 +137,7 @@ fn road_builds_do_not_create_cross_region_imports() {
     );
 
     assert!(
-        !has_imported_resource_note(&game, RegionId(2)),
+        !has_generic_imported_resource_note(&game, RegionId(2)),
         "common road placement should not fan out regional resource offers"
-    );
-}
-
-#[test]
-fn cross_region_imported_resource_regenerates_after_save_load() {
-    let path = std::env::temp_dir().join(format!(
-        "small_city_regional_import_round_trip_{}.json",
-        std::process::id()
-    ));
-    let game = RegionalGame::two_region_default(3, 3).unwrap();
-
-    assert!(
-        game.build(RegionId(1), 1, 1, BuildingKind::Park)
-            .unwrap()
-            .success
-    );
-    assert!(has_imported_resource_note(&game, RegionId(2)));
-
-    let restarted = game.save_to_file(&path).unwrap();
-    let loaded = RegionalGame::load_from_file(&path).unwrap();
-
-    assert!(
-        has_imported_resource_note(&loaded, RegionId(2)),
-        "save/load should rebuild imported resources from authoritative regions"
-    );
-
-    assert!(
-        restarted.shutdown().is_ok(),
-        "restarted saved game should shut down cleanly"
-    );
-    assert!(
-        loaded.shutdown().is_ok(),
-        "loaded regional game should shut down cleanly"
-    );
-    let _ = fs::remove_file(path);
-}
-
-#[test]
-fn cross_region_imported_resource_is_removed_when_source_is_bulldozed() {
-    let game = RegionalGame::two_region_default(3, 3).unwrap();
-
-    assert!(
-        game.build(RegionId(1), 1, 1, BuildingKind::Park)
-            .unwrap()
-            .success
-    );
-    assert!(has_imported_resource_note(&game, RegionId(2)));
-
-    assert!(game.bulldoze(RegionId(1), 1, 1).unwrap().success);
-
-    assert!(
-        !has_imported_resource_note(&game, RegionId(2)),
-        "bulldozing the source resource should clear the neighbor import cache"
     );
 }

@@ -130,32 +130,6 @@ fn old_regional_save_without_layout_infers_row_major_topology() {
 }
 
 #[test]
-fn save_load_rebuilds_imported_resource_cache_without_saving_it() {
-    let path = save_path("regional-import-cache-rebuild");
-    let game = RegionalGame::two_region_default(3, 3).unwrap();
-    assert!(
-        game.build(RegionId(1), 1, 1, BuildingKind::Park)
-            .unwrap()
-            .success
-    );
-    assert!(has_imported_resource_note(&game, RegionId(2)));
-
-    game.save_to_file(&path).unwrap();
-    let save_text = std::fs::read_to_string(&path).unwrap();
-    assert!(!save_text.contains("imported_resources"));
-    assert!(!save_text.contains("neighbor_import_results"));
-    assert!(!save_text.contains("Imported regional resources"));
-
-    let loaded = RegionalGame::load_from_file(&path).unwrap();
-    assert!(
-        has_imported_resource_note(&loaded, RegionId(2)),
-        "loaded runner should rebuild imported cache from authoritative regional exports"
-    );
-
-    remove_save_file(path);
-}
-
-#[test]
 fn save_load_rebuilds_cross_region_power_export_after_tick_without_saving_grant() {
     let path = save_path("regional-power-export-rebuild");
     let game = RegionalGame::two_region_default(3, 2).unwrap();
@@ -178,6 +152,36 @@ fn save_load_rebuilds_cross_region_power_export_after_tick_without_saving_grant(
     assert!(
         region_cell_powered(&loaded, RegionId(2), 1, 0),
         "loaded topology and hints should allow the normal tick flow to re-request exported power"
+    );
+
+    remove_save_file(path);
+}
+
+#[test]
+fn save_load_rebuilds_cross_region_remote_jobs_after_daily_tick() {
+    let path = save_path("regional-remote-job-rebuild");
+    let game = RegionalGame::two_region_default(6, 3).unwrap();
+    build_cross_region_remote_job_fixture(&game);
+    run_regional_days(&game, 10);
+
+    let before = region_view(&game.view().unwrap().regions, RegionId(1))
+        .status
+        .unemployment;
+    assert_eq!(before, 0);
+
+    game.save_to_file(&path).unwrap();
+    let loaded = RegionalGame::load_from_file(&path).unwrap();
+    run_regional_days(&loaded, 1);
+
+    let loaded_view = loaded.view().unwrap();
+    let loaded_region = region_view(&loaded_view.regions, RegionId(1));
+    assert!(
+        loaded_region.status.population > 0,
+        "fixture should have residents that need jobs"
+    );
+    assert_eq!(
+        loaded_region.status.unemployment, 0,
+        "loaded game should rebuild remote jobs through normal export allocation"
     );
 
     remove_save_file(path);
@@ -336,6 +340,74 @@ fn build_cross_region_power_fixture(game: &RegionalGame) {
     );
 }
 
+fn build_cross_region_remote_job_fixture(game: &RegionalGame) {
+    assert!(
+        game.build(RegionId(1), 0, 0, BuildingKind::Residential)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(1), 0, 1, BuildingKind::Park)
+            .unwrap()
+            .success
+    );
+    for x in 1..=5 {
+        assert!(
+            game.build(RegionId(1), x, 0, BuildingKind::Road)
+                .unwrap()
+                .success
+        );
+    }
+    assert!(
+        game.build(RegionId(1), 4, 1, BuildingKind::PowerPlant)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(1), 3, 2, BuildingKind::Road)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(1), 4, 2, BuildingKind::Road)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(1), 5, 2, BuildingKind::Industrial)
+            .unwrap()
+            .success
+    );
+
+    assert!(
+        game.build(RegionId(2), 0, 0, BuildingKind::Road)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(2), 1, 0, BuildingKind::Road)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(2), 0, 1, BuildingKind::Industrial)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(2), 1, 1, BuildingKind::PowerPlant)
+            .unwrap()
+            .success
+    );
+}
+
+fn run_regional_days(game: &RegionalGame, days: u64) {
+    for _ in 0..(days * 24) {
+        game.tick_region(RegionId(1)).unwrap();
+        game.tick_region(RegionId(2)).unwrap();
+    }
+}
+
 fn region_view(
     regions: &[small_city::core::regional_game::RegionViewSnapshot],
     region_id: RegionId,
@@ -364,14 +436,6 @@ fn region_cell_powered(game: &RegionalGame, region_id: RegionId, x: usize, y: us
         .find(|cell| cell.x == x && cell.y == y)
         .and_then(|cell| cell.powered)
         .unwrap_or(false)
-}
-
-fn has_imported_resource_note(game: &RegionalGame, region_id: RegionId) -> bool {
-    game.inspect_region(region_id, 0, 0)
-        .unwrap()
-        .explanations
-        .iter()
-        .any(|note| note.contains("Imported regional resources: 1"))
 }
 
 fn turn(game: &RegionalGame, region_id: RegionId) -> u32 {

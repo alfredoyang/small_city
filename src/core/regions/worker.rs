@@ -15,7 +15,7 @@ use crate::core::regions::runtime::{
 };
 use crate::core::regions::{
     BorderEdge, JobExportGrant, NetworkBorderLink, PowerExportGrant, RegionId, RegionNeighborLink,
-    RegionRoadNetworkId, RegionalAvailabilityHint, RegionalExportChange,
+    RegionRoadNetworkId, RegionalAvailabilityHint,
 };
 use std::collections::HashMap;
 
@@ -264,20 +264,6 @@ impl RegionWorker {
         message: OutboundMessage,
     ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
         match message {
-            OutboundMessage::ReturnImportedResourceContinuation {
-                caller_region,
-                continuation,
-                result,
-            } => {
-                self.push_event(
-                    caller_region,
-                    RegionEvent::RunImportedResourceContinuation {
-                        continuation,
-                        result,
-                    },
-                )?;
-                Ok(WorkerRoutedMessage::None)
-            }
             OutboundMessage::RegionCommandCompleted(reply) => {
                 Ok(WorkerRoutedMessage::CommandReply(reply))
             }
@@ -286,10 +272,6 @@ impl RegionWorker {
             }
             OutboundMessage::RegionSnapshotReady(reply) => {
                 Ok(WorkerRoutedMessage::SnapshotReply(reply))
-            }
-            OutboundMessage::RegionExportsChanged(change) => {
-                self.route_export_change(change)?;
-                Ok(WorkerRoutedMessage::None)
             }
             OutboundMessage::PowerExportRequested(request) => {
                 self.route_export_request::<PowerExport>(request)?;
@@ -320,50 +302,6 @@ impl RegionWorker {
                 error,
             }),
         }
-    }
-
-    fn route_export_change(
-        &mut self,
-        change: RegionalExportChange,
-    ) -> Result<(), WorkerRoutingError> {
-        let target_regions = self
-            .regions
-            .iter()
-            .map(RegionRuntime::region_id)
-            .filter(|region_id| *region_id != change.source_region)
-            .collect::<Vec<_>>();
-
-        for target_region in &target_regions {
-            let target_neighbors = target_regions
-                .iter()
-                .copied()
-                .filter(|region_id| *region_id != *target_region)
-                .collect::<Vec<_>>();
-
-            for export in &change.current {
-                self.push_event(
-                    *target_region,
-                    RegionEvent::process_imported_resource(
-                        change.source_region,
-                        export.imported_resource(),
-                        target_neighbors.clone(),
-                    ),
-                )?;
-            }
-
-            for removed_kind in &change.removed {
-                self.push_event(
-                    *target_region,
-                    RegionEvent::process_imported_resource(
-                        change.source_region,
-                        RegionalExportChange::tombstone(change.source_region, *removed_kind),
-                        target_neighbors.clone(),
-                    ),
-                )?;
-            }
-        }
-
-        Ok(())
     }
 
     /// Routes a fresh consumer export request to the first reachable candidate.

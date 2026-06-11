@@ -1,13 +1,10 @@
 //! Integration tests for the optional threaded region worker runner.
 
 use small_city::core::regional_game::UiRequestId;
-use small_city::core::regions::continuation::{CallerContinuation, NeighborRequest};
-use small_city::core::regions::runtime::{ImportedResourcePayload, RegionEvent, RegionRuntime};
+use small_city::core::regions::runtime::{RegionEvent, RegionRuntime};
 use small_city::core::regions::threaded::{ThreadedRegionWorker, ThreadedWorkerShutdown};
 use small_city::core::regions::worker::{RegionWorker, WorkerId};
-use small_city::core::regions::{
-    ImportedResource, ImportedResourceResult, RegionId, RegionState, ResourceId, ResourceKind,
-};
+use small_city::core::regions::{RegionId, RegionState};
 
 #[test]
 fn threaded_worker_processes_tick_request_and_returns_summary() {
@@ -92,33 +89,6 @@ fn shutdown_can_drain_one_bounded_pass_deterministically() {
     assert_eq!(turn(&shutdown.worker, region_id), 1);
 }
 
-#[test]
-fn threaded_worker_routes_returned_continuation_to_caller_region() {
-    let caller = RegionId(6);
-    let target = RegionId(7);
-    let worker = worker_with_regions(WorkerId(6), &[caller, target]);
-    let target_handle = worker.handle_for(target).expect("target handle");
-    let threaded = ThreadedRegionWorker::start(worker);
-
-    target_handle.send(RegionEvent::ProcessImportedResource(import_request(
-        caller,
-        resource(90, ResourceKind::ServiceAccess, 1),
-    )));
-    let target_summary = threaded.process_region_events(1).unwrap();
-    let caller_summary = threaded.process_region_events(1).unwrap();
-    let shutdown = threaded
-        .shutdown(ThreadedWorkerShutdown::RejectPending)
-        .unwrap();
-
-    assert_eq!(target_summary.processed_regions, 1);
-    assert!(target_summary.routing_errors.is_empty());
-    assert_eq!(caller_summary.processed_regions, 1);
-    assert!(caller_summary.routing_errors.is_empty());
-    assert_eq!(turn(&shutdown.worker, caller), 1);
-    assert_eq!(neighbor_import_result_count(&shutdown.worker, caller), 1);
-    assert_eq!(turn(&shutdown.worker, target), 0);
-}
-
 fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
     let mut worker = RegionWorker::new(id);
     for region_id in regions {
@@ -150,46 +120,4 @@ fn pending_events(worker: &RegionWorker, region_id: RegionId) -> usize {
         .region(region_id)
         .expect("region")
         .pending_event_count()
-}
-
-fn neighbor_import_result_count(worker: &RegionWorker, region_id: RegionId) -> usize {
-    worker
-        .region(region_id)
-        .expect("region")
-        .state()
-        .neighbor_import_results()
-        .len()
-}
-
-fn import_request(
-    caller_region: RegionId,
-    resource: ImportedResource,
-) -> NeighborRequest<ImportedResourcePayload, ImportedResourceResult> {
-    NeighborRequest {
-        payload: ImportedResourcePayload {
-            resource,
-            local_used_capacity: 0,
-            border_crossing_cost: 1,
-            target_neighbors: Vec::new(),
-        },
-        continuation: CallerContinuation::new(caller_region, |region, result| {
-            region.tick_local();
-            region.apply_neighbor_import_result(result);
-        }),
-    }
-}
-
-fn resource(origin_region: u32, resource_kind: ResourceKind, generation: u64) -> ImportedResource {
-    ImportedResource {
-        id: ResourceId {
-            origin_region: RegionId(origin_region),
-            resource_kind,
-            generation,
-        },
-        remaining_capacity: 5,
-        hop_count: 0,
-        max_hops: 2,
-        travel_cost: 0,
-        source_neighbor: RegionId(origin_region),
-    }
 }

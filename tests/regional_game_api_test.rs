@@ -3,9 +3,7 @@
 use small_city::core::regional_game::{
     RegionViewSnapshot, RegionalGame, RegionalGameError, UiReply, UiRequest, UiRequestId,
 };
-use small_city::core::regions::{
-    ImportDecision, ImportedResource, RegionId, RegionState, ResourceId, ResourceKind,
-};
+use small_city::core::regions::{RegionId, RegionState};
 use small_city::interface::input::BuildingKind;
 use small_city::interface::view::GameView;
 
@@ -157,24 +155,6 @@ fn selected_region_commands_target_first_region_without_exposing_region_id_to_ui
 }
 
 #[test]
-fn imported_resource_cache_can_be_rebuilt_from_authoritative_region_state() {
-    let mut region = RegionState::new(RegionId(9), 2, 2);
-    let result = region.process_imported_resource(
-        resource(50, ResourceKind::Jobs, 1),
-        0,
-        1,
-        &[RegionId(10)],
-    );
-
-    assert_eq!(result.decision, ImportDecision::Accepted);
-    assert_eq!(region.imported_resources().len(), 1);
-
-    region.rebuild_imported_resource_cache();
-
-    assert_eq!(region.imported_resources().len(), 0);
-}
-
-#[test]
 fn regional_game_uses_threaded_runner_and_processes_events() {
     let region_id = RegionId(11);
     let game = RegionalGame::from_regions(vec![RegionState::new(region_id, 2, 2)]).unwrap();
@@ -228,19 +208,4 @@ fn turn(snapshots: &[RegionViewSnapshot], region_id: RegionId) -> u32 {
         .view
         .status
         .turn
-}
-
-fn resource(origin_region: u32, resource_kind: ResourceKind, generation: u64) -> ImportedResource {
-    ImportedResource {
-        id: ResourceId {
-            origin_region: RegionId(origin_region),
-            resource_kind,
-            generation,
-        },
-        remaining_capacity: 5,
-        hop_count: 0,
-        max_hops: 2,
-        travel_cost: 0,
-        source_neighbor: RegionId(origin_region),
-    }
 }
