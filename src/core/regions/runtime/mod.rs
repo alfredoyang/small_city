@@ -453,12 +453,11 @@ impl<U: Copy> ExportAllocations<U> {
         &self,
         key: ExportAllocationKey,
         network: RegionRoadNetworkId,
-    ) -> Vec<U> {
+    ) -> impl Iterator<Item = U> + '_ {
         self.allocations
             .iter()
-            .filter(|allocation| allocation.network == network && allocation.key != key)
+            .filter(move |allocation| allocation.network == network && allocation.key != key)
             .map(|allocation| allocation.unit)
-            .collect()
     }
 
     /// Reserved units held by callers other than `key`, across *all* networks.
@@ -469,12 +468,14 @@ impl<U: Copy> ExportAllocations<U> {
     /// still block that same slot when requested via the other, or the producer
     /// would double-grant one slot. Excluding `key` lets a caller's own retry
     /// re-grant.
-    fn reserved_units_excluding_key(&self, key: ExportAllocationKey) -> Vec<U> {
+    fn reserved_units_excluding_key(
+        &self,
+        key: ExportAllocationKey,
+    ) -> impl Iterator<Item = U> + '_ {
         self.allocations
             .iter()
-            .filter(|allocation| allocation.key != key)
+            .filter(move |allocation| allocation.key != key)
             .map(|allocation| allocation.unit)
-            .collect()
     }
 
     /// Inserts or refreshes the reservation identified by `key`.
@@ -587,9 +588,7 @@ impl RegionRuntime {
 
     fn process_event(&mut self, event: RegionEvent) -> Vec<OutboundMessage> {
         match event {
-            RegionEvent::Tick { request_id } => {
-                self.start_tick_with_power_export_requests(request_id)
-            }
+            RegionEvent::Tick { request_id } => self.start_tick_power_phase(request_id),
             RegionEvent::BuildSnapshot {
                 request_id,
                 overlay,
@@ -679,11 +678,24 @@ impl RegionRuntime {
         })
     }
 
-    fn start_tick_with_power_export_requests(
+    fn start_tick_power_phase(&mut self, request_id: UiRequestId) -> Vec<OutboundMessage> {
+        let phase = self.state.begin_tick_power_demand_phase();
+        self.reconcile_power_export_allocations(request_id, phase)
+    }
+
+    // Reconciliation currently uses the simple policy:
+    // release all previous allocations for this caller generation, then request all
+    // current demands. Future patches can make this incremental by tracking granted
+    // producer regions and invalidating only when local demand, producer capacity,
+    // or road components change.
+    // TODO(CR allocation lifecycle): trigger reconciliation from explicit demand,
+    // producer-capacity, or component-change events so it runs only when needed
+    // instead of every tick.
+    fn reconcile_power_export_allocations(
         &mut self,
         request_id: UiRequestId,
+        phase: RegionalTickPowerPhase,
     ) -> Vec<OutboundMessage> {
-        let phase = self.state.begin_tick_power_demand_phase();
         let release =
             OutboundMessage::PowerExportAllocationsReleased(PowerExportAllocationRelease {
                 caller_region: self.region_id(),
@@ -741,6 +753,22 @@ impl RegionRuntime {
             outbound.extend(self.export_change_messages());
             return outbound;
         }
+        self.reconcile_job_export_allocations(request_id, phase)
+    }
+
+    // Reconciliation currently uses the simple policy:
+    // release all previous allocations for this caller generation, then request all
+    // current demands. Future patches can make this incremental by tracking granted
+    // producer regions and invalidating only when local demand, producer capacity,
+    // or road components change.
+    // TODO(CR allocation lifecycle): trigger reconciliation from explicit demand,
+    // producer-capacity, or component-change events so it runs only when needed
+    // instead of every daily job tick.
+    fn reconcile_job_export_allocations(
+        &mut self,
+        request_id: UiRequestId,
+        phase: RegionalTickJobPhase,
+    ) -> Vec<OutboundMessage> {
         let release = OutboundMessage::JobExportAllocationsReleased(JobExportAllocationRelease {
             caller_region: self.region_id(),
             request_id,
@@ -819,7 +847,6 @@ impl RegionRuntime {
         let active_export_allocations: i32 = self
             .power_export_allocations
             .reserved_units_excluding(allocation_key, producer_network)
-            .into_iter()
             .sum();
         // Producer-owned export capacity is authoritative here:
         // local remaining capacity minus active transient export allocations.
@@ -1131,6 +1158,16 @@ mod tick_state_tests {
             .collect()
     }
 
+    fn message_index(
+        outbound: &[OutboundMessage],
+        predicate: impl Fn(&OutboundMessage) -> bool,
+    ) -> usize {
+        outbound
+            .iter()
+            .position(predicate)
+            .expect("expected outbound message")
+    }
+
     fn has_tick_completed(outbound: &[OutboundMessage]) -> bool {
         outbound
             .iter()
@@ -1149,6 +1186,10 @@ mod tick_state_tests {
         assert!(runtime.tick_state.is_waiting());
         assert!(!has_tick_completed(&outbound));
         assert_eq!(export_requests(&outbound).len(), 1);
+        assert!(matches!(
+            outbound.first(),
+            Some(OutboundMessage::PowerExportAllocationsReleased(_))
+        ));
     }
 
     #[test]
@@ -1162,6 +1203,43 @@ mod tick_state_tests {
 
         assert!(!runtime.tick_state.is_waiting());
         assert!(has_tick_completed(&outbound));
+        assert!(matches!(
+            outbound.first(),
+            Some(OutboundMessage::PowerExportAllocationsReleased(_))
+        ));
+    }
+
+    #[test]
+    fn daily_tick_without_job_demands_releases_job_allocations_before_finishing() {
+        let mut runtime = RegionRuntime::new(RegionState::new(RegionId(1), 2, 2));
+        let mut last_outbound = Vec::new();
+
+        for request_id in 1..=24 {
+            runtime.push_event(RegionEvent::Tick {
+                request_id: UiRequestId(request_id),
+            });
+            last_outbound = runtime.process_next_event();
+            assert!(!runtime.tick_state.is_waiting());
+        }
+
+        let power_release = message_index(&last_outbound, |message| {
+            matches!(message, OutboundMessage::PowerExportAllocationsReleased(_))
+        });
+        let job_release = message_index(&last_outbound, |message| {
+            matches!(message, OutboundMessage::JobExportAllocationsReleased(_))
+        });
+        let completed = message_index(&last_outbound, |message| {
+            matches!(message, OutboundMessage::RegionTickCompleted(_))
+        });
+
+        assert!(
+            power_release < job_release,
+            "power reconciliation should run before daily job reconciliation"
+        );
+        assert!(
+            job_release < completed,
+            "job reconciliation should release old allocations before finishing"
+        );
     }
 
     #[test]
@@ -1301,6 +1379,16 @@ mod tick_state_tests {
                 .iter()
                 .any(|message| matches!(message, OutboundMessage::JobExportRequested(_)))
             {
+                let release = message_index(&outbound, |message| {
+                    matches!(message, OutboundMessage::JobExportAllocationsReleased(_))
+                });
+                let request = message_index(&outbound, |message| {
+                    matches!(message, OutboundMessage::JobExportRequested(_))
+                });
+                assert!(
+                    release < request,
+                    "job reconciliation should release before requesting current demands"
+                );
                 assert!(matches!(
                     runtime.tick_state,
                     TickState::WaitingForJobExports(_)
@@ -1470,7 +1558,7 @@ mod export_allocations_tests {
         // On network (2,0), excluding token-0's own key, only token-1's 4 remains;
         // token-2's reservation on a different network is never counted.
         let reserved = allocations.reserved_units_excluding(key(1, 5, 0), net(2, 0));
-        assert_eq!(reserved, vec![4]);
+        assert_eq!(reserved.collect::<Vec<_>>(), vec![4]);
     }
 
     #[test]
@@ -1484,7 +1572,7 @@ mod export_allocations_tests {
         // reservation counts regardless of which network it was taken under, so a
         // bridge slot reserved via one network still blocks the other.
         let reserved = allocations.reserved_units_excluding_key(key(1, 5, 0));
-        assert_eq!(reserved, vec![4, 9]);
+        assert_eq!(reserved.collect::<Vec<_>>(), vec![4, 9]);
     }
 
     #[test]
