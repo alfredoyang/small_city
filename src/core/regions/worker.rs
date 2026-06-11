@@ -10,9 +10,8 @@ use crate::core::regional_types::{
 use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::load_manager::WorkerLoad;
 use crate::core::regions::runtime::{
-    JobExportAllocationRelease, JobExportAllocationRequest, JobExportRequest, OutboundMessage,
-    PowerExportAllocationRelease, PowerExportAllocationRequest, PowerExportRequest, RegionEvent,
-    RegionRuntime, RegionRuntimeError,
+    ExportAllocationRelease, ExportAllocationRequest, JobExportRequest, OutboundMessage,
+    PowerExportRequest, RegionEvent, RegionRuntime, RegionRuntimeError,
 };
 use crate::core::regions::{
     BorderEdge, JobExportGrant, NetworkBorderLink, PowerExportGrant, RegionId, RegionNeighborLink,
@@ -293,27 +292,27 @@ impl RegionWorker {
                 Ok(WorkerRoutedMessage::None)
             }
             OutboundMessage::PowerExportRequested(request) => {
-                self.route_power_export_request(request)?;
+                self.route_export_request::<PowerExport>(request)?;
                 Ok(WorkerRoutedMessage::None)
             }
             OutboundMessage::PowerExportRequestCompleted { request, grant } => {
-                self.route_power_export_request_result(request, grant)?;
+                self.route_export_request_result::<PowerExport>(request, grant)?;
                 Ok(WorkerRoutedMessage::None)
             }
             OutboundMessage::PowerExportAllocationsReleased(release) => {
-                self.route_power_export_allocation_release(release)?;
+                self.route_export_allocation_release::<PowerExport>(release)?;
                 Ok(WorkerRoutedMessage::None)
             }
             OutboundMessage::JobExportRequested(request) => {
-                self.route_job_export_request(request)?;
+                self.route_export_request::<JobExport>(request)?;
                 Ok(WorkerRoutedMessage::None)
             }
             OutboundMessage::JobExportRequestCompleted { request, grant } => {
-                self.route_job_export_request_result(request, grant)?;
+                self.route_export_request_result::<JobExport>(request, grant)?;
                 Ok(WorkerRoutedMessage::None)
             }
             OutboundMessage::JobExportAllocationsReleased(release) => {
-                self.route_job_export_allocation_release(release)?;
+                self.route_export_allocation_release::<JobExport>(release)?;
                 Ok(WorkerRoutedMessage::None)
             }
             OutboundMessage::RuntimeError(error) => Err(WorkerRoutingError::RuntimeError {
@@ -367,41 +366,44 @@ impl RegionWorker {
         Ok(())
     }
 
-    fn route_power_export_request(
+    /// Routes a fresh consumer export request to the first reachable candidate.
+    ///
+    /// Shared by power and jobs (CR3R): candidates are component members on another
+    /// region whose availability hint says spare, in stable order. The resource
+    /// trait supplies only the hint selector, event constructors, and deny grant.
+    fn route_export_request<R: ExportResource>(
         &mut self,
-        request: PowerExportRequest,
+        request: R::Request,
     ) -> Result<(), WorkerRoutingError> {
         // TODO(CR2 perf): cache cross-region discovery for one scheduling pass
         // instead of rebuilding the component graph for every export request.
         let discovery = self.cross_region_discovery(&self.topology);
         let candidates = discovery
-            .component_of(request.caller_network)
+            .component_of(R::caller_network(&request))
             .unwrap_or(&[])
             .iter()
             .copied()
-            .filter(|network| network.region != request.caller_region)
+            .filter(|network| network.region != R::caller_region(&request))
             .filter(|network| {
                 discovery
                     .availability_hints
                     .iter()
-                    .any(|hint| hint.network == *network && hint.has_spare_power)
+                    .any(|hint| hint.network == *network && R::has_spare(hint))
             })
             .collect::<Vec<_>>();
 
         if candidates.is_empty() {
-            self.deny_power_export_request(&request)?;
-            return Ok(());
+            return self.deny_export_request::<R>(&request);
         }
 
         let target_region = candidates[0].region;
         if self.region(target_region).is_none() {
-            self.deny_power_export_request(&request)?;
-            return Ok(());
+            return self.deny_export_request::<R>(&request);
         }
 
         self.push_event(
             target_region,
-            RegionEvent::ProcessPowerExportRequest(PowerExportAllocationRequest {
+            R::process_request_event(ExportAllocationRequest {
                 request,
                 candidates,
                 candidate_index: 0,
@@ -409,45 +411,46 @@ impl RegionWorker {
         )
     }
 
-    fn route_power_export_request_result(
+    /// Applies a producer grant, or walks to the next candidate on a stale-hint
+    /// denial; denies the caller once candidates are exhausted. Shared (CR3R).
+    fn route_export_request_result<R: ExportResource>(
         &mut self,
-        mut request: PowerExportAllocationRequest,
-        grant: PowerExportGrant,
+        mut request: ExportAllocationRequest<R::Request>,
+        grant: R::Grant,
     ) -> Result<(), WorkerRoutingError> {
-        if grant.granted {
+        if R::granted(&grant) {
             return self.push_event(
-                request.request.caller_region,
-                RegionEvent::ApplyPowerExportGrant(grant),
+                R::caller_region(&request.request),
+                R::apply_grant_event(grant),
             );
         }
 
         request.candidate_index += 1;
         if request.candidate_index >= request.candidates.len() {
             return self.push_event(
-                request.request.caller_region,
-                RegionEvent::ApplyPowerExportGrant(grant),
+                R::caller_region(&request.request),
+                R::apply_grant_event(grant),
             );
         }
 
         let target_region = request.candidates[request.candidate_index].region;
         if self.region(target_region).is_none() {
-            self.deny_power_export_request(&request.request)?;
-            return Ok(());
+            return self.deny_export_request::<R>(&request.request);
         }
 
-        self.push_event(
-            target_region,
-            RegionEvent::ProcessPowerExportRequest(request),
-        )
+        self.push_event(target_region, R::process_request_event(request))
     }
 
-    fn route_power_export_allocation_release(
+    /// Broadcasts a caller's new-generation release to every other owned region so
+    /// producers drop the caller's prior reservations. Shared (CR3R).
+    fn route_export_allocation_release<R: ExportResource>(
         &mut self,
-        release: PowerExportAllocationRelease,
+        release: ExportAllocationRelease,
     ) -> Result<(), WorkerRoutingError> {
         // TODO(CR2 scale): this broadcasts to every owned region today. Track
-        // which producer regions actually accepted export allocations for a
-        // caller so release messages can be narrowed to those producers.
+        // producer regions recorded from successful caller grants (for example
+        // imported power sources and remote workplace regions) so release
+        // messages can be narrowed to producers that may hold old allocations.
         let target_regions = self
             .regions
             .iter()
@@ -456,136 +459,151 @@ impl RegionWorker {
             .collect::<Vec<_>>();
 
         for target_region in target_regions {
-            self.push_event(
-                target_region,
-                RegionEvent::ReleasePowerExportAllocations(release),
-            )?;
+            self.push_event(target_region, R::release_event(release))?;
         }
 
         Ok(())
     }
 
-    fn deny_power_export_request(
+    fn deny_export_request<R: ExportResource>(
         &mut self,
-        request: &PowerExportRequest,
+        request: &R::Request,
     ) -> Result<(), WorkerRoutingError> {
         self.push_event(
-            request.caller_region,
-            RegionEvent::ApplyPowerExportGrant(PowerExportGrant {
-                token: request.token,
-                granted: false,
-                source_region: None,
-            }),
+            R::caller_region(request),
+            R::apply_grant_event(R::deny_grant(request)),
         )
     }
+}
 
-    fn route_job_export_request(
-        &mut self,
-        request: JobExportRequest,
-    ) -> Result<(), WorkerRoutingError> {
-        // Discovery is read-only here; the producer runtime stays authoritative for
-        // granting or denying the slot. Candidates follow roads (same component) and
-        // the stale-tolerant `has_spare_jobs` hint, in stable order.
-        let discovery = self.cross_region_discovery(&self.topology);
-        let candidates = discovery
-            .component_of(request.caller_network)
-            .unwrap_or(&[])
-            .iter()
-            .copied()
-            .filter(|network| network.region != request.caller_region)
-            .filter(|network| {
-                discovery
-                    .availability_hints
-                    .iter()
-                    .any(|hint| hint.network == *network && hint.has_spare_jobs)
-            })
-            .collect::<Vec<_>>();
+/// The variable bits of one cross-region export resource for the shared routing.
+///
+/// Everything in `route_export_request*` / `route_export_allocation_release` is
+/// identical between power and jobs; this trait supplies only what differs: which
+/// availability hint to read, how to build the concrete `RegionEvent`s, and the
+/// deny grant. Available-capacity computation and grant application stay on the
+/// producer runtime / `RegionState`, where the two resources genuinely diverge.
+///
+///   route_outbound
+///     ├─ route_export_request::<PowerExport>(req)   ┐  same candidate-walk,
+///     └─ route_export_request::<JobExport>(req)     ┘  missing-target deny,
+///                  │                                   release ordering …
+///                  ▼  calls back into R = PowerExport | JobExport for:
+///        ┌──────────────────────────────────────────────────────────────┐
+///        │  has_spare(hint)        → has_spare_power | has_spare_jobs      │
+///        │  process_request_event  → ProcessPowerExportRequest | …Job…    │
+///        │  apply_grant_event      → ApplyPowerExportGrant | …Job…        │
+///        │  deny_grant(request)    → PowerExportGrant{..} | JobExportGrant │
+///        └──────────────────────────────────────────────────────────────┘
+///
+/// `RegionEvent` / `OutboundMessage` variants stay concrete (PowerXxx / JobXxx);
+/// the trait only chooses which one to build, so the wire format is unchanged.
+///
+/// ```text
+/// Caller demand
+///   |
+///   v
+/// Worker route_export_request<R>
+///   |
+///   +-- PowerExport -> has_spare_power -> ProcessPowerExportRequest
+///   |
+///   +-- JobExport   -> has_spare_jobs  -> ProcessJobExportRequest
+///                                       |
+///                                       v
+///                          Producer ExportAllocations<U>
+///                            U = i32 power demand
+///                            U = Entity workplace slot
+///                                       |
+///                                       v
+///                          grant/deny -> caller applies grant
+/// ```
+trait ExportResource {
+    type Request: Clone;
+    type Grant;
 
-        if candidates.is_empty() {
-            self.deny_job_export_request(&request)?;
-            return Ok(());
-        }
+    fn caller_region(request: &Self::Request) -> RegionId;
+    fn caller_network(request: &Self::Request) -> RegionRoadNetworkId;
+    fn has_spare(hint: &RegionalAvailabilityHint) -> bool;
+    fn granted(grant: &Self::Grant) -> bool;
+    fn deny_grant(request: &Self::Request) -> Self::Grant;
+    fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent;
+    fn apply_grant_event(grant: Self::Grant) -> RegionEvent;
+    fn release_event(release: ExportAllocationRelease) -> RegionEvent;
+}
 
-        let target_region = candidates[0].region;
-        if self.region(target_region).is_none() {
-            self.deny_job_export_request(&request)?;
-            return Ok(());
-        }
+/// Power: capacity hint, demand-carrying request, region-only grant.
+struct PowerExport;
 
-        self.push_event(
-            target_region,
-            RegionEvent::ProcessJobExportRequest(JobExportAllocationRequest {
-                request,
-                candidates,
-                candidate_index: 0,
-            }),
-        )
+impl ExportResource for PowerExport {
+    type Request = PowerExportRequest;
+    type Grant = PowerExportGrant;
+
+    fn caller_region(request: &Self::Request) -> RegionId {
+        request.caller_region
     }
-
-    fn route_job_export_request_result(
-        &mut self,
-        mut request: JobExportAllocationRequest,
-        grant: JobExportGrant,
-    ) -> Result<(), WorkerRoutingError> {
-        if grant.granted {
-            return self.push_event(
-                request.request.caller_region,
-                RegionEvent::ApplyJobExportGrant(grant),
-            );
-        }
-
-        request.candidate_index += 1;
-        if request.candidate_index >= request.candidates.len() {
-            return self.push_event(
-                request.request.caller_region,
-                RegionEvent::ApplyJobExportGrant(grant),
-            );
-        }
-
-        let target_region = request.candidates[request.candidate_index].region;
-        if self.region(target_region).is_none() {
-            self.deny_job_export_request(&request.request)?;
-            return Ok(());
-        }
-
-        self.push_event(target_region, RegionEvent::ProcessJobExportRequest(request))
+    fn caller_network(request: &Self::Request) -> RegionRoadNetworkId {
+        request.caller_network
     }
-
-    fn route_job_export_allocation_release(
-        &mut self,
-        release: JobExportAllocationRelease,
-    ) -> Result<(), WorkerRoutingError> {
-        let target_regions = self
-            .regions
-            .iter()
-            .map(RegionRuntime::region_id)
-            .filter(|region_id| *region_id != release.caller_region)
-            .collect::<Vec<_>>();
-
-        for target_region in target_regions {
-            self.push_event(
-                target_region,
-                RegionEvent::ReleaseJobExportAllocations(release),
-            )?;
-        }
-
-        Ok(())
+    fn has_spare(hint: &RegionalAvailabilityHint) -> bool {
+        hint.has_spare_power
     }
+    fn granted(grant: &Self::Grant) -> bool {
+        grant.granted
+    }
+    fn deny_grant(request: &Self::Request) -> Self::Grant {
+        PowerExportGrant {
+            token: request.token,
+            granted: false,
+            source_region: None,
+        }
+    }
+    fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent {
+        RegionEvent::ProcessPowerExportRequest(request)
+    }
+    fn apply_grant_event(grant: Self::Grant) -> RegionEvent {
+        RegionEvent::ApplyPowerExportGrant(grant)
+    }
+    fn release_event(release: ExportAllocationRelease) -> RegionEvent {
+        RegionEvent::ReleasePowerExportAllocations(release)
+    }
+}
 
-    fn deny_job_export_request(
-        &mut self,
-        request: &JobExportRequest,
-    ) -> Result<(), WorkerRoutingError> {
-        self.push_event(
-            request.caller_region,
-            RegionEvent::ApplyJobExportGrant(JobExportGrant {
-                token: request.token,
-                granted: false,
-                source_region: None,
-                slot_id: None,
-                salary: 0,
-            }),
-        )
+/// Jobs: spare-slots hint, identity-free request, slot+salary grant.
+struct JobExport;
+
+impl ExportResource for JobExport {
+    type Request = JobExportRequest;
+    type Grant = JobExportGrant;
+
+    fn caller_region(request: &Self::Request) -> RegionId {
+        request.caller_region
+    }
+    fn caller_network(request: &Self::Request) -> RegionRoadNetworkId {
+        request.caller_network
+    }
+    fn has_spare(hint: &RegionalAvailabilityHint) -> bool {
+        hint.has_spare_jobs
+    }
+    fn granted(grant: &Self::Grant) -> bool {
+        grant.granted
+    }
+    fn deny_grant(request: &Self::Request) -> Self::Grant {
+        JobExportGrant {
+            token: request.token,
+            granted: false,
+            source_region: None,
+            slot_id: None,
+            salary: 0,
+        }
+    }
+    fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent {
+        RegionEvent::ProcessJobExportRequest(request)
+    }
+    fn apply_grant_event(grant: Self::Grant) -> RegionEvent {
+        RegionEvent::ApplyJobExportGrant(grant)
+    }
+    fn release_event(release: ExportAllocationRelease) -> RegionEvent {
+        RegionEvent::ReleaseJobExportAllocations(release)
     }
 }
 
@@ -748,7 +766,7 @@ mod tests {
         worker
             .add_region(RegionRuntime::new(RegionState::new(RegionId(1), 2, 2)))
             .unwrap();
-        let request = PowerExportAllocationRequest {
+        let request = ExportAllocationRequest {
             request: PowerExportRequest {
                 request_id: UiRequestId(1),
                 caller_region: RegionId(1),
@@ -760,7 +778,7 @@ mod tests {
             candidate_index: 0,
         };
 
-        let result = worker.route_power_export_request_result(
+        let result = worker.route_export_request_result::<PowerExport>(
             request,
             PowerExportGrant {
                 token: 7,

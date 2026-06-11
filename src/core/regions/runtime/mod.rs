@@ -180,21 +180,6 @@ pub struct PowerExportRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Producer-side allocation request plus remaining candidates if a stale hint denies it.
-pub struct PowerExportAllocationRequest {
-    pub request: PowerExportRequest,
-    pub candidates: Vec<RegionRoadNetworkId>,
-    pub candidate_index: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Producer-side marker that a caller started a new tick power-resolution generation.
-pub struct PowerExportAllocationRelease {
-    pub caller_region: RegionId,
-    pub request_id: UiRequestId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// Consumer request for a producer to export one workplace slot for a job seeker.
 ///
 /// Unlike power there is no demand amount: one citizen fills one whole slot.
@@ -206,18 +191,65 @@ pub struct JobExportRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Producer-side job allocation request plus candidates if a stale hint denies it.
-pub struct JobExportAllocationRequest {
-    pub request: JobExportRequest,
+/// Producer-side allocation request: one consumer request plus the remaining
+/// candidate producer networks to try if a stale availability hint denies it.
+///
+/// Generic over the resource's request payload `R` (power demand vs job seeker);
+/// the candidate-walk transport around it is identical for both (see CR3R).
+pub struct ExportAllocationRequest<R> {
+    pub request: R,
     pub candidates: Vec<RegionRoadNetworkId>,
     pub candidate_index: usize,
 }
 
+/// Producer-side power allocation request (one consumer request + candidates).
+pub type PowerExportAllocationRequest = ExportAllocationRequest<PowerExportRequest>;
+/// Producer-side job allocation request (one consumer request + candidates).
+pub type JobExportAllocationRequest = ExportAllocationRequest<JobExportRequest>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Producer-side marker that a caller started a new tick job-resolution generation.
-pub struct JobExportAllocationRelease {
+/// Producer-side marker that a caller started a new tick export-resolution
+/// generation, so producers may drop the caller's prior reservations.
+///
+/// Shared by power and jobs: the release shape and routing are identical (CR3R).
+pub struct ExportAllocationRelease {
     pub caller_region: RegionId,
     pub request_id: UiRequestId,
+}
+
+/// Power flavor of the shared export allocation release.
+pub type PowerExportAllocationRelease = ExportAllocationRelease;
+/// Job flavor of the shared export allocation release.
+pub type JobExportAllocationRelease = ExportAllocationRelease;
+
+/// A consumer export request that can name the producer-side reservation key it
+/// belongs to. Both power and job requests carry the same `(caller, gen, token)`.
+trait ExportRequestKey {
+    fn allocation_key(&self) -> ExportAllocationKey;
+}
+
+impl ExportRequestKey for PowerExportRequest {
+    fn allocation_key(&self) -> ExportAllocationKey {
+        ExportAllocationKey {
+            caller_region: self.caller_region,
+            request_id: self.request_id,
+            token: self.token,
+        }
+    }
+}
+
+impl ExportRequestKey for JobExportRequest {
+    fn allocation_key(&self) -> ExportAllocationKey {
+        ExportAllocationKey {
+            caller_region: self.caller_region,
+            request_id: self.request_id,
+            token: self.token,
+        }
+    }
+}
+
+fn export_allocation_key<R: ExportRequestKey>(request: &R) -> ExportAllocationKey {
+    request.allocation_key()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,8 +296,8 @@ pub struct RegionRuntime {
     state: RegionState,
     exports: Vec<RegionalExport>,
     tick_state: TickState,
-    power_export_allocations: Vec<PowerExportAllocation>,
-    job_export_allocations: Vec<JobExportAllocation>,
+    power_export_allocations: ExportAllocations<i32>,
+    job_export_allocations: ExportAllocations<Entity>,
     handle: RegionHandle,
     receiver: RegionEventReceiver,
 }
@@ -328,34 +360,153 @@ struct TickJobContinuation {
     pending_demands: Vec<PendingJobDemand>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PowerExportAllocation {
-    key: PowerExportAllocationKey,
-    network: RegionRoadNetworkId,
-    demand: i32,
-    caller_generation: UiRequestId,
-}
+// CR3R — one reservation engine shared by power and jobs.
+//
+// Power and jobs once carried two byte-for-byte copies of the producer-side
+// reservation bookkeeping. CR3R keeps ONE generic engine and varies only the
+// reserved unit `U`: power reserves an `i32` demand, jobs reserve an `Entity`
+// slot. The transport/lifecycle (keying, staleness, upsert) is identical; only
+// "how do I read available capacity out of these units" stays resource-specific.
+//
+//                    ExportAllocations<U>                 (one engine, two U's)
+//   ┌───────────────────────────────────────────────────────────────────────┐
+//   │ Vec<ExportAllocation<U>>                                                │
+//   │   each = { key: ExportAllocationKey,   ← (caller_region, gen, token)    │
+//   │           network: RegionRoadNetworkId,                                 │
+//   │           unit: U,                     ← i32 (power) | Entity (jobs)     │
+//   │           caller_generation }                                           │
+//   │                                                                         │
+//   │ shared lifecycle:  upsert · release_stale_for_caller · units            │
+//   │ shared read:       reserved_units_excluding(key, network)  ← power      │
+//   │                    reserved_units_excluding_key(key)        ← jobs      │
+//   └───────────────────────────────────────────────────────────────────────┘
+//          ▲ instantiated as                          ▲ instantiated as
+//          power_export_allocations: ExportAllocations<i32>
+//          job_export_allocations:   ExportAllocations<Entity>
+//
+//   resource-specific (NOT shared) — how units become "available capacity":
+//     power → sum reserved demand, subtract from per-network remaining (scalar)
+//     jobs  → remove each reserved slot Entity from the spare-slot set (discrete)
+//
+// The two `reserved_units_*` readers above are deliberately different and that
+// difference is the whole point: power capacity is POOLED PER NETWORK, so a
+// reservation on one network must not shrink another's; a job slot is ONE global
+// `Entity` that can be adjacent to two networks, so it must be excluded globally.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct JobExportAllocation {
-    key: JobExportAllocationKey,
-    network: RegionRoadNetworkId,
-    workplace: Entity,
-    caller_generation: UiRequestId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PowerExportAllocationKey {
+/// Identity of one caller demand a producer has reserved for, shared by power and
+/// jobs: a `(caller_region, generation, token)` triple.
+struct ExportAllocationKey {
     caller_region: RegionId,
     request_id: UiRequestId,
     token: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct JobExportAllocationKey {
-    caller_region: RegionId,
-    request_id: UiRequestId,
-    token: u32,
+/// One producer-owned transient reservation of a reserved unit `U` on a network.
+///
+/// `U` is the resource's reserved unit: `i32` demand for power, `Entity` slot for
+/// jobs. `caller_generation` lets a producer drop a caller's reservations once the
+/// caller starts a new tick generation.
+struct ExportAllocation<U> {
+    key: ExportAllocationKey,
+    network: RegionRoadNetworkId,
+    unit: U,
+    caller_generation: UiRequestId,
+}
+
+#[derive(Debug)]
+/// Producer-side reservation bookkeeping shared by power and jobs (CR3R).
+///
+/// This carries only the transport/lifecycle that both resources share. How
+/// available capacity is computed from the reserved units stays resource-specific
+/// (a scalar remaining for power, a discrete spare set for jobs).
+struct ExportAllocations<U> {
+    allocations: Vec<ExportAllocation<U>>,
+}
+
+impl<U: Copy> ExportAllocations<U> {
+    fn new() -> Self {
+        Self {
+            allocations: Vec::new(),
+        }
+    }
+
+    /// Drops a caller's reservations once it starts a new tick generation.
+    fn release_stale_for_caller(
+        &mut self,
+        caller_region: RegionId,
+        caller_generation: UiRequestId,
+    ) {
+        self.allocations.retain(|allocation| {
+            allocation.key.caller_region != caller_region
+                || allocation.caller_generation == caller_generation
+        });
+    }
+
+    /// Reserved units on one network held by callers other than `key`.
+    ///
+    /// Power uses this network-scoped view: capacity is pooled per road network, so
+    /// a reservation on one network must not reduce another's remaining capacity.
+    /// Excluding `key` lets a caller's own retry re-grant.
+    fn reserved_units_excluding(
+        &self,
+        key: ExportAllocationKey,
+        network: RegionRoadNetworkId,
+    ) -> Vec<U> {
+        self.allocations
+            .iter()
+            .filter(|allocation| allocation.network == network && allocation.key != key)
+            .map(|allocation| allocation.unit)
+            .collect()
+    }
+
+    /// Reserved units held by callers other than `key`, across *all* networks.
+    ///
+    /// Jobs use this network-agnostic view: the reserved unit is a global workplace
+    /// `Entity`, and one physical slot can be adjacent to two disconnected road
+    /// networks (a "bridge" workplace). A reservation taken under one network must
+    /// still block that same slot when requested via the other, or the producer
+    /// would double-grant one slot. Excluding `key` lets a caller's own retry
+    /// re-grant.
+    fn reserved_units_excluding_key(&self, key: ExportAllocationKey) -> Vec<U> {
+        self.allocations
+            .iter()
+            .filter(|allocation| allocation.key != key)
+            .map(|allocation| allocation.unit)
+            .collect()
+    }
+
+    /// Inserts or refreshes the reservation identified by `key`.
+    fn upsert(
+        &mut self,
+        key: ExportAllocationKey,
+        network: RegionRoadNetworkId,
+        unit: U,
+        caller_generation: UiRequestId,
+    ) {
+        if let Some(allocation) = self
+            .allocations
+            .iter_mut()
+            .find(|allocation| allocation.key == key)
+        {
+            allocation.network = network;
+            allocation.unit = unit;
+            allocation.caller_generation = caller_generation;
+        } else {
+            self.allocations.push(ExportAllocation {
+                key,
+                network,
+                unit,
+                caller_generation,
+            });
+        }
+    }
+
+    /// The reserved unit of every active reservation, in insertion order.
+    fn units(&self) -> impl Iterator<Item = U> + '_ {
+        self.allocations.iter().map(|allocation| allocation.unit)
+    }
 }
 
 impl RegionRuntime {
@@ -367,8 +518,8 @@ impl RegionRuntime {
             state,
             exports: Vec::new(),
             tick_state: TickState::Idle,
-            power_export_allocations: Vec::new(),
-            job_export_allocations: Vec::new(),
+            power_export_allocations: ExportAllocations::new(),
+            job_export_allocations: ExportAllocations::new(),
             handle,
             receiver,
         };
@@ -487,10 +638,8 @@ impl RegionRuntime {
                 vec![OutboundMessage::PowerExportRequestCompleted { request, grant }]
             }
             RegionEvent::ReleasePowerExportAllocations(release) => {
-                self.release_stale_power_export_allocations_for_caller(
-                    release.caller_region,
-                    release.request_id,
-                );
+                self.power_export_allocations
+                    .release_stale_for_caller(release.caller_region, release.request_id);
                 Vec::new()
             }
             RegionEvent::ApplyPowerExportGrant(grant) => self.apply_power_export_grant(grant),
@@ -499,10 +648,8 @@ impl RegionRuntime {
                 vec![OutboundMessage::JobExportRequestCompleted { request, grant }]
             }
             RegionEvent::ReleaseJobExportAllocations(release) => {
-                self.release_stale_job_export_allocations_for_caller(
-                    release.caller_region,
-                    release.request_id,
-                );
+                self.job_export_allocations
+                    .release_stale_for_caller(release.caller_region, release.request_id);
                 Vec::new()
             }
             RegionEvent::ApplyJobExportGrant(grant) => self.apply_job_export_grant(grant),
@@ -648,11 +795,7 @@ impl RegionRuntime {
         // self-correcting in steady state; pairing salary and tax on the same day
         // would require a global "all exports resolved" barrier before any economy
         // runs, which is far more synchronization for little gain.
-        let exported_job_slots = self
-            .job_export_allocations
-            .iter()
-            .map(|allocation| allocation.workplace)
-            .collect::<Vec<_>>();
+        let exported_job_slots = self.job_export_allocations.units().collect::<Vec<_>>();
         RegionTickResponse {
             request_id,
             region_id: self.region_id(),
@@ -667,23 +810,17 @@ impl RegionRuntime {
         request: &PowerExportAllocationRequest,
     ) -> PowerExportGrant {
         let producer_network = request.candidates[request.candidate_index];
-        let allocation_key = PowerExportAllocationKey {
-            caller_region: request.request.caller_region,
-            request_id: request.request.request_id,
-            token: request.request.token,
-        };
-        self.release_stale_power_export_allocations_for_caller(
-            request.request.caller_region,
-            request.request.request_id,
-        );
-        let active_export_allocations = self
+        let allocation_key = export_allocation_key(&request.request);
+        // TODO(CR2 lifecycle): reservations clear when the caller starts a new tick
+        // generation. Add explicit cleanup when caller regions are removed,
+        // reassigned, or intentionally stop ticking.
+        self.power_export_allocations
+            .release_stale_for_caller(request.request.caller_region, request.request.request_id);
+        let active_export_allocations: i32 = self
             .power_export_allocations
-            .iter()
-            .filter(|allocation| {
-                allocation.network == producer_network && allocation.key != allocation_key
-            })
-            .map(|allocation| allocation.demand)
-            .sum::<i32>();
+            .reserved_units_excluding(allocation_key, producer_network)
+            .into_iter()
+            .sum();
         // Producer-owned export capacity is authoritative here:
         // local remaining capacity minus active transient export allocations.
         let remaining = self
@@ -699,22 +836,12 @@ impl RegionRuntime {
             };
         }
 
-        if let Some(allocation) = self
-            .power_export_allocations
-            .iter_mut()
-            .find(|allocation| allocation.key == allocation_key)
-        {
-            allocation.network = producer_network;
-            allocation.demand = request.request.demand;
-            allocation.caller_generation = request.request.request_id;
-        } else {
-            self.power_export_allocations.push(PowerExportAllocation {
-                key: allocation_key,
-                network: producer_network,
-                demand: request.request.demand,
-                caller_generation: request.request.request_id,
-            });
-        }
+        self.power_export_allocations.upsert(
+            allocation_key,
+            producer_network,
+            request.request.demand,
+            request.request.request_id,
+        );
 
         PowerExportGrant {
             token: request.request.token,
@@ -723,47 +850,27 @@ impl RegionRuntime {
         }
     }
 
-    fn release_stale_power_export_allocations_for_caller(
-        &mut self,
-        caller_region: RegionId,
-        caller_generation: UiRequestId,
-    ) {
-        // TODO(CR2 lifecycle): allocations clear when the caller starts a new
-        // tick generation. Add explicit cleanup when caller regions are
-        // removed, reassigned, or intentionally stop ticking.
-        self.power_export_allocations.retain(|allocation| {
-            allocation.key.caller_region != caller_region
-                || allocation.caller_generation == caller_generation
-        });
-    }
-
     fn process_job_export_request(
         &mut self,
         request: &JobExportAllocationRequest,
     ) -> JobExportGrant {
         let producer_network = request.candidates[request.candidate_index];
-        let allocation_key = JobExportAllocationKey {
-            caller_region: request.request.caller_region,
-            request_id: request.request.request_id,
-            token: request.request.token,
-        };
-        self.release_stale_job_export_allocations_for_caller(
-            request.request.caller_region,
-            request.request.request_id,
-        );
+        let allocation_key = export_allocation_key(&request.request);
+        self.job_export_allocations
+            .release_stale_for_caller(request.request.caller_region, request.request.request_id);
 
         // Producer-owned spare: slots on this network minus those already reserved
-        // by other active allocations (one slot occurrence per reservation). This
-        // key's own reservation, if any, is left in so a retry re-grants a slot.
+        // by other active allocations (one slot occurrence per reservation). The
+        // exclusion spans all networks, not just `producer_network`: a workplace
+        // bridging two disconnected networks is one physical slot, so a reservation
+        // taken via either network must block it here. This key's own reservation,
+        // if any, is left in so a retry re-grants a slot.
         let mut available = self.state.spare_job_slots_on_network(producer_network);
-        for allocation in &self.job_export_allocations {
-            if allocation.key == allocation_key {
-                continue;
-            }
-            if let Some(index) = available
-                .iter()
-                .position(|slot| *slot == allocation.workplace)
-            {
+        for reserved in self
+            .job_export_allocations
+            .reserved_units_excluding_key(allocation_key)
+        {
+            if let Some(index) = available.iter().position(|slot| *slot == reserved) {
                 available.remove(index);
             }
         }
@@ -779,22 +886,12 @@ impl RegionRuntime {
         };
         let salary = self.state.workplace_salary(workplace);
 
-        if let Some(allocation) = self
-            .job_export_allocations
-            .iter_mut()
-            .find(|allocation| allocation.key == allocation_key)
-        {
-            allocation.network = producer_network;
-            allocation.workplace = workplace;
-            allocation.caller_generation = request.request.request_id;
-        } else {
-            self.job_export_allocations.push(JobExportAllocation {
-                key: allocation_key,
-                network: producer_network,
-                workplace,
-                caller_generation: request.request.request_id,
-            });
-        }
+        self.job_export_allocations.upsert(
+            allocation_key,
+            producer_network,
+            workplace,
+            request.request.request_id,
+        );
 
         JobExportGrant {
             token: request.request.token,
@@ -803,17 +900,6 @@ impl RegionRuntime {
             slot_id: Some(workplace.0),
             salary,
         }
-    }
-
-    fn release_stale_job_export_allocations_for_caller(
-        &mut self,
-        caller_region: RegionId,
-        caller_generation: UiRequestId,
-    ) {
-        self.job_export_allocations.retain(|allocation| {
-            allocation.key.caller_region != caller_region
-                || allocation.caller_generation == caller_generation
-        });
     }
 
     fn apply_power_export_grant(&mut self, grant: PowerExportGrant) -> Vec<OutboundMessage> {
@@ -1234,6 +1320,98 @@ mod tick_state_tests {
         );
     }
 
+    #[test]
+    fn bridge_workplace_is_not_granted_twice_across_networks() {
+        // A single workplace adjacent to two disconnected road networks is one
+        // physical slot, yet it appears as spare on BOTH networks. CR1 deliberately
+        // keeps such networks in separate components, so two consumers in different
+        // components can each request this slot via a different network. A
+        // reservation taken via one network must block the other request, or the
+        // producer double-grants one slot (charging its tax twice while two remote
+        // citizens both "hold" the job). Regression guard for the CR3R network-scoped
+        // exclusion bug.
+        let mut runtime = RegionRuntime::new(bridge_producer_region(RegionId(2)));
+
+        // Both disconnected networks expose the single bridge slot.
+        let networks: Vec<RegionRoadNetworkId> = runtime
+            .state()
+            .availability_hints()
+            .into_iter()
+            .filter(|hint| hint.has_spare_jobs)
+            .map(|hint| hint.network)
+            .collect();
+        assert_eq!(
+            networks.len(),
+            2,
+            "bridge slots should be spare on both networks"
+        );
+        let bridge = runtime.state().spare_job_slots_on_network(networks[0]);
+        // The bridge building's slots are the same physical slots on both networks.
+        assert!(!bridge.is_empty());
+        assert!(
+            bridge.iter().all(|slot| *slot == bridge[0]),
+            "one bridge building"
+        );
+        assert_eq!(
+            runtime.state().spare_job_slots_on_network(networks[1]),
+            bridge,
+            "the same physical slots are spare on the second network"
+        );
+
+        // Caller A reserves every slot of the bridge building via the first network.
+        for token in 0..bridge.len() as u32 {
+            let grant = runtime.process_job_export_request(&job_export_request(
+                RegionId(10),
+                token,
+                networks[0],
+            ));
+            assert!(grant.granted, "caller A takes bridge slot {token}");
+            assert_eq!(grant.slot_id, Some(bridge[0].0));
+        }
+
+        // Caller B (a different component) requests a slot of the same building via
+        // the second network. Every slot is already reserved, so it must be denied:
+        // the network-scoped exclusion bug missed caller A's reservations here.
+        let grant_b =
+            runtime.process_job_export_request(&job_export_request(RegionId(11), 99, networks[1]));
+        assert!(
+            !grant_b.granted,
+            "all bridge slots are reserved on the other network; no double-grant"
+        );
+    }
+
+    fn job_export_request(
+        caller: RegionId,
+        token: u32,
+        producer_network: RegionRoadNetworkId,
+    ) -> JobExportAllocationRequest {
+        ExportAllocationRequest {
+            request: JobExportRequest {
+                request_id: UiRequestId(1),
+                caller_region: caller,
+                // The producer ignores the caller's own network; only the candidate
+                // (producer) network and the (caller, gen, token) key matter here.
+                caller_network: producer_network,
+                token,
+            },
+            candidates: vec![producer_network],
+            candidate_index: 0,
+        }
+    }
+
+    // A producer whose only workplace bridges two single-cell, disconnected road
+    // networks: roads at (0,0) [west] and (2,0) [east] never connect (the commercial
+    // between them is not a road), but the commercial is adjacent to both. The plant
+    // powers the west network, so the commercial is powered and offers its slots.
+    fn bridge_producer_region(region_id: RegionId) -> RegionState {
+        let mut region = RegionState::new(region_id, 3, 2);
+        assert!(region.build(0, 0, BuildingKind::Road).success);
+        assert!(region.build(2, 0, BuildingKind::Road).success);
+        assert!(region.build(1, 0, BuildingKind::Commercial).success);
+        assert!(region.build(0, 1, BuildingKind::PowerPlant).success);
+        region
+    }
+
     // Residential on a locally-powered border network whose only workplace is on a
     // disconnected network: jobs are counted (population grows) but unreachable, so
     // citizens stay locally jobless and seek a remote slot.
@@ -1249,5 +1427,75 @@ mod tick_state_tests {
         assert!(region.build(4, 2, BuildingKind::Road).success);
         assert!(region.build(5, 2, BuildingKind::Industrial).success);
         region
+    }
+}
+
+#[cfg(test)]
+mod export_allocations_tests {
+    //! Unit tests for the shared producer-side reservation bookkeeping (CR3R).
+
+    use super::*;
+
+    fn key(caller: u32, generation: u64, token: u32) -> ExportAllocationKey {
+        ExportAllocationKey {
+            caller_region: RegionId(caller),
+            request_id: UiRequestId(generation),
+            token,
+        }
+    }
+
+    fn net(region: u32, road_network: u32) -> RegionRoadNetworkId {
+        RegionRoadNetworkId {
+            region: RegionId(region),
+            road_network,
+        }
+    }
+
+    #[test]
+    fn upsert_inserts_then_refreshes_same_key() {
+        let mut allocations = ExportAllocations::<i32>::new();
+        allocations.upsert(key(1, 5, 0), net(2, 0), 3, UiRequestId(5));
+        // Same key updates in place rather than adding a second reservation.
+        allocations.upsert(key(1, 5, 0), net(2, 0), 7, UiRequestId(5));
+        assert_eq!(allocations.units().collect::<Vec<_>>(), vec![7]);
+    }
+
+    #[test]
+    fn reserved_units_excludes_own_key_and_other_networks() {
+        let mut allocations = ExportAllocations::<i32>::new();
+        allocations.upsert(key(1, 5, 0), net(2, 0), 3, UiRequestId(5));
+        allocations.upsert(key(1, 5, 1), net(2, 0), 4, UiRequestId(5));
+        allocations.upsert(key(1, 5, 2), net(2, 1), 9, UiRequestId(5));
+
+        // On network (2,0), excluding token-0's own key, only token-1's 4 remains;
+        // token-2's reservation on a different network is never counted.
+        let reserved = allocations.reserved_units_excluding(key(1, 5, 0), net(2, 0));
+        assert_eq!(reserved, vec![4]);
+    }
+
+    #[test]
+    fn reserved_units_excluding_key_spans_all_networks() {
+        let mut allocations = ExportAllocations::<i32>::new();
+        allocations.upsert(key(1, 5, 0), net(2, 0), 3, UiRequestId(5));
+        allocations.upsert(key(1, 5, 1), net(2, 0), 4, UiRequestId(5));
+        allocations.upsert(key(1, 5, 2), net(2, 1), 9, UiRequestId(5));
+
+        // Network-agnostic (jobs): excluding token-0's own key, every other
+        // reservation counts regardless of which network it was taken under, so a
+        // bridge slot reserved via one network still blocks the other.
+        let reserved = allocations.reserved_units_excluding_key(key(1, 5, 0));
+        assert_eq!(reserved, vec![4, 9]);
+    }
+
+    #[test]
+    fn release_drops_only_stale_generations_for_caller() {
+        let mut allocations = ExportAllocations::<i32>::new();
+        allocations.upsert(key(1, 5, 0), net(2, 0), 3, UiRequestId(5));
+        allocations.upsert(key(2, 5, 0), net(2, 0), 4, UiRequestId(5));
+
+        // Caller 1 starts generation 6: its generation-5 reservation is dropped,
+        // while caller 2's reservation is untouched.
+        allocations.release_stale_for_caller(RegionId(1), UiRequestId(6));
+        assert_eq!(allocations.units().collect::<Vec<_>>(), vec![4]);
     }
 }
