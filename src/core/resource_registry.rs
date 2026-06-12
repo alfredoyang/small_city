@@ -1,10 +1,12 @@
-//! Region-local resource registry for deterministic provider/consumer allocation.
+//! Region-local resource registry and cache for deterministic provider/consumer allocation.
 //!
 //! The first registry entry is power. It registers local power providers and
 //! consumers from a `World`, emits map-ordered requests, and resolves local
 //! grants without mutating the world. Systems apply those grants afterward.
 //! The jobs entry follows the same registry pattern while preserving its own
-//! proximity-based matching rule.
+//! proximity-based matching rule. `World` owns a skipped `ResourceRegistryCache`
+//! so systems can reuse these pure derived results until topology, citizens, or
+//! workplace capacity changes.
 //!
 //! Flow inside `power::run` (one tick, before downstream systems read `powered`):
 //!
@@ -12,7 +14,7 @@
 //! power::run(world)
 //!   |  (1) reset every PowerConsumer { powered = false, source = None }
 //!   v
-//! ResourceRegistry::for_power(world)       read-only snapshot, never mutates World
+//! world.cached_power_resolution()          read-only snapshot, never mutates World
 //!   |    networks[] : one POOLED entry per road network
 //!   |    requests[] : one per consumer, sorted in map order (y, then x)
 //!   v
@@ -39,7 +41,7 @@
 //!   buildings + citizens + powered flags + road_analysis
 //!        |
 //!        v
-//! ResourceRegistry::for_jobs(world)
+//! world.cached_job_resolution()
 //!        |
 //!        +-- Jobs entry
 //!        |     register effective workplace slots:
@@ -121,6 +123,8 @@ pub(crate) struct JobAssignment {
 /// Full result of resolving local jobs through the registry.
 pub(crate) struct JobResolution {
     pub assignments: Vec<JobAssignment>,
+    pub workplace_slots: Vec<Entity>,
+    pub remaining_workplaces: Vec<Entity>,
     pub total_jobs: i32,
     pub job_seekers: i32,
     pub unemployment: i32,
@@ -167,29 +171,96 @@ impl ResourceRegistry {
     pub(crate) fn resolve_local_jobs(&self) -> JobResolution {
         self.jobs.as_ref().expect("jobs registry entry").resolve()
     }
+}
 
-    pub(crate) fn local_job_slots(&self) -> &[Entity] {
-        &self
-            .jobs
-            .as_ref()
-            .expect("jobs registry entry")
-            .workplace_slots
+#[derive(Debug, Default)]
+/// Persistent derived registry cache owned by `World`.
+///
+/// # Why this cache exists
+///
+/// A `PowerResolution` / `JobResolution` is **not** raw data the ECS can hand
+/// back with a lookup -- it is the output of a non-trivial computation over many
+/// entities: power flood-fills road tiles into networks and allocates capacity;
+/// jobs gate effective workplaces on power and road connectivity, then assign
+/// each citizen to its nearest slot. The ECS stores the *inputs*; this result has
+/// to be *computed*.
+///
+/// That computation is read-heavy but change-light:
+///
+/// ```text
+///   reads per tick (many)                inputs change (rarely)
+///   --------------------                 ----------------------
+///   power::run, stats, economy,          build / bulldoze / replace / upgrade,
+///   discovery hints, regional spare,     business auto-upgrade, citizen
+///   per cross-region export request      growth/removal, imported power grant
+///        |                                      |
+///        v                                      v
+///   recompute every read?  -- wasteful    mark dirty here (invalidate_*)
+///        \____________ cache _____________/
+///                       |
+///   compute once on change, hand back the stored result until the next change.
+/// ```
+///
+/// So the win is **compute-on-change instead of compute-per-read** (a plain hourly
+/// tick changes none of the inputs, yet several systems still need the result).
+/// An earlier step in this plan that merely stopped recomputing jobs when only
+/// power was needed already cut a scenario suite ~7.3s -> ~1.9s; this extends that
+/// across ticks.
+///
+/// The cost is the invalidation surface: every mutation that changes a registry
+/// input must mark the matching entry dirty, and a *missed* invalidation is a
+/// silent determinism bug -- hence the parity-guard test asserting the cached
+/// result equals a fresh recompute. The cache stores only owned ECS ids and
+/// derived values, is `#[serde(skip)]` (never persisted), and is rebuilt lazily
+/// from authoritative state on the next read after `invalidate_*`.
+pub(crate) struct ResourceRegistryCache {
+    power: Option<PowerResolution>,
+    jobs: Option<JobResolution>,
+    power_dirty: bool,
+    jobs_dirty: bool,
+    #[cfg(test)]
+    power_recomputes: usize,
+    #[cfg(test)]
+    jobs_recomputes: usize,
+}
+
+impl ResourceRegistryCache {
+    pub(crate) fn invalidate_all(&mut self) {
+        self.power_dirty = true;
+        self.jobs_dirty = true;
     }
 
-    /// Workplace slot entities left unassigned after local job resolution.
-    ///
-    /// These are the spare slots a region can export to remote workers. Entities
-    /// repeat once per still-open slot in a multi-slot building.
-    pub(crate) fn remaining_job_slots(&self) -> &[Entity] {
-        &self
-            .jobs
-            .as_ref()
-            .expect("jobs registry entry")
-            .remaining_workplaces
+    pub(crate) fn invalidate_jobs(&mut self) {
+        self.jobs_dirty = true;
     }
 
-    pub(crate) fn local_job_counts(world: &World) -> JobCounts {
-        JobsRegistry::counts_from_world(world)
+    pub(crate) fn power_resolution(&mut self, world: &World) -> PowerResolution {
+        if self.power_dirty || self.power.is_none() {
+            self.power = Some(ResourceRegistry::for_power(world).resolve_local_power());
+            self.power_dirty = false;
+            #[cfg(test)]
+            {
+                self.power_recomputes += 1;
+            }
+        }
+        self.power.as_ref().expect("power registry cache").clone()
+    }
+
+    pub(crate) fn job_resolution(&mut self, world: &World) -> JobResolution {
+        if self.jobs_dirty || self.jobs.is_none() {
+            self.jobs = Some(ResourceRegistry::for_jobs(world).resolve_local_jobs());
+            self.jobs_dirty = false;
+            #[cfg(test)]
+            {
+                self.jobs_recomputes += 1;
+            }
+        }
+        self.jobs.as_ref().expect("jobs registry cache").clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recompute_counts(&self) -> (usize, usize) {
+        (self.power_recomputes, self.jobs_recomputes)
     }
 }
 
@@ -325,21 +396,13 @@ impl JobsRegistry {
         }
     }
 
-    fn counts_from_world(world: &World) -> JobCounts {
-        let total_jobs = workplace_slot_count(world);
-        let job_seekers = world.citizens.len() as i32;
-        JobCounts {
-            total_jobs,
-            job_seekers,
-            unemployment: (job_seekers - total_jobs).max(0),
-        }
-    }
-
     fn resolve(&self) -> JobResolution {
         let total_jobs = self.workplace_slots.len() as i32;
         let job_seekers = self.requests.len() as i32;
         JobResolution {
             assignments: self.assignments.clone(),
+            workplace_slots: self.workplace_slots.clone(),
+            remaining_workplaces: self.remaining_workplaces.clone(),
             total_jobs,
             job_seekers,
             unemployment: (job_seekers - total_jobs).max(0),
@@ -359,13 +422,6 @@ fn workplace_slots_from_world(world: &World) -> Vec<Entity> {
     }
 
     workplace_slots
-}
-
-fn workplace_slot_count(world: &World) -> i32 {
-    effective_workplace_entities(world)
-        .into_iter()
-        .map(|(_entity, kind, level)| kind.jobs_at_level(level).max(0))
-        .sum()
 }
 
 fn effective_workplace_entities(world: &World) -> Vec<(Entity, BuildingKind, u8)> {
@@ -519,7 +575,12 @@ fn grant_request(request: &PowerRequest, networks: &mut [PowerNetworkPool]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::systems::{citizens, placement, road_network_analysis};
+    use crate::core::components::{BuildingData, BusinessFinance, PowerSource};
+    use crate::core::regions::RegionId;
+    use crate::core::simulation::tick_world;
+    use crate::core::systems::{
+        business_growth, citizens, placement, power, road_network_analysis,
+    };
 
     #[test]
     fn jobs_entry_reports_totals_unemployment_and_remaining_slots() {
@@ -545,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn counts_only_jobs_entry_skips_assignment_resolution() {
+    fn cached_job_counts_report_totals_without_mutating_assignments() {
         let mut world = World::new(5, 3);
         placement::place_building(&mut world, 0, 0, BuildingKind::Residential);
         placement::place_building(&mut world, 1, 0, BuildingKind::Commercial);
@@ -558,7 +619,7 @@ mod tests {
         let home = world.grid.get(0, 0).expect("home");
         citizens::spawn_for_home(&mut world, home, 7);
 
-        let counts = ResourceRegistry::local_job_counts(&world);
+        let counts = world.cached_job_counts();
 
         assert_eq!(counts.total_jobs, 5);
         assert_eq!(counts.job_seekers, 7);
@@ -601,6 +662,147 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cached_power_resolution_reuses_until_build_invalidation() {
+        let mut world = World::new(5, 3);
+        placement::place_building(&mut world, 0, 0, BuildingKind::PowerPlant);
+        placement::place_building(&mut world, 0, 1, BuildingKind::Road);
+        placement::place_building(&mut world, 1, 1, BuildingKind::Road);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Residential);
+
+        assert_eq!(world.cached_power_resolution().total_capacity, 10);
+        assert_eq!(world.cached_power_resolution().total_capacity, 10);
+        assert_eq!(world.registry_cache_recompute_counts().0, 1);
+
+        placement::place_building(&mut world, 4, 0, BuildingKind::PowerPlant);
+        placement::place_building(&mut world, 4, 1, BuildingKind::Road);
+
+        assert_eq!(world.cached_power_resolution().total_capacity, 20);
+        assert_eq!(world.registry_cache_recompute_counts().0, 2);
+    }
+
+    #[test]
+    fn cached_job_resolution_reuses_until_citizen_invalidation() {
+        let mut world = World::new(5, 3);
+        placement::place_building(&mut world, 0, 0, BuildingKind::Residential);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Commercial);
+        for x in 0..=1 {
+            placement::place_building(&mut world, x, 1, BuildingKind::Road);
+        }
+        power_workplace(&mut world, 1, 0);
+        road_network_analysis::run(&mut world);
+
+        assert_eq!(world.cached_job_resolution().job_seekers, 0);
+        assert_eq!(world.cached_job_resolution().job_seekers, 0);
+        assert_eq!(world.registry_cache_recompute_counts().1, 1);
+
+        let home = world.grid.get(0, 0).expect("home");
+        citizens::spawn_for_home(&mut world, home, 1);
+
+        assert_eq!(world.cached_job_resolution().job_seekers, 1);
+        assert_eq!(world.registry_cache_recompute_counts().1, 2);
+    }
+
+    #[test]
+    fn cached_registry_matches_forced_recompute_script() {
+        let mut cached = parity_world();
+        let mut forced = parity_world();
+        assert_worlds_match("initial build", &cached, &forced);
+
+        for _ in 0..24 {
+            assert!(tick_world(&mut cached).success);
+            forced.invalidate_resource_registry();
+            assert!(tick_world(&mut forced).success);
+        }
+        assert_worlds_match("after population growth", &cached, &forced);
+        assert!(cached.stats.population > 0);
+
+        let cached_commercial = cached.grid.get(2, 0).expect("cached commercial");
+        let forced_commercial = forced.grid.get(2, 0).expect("forced commercial");
+        set_business_finance(&mut cached, cached_commercial, 10, 3);
+        set_business_finance(&mut forced, forced_commercial, 10, 3);
+        let cached_upgrade = business_growth::run(&mut cached);
+        forced.invalidate_resource_registry();
+        let forced_upgrade = business_growth::run(&mut forced);
+        assert_eq!(cached_upgrade, forced_upgrade);
+        assert_worlds_match("after business auto-upgrade", &cached, &forced);
+
+        cached = roundtrip_world(cached);
+        forced = roundtrip_world(forced);
+        assert_worlds_match("after save/load", &cached, &forced);
+
+        for _ in 0..24 {
+            assert!(tick_world(&mut cached).success);
+            forced.invalidate_resource_registry();
+            assert!(tick_world(&mut forced).success);
+        }
+        assert_worlds_match("after post-load ticks", &cached, &forced);
+    }
+
+    #[test]
+    fn cached_jobs_rebuild_when_imported_power_is_lost() {
+        let mut world = World::new(3, 2);
+        placement::place_building(&mut world, 0, 0, BuildingKind::Commercial);
+        placement::place_building(&mut world, 0, 1, BuildingKind::Road);
+        let commercial = world.grid.get(0, 0).expect("commercial");
+        let consumer = world
+            .power_consumers
+            .get_mut(&commercial)
+            .expect("power consumer");
+        consumer.powered = true;
+        consumer.source = Some(PowerSource::Imported {
+            source_region: RegionId(2),
+        });
+        road_network_analysis::run(&mut world);
+
+        assert_eq!(world.cached_job_resolution().total_jobs, 2);
+        power::run(&mut world);
+
+        assert_eq!(world.cached_job_resolution().total_jobs, 0);
+        assert_cached_matches_forced(&world);
+    }
+
+    #[test]
+    fn cached_jobs_rebuild_after_business_auto_upgrade() {
+        let mut world = World::new(4, 3);
+        placement::place_building(&mut world, 0, 0, BuildingKind::Residential);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Commercial);
+        for x in 0..=1 {
+            placement::place_building(&mut world, x, 1, BuildingKind::Road);
+        }
+        let residential = world.grid.get(0, 0).expect("residential");
+        let commercial = world.grid.get(1, 0).expect("commercial");
+        citizens::spawn_for_home(&mut world, residential, 1);
+        power_workplace(&mut world, 1, 0);
+        road_network_analysis::run(&mut world);
+        set_business_finance(&mut world, commercial, 10, 3);
+
+        assert_eq!(world.cached_job_resolution().total_jobs, 2);
+        let summary = business_growth::run(&mut world);
+
+        assert_eq!(summary.commercial_upgrades, 1);
+        assert_eq!(world.cached_job_resolution().total_jobs, 3);
+        assert_cached_matches_forced(&world);
+    }
+
+    #[test]
+    fn cached_registry_rebuilds_after_save_load() {
+        let mut world = World::new(4, 3);
+        placement::place_building(&mut world, 0, 0, BuildingKind::PowerPlant);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Commercial);
+        for x in 0..=1 {
+            placement::place_building(&mut world, x, 1, BuildingKind::Road);
+        }
+        road_network_analysis::run(&mut world);
+        power::run(&mut world);
+        assert_cached_matches_forced(&world);
+
+        let encoded = serde_json::to_vec(&world).expect("serialize world");
+        let loaded: World = serde_json::from_slice(&encoded).expect("deserialize world");
+
+        assert_cached_matches_forced(&loaded);
+    }
+
     fn power_workplace(world: &mut World, x: usize, y: usize) {
         let entity = world.grid.get(x, y).expect("workplace");
         world
@@ -608,5 +810,93 @@ mod tests {
             .get_mut(&entity)
             .expect("power consumer")
             .powered = true;
+    }
+
+    fn assert_cached_matches_forced(world: &World) {
+        let cached_power = world.cached_power_resolution();
+        let forced_power = ResourceRegistry::for_power(world).resolve_local_power();
+        assert_eq!(cached_power, forced_power);
+
+        let cached_jobs = world.cached_job_resolution();
+        let forced_jobs = ResourceRegistry::for_jobs(world).resolve_local_jobs();
+        assert_eq!(cached_jobs, forced_jobs);
+    }
+
+    fn set_business_finance(
+        world: &mut World,
+        entity: Entity,
+        business_cash: i32,
+        last_period_profit: i32,
+    ) {
+        let building = world.buildings.get_mut(&entity).expect("business building");
+        match &mut building.data {
+            BuildingData::Commercial { business, .. } | BuildingData::Industrial { business } => {
+                *business = BusinessFinance {
+                    business_cash,
+                    last_period_profit,
+                    days_profitable: 1,
+                    lifetime_profit: business_cash,
+                };
+            }
+            BuildingData::None => panic!("not a business building"),
+        }
+    }
+
+    fn parity_world() -> World {
+        let mut world = World::new(6, 3);
+        placement::place_building(&mut world, 0, 0, BuildingKind::PowerPlant);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Residential);
+        placement::place_building(&mut world, 2, 0, BuildingKind::Commercial);
+        placement::place_building(&mut world, 4, 0, BuildingKind::Industrial);
+        for x in 0..=4 {
+            placement::place_building(&mut world, x, 1, BuildingKind::Road);
+        }
+        road_network_analysis::run(&mut world);
+        power::run(&mut world);
+        world
+    }
+
+    fn roundtrip_world(world: World) -> World {
+        let encoded = serde_json::to_vec(&world).expect("serialize world");
+        let mut loaded: World = serde_json::from_slice(&encoded).expect("deserialize world");
+        loaded.rebuild_entity_records();
+        road_network_analysis::run(&mut loaded);
+        power::run(&mut loaded);
+        loaded
+    }
+
+    fn assert_worlds_match(label: &str, cached: &World, forced: &World) {
+        assert_cached_matches_forced(cached);
+        forced.invalidate_resource_registry();
+        assert_cached_matches_forced(forced);
+
+        assert_eq!(cached.stats, forced.stats, "{label}: stats diverged");
+        assert_eq!(
+            powered_state(cached),
+            powered_state(forced),
+            "{label}: powered flags diverged"
+        );
+        assert_eq!(
+            cached.cached_job_resolution().assignments,
+            forced.cached_job_resolution().assignments,
+            "{label}: job assignments diverged"
+        );
+
+        let stats_before = cached.stats.clone();
+        assert_cached_matches_forced(cached);
+        assert_eq!(
+            cached.stats, stats_before,
+            "{label}: registry reads mutated stats"
+        );
+    }
+
+    fn powered_state(world: &World) -> Vec<(Entity, bool, Option<PowerSource>)> {
+        let mut powered = world
+            .power_consumers
+            .iter()
+            .map(|(entity, consumer)| (*entity, consumer.powered, consumer.source))
+            .collect::<Vec<_>>();
+        powered.sort_by_key(|(entity, _powered, _source)| entity.0);
+        powered
     }
 }

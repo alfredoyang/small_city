@@ -27,7 +27,6 @@
 
 use crate::core::components::{PowerSource, RemoteWorkplace};
 use crate::core::entity::Entity;
-use crate::core::resource_registry::ResourceRegistry;
 use crate::core::simulation::{
     TickJobPhase, TickPowerPhase, begin_tick_power_phase, continue_to_job_phase,
     finish_tick_after_job_phase, refresh_derived_state_for_world, tick_world,
@@ -53,12 +52,13 @@ pub mod worker;
 /// entity ID and should never identify another region's local `World` storage.
 pub struct RegionId(pub u32);
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Owned region-level spare capacity summary for cross-region planning.
 ///
 /// This intentionally contains only aggregate counts. It does not expose ECS
 /// entities, component references, or handles to this region's private `World`.
-pub struct RegionalSpareCapacity {
+pub(crate) struct RegionalSpareCapacity {
     pub power_capacity: i32,
     pub job_slots: i32,
 }
@@ -309,11 +309,12 @@ impl RegionState {
             .count()
     }
 
+    #[cfg(test)]
     /// Owned `(source region, slot id)` pairs for citizens working remotely.
     ///
-    /// This is owned summary data: the slot id is an opaque `u32`, never a remote
-    /// ECS entity. Useful for CR4 visibility and for verifying cross-region jobs.
-    pub fn imported_job_slots(&self) -> Vec<(RegionId, u32)> {
+    /// This test-only summary verifies remote jobs store owned opaque ids, never a
+    /// remote ECS entity. UI should use facade snapshots instead.
+    pub(crate) fn imported_job_slots(&self) -> Vec<(RegionId, u32)> {
         let mut slots = self
             .world
             .citizens
@@ -358,9 +359,10 @@ impl RegionState {
     /// Power spare capacity is the remaining pooled capacity after local power
     /// grants. Job spare capacity is the unused effective workplace slots after
     /// local citizens are accounted for.
-    pub fn regional_spare_capacity(&self) -> RegionalSpareCapacity {
-        let power = ResourceRegistry::for_power(&self.world).resolve_local_power();
-        let jobs = ResourceRegistry::for_jobs(&self.world).resolve_local_jobs();
+    #[cfg(test)]
+    pub(crate) fn regional_spare_capacity(&self) -> RegionalSpareCapacity {
+        let power = self.world.cached_power_resolution();
+        let jobs = self.world.cached_job_resolution();
 
         RegionalSpareCapacity {
             power_capacity: power.remaining_capacity,
@@ -373,8 +375,8 @@ impl RegionState {
         // `network_border_links` and the power registry both use deterministic
         // road-network discovery over this same world, so their `road_network`
         // ids are stable summary keys for one discovery snapshot.
-        let power = ResourceRegistry::for_power(&self.world).resolve_local_power();
-        let jobs = ResourceRegistry::for_jobs(&self.world).resolve_local_jobs();
+        let power = self.world.cached_power_resolution();
+        let jobs = self.world.cached_job_resolution();
         let has_spare_jobs = jobs.remaining_slots > 0;
 
         let mut hints = power
@@ -398,11 +400,10 @@ impl RegionState {
             return 0;
         }
 
-        // TODO(CR2 perf): producer export requests re-resolve local power for every
-        // request. Cache per-network remaining capacity for one scheduling pass
-        // once cross-region exports move beyond the first implementation.
-        ResourceRegistry::for_power(&self.world)
-            .resolve_local_power()
+        // Reads the persistent registry cache; producer allocation remains
+        // authoritative in the runtime ledger on top of this local spare summary.
+        self.world
+            .cached_power_resolution()
             .network_capacities
             .into_iter()
             .find(|capacity| capacity.road_network == network.road_network)
@@ -456,6 +457,11 @@ impl RegionState {
         demand: PendingPowerDemand,
         grant: PowerExportGrant,
     ) {
+        // Power grants, including denials, complete the cross-region power phase.
+        // Effective workplaces depend on final powered state, so job registry
+        // readers must re-check after this phase instead of trusting a cache built
+        // before imported power resolved or was lost.
+        self.world.invalidate_jobs_registry();
         if !grant.granted {
             return;
         }
@@ -526,10 +532,12 @@ impl RegionState {
             return Vec::new();
         }
 
-        // TODO(CR3 perf): this rebuilds the jobs registry (the full local
-        // assignment) on every export request, and `workplace_salary` re-resolves
-        // per grant -- exactly the per-tick cost the R2 split aimed to avoid. Cache
-        // spare slots per scheduling pass, mirroring TODO(CR2 perf) for power.
+        // Reads the persistent job-registry cache. Export allocation remains
+        // runtime-owned, so this is only the local spare-slot candidate set.
+        // TODO(R5 perf): `cached_job_resolution()` clones the full resolution
+        // (assignments + all slots) even though export allocation only needs
+        // `remaining_workplaces`. Add a narrower cache reader or closure-based
+        // accessor if export-request volume grows.
         let Some(roads) = road_connectivity::discover_road_networks(&self.world)
             .into_iter()
             .find(|candidate| candidate.id == network.road_network)
@@ -538,8 +546,9 @@ impl RegionState {
             return Vec::new();
         };
 
-        ResourceRegistry::for_jobs(&self.world)
-            .remaining_job_slots()
+        self.world
+            .cached_job_resolution()
+            .remaining_workplaces
             .iter()
             .copied()
             .filter(|slot| {
@@ -783,6 +792,10 @@ fn border_links_for_cell(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::core::systems::citizens;
+    use crate::interface::input::BuildingKind;
+
     #[test]
     fn regional_state_imports_shared_simulation_helpers_not_game_facade() {
         let source = std::fs::read_to_string("src/core/regions/mod.rs").expect("region source");
@@ -790,5 +803,85 @@ mod tests {
 
         assert!(!source.contains(&forbidden));
         assert!(source.contains("crate::core::simulation"));
+    }
+
+    #[test]
+    fn imported_job_slots_are_owned_region_and_slot_summaries() {
+        let mut region = RegionState::new(RegionId(1), 2, 1);
+        assert!(region.build(0, 0, BuildingKind::Residential).success);
+        let home = region.world.grid.get(0, 0).expect("home");
+        citizens::spawn_for_home(&mut region.world, home, 1);
+        let citizen = *region.world.citizens.keys().next().expect("citizen");
+
+        region.apply_job_export_grant(
+            PendingJobDemand {
+                token: 7,
+                citizen,
+                caller_network: RegionRoadNetworkId {
+                    region: RegionId(1),
+                    road_network: 0,
+                },
+            },
+            JobExportGrant {
+                token: 7,
+                granted: true,
+                source_region: Some(RegionId(2)),
+                slot_id: Some(42),
+                salary: 4,
+            },
+        );
+
+        assert_eq!(region.imported_job_slots(), vec![(RegionId(2), 42)]);
+    }
+
+    #[test]
+    fn regional_spare_capacity_matches_local_registry_remaining_capacity() {
+        let mut region = RegionState::new(RegionId(5), 5, 3);
+        assert!(region.build(0, 0, BuildingKind::PowerPlant).success);
+        assert!(region.build(0, 1, BuildingKind::Road).success);
+        assert!(region.build(1, 1, BuildingKind::Road).success);
+        assert!(region.build(2, 1, BuildingKind::Road).success);
+        assert!(region.build(1, 0, BuildingKind::Commercial).success);
+        assert!(region.build(2, 0, BuildingKind::Industrial).success);
+
+        assert_eq!(
+            region.regional_spare_capacity(),
+            RegionalSpareCapacity {
+                power_capacity: 5,
+                job_slots: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn regional_spare_capacity_keeps_unreachable_jobs_spare() {
+        let mut region = RegionState::new(RegionId(7), 6, 3);
+        assert!(region.build(0, 0, BuildingKind::PowerPlant).success);
+        assert!(region.build(0, 1, BuildingKind::Road).success);
+        assert!(region.build(1, 1, BuildingKind::Road).success);
+        assert!(region.build(1, 0, BuildingKind::Residential).success);
+
+        assert!(region.build(5, 0, BuildingKind::PowerPlant).success);
+        assert!(region.build(5, 1, BuildingKind::Road).success);
+        assert!(region.build(4, 1, BuildingKind::Road).success);
+        assert!(region.build(4, 0, BuildingKind::Commercial).success);
+
+        for _ in 0..24 {
+            assert!(region.tick_local().success);
+        }
+
+        assert_eq!(region.view().status.population, 1);
+        assert_eq!(region.regional_spare_capacity().job_slots, 2);
+    }
+
+    #[test]
+    fn regional_spare_capacity_is_owned_summary_without_ecs_identity() {
+        let region = RegionState::new(RegionId(6), 3, 3);
+        let summary = region.regional_spare_capacity();
+
+        let copied = summary;
+        assert_eq!(summary, copied);
+        assert_eq!(summary.power_capacity, 0);
+        assert_eq!(summary.job_slots, 0);
     }
 }

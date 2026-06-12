@@ -151,10 +151,27 @@ Four things differ from power and are **not** a blind rename:
 
 ---
 
-## 5. Runtime and scheduling
+## 5. Ownership, runtime, and scheduling
 
-How the above moves between regions on the actor-style worker.
+The ownership chain, bottom to top, is `World → RegionState → RegionRuntime →
+RegionWorker` (one OS thread). A `World` is only ever touched by the single thread
+that owns its region; it is moved between threads, never shared (its `RefCell`
+registry cache is `Send`, not `Sync`).
 
+- **`World`** — one self-contained city's **private ECS instance**: entities,
+  component maps, grid, `CityResources`/`CityStats`, and the derived
+  `ResourceRegistryCache`. It is the substrate every `systems/` function operates on
+  (`fn run(world: &mut World)`) and the unit that is serialized on save. It is
+  **region-agnostic**: it holds *one region's* data but knows nothing about regions,
+  neighbors, or threads. There is one `World` per region; the name is the ECS
+  convention for "one simulation instance," not "the whole game" (the multi-region
+  container is `RegionalGame`). A single-city game is just a one-region `RegionalGame`.
+- **`RegionState`** — the **region coordinator** that owns one `World` plus its
+  `RegionId` (its only two fields). It adds the region-scoped operations on top of
+  the bare ECS: cross-region export/discovery (`pending_power_demands`,
+  `spare_job_slots_on_network`, `availability_hints`, …) and tick-phase
+  orchestration (`begin/continue/finish` phases). It is the behavioral seam between
+  "the simulation" (`World`) and "the region that runs one and talks to others."
 - **`RegionRuntime`** — actor shell owning one `RegionState`, its inbox, and its
   producer-side `power_export_allocations` ledger.
 - **`RegionWorker`** — single-threaded scheduler owning several runtimes; routes

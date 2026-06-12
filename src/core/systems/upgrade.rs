@@ -87,4 +87,11 @@ pub(crate) fn apply_upgrade_effect(
         }
         BuildingKind::Road | BuildingKind::Commercial => {}
     }
+    match kind {
+        BuildingKind::PowerPlant => world.invalidate_resource_registry(),
+        BuildingKind::Residential | BuildingKind::Commercial | BuildingKind::Industrial => {
+            world.invalidate_jobs_registry();
+        }
+        BuildingKind::Road | BuildingKind::Park => {}
+    }
 }

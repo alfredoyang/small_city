@@ -7,6 +7,7 @@ pub(crate) fn remove_entity(world: &mut World, entity: Entity, x: usize, y: usiz
     world.grid.clear(x, y);
     let Some(record) = world.entities.remove(&entity) else {
         remove_from_all_component_maps(world, entity);
+        world.invalidate_resource_registry();
         return;
     };
 
@@ -35,6 +36,7 @@ pub(crate) fn remove_entity(world: &mut World, entity: Entity, x: usize, y: usiz
         world.happiness_effects.remove(&entity);
     }
     remove_citizens_for_home(world, entity);
+    world.invalidate_resource_registry();
 }
 
 fn remove_from_all_component_maps(world: &mut World, entity: Entity) {

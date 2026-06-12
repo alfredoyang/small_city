@@ -1,6 +1,5 @@
 //! City statistics refresh system for population, effective jobs, and unemployment.
 
-use crate::core::resource_registry::ResourceRegistry;
 use crate::core::systems::citizens;
 use crate::core::world::World;
 
@@ -11,7 +10,7 @@ pub(crate) fn run(world: &mut World) {
 pub(crate) fn refresh_population_and_jobs(world: &mut World) {
     citizens::sync_population_from_citizens(world);
     let population = citizens::citizen_count(world);
-    let jobs = ResourceRegistry::local_job_counts(world);
+    let jobs = world.cached_job_counts();
 
     world.stats.population = population;
     world.stats.jobs = jobs.total_jobs;

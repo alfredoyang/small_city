@@ -8,7 +8,7 @@
 
 use crate::core::components::{BuildingData, BusinessFinance, Citizen};
 use crate::core::entity::Entity;
-use crate::core::resource_registry::{JobAssignment, ResourceRegistry};
+use crate::core::resource_registry::JobAssignment;
 use crate::core::systems::{road_connectivity, road_network_analysis};
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;
@@ -62,7 +62,7 @@ pub(crate) fn assign_local_jobs(world: &mut World) {
     for citizen in world.citizens.values_mut() {
         citizen.remote_workplace = None;
     }
-    let job_resolution = ResourceRegistry::for_jobs(world).resolve_local_jobs();
+    let job_resolution = world.cached_job_resolution();
     apply_workplace_assignments(world, &job_resolution.assignments);
 }
 
@@ -78,8 +78,8 @@ pub(crate) fn run(world: &mut World, exported_job_slots: &[Entity]) -> EconomyBr
     // road-connected buildings. This keeps employment and shopping deterministic
     // after build, bulldoze, replace, upgrade, save, or load.
     ensure_business_building_data(world);
-    let registry = ResourceRegistry::for_jobs(world);
-    let index = EconomyIndex::from_world(world, &registry);
+    let job_resolution = world.cached_job_resolution();
+    let index = EconomyIndex::from_world(world, &job_resolution.workplace_slots);
     reset_business_periods(world, &index.business_entities);
 
     // Industry flow:
@@ -254,10 +254,10 @@ struct EconomyIndex {
 }
 
 impl EconomyIndex {
-    fn from_world(world: &World, registry: &ResourceRegistry) -> Self {
+    fn from_world(world: &World, workplace_slots: &[Entity]) -> Self {
         let mut index = Self::default();
         let mut shopping_commercials = Vec::new();
-        index.workplace_slots = registry.local_job_slots().to_vec();
+        index.workplace_slots = workplace_slots.to_vec();
 
         for (entity, building) in &world.buildings {
             index.maintenance_cost += maintenance_for_building(building.kind, building.level);
@@ -761,7 +761,6 @@ pub(crate) fn maintenance_for_building(kind: BuildingKind, level: u8) -> i32 {
 mod tests {
     use super::{EconomyIndex, run};
     use crate::core::entity::Entity;
-    use crate::core::resource_registry::ResourceRegistry;
     use crate::core::systems::{citizens, placement, road_network_analysis};
     use crate::core::world::World;
     use crate::interface::input::BuildingKind;
@@ -779,8 +778,8 @@ mod tests {
         world.power_consumers.get_mut(&commercial).unwrap().powered = true;
         world.power_consumers.get_mut(&industrial).unwrap().powered = true;
 
-        let registry = ResourceRegistry::for_jobs(&world);
-        let index = EconomyIndex::from_world(&world, &registry);
+        let job_resolution = world.cached_job_resolution();
+        let index = EconomyIndex::from_world(&world, &job_resolution.workplace_slots);
 
         assert_eq!(index.business_entities, vec![commercial, industrial]);
         assert_eq!(index.productive_commercials, vec![commercial]);

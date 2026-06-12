@@ -648,17 +648,6 @@ fn cross_region_job_export_employs_jobless_citizen() {
         imported >= 1,
         "a jobless citizen should import a remote job"
     );
-    // The recorded reference is owned data pointing at the producer region.
-    let slots = worker
-        .region(RegionId(60))
-        .expect("consumer")
-        .state()
-        .imported_job_slots();
-    assert!(
-        slots
-            .iter()
-            .all(|(region, _slot_id)| *region == RegionId(61))
-    );
 }
 
 #[test]

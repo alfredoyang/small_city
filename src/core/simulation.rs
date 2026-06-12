@@ -122,6 +122,9 @@ pub(crate) fn finish_tick_after_job_phase(
     } else {
         Vec::new()
     };
+    if !business_upgrades.is_empty() {
+        world.invalidate_jobs_registry();
+    }
     stats::refresh_population_and_jobs(world);
     pollution::run(world);
     happiness::run(world);

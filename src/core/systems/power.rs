@@ -3,18 +3,23 @@
 use std::collections::HashSet;
 
 use crate::core::entity::Entity;
-use crate::core::resource_registry::ResourceRegistry;
 use crate::core::resources::PowerStats;
 use crate::core::systems::road_connectivity;
 use crate::core::world::World;
 
 pub(crate) fn run(world: &mut World) {
+    let before = world
+        .power_consumers
+        .iter()
+        .map(|(entity, consumer)| (*entity, consumer.powered, consumer.source))
+        .collect::<Vec<_>>();
+
     for consumer in world.power_consumers.values_mut() {
         consumer.powered = false;
         consumer.source = None;
     }
 
-    let resolution = ResourceRegistry::for_power(world).resolve_local_power();
+    let resolution = world.cached_power_resolution();
     for grant in &resolution.grants {
         if let Some(consumer) = world.power_consumers.get_mut(&grant.consumer) {
             if consumer.demand != grant.amount {
@@ -31,6 +36,16 @@ pub(crate) fn run(world: &mut World) {
         total_power_supplied: resolution.total_supplied,
         total_power_shortage: (resolution.total_demand - resolution.total_supplied).max(0),
     };
+
+    let power_state_changed = before.iter().any(|(entity, powered, source)| {
+        world
+            .power_consumers
+            .get(entity)
+            .is_some_and(|consumer| consumer.powered != *powered || consumer.source != *source)
+    });
+    if power_state_changed {
+        world.invalidate_jobs_registry();
+    }
 }
 
 pub(crate) fn is_powered_road(world: &World, x: usize, y: usize) -> bool {

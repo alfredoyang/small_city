@@ -1,4 +1,15 @@
 //! Private ECS world storage for entities, component maps, grid, resources, and derived state.
+//!
+//! A `World` is **one self-contained city's ECS instance** — the substrate every
+//! `systems/` function operates on (`fn run(world: &mut World)`) and the unit that
+//! is serialized on save. It is deliberately **region-agnostic**: it holds one
+//! region's data but knows nothing about regions, neighbors, threads, or
+//! cross-region sharing. Region identity (`RegionId`) and all cross-region
+//! coordination live one layer up in `RegionState`, which owns a `World`. So the
+//! name follows the ECS convention ("one simulation instance"), not "the whole
+//! game" — there is one `World` per region, and a single-city game is simply a
+//! one-region `RegionalGame`. Owned by exactly one worker thread at a time; moved
+//! between threads, never shared.
 
 use std::collections::HashMap;
 
@@ -10,9 +21,13 @@ use crate::core::components::{
 };
 use crate::core::entity::Entity;
 use crate::core::grid::Grid;
+use crate::core::resource_registry::{
+    JobCounts, JobResolution, PowerResolution, ResourceRegistryCache,
+};
 use crate::core::resources::{CityResources, CityStats, LocalEffectsMap};
 use crate::core::systems::road_network_analysis::RoadNetworkAnalysis;
 use crate::interface::input::BuildingKind;
+use std::cell::RefCell;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct World {
@@ -27,6 +42,8 @@ pub(crate) struct World {
     pub local_effects: LocalEffectsMap,
     #[serde(skip, default)]
     pub road_analysis: RoadNetworkAnalysis,
+    #[serde(skip, default)]
+    registry_cache: RefCell<ResourceRegistryCache>,
     pub positions: HashMap<Entity, Position>,
     pub buildings: HashMap<Entity, Building>,
     pub populations: HashMap<Entity, Population>,
@@ -61,6 +78,7 @@ impl World {
             stats: CityStats::default(),
             local_effects: LocalEffectsMap::new(width, height),
             road_analysis: RoadNetworkAnalysis::default(),
+            registry_cache: RefCell::default(),
             positions: HashMap::new(),
             buildings: HashMap::new(),
             populations: HashMap::new(),
@@ -82,31 +100,37 @@ impl World {
     pub(crate) fn attach_position(&mut self, entity: Entity, position: Position) {
         self.positions.insert(entity, position);
         self.record_mut(entity).has_position = true;
+        self.invalidate_resource_registry();
     }
 
     pub(crate) fn attach_building(&mut self, entity: Entity, building: Building) {
         self.buildings.insert(entity, building);
         self.record_mut(entity).kind = Some(building.kind);
+        self.invalidate_resource_registry();
     }
 
     pub(crate) fn attach_population(&mut self, entity: Entity, population: Population) {
         self.populations.insert(entity, population);
         self.record_mut(entity).has_population = true;
+        self.invalidate_jobs_registry();
     }
 
     pub(crate) fn attach_citizen(&mut self, entity: Entity, citizen: Citizen) {
         self.citizens.insert(entity, citizen);
         self.record_mut(entity).has_citizen = true;
+        self.invalidate_jobs_registry();
     }
 
     pub(crate) fn attach_power_provider(&mut self, entity: Entity, provider: PowerProvider) {
         self.power_providers.insert(entity, provider);
         self.record_mut(entity).has_power_provider = true;
+        self.invalidate_resource_registry();
     }
 
     pub(crate) fn attach_power_consumer(&mut self, entity: Entity, consumer: PowerConsumer) {
         self.power_consumers.insert(entity, consumer);
         self.record_mut(entity).has_power_consumer = true;
+        self.invalidate_resource_registry();
     }
 
     pub(crate) fn attach_pollution_source(&mut self, entity: Entity, source: PollutionSource) {
@@ -145,6 +169,42 @@ impl World {
         for entity in self.happiness_effects.keys().copied().collect::<Vec<_>>() {
             self.record_mut(entity).has_happiness_effect = true;
         }
+        self.invalidate_resource_registry();
+    }
+
+    /// Mark all registry entries dirty after topology/provider/consumer changes.
+    pub(crate) fn invalidate_resource_registry(&self) {
+        self.registry_cache.borrow_mut().invalidate_all();
+    }
+
+    /// Mark only job entries dirty after citizen or workplace-effect changes.
+    pub(crate) fn invalidate_jobs_registry(&self) {
+        self.registry_cache.borrow_mut().invalidate_jobs();
+    }
+
+    /// Return cached local power resolution, recomputing lazily when dirty.
+    pub(crate) fn cached_power_resolution(&self) -> PowerResolution {
+        self.registry_cache.borrow_mut().power_resolution(self)
+    }
+
+    /// Return cached local job resolution, recomputing lazily when dirty.
+    pub(crate) fn cached_job_resolution(&self) -> JobResolution {
+        self.registry_cache.borrow_mut().job_resolution(self)
+    }
+
+    /// Count-only job stats derived from the cached job registry.
+    pub(crate) fn cached_job_counts(&self) -> JobCounts {
+        let jobs = self.cached_job_resolution();
+        JobCounts {
+            total_jobs: jobs.total_jobs,
+            job_seekers: jobs.job_seekers,
+            unemployment: jobs.unemployment,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registry_cache_recompute_counts(&self) -> (usize, usize) {
+        self.registry_cache.borrow().recompute_counts()
     }
 
     fn record_mut(&mut self, entity: Entity) -> &mut EntityRecord {

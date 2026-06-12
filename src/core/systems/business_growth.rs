@@ -59,6 +59,9 @@ pub(crate) fn run(world: &mut World) -> BusinessGrowthSummary {
             });
         }
     }
+    if !summary.upgrades.is_empty() {
+        world.invalidate_jobs_registry();
+    }
 
     summary
 }
