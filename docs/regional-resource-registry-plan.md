@@ -13,7 +13,7 @@ Three phases:
 - **Cross-region sharing (R4 = CR1-CR3, CR3R, CR5-CR6):** regions share spare
   over connected roads via a discovery directory plus authoritative
   producer-owned export allocation over the existing region-runtime event flow.
-- **Persistent registry (R5, deferred):** recompute on change instead of per tick.
+- **Persistent registry (R5, done):** recompute on change instead of per tick.
 
 It supersedes a discarded first attempt at cross-region power that recomputed
 export capacity independently of the local power system; that duplication was the
@@ -199,6 +199,53 @@ Concurrency and determinism:
   serializes requests in its own event loop and records active allocations as it
   grants. Cross-worker request ordering is the existing event flow's
   responsibility, not the hint's.
+
+Where discovery lives (single vs multi-worker): a coordinator-owned directory.
+
+Discovery (the component graph + the per-network hints) is owned by a **coordinator
+directory**, distinct from the regions themselves. Today there is one
+`RegionWorker`, so that worker *is* the coordinator: `cross_region_discovery`
+aggregates the hints of the regions it owns and builds the component graph over
+them. When regions are sharded across multiple workers, this role is promoted to an
+explicit directory owned above the workers (the natural home is
+`RegionalGameRunner`), shared into each worker.
+
+```text
+            RegionalGameRunner
+                   | owns
+        +----------v-----------+
+        | coordinator directory|   owns: topology, aggregated border links,
+        |  (CrossRegionDiscovery)   component graph, per-network hints
+        |  small, stale-tolerant,   (shared: Arc + lock / atomic / double-buffer)
+        |  shared across threads |
+        +---^--------------^-----+
+   publish  | hint     read | "candidates in my component with spare?"
+        +---+----+     +----+---+
+        |Worker 1|     |Worker 2|   each OWNS a disjoint set of regions;
+        | Reg A,B|     | Reg C,D|   their Worlds stay pinned to that thread
+        +--------+     +--------+
+```
+
+The ownership boundary is the point: the coordinator owns the **directory** (small
+owned summaries -- hints keyed by `RegionRoadNetworkId`, plus the union-find graph),
+**not** the regions' `World`s. Worlds stay sharded on worker threads -- that is the
+whole reason for multiple workers, and `World` is `Send` but not `Sync`, so it could
+not be centrally owned anyway. Regions publish their hint *up* into the directory;
+anyone reads candidates *down* from it. The component graph in particular *must*
+live here once regions span workers, because it is built from every region's border
+links, which now sit on different threads.
+
+This changes nothing about determinism: the directory is **discovery only** (it
+decides whom to ask, and may be read stale), while the binding decision stays an
+authoritative `RegionEvent` that the producer's runtime re-validates against its
+real `ExportAllocations` ledger. So the split is exactly the plan's two halves:
+the runner owns the coordinator (discovery); the workers own the regions
+(simulation + authoritative claim).
+
+This is the *target shape* only; building it (extract the directory, publish hints
+cross-thread, cross-worker routing with a deterministic barrier, spawn N workers) is
+staged separately in [regional-multi-worker-plan.md](regional-multi-worker-plan.md),
+since true parallelism is a Non-Goal of this plan.
 
 Save and rebuild: imported resources are rebuildable cache. On load each region
 re-resolves locally, the component graph and hints rebuild, and imports
@@ -669,16 +716,19 @@ Review focus:
 - Building-derived resource sharing beyond power/jobs remains deferred and must
   not reintroduce a visibility-only push cache.
 
-## Patch R5 (Deferred): Persistent, Change-Driven Registry
+## Patch R5: Persistent, Change-Driven Registry
+
+Status: implemented. `World` owns a skipped derived `ResourceRegistryCache`.
+Power/job readers use cached resolutions; build/bulldoze/replace/upgrade,
+business auto-upgrades, citizen growth/removal, imported power grants, and
+save/load rebuild paths invalidate the relevant entries before the next read.
 
 Goal: stop rebuilding the registry from `World` every tick. Power and job-slot
 results are pure functions of building/provider/consumer topology, which only
 changes on a few events; recompute on those events instead of every hourly tick.
 
-Do this only after R1-R4 are stable, and only if it is worth the added
-invalidation surface. The deciding factors are a profile showing per-tick
-resolution is hot on large/multi-region games, or the cross-region event flow
-making a maintained registry the natural shape anyway.
+This was deferred until after R1-R4 were stable because the added invalidation
+surface is the main risk.
 
 What is and is not per-tick today:
 
