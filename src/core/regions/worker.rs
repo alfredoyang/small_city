@@ -7,6 +7,8 @@
 use crate::core::regional_types::{
     RegionCommandResponse, RegionSnapshotResponse, RegionTickResponse,
 };
+pub use crate::core::regions::directory::CrossRegionDiscovery;
+use crate::core::regions::directory::RegionDirectory;
 use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::load_manager::WorkerLoad;
 use crate::core::regions::runtime::{
@@ -14,10 +16,10 @@ use crate::core::regions::runtime::{
     PowerExportRequest, RegionEvent, RegionRuntime, RegionRuntimeError,
 };
 use crate::core::regions::{
-    BorderEdge, JobExportGrant, NetworkBorderLink, PowerExportGrant, RegionId, RegionNeighborLink,
-    RegionRoadNetworkId, RegionalAvailabilityHint,
+    JobExportGrant, PowerExportGrant, RegionId, RegionNeighborLink, RegionRoadNetworkId,
+    RegionalAvailabilityHint,
 };
-use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// Stable identity for one single-threaded worker scheduler.
@@ -64,38 +66,24 @@ pub struct WorkerRunSummary {
     pub snapshot_replies: Vec<RegionSnapshotResponse>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-/// Owned discovery snapshot used before authoritative cross-region requests.
-///
-/// Components are keyed by `(region, road-network)`, not just by region.
-pub struct CrossRegionDiscovery {
-    pub components: Vec<Vec<RegionRoadNetworkId>>,
-    pub availability_hints: Vec<RegionalAvailabilityHint>,
-}
-
-impl CrossRegionDiscovery {
-    pub fn component_of(&self, network: RegionRoadNetworkId) -> Option<&[RegionRoadNetworkId]> {
-        self.components
-            .iter()
-            .find(|component| component.contains(&network))
-            .map(Vec::as_slice)
-    }
-}
-
 #[derive(Debug)]
 /// Owns and schedules multiple regional runtimes on one thread.
 pub struct RegionWorker {
     id: WorkerId,
     regions: Vec<RegionRuntime>,
-    topology: Vec<RegionNeighborLink>,
+    directory: Arc<Mutex<RegionDirectory>>,
 }
 
 impl RegionWorker {
     pub fn new(id: WorkerId) -> Self {
+        Self::with_directory(id, Arc::new(Mutex::new(RegionDirectory::default())))
+    }
+
+    pub fn with_directory(id: WorkerId, directory: Arc<Mutex<RegionDirectory>>) -> Self {
         Self {
             id,
             regions: Vec::new(),
-            topology: Vec::new(),
+            directory,
         }
     }
 
@@ -152,7 +140,12 @@ impl RegionWorker {
     }
 
     pub fn set_region_topology(&mut self, topology: Vec<RegionNeighborLink>) {
-        self.topology = topology;
+        // Compatibility shim for direct worker tests. Production routing receives
+        // topology through the shared `RegionDirectory` owned by the runner.
+        self.directory
+            .lock()
+            .expect("region directory lock poisoned")
+            .set_topology(topology);
     }
 
     /// Builds discovery data only; availability hints are not allocations.
@@ -161,22 +154,15 @@ impl RegionWorker {
     /// route export requests. The producer runtime remains authoritative for
     /// granting or denying export allocation.
     pub fn cross_region_discovery(&self, topology: &[RegionNeighborLink]) -> CrossRegionDiscovery {
-        let links = self
-            .regions
-            .iter()
-            .flat_map(|runtime| runtime.state().network_border_links())
-            .collect::<Vec<_>>();
-        let mut availability_hints = self
-            .regions
-            .iter()
-            .flat_map(|runtime| runtime.state().availability_hints())
-            .collect::<Vec<_>>();
-        availability_hints.sort_by_key(|hint| hint.network);
-
-        CrossRegionDiscovery {
-            components: build_component_graph(&links, &availability_hints, topology),
-            availability_hints,
-        }
+        // Compatibility shim for the integration test suite. Production routing
+        // reads the shared directory snapshot instead of allocating this
+        // throwaway directory.
+        let directory = RegionDirectory::from_summaries(
+            topology.to_vec(),
+            self.network_border_links(),
+            self.availability_hints(),
+        );
+        directory.discovery().clone()
     }
 
     pub fn push_event(
@@ -218,6 +204,10 @@ impl RegionWorker {
                     .into_iter()
                     .map(|message| (source_region, message)),
             );
+        }
+
+        if processed_regions > 0 {
+            self.refresh_directory();
         }
 
         let mut routing_errors = Vec::new();
@@ -313,24 +303,26 @@ impl RegionWorker {
         &mut self,
         request: R::Request,
     ) -> Result<(), WorkerRoutingError> {
-        // TODO(CR2 perf): cache cross-region discovery for one scheduling pass
-        // instead of rebuilding the component graph for every export request.
-        // Tracked in docs/regional-multi-worker-plan.md (M1): the coordinator
-        // directory holds the built discovery and removes this per-request rebuild.
-        let discovery = self.cross_region_discovery(&self.topology);
-        let candidates = discovery
-            .component_of(R::caller_network(&request))
-            .unwrap_or(&[])
-            .iter()
-            .copied()
-            .filter(|network| network.region != R::caller_region(&request))
-            .filter(|network| {
-                discovery
-                    .availability_hints
-                    .iter()
-                    .any(|hint| hint.network == *network && R::has_spare(hint))
-            })
-            .collect::<Vec<_>>();
+        let candidates = {
+            let directory = self
+                .directory
+                .lock()
+                .expect("region directory lock poisoned");
+            let discovery = directory.discovery();
+            discovery
+                .component_of(R::caller_network(&request))
+                .unwrap_or(&[])
+                .iter()
+                .copied()
+                .filter(|network| network.region != R::caller_region(&request))
+                .filter(|network| {
+                    discovery
+                        .availability_hints
+                        .iter()
+                        .any(|hint| hint.network == *network && R::has_spare(hint))
+                })
+                .collect::<Vec<_>>()
+        };
 
         if candidates.is_empty() {
             return self.deny_export_request::<R>(&request);
@@ -414,6 +406,27 @@ impl RegionWorker {
             R::caller_region(request),
             R::apply_grant_event(R::deny_grant(request)),
         )
+    }
+
+    fn refresh_directory(&self) {
+        self.directory
+            .lock()
+            .expect("region directory lock poisoned")
+            .refresh(self.network_border_links(), self.availability_hints());
+    }
+
+    fn network_border_links(&self) -> Vec<crate::core::regions::NetworkBorderLink> {
+        self.regions
+            .iter()
+            .flat_map(|runtime| runtime.state().network_border_links())
+            .collect()
+    }
+
+    fn availability_hints(&self) -> Vec<RegionalAvailabilityHint> {
+        self.regions
+            .iter()
+            .flat_map(|runtime| runtime.state().availability_hints())
+            .collect()
     }
 }
 
@@ -556,151 +569,46 @@ enum WorkerRoutedMessage {
     SnapshotReply(RegionSnapshotResponse),
 }
 
-fn build_component_graph(
-    links: &[NetworkBorderLink],
-    hints: &[RegionalAvailabilityHint],
-    topology: &[RegionNeighborLink],
-) -> Vec<Vec<RegionRoadNetworkId>> {
-    let mut networks = links
-        .iter()
-        .map(|link| link.network)
-        .chain(hints.iter().map(|hint| hint.network))
-        .collect::<Vec<_>>();
-    networks.sort();
-    networks.dedup();
-
-    let link_index = BorderLinkIndex::new(links);
-    let mut union_find = UnionFind::new(&networks);
-    for left in links {
-        for neighbor in topology
-            .iter()
-            .filter(|neighbor| neighbor.allows_source(left.network.region, left.link.edge))
-        {
-            for right in link_index.matching_links(*left, *neighbor) {
-                union_find.union(left.network, right.network);
-            }
-        }
-    }
-
-    union_find.components()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct BorderLinkKey {
-    region: RegionId,
-    edge: BorderEdge,
-    offset: usize,
-}
-
-#[derive(Debug)]
-struct BorderLinkIndex {
-    links: HashMap<BorderLinkKey, Vec<NetworkBorderLink>>,
-}
-
-impl BorderLinkIndex {
-    fn new(links: &[NetworkBorderLink]) -> Self {
-        let mut index: HashMap<BorderLinkKey, Vec<NetworkBorderLink>> = HashMap::new();
-        for link in links {
-            index
-                .entry(BorderLinkKey::from(*link))
-                .or_default()
-                .push(*link);
-        }
-        Self { links: index }
-    }
-
-    fn matching_links(
-        &self,
-        left: NetworkBorderLink,
-        topology: RegionNeighborLink,
-    ) -> &[NetworkBorderLink] {
-        self.links
-            .get(&BorderLinkKey {
-                region: topology.neighbor,
-                edge: left.link.edge.complementary_neighbor_edge(),
-                offset: left.link.offset,
-            })
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-    }
-}
-
-impl From<NetworkBorderLink> for BorderLinkKey {
-    fn from(link: NetworkBorderLink) -> Self {
-        Self {
-            region: link.network.region,
-            edge: link.link.edge,
-            offset: link.link.offset,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct UnionFind {
-    parent: HashMap<RegionRoadNetworkId, RegionRoadNetworkId>,
-}
-
-impl UnionFind {
-    fn new(networks: &[RegionRoadNetworkId]) -> Self {
-        Self {
-            parent: networks
-                .iter()
-                .copied()
-                .map(|network| (network, network))
-                .collect(),
-        }
-    }
-
-    fn union(&mut self, left: RegionRoadNetworkId, right: RegionRoadNetworkId) {
-        let left_root = self.find(left);
-        let right_root = self.find(right);
-        if left_root == right_root {
-            return;
-        }
-
-        let (parent, child) = if left_root <= right_root {
-            (left_root, right_root)
-        } else {
-            (right_root, left_root)
-        };
-        self.parent.insert(child, parent);
-    }
-
-    fn find(&mut self, network: RegionRoadNetworkId) -> RegionRoadNetworkId {
-        let parent = *self.parent.get(&network).expect("known network");
-        if parent == network {
-            return network;
-        }
-
-        let root = self.find(parent);
-        self.parent.insert(network, root);
-        root
-    }
-
-    fn components(mut self) -> Vec<Vec<RegionRoadNetworkId>> {
-        let mut networks = self.parent.keys().copied().collect::<Vec<_>>();
-        networks.sort();
-
-        let mut grouped: HashMap<RegionRoadNetworkId, Vec<RegionRoadNetworkId>> = HashMap::new();
-        for network in networks {
-            let root = self.find(network);
-            grouped.entry(root).or_default().push(network);
-        }
-
-        let mut components = grouped.into_values().collect::<Vec<_>>();
-        for component in &mut components {
-            component.sort();
-        }
-        components.sort_by_key(|component| component[0]);
-        components
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::regional_types::UiRequestId;
     use crate::core::regions::RegionState;
+
+    #[test]
+    fn export_routing_uses_one_directory_rebuild_for_multiple_requests() {
+        let directory = Arc::new(Mutex::new(RegionDirectory::new(Vec::new())));
+        let mut worker = RegionWorker::with_directory(WorkerId(100), Arc::clone(&directory));
+        worker
+            .add_region(RegionRuntime::new(RegionState::new(RegionId(1), 2, 2)))
+            .unwrap();
+        worker.refresh_directory();
+        let first = PowerExportRequest {
+            request_id: UiRequestId(1),
+            caller_region: RegionId(1),
+            caller_network: network(1, 0),
+            token: 10,
+            demand: 1,
+        };
+        let second = PowerExportRequest {
+            request_id: UiRequestId(2),
+            caller_region: RegionId(1),
+            caller_network: network(1, 0),
+            token: 11,
+            demand: 1,
+        };
+
+        worker.route_export_request::<PowerExport>(first).unwrap();
+        worker.route_export_request::<PowerExport>(second).unwrap();
+
+        assert_eq!(
+            directory
+                .lock()
+                .expect("region directory lock poisoned")
+                .rebuild_count(),
+            1
+        );
+    }
 
     #[test]
     fn missing_power_request_candidate_denies_caller_instead_of_routing_error() {

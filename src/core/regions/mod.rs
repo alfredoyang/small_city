@@ -39,6 +39,7 @@ use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{BuildPreviewView, GameView, InspectView};
 use serde::{Deserialize, Serialize};
 
+pub mod directory;
 pub mod handle;
 pub mod load_manager;
 pub mod runtime;

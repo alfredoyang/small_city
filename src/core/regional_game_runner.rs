@@ -4,11 +4,12 @@
 //! path. It starts exactly one worker thread, keeps worker handles private, and
 //! exposes only narrow UI-safe operations.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionViewSnapshot, UiReply, UiRequestId,
 };
+use crate::core::regions::directory::RegionDirectory;
 use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::runtime::RegionRuntime;
 use crate::core::regions::threaded::{
@@ -67,6 +68,9 @@ pub enum RegionalGameRunnerError {
 pub struct RegionalGameRunner {
     worker: ThreadedRegionWorker,
     handles: Vec<RegionHandle>,
+    // M1 keeps a coordinator-owned directory handle so later multi-worker
+    // patches can publish/read discovery without exposing worker internals.
+    _directory: Arc<Mutex<RegionDirectory>>,
     operation_lock: Mutex<()>,
 }
 
@@ -79,8 +83,8 @@ impl RegionalGameRunner {
         regions: Vec<RegionState>,
         topology: Vec<RegionNeighborLink>,
     ) -> Result<Self, RegionalGameRunnerError> {
-        let mut worker = RegionWorker::new(INITIAL_WORKER_ID);
-        worker.set_region_topology(topology);
+        let directory = Arc::new(Mutex::new(RegionDirectory::new(topology)));
+        let mut worker = RegionWorker::with_directory(INITIAL_WORKER_ID, Arc::clone(&directory));
         let mut handles = Vec::new();
 
         for region in regions {
@@ -105,6 +109,7 @@ impl RegionalGameRunner {
         let runner = Self {
             worker: ThreadedRegionWorker::start(worker),
             handles,
+            _directory: directory,
             operation_lock: Mutex::new(()),
         };
         runner.process_worker_until_drained()?;
@@ -461,6 +466,7 @@ mod tests {
             RegionalGameRunner {
                 worker: ThreadedRegionWorker::start(worker),
                 handles: vec![handle.clone()],
+                _directory: Arc::new(Mutex::new(RegionDirectory::default())),
                 operation_lock: Mutex::new(()),
             },
             handle,
