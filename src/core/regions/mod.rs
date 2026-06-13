@@ -532,12 +532,6 @@ impl RegionState {
             return Vec::new();
         }
 
-        // Reads the persistent job-registry cache. Export allocation remains
-        // runtime-owned, so this is only the local spare-slot candidate set.
-        // TODO(R5 perf): `cached_job_resolution()` clones the full resolution
-        // (assignments + all slots) even though export allocation only needs
-        // `remaining_workplaces`. Add a narrower cache reader or closure-based
-        // accessor if export-request volume grows.
         let Some(roads) = road_connectivity::discover_road_networks(&self.world)
             .into_iter()
             .find(|candidate| candidate.id == network.road_network)
@@ -547,15 +541,16 @@ impl RegionState {
         };
 
         self.world
-            .cached_job_resolution()
-            .remaining_workplaces
-            .iter()
-            .copied()
-            .filter(|slot| {
-                road_connectivity::adjacent_road_entities(&self.world, *slot)
-                    .any(|road| roads.contains(&road))
+            .with_cached_remaining_job_workplaces(|remaining_workplaces| {
+                remaining_workplaces
+                    .iter()
+                    .copied()
+                    .filter(|slot| {
+                        road_connectivity::adjacent_road_entities(&self.world, *slot)
+                            .any(|road| roads.contains(&road))
+                    })
+                    .collect()
             })
-            .collect()
     }
 
     /// Salary an exported workplace slot pays its (remote) worker.

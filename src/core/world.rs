@@ -192,6 +192,16 @@ impl World {
         self.registry_cache.borrow_mut().job_resolution(self)
     }
 
+    /// Read the cached remaining workplace slots without cloning full job output.
+    pub(crate) fn with_cached_remaining_job_workplaces<R>(
+        &self,
+        read: impl FnOnce(&[Entity]) -> R,
+    ) -> R {
+        self.registry_cache
+            .borrow_mut()
+            .with_remaining_job_workplaces(self, read)
+    }
+
     /// Count-only job stats derived from the cached job registry.
     pub(crate) fn cached_job_counts(&self) -> JobCounts {
         let jobs = self.cached_job_resolution();

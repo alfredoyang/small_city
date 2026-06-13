@@ -247,6 +247,19 @@ impl ResourceRegistryCache {
     }
 
     pub(crate) fn job_resolution(&mut self, world: &World) -> JobResolution {
+        self.ensure_jobs(world).clone()
+    }
+
+    pub(crate) fn with_remaining_job_workplaces<R>(
+        &mut self,
+        world: &World,
+        read: impl FnOnce(&[Entity]) -> R,
+    ) -> R {
+        let jobs = self.ensure_jobs(world);
+        read(&jobs.remaining_workplaces)
+    }
+
+    fn ensure_jobs(&mut self, world: &World) -> &JobResolution {
         if self.jobs_dirty || self.jobs.is_none() {
             self.jobs = Some(ResourceRegistry::for_jobs(world).resolve_local_jobs());
             self.jobs_dirty = false;
@@ -255,7 +268,8 @@ impl ResourceRegistryCache {
                 self.jobs_recomputes += 1;
             }
         }
-        self.jobs.as_ref().expect("jobs registry cache").clone()
+
+        self.jobs.as_ref().expect("jobs registry cache")
     }
 
     #[cfg(test)]
@@ -700,6 +714,36 @@ mod tests {
         citizens::spawn_for_home(&mut world, home, 1);
 
         assert_eq!(world.cached_job_resolution().job_seekers, 1);
+        assert_eq!(world.registry_cache_recompute_counts().1, 2);
+    }
+
+    #[test]
+    fn cached_remaining_job_workplaces_reuses_job_cache_without_full_resolution_read() {
+        let mut world = World::new(5, 3);
+        placement::place_building(&mut world, 0, 0, BuildingKind::Residential);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Commercial);
+        placement::place_building(&mut world, 2, 0, BuildingKind::Industrial);
+        for x in 0..=2 {
+            placement::place_building(&mut world, x, 1, BuildingKind::Road);
+        }
+        power_workplace(&mut world, 1, 0);
+        power_workplace(&mut world, 2, 0);
+        let home = world.grid.get(0, 0).expect("home");
+        citizens::spawn_for_home(&mut world, home, 4);
+        road_network_analysis::run(&mut world);
+
+        let first = world.with_cached_remaining_job_workplaces(|slots| slots.len());
+        let second = world.with_cached_remaining_job_workplaces(|slots| slots.len());
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 1);
+        assert_eq!(world.registry_cache_recompute_counts().1, 1);
+
+        citizens::spawn_for_home(&mut world, home, 1);
+
+        let after_citizen_growth = world.with_cached_remaining_job_workplaces(|slots| slots.len());
+
+        assert_eq!(after_citizen_growth, 0);
         assert_eq!(world.registry_cache_recompute_counts().1, 2);
     }
 
