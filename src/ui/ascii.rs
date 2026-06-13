@@ -522,8 +522,9 @@ pub fn format_inspect(inspect: &InspectView) -> String {
             citizens,
             average_happiness,
             average_money,
+            job_assignments,
         } => format!(
-            "({}, {}) Residential | Powered: {} | Demand: {} | Road: {} | Level: {} | Maintenance: {} | Rent: {} | Population: {}/{} | Citizens: {} | Avg Happiness: {} | Avg Money: {}",
+            "({}, {}) Residential | Powered: {} | Demand: {} | Road: {} | Level: {} | Maintenance: {} | Rent: {} | Population: {}/{} | Citizens: {} | Avg Happiness: {} | Avg Money: {} | Jobs: {}",
             inspect.x,
             inspect.y,
             yes_no(*powered),
@@ -536,7 +537,8 @@ pub fn format_inspect(inspect: &InspectView) -> String {
             max_population,
             citizens,
             optional_number(*average_happiness),
-            optional_number(*average_money)
+            optional_number(*average_money),
+            format_job_assignments(job_assignments)
         ),
         InspectDetailsView::Commercial {
             powered,
@@ -640,6 +642,28 @@ fn optional_number(value: Option<i32>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "None".to_string())
+}
+
+fn format_job_assignments(assignments: &[crate::interface::view::JobAssignmentView]) -> String {
+    if assignments.is_empty() {
+        return "none".to_string();
+    }
+
+    assignments
+        .iter()
+        .map(|assignment| {
+            let scope = if assignment.is_remote {
+                "remote"
+            } else {
+                "local"
+            };
+            format!(
+                "{} R{} ({}, {}) salary {}",
+                scope, assignment.region.0, assignment.x, assignment.y, assignment.salary
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn optional_threshold(value: Option<i32>) -> String {

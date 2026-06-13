@@ -1,5 +1,6 @@
 //! Adapter that converts private ECS world data into UI-safe view and inspect models.
 
+use crate::core::components::WorkplaceSource;
 use crate::core::systems::{
     business_growth, citizens, economy, power, road_connectivity, road_network_analysis,
 };
@@ -7,7 +8,8 @@ use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
     BuildOptionView, CellView, CityDemand, CityStatusView, DemandLevel, GameTimeView, GameView,
-    InspectDetailsView, InspectView, LocalEffectsView, MapView, PowerStatusView, RoadLinks,
+    InspectDetailsView, InspectView, JobAssignmentView, LocalEffectsView, MapView, PowerStatusView,
+    RoadLinks,
 };
 
 /// Converts the private ECS World into the only render model the UI may consume.
@@ -164,6 +166,7 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 citizens: citizens::citizen_count_for_home(world, entity),
                 average_happiness: citizens::average_happiness_for_home(world, entity),
                 average_money: citizens::average_money_for_home(world, entity),
+                job_assignments: job_assignment_views_for_home(world, entity),
             }
         }
         BuildingKind::Commercial => InspectDetailsView::Commercial {
@@ -524,6 +527,7 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
             road_connected: None,
             road_links: RoadLinks::default(),
             upgrade_level: None,
+            job_assignments: Vec::new(),
             local_effects: local_effects_view(world, x, y),
         };
     };
@@ -558,8 +562,38 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
         }),
         road_links: road_links(world, x, y, building),
         upgrade_level: (upgrade_level > 0).then_some(upgrade_level),
+        job_assignments: job_assignment_views_for_home(world, entity),
         local_effects: local_effects_view(world, x, y),
     }
+}
+
+fn job_assignment_views_for_home(
+    world: &World,
+    home: crate::core::entity::Entity,
+) -> Vec<JobAssignmentView> {
+    let mut citizens = world
+        .citizens
+        .iter()
+        .filter(|(_, citizen)| citizen.home == home)
+        .collect::<Vec<_>>();
+    citizens.sort_by_key(|(entity, _)| entity.0);
+
+    citizens
+        .into_iter()
+        .filter_map(|(_, citizen)| {
+            let assignment = citizen.workplace_assignment?;
+            Some(JobAssignmentView {
+                region: assignment.region,
+                x: assignment.position.x,
+                y: assignment.position.y,
+                salary: assignment.salary,
+                is_remote: match assignment.source {
+                    WorkplaceSource::Local { .. } => false,
+                    WorkplaceSource::Remote { .. } => true,
+                },
+            })
+        })
+        .collect()
 }
 
 fn road_links(world: &World, x: usize, y: usize, building: Option<BuildingKind>) -> RoadLinks {

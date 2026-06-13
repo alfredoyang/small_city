@@ -815,11 +815,13 @@ impl RegionRuntime {
                 token: request.request.token,
                 granted: false,
                 source_region: None,
+                position: None,
                 slot_id: None,
                 salary: 0,
             };
         };
         let salary = self.state.workplace_salary(workplace);
+        let position = self.state.workplace_position(workplace);
 
         self.job_export_allocations.upsert(
             allocation_key,
@@ -832,6 +834,7 @@ impl RegionRuntime {
             token: request.request.token,
             granted: true,
             source_region: Some(self.region_id()),
+            position,
             slot_id: Some(workplace.0),
             salary,
         }
@@ -1162,6 +1165,7 @@ mod tick_state_tests {
             token: 0,
             granted: true,
             source_region: Some(RegionId(2)),
+            position: Some(crate::core::components::Position { x: 0, y: 0 }),
             slot_id: Some(0),
             salary: 4,
         }));

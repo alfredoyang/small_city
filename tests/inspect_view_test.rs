@@ -47,12 +47,51 @@ fn inspect_residential_shows_powered_state_and_population() {
             citizens: 0,
             average_happiness: None,
             average_money: None,
+            job_assignments: Vec::new(),
         })
     );
     assert_eq!(
         format_inspect(&inspect),
-        "(1, 0) Residential | Powered: Yes | Demand: 1 | Road: Yes | Level: 1 | Maintenance: 0 | Rent: 2 | Population: 0/5 | Citizens: 0 | Avg Happiness: None | Avg Money: None"
+        "(1, 0) Residential | Powered: Yes | Demand: 1 | Road: Yes | Level: 1 | Maintenance: 0 | Rent: 2 | Population: 0/5 | Citizens: 0 | Avg Happiness: None | Avg Money: None | Jobs: none"
     );
+}
+
+#[test]
+fn inspect_and_cell_view_show_local_citizen_workplace_tile() {
+    let mut game = SingleRegionTestGame::new(4, 3);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(2, 0, BuildingKind::Commercial).success);
+    for x in 0..=2 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+
+    for _ in 0..24 {
+        assert!(game.tick().success);
+    }
+
+    let inspect = game.inspect(1, 0);
+    let assignment = match &inspect.details {
+        Some(InspectDetailsView::Residential {
+            job_assignments, ..
+        }) => job_assignments.first().copied().expect("local assignment"),
+        details => panic!("expected residential inspect, got {details:?}"),
+    };
+    let cell_assignment = game
+        .view()
+        .map
+        .cells
+        .iter()
+        .find(|cell| cell.x == 1 && cell.y == 0)
+        .and_then(|cell| cell.job_assignments.first().copied())
+        .expect("cell assignment");
+
+    assert_eq!(assignment.region.0, 1);
+    assert_eq!((assignment.x, assignment.y), (2, 0));
+    assert_eq!(assignment.salary, 3);
+    assert!(!assignment.is_remote);
+    assert_eq!(cell_assignment, assignment);
+    assert!(format_inspect(&inspect).contains("local R1 (2, 0) salary 3"));
 }
 
 #[test]

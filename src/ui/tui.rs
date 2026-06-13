@@ -2760,6 +2760,7 @@ mod tests {
             road_connected,
             road_links: crate::interface::view::RoadLinks::default(),
             upgrade_level,
+            job_assignments: Vec::new(),
             local_effects: crate::interface::view::LocalEffectsView {
                 land_value: effect_value,
                 pollution_pressure: effect_value,

@@ -263,8 +263,7 @@ mod tests {
             Citizen {
                 age: 0,
                 home: residential,
-                workplace: None,
-                remote_workplace: None,
+                workplace_assignment: None,
                 happiness: 50,
                 happiness_decay: 0,
                 money: 0,

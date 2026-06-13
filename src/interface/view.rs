@@ -1,5 +1,6 @@
 //! UI-safe view models used by renderers instead of exposing ECS internals.
 
+use crate::core::regions::RegionId;
 use crate::interface::input::BuildingKind;
 
 /// Complete read-only snapshot required to render the city UI.
@@ -34,7 +35,20 @@ pub struct CellView {
     pub road_connected: Option<bool>,
     pub road_links: RoadLinks,
     pub upgrade_level: Option<u8>,
+    pub job_assignments: Vec<JobAssignmentView>,
     pub local_effects: LocalEffectsView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// UI-safe workplace location for one employed resident.
+///
+/// Local ECS entity ids and remote producer slot ids are intentionally omitted.
+pub struct JobAssignmentView {
+    pub region: RegionId,
+    pub x: usize,
+    pub y: usize,
+    pub salary: i32,
+    pub is_remote: bool,
 }
 
 /// Orthogonal road neighbors for a road cell, exposed as derived UI-safe data.
@@ -158,6 +172,7 @@ pub enum InspectDetailsView {
         citizens: i32,
         average_happiness: Option<i32>,
         average_money: Option<i32>,
+        job_assignments: Vec<JobAssignmentView>,
     },
     Commercial {
         powered: bool,

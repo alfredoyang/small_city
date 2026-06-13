@@ -533,6 +533,7 @@ impl ExportResource for JobExport {
             token: request.token,
             granted: false,
             source_region: None,
+            position: None,
             slot_id: None,
             salary: 0,
         }

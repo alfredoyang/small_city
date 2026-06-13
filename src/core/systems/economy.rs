@@ -6,8 +6,11 @@
 //! `EconomyBreakdown` so UI layers can explain the money change without reading
 //! ECS internals.
 
-use crate::core::components::{BuildingData, BusinessFinance, Citizen};
+use crate::core::components::{
+    BuildingData, BusinessFinance, Citizen, WorkplaceAssignment, WorkplaceSource,
+};
 use crate::core::entity::Entity;
+use crate::core::regions::RegionId;
 use crate::core::resource_registry::JobAssignment;
 use crate::core::systems::{road_connectivity, road_network_analysis};
 use crate::core::world::World;
@@ -58,17 +61,17 @@ pub(crate) struct EconomyBreakdown {
 /// a reachable local slot becomes a candidate for an imported (remote) workplace.
 /// It also clears any prior remote-workplace assignment so it is recomputed each
 /// day from authoritative state.
-pub(crate) fn assign_local_jobs(world: &mut World) {
+pub(crate) fn assign_local_jobs(world: &mut World, local_region: RegionId) {
     for citizen in world.citizens.values_mut() {
-        citizen.remote_workplace = None;
+        citizen.workplace_assignment = None;
     }
     let job_resolution = world.cached_job_resolution();
-    apply_workplace_assignments(world, &job_resolution.assignments);
+    apply_workplace_assignments(world, local_region, &job_resolution.assignments);
 }
 
 /// Runs the daily economy after job assignment (local in `assign_local_jobs`,
 /// remote in the cross-region job export phase) has already written each
-/// citizen's `workplace` / `remote_workplace`.
+/// citizen's `workplace_assignment`.
 ///
 /// `exported_job_slots` lists this region's workplace entities reserved for
 /// remote workers in other regions. The exporting region owns those slots, so it
@@ -116,23 +119,30 @@ pub(crate) fn run(world: &mut World, exported_job_slots: &[Entity]) -> EconomyBr
         // Salary/tax come from the assigned workplace; rent comes from the
         // citizen's home land value and building level; shopping tax comes from
         // the next available commercial shopping slot.
-        let (home, workplace, remote_workplace) = world
+        let (home, workplace_assignment) = world
             .citizens
             .get(&citizen_entity)
-            .map(|citizen| (citizen.home, citizen.workplace, citizen.remote_workplace))
-            .unwrap_or((Entity(u32::MAX), None, None));
+            .map(|citizen| (citizen.home, citizen.workplace_assignment))
+            .unwrap_or((Entity(u32::MAX), None));
         // A remote workplace pays the citizen salary captured at grant time but
         // collects no local workplace tax: that tax accrues to the exporting
         // region instead (see `exported_job_slots` below).
-        let salary = if let Some(remote) = remote_workplace {
-            (remote.salary, 0)
-        } else {
-            workplace
-                .and_then(|workplace| {
-                    salary_for_workplace(world, workplace)
-                        .map(|salary| (salary, workplace_tax_for_workplace(world, workplace)))
-                })
-                .unwrap_or((0, 0))
+        let salary = match workplace_assignment.map(|assignment| assignment.source) {
+            Some(WorkplaceSource::Remote { .. }) => (
+                workplace_assignment
+                    .map(|assignment| assignment.salary)
+                    .unwrap_or(0),
+                0,
+            ),
+            Some(WorkplaceSource::Local { entity: workplace }) => {
+                // Re-check local workplace effectiveness at settlement time. The
+                // assignment stores salary for UI, but local tax/salary should
+                // still reflect the authoritative current local world state.
+                salary_for_workplace(world, workplace)
+                    .map(|salary| (salary, workplace_tax_for_workplace(world, workplace)))
+                    .unwrap_or((0, 0))
+            }
+            None => (0, 0),
         };
         let rent = rent_per_citizen(world, home);
         let shopping = next_shopping_offer(world, home, &shopping_slots);
@@ -322,10 +332,22 @@ struct ShoppingOffer {
     slot_index: Option<usize>,
 }
 
-fn apply_workplace_assignments(world: &mut World, assignments: &[JobAssignment]) {
+fn apply_workplace_assignments(
+    world: &mut World,
+    local_region: RegionId,
+    assignments: &[JobAssignment],
+) {
     for assignment in assignments {
+        let workplace_assignment = assignment.workplace.and_then(|workplace| {
+            Some(WorkplaceAssignment {
+                region: local_region,
+                position: *world.positions.get(&workplace)?,
+                salary: salary_for_workplace(world, workplace).unwrap_or(0),
+                source: WorkplaceSource::Local { entity: workplace },
+            })
+        });
         if let Some(citizen) = world.citizens.get_mut(&assignment.citizen) {
-            citizen.workplace = assignment.workplace;
+            citizen.workplace_assignment = workplace_assignment;
         }
     }
 }
@@ -761,6 +783,7 @@ pub(crate) fn maintenance_for_building(kind: BuildingKind, level: u8) -> i32 {
 mod tests {
     use super::{EconomyIndex, run};
     use crate::core::entity::Entity;
+    use crate::core::regions::RegionId;
     use crate::core::systems::{citizens, placement, road_network_analysis};
     use crate::core::world::World;
     use crate::interface::input::BuildingKind;
@@ -836,7 +859,7 @@ mod tests {
             citizens::update_happiness(&mut world);
             // The daily tick assigns local jobs before the economy settles; mirror
             // that here so the citizen earns the salary it spends on shopping.
-            super::assign_local_jobs(&mut world);
+            super::assign_local_jobs(&mut world, RegionId(1));
             let economy = run(&mut world, &[]);
             assert_eq!(economy.shoppers_served, 1);
         }

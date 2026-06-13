@@ -15,8 +15,7 @@ pub(crate) fn spawn_for_home(world: &mut World, residential: Entity, count: i32)
             Citizen {
                 age: 0,
                 home: residential,
-                workplace: None,
-                remote_workplace: None,
+                workplace_assignment: None,
                 happiness: 50,
                 happiness_decay: 0,
                 money: 0,
@@ -145,7 +144,7 @@ fn citizen_happiness(world: &World, citizen: Entity) -> i32 {
 
     let mut happiness = 35 + effects.desirability * 6 + effects.accessibility;
     happiness -= effects.pollution_pressure * 3;
-    if citizen.workplace.is_none() {
+    if citizen.workplace_assignment.is_none() {
         happiness -= 10;
     }
     let road_access = road_network_analysis::access_for(world, citizen.home);

@@ -4,6 +4,7 @@
 //! regional `RegionState`. It remains crate-local so UI code cannot receive or
 //! manipulate ECS `World` storage directly.
 
+use crate::core::regions::RegionId;
 use crate::core::resources::{GameTime, is_new_day, is_new_week};
 use crate::core::systems::{
     business_growth, citizens, economy, happiness, local_effects, pollution, population, power,
@@ -13,9 +14,10 @@ use crate::core::world::World;
 use crate::interface::events::{CommandResult, EconomyBreakdownView, GameEventView, MetricChange};
 use crate::interface::view::GameTimeView;
 
+#[cfg(test)]
 pub(crate) fn tick_world(world: &mut World) -> CommandResult {
     let phase = begin_tick_power_phase(world);
-    finish_tick_after_power_phase(world, phase)
+    finish_tick_after_power_phase(world, RegionId(1), phase)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,11 +70,13 @@ pub(crate) fn begin_tick_power_phase(world: &mut World) -> TickPowerPhase {
 ///
 /// Regional runtimes call `continue_to_job_phase` and `finish_tick_after_job_phase`
 /// separately so they can pause between them for cross-region job exports.
+#[cfg(test)]
 pub(crate) fn finish_tick_after_power_phase(
     world: &mut World,
+    local_region: RegionId,
     phase: TickPowerPhase,
 ) -> CommandResult {
-    let job_phase = continue_to_job_phase(world, phase);
+    let job_phase = continue_to_job_phase(world, local_region, phase);
     finish_tick_after_job_phase(world, job_phase, &[])
 }
 
@@ -81,7 +85,11 @@ pub(crate) fn finish_tick_after_power_phase(
 /// Local assignment happens here (before the economy settles salaries/taxes) so a
 /// citizen left without a reachable local slot becomes a candidate for an imported
 /// remote workplace during the cross-region job export phase.
-pub(crate) fn continue_to_job_phase(world: &mut World, phase: TickPowerPhase) -> TickJobPhase {
+pub(crate) fn continue_to_job_phase(
+    world: &mut World,
+    local_region: RegionId,
+    phase: TickPowerPhase,
+) -> TickJobPhase {
     let is_daily = is_new_day(phase.before_time, phase.after_time);
     stats::run(world);
     local_effects::run(world);
@@ -94,7 +102,7 @@ pub(crate) fn continue_to_job_phase(world: &mut World, phase: TickPowerPhase) ->
     citizens::update_happiness(world);
     local_effects::run(world);
     if is_daily {
-        economy::assign_local_jobs(world);
+        economy::assign_local_jobs(world, local_region);
     }
 
     TickJobPhase {

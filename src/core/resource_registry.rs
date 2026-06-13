@@ -56,7 +56,7 @@
 //!        |       ties keep the pre-sorted slot order
 //!        v
 //! JobResolution
-//!   assignments      -> economy::run applies Citizen.workplace
+//!   assignments      -> economy::assign_local_jobs applies Citizen.workplace_assignment
 //!   total_jobs       -> stats::refresh_population_and_jobs
 //!   unemployment     -> stats::refresh_population_and_jobs
 //!   remaining_slots  -> later regional spare-capacity queries
@@ -642,7 +642,7 @@ mod tests {
             world
                 .citizens
                 .values()
-                .all(|citizen| citizen.workplace.is_none())
+                .all(|citizen| citizen.workplace_assignment.is_none())
         );
     }
 

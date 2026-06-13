@@ -25,13 +25,13 @@
 //! region stores another region's generic exported-resource cache.
 //! ```
 
-use crate::core::components::{PowerSource, RemoteWorkplace};
+use crate::core::components::{Position, PowerSource, WorkplaceAssignment, WorkplaceSource};
 use crate::core::entity::Entity;
 use crate::core::simulation::{
     TickJobPhase, TickPowerPhase, begin_tick_power_phase, continue_to_job_phase,
-    finish_tick_after_job_phase, refresh_derived_state_for_world, tick_world,
+    finish_tick_after_job_phase, refresh_derived_state_for_world,
 };
-use crate::core::systems::{build, bulldoze, replace, road_connectivity, upgrade};
+use crate::core::systems::{build, bulldoze, economy, replace, road_connectivity, upgrade};
 use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
 use crate::interface::events::CommandResult;
@@ -206,6 +206,7 @@ pub struct JobExportGrant {
     pub token: u32,
     pub granted: bool,
     pub source_region: Option<RegionId>,
+    pub position: Option<Position>,
     pub slot_id: Option<u32>,
     pub salary: i32,
 }
@@ -243,7 +244,9 @@ impl RegionState {
 
     /// Advances only this region's local simulation using the shared tick order.
     pub fn tick_local(&mut self) -> CommandResult {
-        tick_world(&mut self.world)
+        let phase = begin_tick_power_phase(&mut self.world);
+        let job_phase = continue_to_job_phase(&mut self.world, self.id, phase);
+        finish_tick_after_job_phase(&mut self.world, job_phase, &[])
     }
 
     /// Applies one player build command through the core systems.
@@ -305,7 +308,14 @@ impl RegionState {
         self.world
             .citizens
             .values()
-            .filter(|citizen| citizen.remote_workplace.is_some())
+            .filter(|citizen| {
+                matches!(
+                    citizen
+                        .workplace_assignment
+                        .map(|assignment| assignment.source),
+                    Some(WorkplaceSource::Remote { .. })
+                )
+            })
             .count()
     }
 
@@ -320,9 +330,11 @@ impl RegionState {
             .citizens
             .values()
             .filter_map(|citizen| {
-                citizen
-                    .remote_workplace
-                    .map(|remote| (remote.region, remote.slot_id))
+                let assignment = citizen.workplace_assignment?;
+                match assignment.source {
+                    WorkplaceSource::Remote { slot_id } => Some((assignment.region, slot_id)),
+                    WorkplaceSource::Local { .. } => None,
+                }
             })
             .collect::<Vec<_>>();
         slots.sort();
@@ -429,7 +441,7 @@ impl RegionState {
         &mut self,
         power_phase: RegionalTickPowerPhase,
     ) -> RegionalTickJobPhase {
-        let phase = continue_to_job_phase(&mut self.world, power_phase.phase);
+        let phase = continue_to_job_phase(&mut self.world, self.id, power_phase.phase);
         // Jobs (and the economy) resolve only on a daily boundary, so cross-region
         // job export is sought only then; hourly ticks carry no job demands.
         let job_demands = if phase.is_daily() {
@@ -505,19 +517,22 @@ impl RegionState {
         if !grant.granted {
             return;
         }
-        let (Some(source_region), Some(slot_id)) = (grant.source_region, grant.slot_id) else {
+        let (Some(source_region), Some(position), Some(slot_id)) =
+            (grant.source_region, grant.position, grant.slot_id)
+        else {
             return;
         };
         let Some(citizen) = self.world.citizens.get_mut(&demand.citizen) else {
             return;
         };
-        if citizen.workplace.is_some() || citizen.remote_workplace.is_some() {
+        if citizen.workplace_assignment.is_some() {
             return;
         }
-        citizen.remote_workplace = Some(RemoteWorkplace {
+        citizen.workplace_assignment = Some(WorkplaceAssignment {
             region: source_region,
-            slot_id,
+            position,
             salary: grant.salary,
+            source: WorkplaceSource::Remote { slot_id },
         });
     }
 
@@ -561,6 +576,10 @@ impl RegionState {
         crate::core::systems::economy::salary_for_workplace(&self.world, slot).unwrap_or(0)
     }
 
+    pub(crate) fn workplace_position(&self, slot: Entity) -> Option<Position> {
+        self.world.positions.get(&slot).copied()
+    }
+
     pub(crate) fn into_save_record(self) -> RegionStateSaveRecord {
         let mut world = self.world;
         scrub_transient_import_state_for_save(&mut world);
@@ -582,6 +601,7 @@ impl RegionState {
     pub(crate) fn from_world(id: RegionId, mut world: World) -> Self {
         world.rebuild_entity_records();
         refresh_derived_state_for_world(&mut world);
+        economy::assign_local_jobs(&mut world, id);
 
         Self { id, world }
     }
@@ -663,7 +683,7 @@ impl RegionState {
                 continue;
             };
             // Only a citizen left without any local or remote workplace seeks one.
-            if citizen_data.workplace.is_some() || citizen_data.remote_workplace.is_some() {
+            if citizen_data.workplace_assignment.is_some() {
                 continue;
             }
             let home = citizen_data.home;
@@ -728,9 +748,7 @@ fn scrub_transient_import_state_for_save(world: &mut World) {
         consumer.source = None;
     }
     for citizen in world.citizens.values_mut() {
-        // `remote_workplace` is also skipped by serde; clearing it keeps the
-        // recovered in-memory game consistent with a fresh load from disk.
-        citizen.remote_workplace = None;
+        citizen.workplace_assignment = None;
     }
 }
 
@@ -821,6 +839,7 @@ mod tests {
                 token: 7,
                 granted: true,
                 source_region: Some(RegionId(2)),
+                position: Some(Position { x: 1, y: 0 }),
                 slot_id: Some(42),
                 salary: 4,
             },

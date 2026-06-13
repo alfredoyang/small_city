@@ -10,6 +10,7 @@ use small_city::core::regions::{
     RegionRoadNetworkId, RegionState,
 };
 use small_city::interface::input::BuildingKind;
+use small_city::interface::view::InspectDetailsView;
 
 #[test]
 fn one_worker_processes_events_for_multiple_regions() {
@@ -453,6 +454,7 @@ fn wrong_region_export_grants_are_ignored_without_mutating_state() {
                 token: 0,
                 granted: true,
                 source_region: Some(RegionId(80)),
+                position: Some(small_city::core::components::Position { x: 0, y: 0 }),
                 slot_id: Some(0),
                 salary: 4,
             }),
@@ -648,6 +650,40 @@ fn cross_region_job_export_employs_jobless_citizen() {
         imported >= 1,
         "a jobless citizen should import a remote job"
     );
+}
+
+#[test]
+fn cross_region_job_export_is_visible_as_producer_workplace_tile() {
+    let consumer = job_seeker_region(RegionId(60));
+    let producer = job_slot_producer_region(RegionId(61));
+    let mut worker = worker_with_region_states(WorkerId(64), vec![consumer, producer]);
+    worker.set_region_topology(vec![neighbor(60, BorderEdge::East, 61)]);
+
+    run_job_growth_days(&mut worker, RegionId(60), RegionId(61), 10);
+
+    let region = worker.region(RegionId(60)).expect("consumer region");
+    let inspect = region.state().inspect(0, 0);
+    let assignment = match &inspect.details {
+        Some(InspectDetailsView::Residential {
+            job_assignments, ..
+        }) => job_assignments.first().copied().expect("remote assignment"),
+        details => panic!("expected residential inspect, got {details:?}"),
+    };
+    let cell_assignment = region
+        .state()
+        .view()
+        .map
+        .cells
+        .iter()
+        .find(|cell| cell.x == 0 && cell.y == 0)
+        .and_then(|cell| cell.job_assignments.first().copied())
+        .expect("cell remote assignment");
+
+    assert_eq!(assignment.region, RegionId(61));
+    assert_eq!((assignment.x, assignment.y), (0, 1));
+    assert_eq!(assignment.salary, 4);
+    assert!(assignment.is_remote);
+    assert_eq!(cell_assignment, assignment);
 }
 
 #[test]

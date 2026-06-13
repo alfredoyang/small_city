@@ -101,23 +101,23 @@ pub struct Population {
 /// Individual resident state for an off-grid citizen entity.
 ///
 /// Citizens do not occupy map cells. Stable citizen-only state is grouped here to keep the custom
-/// ECS simple: `home` links to a residential building, `workplace` may later link to a commercial
-/// or industrial job site, and `happiness` is updated by the citizen system from home conditions
-/// plus persistent morale changes such as daily decay.
+/// ECS simple: `home` links to a residential building, `workplace_assignment`
+/// stores the current derived local-or-remote job, and `happiness` is updated by
+/// the citizen system from home conditions plus persistent morale changes such
+/// as daily decay.
 /// Future movement/pathfinding state should remain in separate reusable components instead of
 /// growing this record.
 pub struct Citizen {
     #[serde(default)]
     pub age: u32,
     pub home: crate::core::entity::Entity,
-    pub workplace: Option<crate::core::entity::Entity>,
-    /// Cross-region workplace assigned when no local slot was reachable.
+    /// Derived local-or-remote workplace assignment used by simulation and views.
     ///
-    /// Derived state recomputed every daily economy boundary, never authoritative
-    /// save data. It holds only owned summary data (region + opaque slot id +
-    /// salary), never a remote ECS entity from the exporting region.
-    #[serde(default, skip_serializing)]
-    pub remote_workplace: Option<RemoteWorkplace>,
+    /// This is rebuilt by the daily job phase. It is skipped on save for the same
+    /// reason as imported power/job state: assignments are derived from local
+    /// buildings, citizens, road components, and producer export allocations.
+    #[serde(default, skip)]
+    pub workplace_assignment: Option<WorkplaceAssignment>,
     pub happiness: i32,
     #[serde(default)]
     pub happiness_decay: i32,
@@ -129,16 +129,24 @@ pub struct Citizen {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-/// Owned reference to a workplace slot exported by another region.
+/// Owned job assignment that can describe either local or producer-exported work.
 ///
-/// The consuming region stores `slot_id` as an opaque owned id (it never
-/// dereferences it as a local ECS entity). The salary is captured at grant time
-/// so the home region can pay the citizen without reading the producer's `World`.
-/// Workplace tax and business profit accrue to the exporting region instead.
-pub struct RemoteWorkplace {
+/// UI adapters convert this to a view-safe shape and never expose the local ECS
+/// entity or the remote opaque slot id. Core simulation still keeps that source
+/// identity so local salary/tax and producer-owned export allocation stay
+/// deterministic.
+pub struct WorkplaceAssignment {
     pub region: RegionId,
-    pub slot_id: u32,
+    pub position: Position,
     pub salary: i32,
+    pub source: WorkplaceSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Internal source identity for a workplace assignment.
+pub enum WorkplaceSource {
+    Local { entity: Entity },
+    Remote { slot_id: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

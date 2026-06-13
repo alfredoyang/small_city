@@ -188,6 +188,40 @@ fn save_load_rebuilds_cross_region_remote_jobs_after_daily_tick() {
 }
 
 #[test]
+fn save_load_rebuilds_local_job_assignment_visibility_immediately() {
+    let path = save_path("regional-local-job-visibility-rebuild");
+    let game = RegionalGame::single_region(4, 3).unwrap();
+    build_local_job_visibility_fixture(&game);
+
+    let before_view = game.view().unwrap();
+    let before_assignment = region_view(&before_view.regions, RegionId(1))
+        .map
+        .cells
+        .iter()
+        .find(|cell| cell.x == 1 && cell.y == 0)
+        .and_then(|cell| cell.job_assignments.first().copied())
+        .expect("pre-save local assignment");
+
+    game.save_to_file(&path).unwrap();
+    let loaded = RegionalGame::load_from_file(&path).unwrap();
+    let loaded_view = loaded.view().unwrap();
+    let loaded_assignment = region_view(&loaded_view.regions, RegionId(1))
+        .map
+        .cells
+        .iter()
+        .find(|cell| cell.x == 1 && cell.y == 0)
+        .and_then(|cell| cell.job_assignments.first().copied())
+        .expect("loaded local assignment");
+
+    assert_eq!(loaded_assignment, before_assignment);
+    assert_eq!(loaded_assignment.region, RegionId(1));
+    assert_eq!((loaded_assignment.x, loaded_assignment.y), (2, 0));
+    assert!(!loaded_assignment.is_remote);
+
+    remove_save_file(path);
+}
+
+#[test]
 fn saved_regional_game_can_continue_after_safe_point_restart() {
     let path = save_path("regional-continues");
     let game = regional_game_with_distinct_regions();
@@ -399,6 +433,35 @@ fn build_cross_region_remote_job_fixture(game: &RegionalGame) {
             .unwrap()
             .success
     );
+}
+
+fn build_local_job_visibility_fixture(game: &RegionalGame) {
+    assert!(
+        game.build(RegionId(1), 0, 0, BuildingKind::PowerPlant)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(1), 1, 0, BuildingKind::Residential)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(1), 2, 0, BuildingKind::Commercial)
+            .unwrap()
+            .success
+    );
+    for x in 0..=2 {
+        assert!(
+            game.build(RegionId(1), x, 1, BuildingKind::Road)
+                .unwrap()
+                .success
+        );
+    }
+
+    for _ in 0..24 {
+        assert!(game.tick_region(RegionId(1)).unwrap().success);
+    }
 }
 
 fn run_regional_days(game: &RegionalGame, days: u64) {
