@@ -16,10 +16,10 @@ use crate::core::regions::runtime::{
     PowerExportRequest, RegionEvent, RegionRuntime, RegionRuntimeError,
 };
 use crate::core::regions::{
-    JobExportGrant, PowerExportGrant, RegionId, RegionNeighborLink, RegionRoadNetworkId,
-    RegionalAvailabilityHint,
+    JobExportGrant, NetworkBorderLink, PowerExportGrant, RegionId, RegionNeighborLink,
+    RegionRoadNetworkId, RegionalAvailabilityHint,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// Stable identity for one single-threaded worker scheduler.
@@ -71,15 +71,15 @@ pub struct WorkerRunSummary {
 pub struct RegionWorker {
     id: WorkerId,
     regions: Vec<RegionRuntime>,
-    directory: Arc<Mutex<RegionDirectory>>,
+    directory: Arc<RegionDirectory>,
 }
 
 impl RegionWorker {
     pub fn new(id: WorkerId) -> Self {
-        Self::with_directory(id, Arc::new(Mutex::new(RegionDirectory::default())))
+        Self::with_directory(id, Arc::new(RegionDirectory::default()))
     }
 
-    pub fn with_directory(id: WorkerId, directory: Arc<Mutex<RegionDirectory>>) -> Self {
+    pub fn with_directory(id: WorkerId, directory: Arc<RegionDirectory>) -> Self {
         Self {
             id,
             regions: Vec::new(),
@@ -100,7 +100,10 @@ impl RegionWorker {
             });
         }
 
+        let links = runtime.state().network_border_links();
+        let hints = runtime.state().availability_hints();
         self.regions.push(runtime);
+        self.publish_region_summary(region_id, links, hints);
         Ok(())
     }
 
@@ -111,7 +114,9 @@ impl RegionWorker {
             .iter()
             .position(|runtime| runtime.region_id() == region_id)?;
 
-        Some(self.regions.remove(position))
+        let runtime = self.regions.remove(position);
+        self.publish_region_summary(region_id, Vec::new(), Vec::new());
+        Some(runtime)
     }
 
     pub fn region(&self, region_id: RegionId) -> Option<&RegionRuntime> {
@@ -142,10 +147,7 @@ impl RegionWorker {
     pub fn set_region_topology(&mut self, topology: Vec<RegionNeighborLink>) {
         // Compatibility shim for direct worker tests. Production routing receives
         // topology through the shared `RegionDirectory` owned by the runner.
-        self.directory
-            .lock()
-            .expect("region directory lock poisoned")
-            .set_topology(topology);
+        self.directory.set_topology(topology);
     }
 
     /// Builds discovery data only; availability hints are not allocations.
@@ -162,7 +164,7 @@ impl RegionWorker {
             self.network_border_links(),
             self.availability_hints(),
         );
-        directory.discovery().clone()
+        (*directory.discovery_snapshot()).clone()
     }
 
     pub fn push_event(
@@ -190,6 +192,7 @@ impl RegionWorker {
 
         let mut processed_regions = 0;
         let mut outbound = Vec::new();
+        let mut changed_summaries = Vec::new();
 
         for runtime in &mut self.regions {
             if runtime.pending_event_count() == 0 {
@@ -204,10 +207,15 @@ impl RegionWorker {
                     .into_iter()
                     .map(|message| (source_region, message)),
             );
+            changed_summaries.push((
+                source_region,
+                runtime.state().network_border_links(),
+                runtime.state().availability_hints(),
+            ));
         }
 
-        if processed_regions > 0 {
-            self.refresh_directory();
+        for (region_id, links, hints) in changed_summaries {
+            self.publish_region_summary(region_id, links, hints);
         }
 
         let mut routing_errors = Vec::new();
@@ -304,11 +312,7 @@ impl RegionWorker {
         request: R::Request,
     ) -> Result<(), WorkerRoutingError> {
         let candidates = {
-            let directory = self
-                .directory
-                .lock()
-                .expect("region directory lock poisoned");
-            let discovery = directory.discovery();
+            let discovery = self.directory.discovery_snapshot();
             discovery
                 .component_of(R::caller_network(&request))
                 .unwrap_or(&[])
@@ -408,14 +412,16 @@ impl RegionWorker {
         )
     }
 
-    fn refresh_directory(&self) {
-        self.directory
-            .lock()
-            .expect("region directory lock poisoned")
-            .refresh(self.network_border_links(), self.availability_hints());
+    fn publish_region_summary(
+        &self,
+        region_id: RegionId,
+        links: Vec<NetworkBorderLink>,
+        hints: Vec<RegionalAvailabilityHint>,
+    ) {
+        self.directory.publish_region(region_id, links, hints);
     }
 
-    fn network_border_links(&self) -> Vec<crate::core::regions::NetworkBorderLink> {
+    fn network_border_links(&self) -> Vec<NetworkBorderLink> {
         self.regions
             .iter()
             .flat_map(|runtime| runtime.state().network_border_links())
@@ -576,13 +582,12 @@ mod tests {
     use crate::core::regions::RegionState;
 
     #[test]
-    fn export_routing_uses_one_directory_rebuild_for_multiple_requests() {
-        let directory = Arc::new(Mutex::new(RegionDirectory::new(Vec::new())));
+    fn export_routing_reads_published_directory_without_rebuilding() {
+        let directory = Arc::new(RegionDirectory::new(Vec::new()));
         let mut worker = RegionWorker::with_directory(WorkerId(100), Arc::clone(&directory));
         worker
             .add_region(RegionRuntime::new(RegionState::new(RegionId(1), 2, 2)))
             .unwrap();
-        worker.refresh_directory();
         let first = PowerExportRequest {
             request_id: UiRequestId(1),
             caller_region: RegionId(1),
@@ -601,13 +606,7 @@ mod tests {
         worker.route_export_request::<PowerExport>(first).unwrap();
         worker.route_export_request::<PowerExport>(second).unwrap();
 
-        assert_eq!(
-            directory
-                .lock()
-                .expect("region directory lock poisoned")
-                .rebuild_count(),
-            1
-        );
+        assert_eq!(directory.rebuild_count(), 0);
     }
 
     #[test]

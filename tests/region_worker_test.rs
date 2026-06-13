@@ -1,16 +1,18 @@
 //! Integration tests for the shared single-threaded region worker.
 
 use small_city::core::regional_types::{RegionCommand, UiRequestId};
+use small_city::core::regions::directory::RegionDirectory;
 use small_city::core::regions::runtime::{
     ExportAllocationRequest, JobExportRequest, PowerExportRequest, RegionEvent, RegionRuntime,
 };
 use small_city::core::regions::worker::{RegionWorker, WorkerId, WorkerRoutingError};
 use small_city::core::regions::{
-    BorderEdge, JobExportGrant, PowerExportGrant, RegionId, RegionNeighborLink,
-    RegionRoadNetworkId, RegionState,
+    BorderEdge, BorderLinkId, JobExportGrant, NetworkBorderLink, PowerExportGrant, RegionId,
+    RegionNeighborLink, RegionRoadNetworkId, RegionState, RegionalAvailabilityHint,
 };
 use small_city::interface::input::BuildingKind;
 use small_city::interface::view::InspectDetailsView;
+use std::sync::Arc;
 
 #[test]
 fn one_worker_processes_events_for_multiple_regions() {
@@ -306,6 +308,65 @@ fn cross_region_power_export_does_not_cross_separate_components() {
     drain_worker(&mut worker);
 
     assert!(!cell_powered(&worker, RegionId(28), 0, 0));
+}
+
+#[test]
+fn stale_spare_power_hint_routes_to_producer_but_denies_cleanly() {
+    let caller = RegionId(80);
+    let producer = RegionId(81);
+    let directory = Arc::new(RegionDirectory::new(vec![neighbor(
+        80,
+        BorderEdge::East,
+        81,
+    )]));
+    let mut worker = RegionWorker::with_directory(WorkerId(52), Arc::clone(&directory));
+    worker
+        .add_region(RegionRuntime::new(power_export_consumer_region(caller)))
+        .unwrap();
+    worker
+        .add_region(RegionRuntime::new(region_with_roads(
+            producer,
+            2,
+            1,
+            &[(0, 0)],
+        )))
+        .unwrap();
+    directory.publish_region(
+        producer,
+        vec![NetworkBorderLink {
+            network: network(81, 0),
+            link: BorderLinkId {
+                edge: BorderEdge::West,
+                offset: 0,
+            },
+        }],
+        vec![RegionalAvailabilityHint {
+            network: network(81, 0),
+            has_spare_power: true,
+            has_spare_jobs: false,
+        }],
+    );
+
+    worker.push_event(caller, tick(1)).unwrap();
+
+    let request_pass = worker.process_region_events(1);
+    assert!(request_pass.routing_errors.is_empty());
+    assert_eq!(pending_events(&worker, producer), 2);
+
+    let release_pass = worker.process_region_events(1);
+    assert!(release_pass.routing_errors.is_empty());
+    assert_eq!(pending_events(&worker, producer), 1);
+
+    let producer_pass = worker.process_region_events(1);
+    assert!(producer_pass.routing_errors.is_empty());
+    assert_eq!(pending_events(&worker, caller), 1);
+
+    let apply_pass = worker.process_region_events(1);
+    assert!(apply_pass.routing_errors.is_empty());
+    assert_eq!(apply_pass.tick_replies.len(), 1);
+    assert_eq!(turn(&worker, caller), 1);
+    assert!(!cell_powered(&worker, caller, 0, 0));
+    assert_eq!(turn(&worker, producer), 0);
 }
 
 #[test]

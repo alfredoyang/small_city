@@ -70,7 +70,7 @@ pub struct RegionalGameRunner {
     handles: Vec<RegionHandle>,
     // M1 keeps a coordinator-owned directory handle so later multi-worker
     // patches can publish/read discovery without exposing worker internals.
-    _directory: Arc<Mutex<RegionDirectory>>,
+    _directory: Arc<RegionDirectory>,
     operation_lock: Mutex<()>,
 }
 
@@ -83,7 +83,7 @@ impl RegionalGameRunner {
         regions: Vec<RegionState>,
         topology: Vec<RegionNeighborLink>,
     ) -> Result<Self, RegionalGameRunnerError> {
-        let directory = Arc::new(Mutex::new(RegionDirectory::new(topology)));
+        let directory = Arc::new(RegionDirectory::new(topology));
         let mut worker = RegionWorker::with_directory(INITIAL_WORKER_ID, Arc::clone(&directory));
         let mut handles = Vec::new();
 
@@ -466,7 +466,7 @@ mod tests {
             RegionalGameRunner {
                 worker: ThreadedRegionWorker::start(worker),
                 handles: vec![handle.clone()],
-                _directory: Arc::new(Mutex::new(RegionDirectory::default())),
+                _directory: Arc::new(RegionDirectory::default()),
                 operation_lock: Mutex::new(()),
             },
             handle,
