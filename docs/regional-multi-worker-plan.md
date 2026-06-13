@@ -116,10 +116,18 @@ directory instead of computing discovery inline.
 - Add `RegionDirectory` owning `topology` + the built `CrossRegionDiscovery`.
 - `RegionWorker` borrows the directory for routing/candidate selection instead of
   calling `cross_region_discovery` on itself.
+- **Subsumes `worker.rs:316 TODO(CR2 perf)`** (discovery rebuilt per export request).
+  Today `route_export_request` calls `cross_region_discovery` for every request;
+  routing is topology-stable within a pass, so the directory is built once and reused
+  for all requests in that pass (and later refreshed only on topology change). Post-R5
+  the registry resolves behind the hints are already cached, so the rebuild that
+  remains is `network_border_links` road-network discovery + the union-find graph --
+  which the directory removes from the per-request path.
 - No behavior change: the existing CR2/CR3 suites must pass unchanged (the proof).
 
 Tests: existing cross-region tests green; a unit test that the directory yields the
-same components/candidates the worker computed before.
+same components/candidates the worker computed before, built once per pass rather
+than once per export request.
 
 ### Patch M2: Publish hints into the directory on change
 
@@ -144,6 +152,18 @@ deterministic merge point. **This is the gating patch.**
   cross-worker channel.
 - Insert the per-step barrier that orders cross-worker events by a stable key before
   delivery.
+- **Narrow the allocation-release fan-out** (subsumes `worker.rs:388 TODO(CR2
+  scale)`). Today a caller's `ExportAllocationRelease` is broadcast to every owned
+  region; cross-worker that would mean broadcasting to every region on every worker.
+  Instead, the caller tracks the producer regions it received `granted` replies from
+  (recorded in `apply_*_export_grant` on every granted reply, *not* only on grants it
+  locally applies -- a producer reserves on grant even when the caller's apply
+  early-returns), carries that set on the release, and the worker routes the release
+  only to those producers. Invariant: the targeted set must be a superset of
+  producers holding the caller's stale allocations, or a forgotten producer pins a
+  reservation forever (a silent leak). Adding a `Vec<RegionId>` to
+  `ExportAllocationRelease` drops its `Copy` derive -- clone it per target at the
+  routing call site.
 - Still may run two workers only in tests here; production can stay one worker until
   M4.
 
@@ -151,6 +171,12 @@ Tests (the hard gate): a **parity guard** -- run a scripted multi-region sequenc
 (builds, ticks, cross-region power and jobs, save/load) on 1 worker and on 2 workers
 and assert identical `powered`, job assignments, and `world.stats` at every step.
 Any divergence is a determinism bug.
+
+Plus, for the narrowed release fan-out: a **silent-leak regression test** -- a
+producer grants an allocation, the caller's local apply rejects it (e.g. the
+consumer is already powered), and the next-generation release must still reach that
+producer so its reservation is dropped, not pinned. This is the test that proves the
+"record on every granted reply" invariant above.
 
 ### Patch M4: Spawn N workers and assign regions
 
@@ -208,9 +234,51 @@ load balancing.
 - Use `RegionMove`; move at a step boundary so no in-flight export allocation is
   stranded (drain or transfer the region's paused-tick state and its inbound events).
 - Re-point the region->worker map and the directory.
+- **Subsumes `runtime/mod.rs` `TODO(CR2 lifecycle)`**: today export reservations only
+  clear when the caller starts a new generation, so a region that is removed,
+  reassigned, or stops ticking would leave its reservations pinned on producers. M6
+  must explicitly release a moved/removed region's allocations (and drop allocations
+  held *for* it) at the move boundary. Not reachable single-worker (regions are never
+  removed and all tick together), which is why it is deferred to here.
+- **Subsumes `load_manager.rs` `TODO(multi-worker)`**: when reassignment is wired to a
+  scheduler, add a post-move balance check so repeated `RegionMove`s cannot oscillate a
+  region between workers.
 
 Tests: a move at a safe point preserves all state and keeps the parity guard green;
-a move never strands a pending export (it is denied or carried, never lost).
+a move never strands a pending export (it is denied or carried, never lost); a region
+removed/moved leaves no pinned reservation on any producer; repeated balance passes do
+not oscillate a region.
+
+## Deferred optimizations (only if profiling at scale shows they matter)
+
+These are not scheduled patches. They are recorded so the corresponding code TODOs
+are tracked rather than dangling. Attempt them only after M1-M3 exist and only if
+measurement shows the cost is real -- the current simple versions are correct and
+cheap at small region counts.
+
+### Incremental export-allocation reconciliation
+
+Tracks `runtime/mod.rs` `TODO(CR allocation lifecycle)` on
+`reconcile_power_export_allocations` and `reconcile_job_export_allocations`.
+
+Today reconciliation is **eager**: every tick (power) / daily tick (jobs) a caller
+releases all its previous-generation allocations and re-requests all current demands.
+This is correct by construction -- a full teardown+rebuild in deterministic order
+can never go stale -- but it churns allocations every tick even when nothing changed.
+
+Going **incremental** (re-reconcile only when local demand, producer capacity, or road
+components change) is a **distributed cache-coherence problem**, not a local one. The
+hard trigger is *producer-capacity change*: it happens in another region's `World`, so
+the producer must notify every consumer holding an allocation on it, and consumers must
+track which producer each allocation depends on. That is a new cross-region (and, post
+M3, cross-worker) invalidation event with the same silent-determinism-bug failure mode
+as the R5 registry cache, but spanning regions you do not own.
+
+- Prerequisites: M1 (directory, for component-change signals) and M3 (cross-worker
+  routing, for the producer -> consumer invalidation notification).
+- Gate: an **eager-vs-incremental parity guard** (incremental result == eager result at
+  every step), mirroring R5's parity guard.
+- Keep the eager version as the reference implementation and the fallback.
 
 ## Non-Goals
 

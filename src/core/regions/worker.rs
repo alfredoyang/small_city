@@ -315,6 +315,8 @@ impl RegionWorker {
     ) -> Result<(), WorkerRoutingError> {
         // TODO(CR2 perf): cache cross-region discovery for one scheduling pass
         // instead of rebuilding the component graph for every export request.
+        // Tracked in docs/regional-multi-worker-plan.md (M1): the coordinator
+        // directory holds the built discovery and removes this per-request rebuild.
         let discovery = self.cross_region_discovery(&self.topology);
         let candidates = discovery
             .component_of(R::caller_network(&request))
@@ -385,10 +387,11 @@ impl RegionWorker {
         &mut self,
         release: ExportAllocationRelease,
     ) -> Result<(), WorkerRoutingError> {
-        // TODO(CR2 scale): this broadcasts to every owned region today. Track
-        // producer regions recorded from successful caller grants (for example
-        // imported power sources and remote workplace regions) so release
-        // messages can be narrowed to producers that may hold old allocations.
+        // TODO(CR2 scale): this broadcasts to every owned region today. Narrow it to
+        // producers that may hold the caller's old allocations by tracking the
+        // producer regions of granted replies. Tracked in
+        // docs/regional-multi-worker-plan.md (M3), where cross-worker routing
+        // reshapes release delivery anyway; the message cost only bites at scale.
         let target_regions = self
             .regions
             .iter()

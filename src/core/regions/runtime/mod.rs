@@ -595,7 +595,10 @@ impl RegionRuntime {
     // or road components change.
     // TODO(CR allocation lifecycle): trigger reconciliation from explicit demand,
     // producer-capacity, or component-change events so it runs only when needed
-    // instead of every tick.
+    // instead of every tick. Tracked under "Deferred optimizations" in
+    // docs/regional-multi-worker-plan.md: incremental reconciliation is a
+    // distributed cache-coherence problem, kept eager (correct, simple) until scale
+    // justifies it.
     fn reconcile_power_export_allocations(
         &mut self,
         request_id: UiRequestId,
@@ -666,7 +669,10 @@ impl RegionRuntime {
     // or road components change.
     // TODO(CR allocation lifecycle): trigger reconciliation from explicit demand,
     // producer-capacity, or component-change events so it runs only when needed
-    // instead of every daily job tick.
+    // instead of every daily job tick. Tracked under "Deferred optimizations" in
+    // docs/regional-multi-worker-plan.md: incremental reconciliation is a
+    // distributed cache-coherence problem, kept eager (correct, simple) until scale
+    // justifies it.
     fn reconcile_job_export_allocations(
         &mut self,
         request_id: UiRequestId,
@@ -742,7 +748,8 @@ impl RegionRuntime {
         let allocation_key = export_allocation_key(&request.request);
         // TODO(CR2 lifecycle): reservations clear when the caller starts a new tick
         // generation. Add explicit cleanup when caller regions are removed,
-        // reassigned, or intentionally stop ticking.
+        // reassigned, or intentionally stop ticking. Not reachable single-worker;
+        // tracked in docs/regional-multi-worker-plan.md (M6).
         self.power_export_allocations
             .release_stale_for_caller(request.request.caller_region, request.request.request_id);
         let active_export_allocations: i32 = self

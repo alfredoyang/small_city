@@ -85,8 +85,9 @@ impl LoadManager {
             return None;
         }
 
-        // TODO: When this is wired to a scheduler, add a post-move balance
-        // check so repeated calls cannot oscillate a region between workers.
+        // TODO(multi-worker): When this is wired to a scheduler, add a post-move
+        // balance check so repeated calls cannot oscillate a region between workers.
+        // Tracked in docs/regional-multi-worker-plan.md (M6).
         Some(RegionMove {
             region_id: *source.region_ids.first()?,
             from_worker: source.worker_id,

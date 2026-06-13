@@ -207,10 +207,12 @@ impl RegionalGame {
         )])
     }
 
+    /// Builds a regional game from owned region states, laid out row-major `1 x N`
+    /// (a single row): region `i` borders region `i+1` west/east. This is the right
+    /// topology for 1-2 regions; a true multi-row grid needs an explicit layout, so
+    /// route any future public multi-row constructor through `from_regions_with_layout`
+    /// rather than here.
     pub fn from_regions(regions: Vec<RegionState>) -> Result<Self, RegionalGameError> {
-        // TODO(regional layout): when a public multi-row constructor is added,
-        // route it through `from_regions_with_layout` so callers do not get the
-        // default single-row `1 x N` topology.
         let layout = infer_layout_for_region_count(regions.len());
         Self::from_regions_with_layout(regions, layout)
     }
