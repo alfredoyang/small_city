@@ -5,7 +5,10 @@ use small_city::core::regions::directory::RegionDirectory;
 use small_city::core::regions::runtime::{
     ExportAllocationRequest, JobExportRequest, PowerExportRequest, RegionEvent, RegionRuntime,
 };
-use small_city::core::regions::worker::{RegionWorker, WorkerId, WorkerRoutingError};
+use small_city::core::regions::worker::{
+    RegionOwnerDirectory, RegionWorker, WorkerId, WorkerRoutingError,
+    process_workers_with_deterministic_barrier,
+};
 use small_city::core::regions::{
     BorderEdge, BorderLinkId, JobExportGrant, NetworkBorderLink, PowerExportGrant, RegionId,
     RegionNeighborLink, RegionRoadNetworkId, RegionState, RegionalAvailabilityHint,
@@ -273,11 +276,6 @@ fn power_grant_continuation_runs_in_caller_region() {
     let request_pass = worker.process_region_events(1);
     assert!(request_pass.routing_errors.is_empty());
     assert!(!cell_powered(&worker, caller, 0, 0));
-    assert_eq!(pending_events(&worker, producer), 2);
-
-    let release_pass = worker.process_region_events(1);
-    assert!(release_pass.routing_errors.is_empty());
-    assert!(!cell_powered(&worker, caller, 0, 0));
     assert_eq!(pending_events(&worker, producer), 1);
 
     let producer_pass = worker.process_region_events(1);
@@ -351,10 +349,6 @@ fn stale_spare_power_hint_routes_to_producer_but_denies_cleanly() {
 
     let request_pass = worker.process_region_events(1);
     assert!(request_pass.routing_errors.is_empty());
-    assert_eq!(pending_events(&worker, producer), 2);
-
-    let release_pass = worker.process_region_events(1);
-    assert!(release_pass.routing_errors.is_empty());
     assert_eq!(pending_events(&worker, producer), 1);
 
     let producer_pass = worker.process_region_events(1);
@@ -367,6 +361,151 @@ fn stale_spare_power_hint_routes_to_producer_but_denies_cleanly() {
     assert_eq!(turn(&worker, caller), 1);
     assert!(!cell_powered(&worker, caller, 0, 0));
     assert_eq!(turn(&worker, producer), 0);
+}
+
+#[test]
+fn cross_worker_power_export_routes_through_deterministic_barrier() {
+    let directory = Arc::new(RegionDirectory::new(vec![neighbor(
+        82,
+        BorderEdge::East,
+        83,
+    )]));
+    let owners = Arc::new(RegionOwnerDirectory::new());
+    let mut consumer_worker = RegionWorker::with_directory_and_owners(
+        WorkerId(53),
+        Arc::clone(&directory),
+        Arc::clone(&owners),
+    );
+    let mut producer_worker = RegionWorker::with_directory_and_owners(
+        WorkerId(54),
+        Arc::clone(&directory),
+        Arc::clone(&owners),
+    );
+    consumer_worker
+        .add_region(RegionRuntime::new(power_export_consumer_region(RegionId(
+            82,
+        ))))
+        .unwrap();
+    producer_worker
+        .add_region(RegionRuntime::new(power_export_producer_region(RegionId(
+            83,
+        ))))
+        .unwrap();
+
+    consumer_worker.push_event(RegionId(82), tick(1)).unwrap();
+
+    let mut tick_replies = Vec::new();
+    for _ in 0..8 {
+        let summary = process_workers_with_deterministic_barrier(
+            &mut [&mut consumer_worker, &mut producer_worker],
+            1,
+        );
+        assert!(summary.routing_errors.is_empty());
+        tick_replies.extend(
+            summary
+                .worker_summaries
+                .into_iter()
+                .flat_map(|summary| summary.tick_replies),
+        );
+        if !tick_replies.is_empty() {
+            break;
+        }
+    }
+
+    assert_eq!(tick_replies.len(), 1);
+    assert!(cell_powered(&consumer_worker, RegionId(82), 0, 0));
+    assert_eq!(turn(&consumer_worker, RegionId(82)), 1);
+    assert_eq!(
+        turn(&producer_worker, RegionId(83)),
+        0,
+        "producer worker must not run the caller continuation"
+    );
+}
+
+#[test]
+fn deterministic_barrier_orders_competing_cross_worker_power_requests() {
+    let directory = Arc::new(RegionDirectory::new(vec![
+        neighbor(84, BorderEdge::East, 86),
+        neighbor(85, BorderEdge::East, 86),
+    ]));
+    let owners = Arc::new(RegionOwnerDirectory::new());
+    let mut mixed_worker = RegionWorker::with_directory_and_owners(
+        WorkerId(55),
+        Arc::clone(&directory),
+        Arc::clone(&owners),
+    );
+    let mut low_caller_worker = RegionWorker::with_directory_and_owners(
+        WorkerId(56),
+        Arc::clone(&directory),
+        Arc::clone(&owners),
+    );
+    mixed_worker
+        .add_region(RegionRuntime::new(power_export_consumer_region(RegionId(
+            85,
+        ))))
+        .unwrap();
+    mixed_worker
+        .add_region(RegionRuntime::new(one_spare_power_producer_region(
+            RegionId(86),
+        )))
+        .unwrap();
+    low_caller_worker
+        .add_region(RegionRuntime::new(power_export_consumer_region(RegionId(
+            84,
+        ))))
+        .unwrap();
+
+    mixed_worker.push_event(RegionId(85), tick(1)).unwrap();
+    low_caller_worker.push_event(RegionId(84), tick(2)).unwrap();
+    drain_workers_with_barrier(&mut [&mut mixed_worker, &mut low_caller_worker]);
+
+    assert!(
+        cell_powered(&low_caller_worker, RegionId(84), 0, 0),
+        "lower remote caller wins even when the higher caller shares a worker with the producer"
+    );
+    assert!(!cell_powered(&mixed_worker, RegionId(85), 0, 0));
+}
+
+#[test]
+fn ignored_granted_reply_still_targets_next_release_to_producer() {
+    let caller = RegionId(87);
+    let producer = RegionId(88);
+    let unrelated = RegionId(89);
+    let mut worker = worker_with_region_states(
+        WorkerId(58),
+        vec![
+            RegionState::new(caller, 2, 2),
+            RegionState::new(producer, 2, 2),
+            RegionState::new(unrelated, 2, 2),
+        ],
+    );
+
+    worker
+        .push_event(
+            caller,
+            RegionEvent::ApplyPowerExportGrant(PowerExportGrant {
+                token: 0,
+                granted: true,
+                source_region: Some(producer),
+            }),
+        )
+        .unwrap();
+    assert!(worker.process_region_events(1).routing_errors.is_empty());
+
+    worker.push_event(caller, tick(1)).unwrap();
+    let summary = worker.process_region_events(1);
+
+    assert!(summary.routing_errors.is_empty());
+    assert_eq!(
+        pending_events(&worker, producer),
+        1,
+        "release must reach the producer that granted even though caller ignored the grant"
+    );
+    assert_eq!(
+        pending_events(&worker, unrelated),
+        0,
+        "M3 release routing should not broadcast to unrelated regions"
+    );
 }
 
 #[test]
@@ -827,6 +966,124 @@ fn tick_short_on_power_and_jobs_resolves_both_phases() {
     );
 }
 
+#[test]
+fn two_worker_barrier_matches_single_worker_for_power_and_jobs_script() {
+    let consumer = RegionId(90);
+    let producer = RegionId(91);
+    let topology = vec![neighbor(90, BorderEdge::East, 91)];
+    let mut single = worker_with_region_states(
+        WorkerId(59),
+        vec![
+            RegionState::new(consumer, 6, 3),
+            RegionState::new(producer, 2, 2),
+        ],
+    );
+    single.set_region_topology(topology.clone());
+
+    let directory = Arc::new(RegionDirectory::new(topology));
+    let owners = Arc::new(RegionOwnerDirectory::new());
+    let mut consumer_worker = RegionWorker::with_directory_and_owners(
+        WorkerId(60),
+        Arc::clone(&directory),
+        Arc::clone(&owners),
+    );
+    let mut producer_worker = RegionWorker::with_directory_and_owners(
+        WorkerId(61),
+        Arc::clone(&directory),
+        Arc::clone(&owners),
+    );
+    consumer_worker
+        .add_region(RegionRuntime::new(RegionState::new(consumer, 6, 3)))
+        .unwrap();
+    producer_worker
+        .add_region(RegionRuntime::new(RegionState::new(producer, 2, 2)))
+        .unwrap();
+
+    let build_script = [
+        BuildStep::new(consumer, 0, 0, BuildingKind::Residential),
+        BuildStep::new(consumer, 0, 1, BuildingKind::Park),
+        BuildStep::new(consumer, 1, 0, BuildingKind::Road),
+        BuildStep::new(consumer, 2, 0, BuildingKind::Road),
+        BuildStep::new(consumer, 3, 0, BuildingKind::Road),
+        BuildStep::new(consumer, 4, 0, BuildingKind::Road),
+        BuildStep::new(consumer, 5, 0, BuildingKind::Road),
+        BuildStep::new(consumer, 1, 2, BuildingKind::Industrial),
+        BuildStep::new(consumer, 2, 2, BuildingKind::Road),
+        BuildStep::new(consumer, 3, 2, BuildingKind::Road),
+        BuildStep::new(consumer, 4, 2, BuildingKind::PowerPlant),
+        BuildStep::new(producer, 0, 0, BuildingKind::Road),
+        BuildStep::new(producer, 1, 0, BuildingKind::Road),
+        BuildStep::new(producer, 0, 1, BuildingKind::Industrial),
+        BuildStep::new(producer, 1, 1, BuildingKind::PowerPlant),
+    ];
+
+    for (index, step) in build_script.into_iter().enumerate() {
+        run_build_step(
+            &mut single,
+            &mut consumer_worker,
+            &mut producer_worker,
+            UiRequestId(10_000 + index as u64),
+            step,
+        );
+        assert_worker_region_parity(&single, &consumer_worker, consumer);
+        assert_worker_region_parity(&single, &producer_worker, producer);
+    }
+
+    for request_id in 1..=(14 * 24) {
+        single.push_event(consumer, tick(request_id)).unwrap();
+        single
+            .push_event(producer, tick(request_id + 100_000))
+            .unwrap();
+        drain_worker(&mut single);
+
+        consumer_worker
+            .push_event(consumer, tick(request_id))
+            .unwrap();
+        producer_worker
+            .push_event(producer, tick(request_id + 100_000))
+            .unwrap();
+        drain_workers_with_barrier(&mut [&mut consumer_worker, &mut producer_worker]);
+
+        assert_worker_region_parity(&single, &consumer_worker, consumer);
+        assert_worker_region_parity(&single, &producer_worker, producer);
+
+        if request_id == 7 * 24 {
+            restart_parity_regions_from_save(
+                &mut single,
+                &mut consumer_worker,
+                &mut producer_worker,
+                consumer,
+                producer,
+            );
+            assert_worker_region_parity(&single, &consumer_worker, consumer);
+            assert_worker_region_parity(&single, &producer_worker, producer);
+        }
+    }
+
+    assert_eq!(
+        cell_powered(&consumer_worker, consumer, 0, 0),
+        cell_powered(&single, consumer, 0, 0)
+    );
+    assert_eq!(
+        imported_job_count(&consumer_worker, consumer),
+        imported_job_count(&single, consumer)
+    );
+    assert_eq!(
+        consumer_worker
+            .region(consumer)
+            .expect("multi consumer")
+            .state()
+            .view()
+            .status,
+        single
+            .region(consumer)
+            .expect("single consumer")
+            .state()
+            .view()
+            .status
+    );
+}
+
 fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
     let mut worker = RegionWorker::new(id);
     for region_id in regions {
@@ -1071,4 +1328,117 @@ fn drain_worker(worker: &mut RegionWorker) {
     }
 
     panic!("worker did not drain");
+}
+
+#[derive(Clone, Copy)]
+struct BuildStep {
+    region: RegionId,
+    x: usize,
+    y: usize,
+    kind: BuildingKind,
+}
+
+impl BuildStep {
+    fn new(region: RegionId, x: usize, y: usize, kind: BuildingKind) -> Self {
+        Self { region, x, y, kind }
+    }
+}
+
+fn run_build_step(
+    single: &mut RegionWorker,
+    consumer_worker: &mut RegionWorker,
+    producer_worker: &mut RegionWorker,
+    request_id: UiRequestId,
+    step: BuildStep,
+) {
+    let event = RegionEvent::RunCommand {
+        request_id,
+        command: RegionCommand::Build {
+            x: step.x,
+            y: step.y,
+            kind: step.kind,
+        },
+    };
+    single.push_event(step.region, event).unwrap();
+    drain_worker(single);
+
+    let event = RegionEvent::RunCommand {
+        request_id,
+        command: RegionCommand::Build {
+            x: step.x,
+            y: step.y,
+            kind: step.kind,
+        },
+    };
+    if consumer_worker.region(step.region).is_some() {
+        consumer_worker.push_event(step.region, event).unwrap();
+    } else {
+        producer_worker.push_event(step.region, event).unwrap();
+    }
+    drain_workers_with_barrier(&mut [consumer_worker, producer_worker]);
+}
+
+fn assert_worker_region_parity(
+    single_worker: &RegionWorker,
+    multi_worker: &RegionWorker,
+    region: RegionId,
+) {
+    let single_view = single_worker
+        .region(region)
+        .expect("single-worker region")
+        .state()
+        .view();
+    let multi_view = multi_worker
+        .region(region)
+        .expect("multi-worker region")
+        .state()
+        .view();
+
+    assert_eq!(multi_view.status, single_view.status);
+    assert_eq!(multi_view.map.cells, single_view.map.cells);
+    assert_eq!(
+        multi_worker
+            .region(region)
+            .expect("multi-worker region")
+            .state()
+            .stats_snapshot(),
+        single_worker
+            .region(region)
+            .expect("single-worker region")
+            .state()
+            .stats_snapshot()
+    );
+}
+
+fn restart_parity_regions_from_save(
+    single: &mut RegionWorker,
+    consumer_worker: &mut RegionWorker,
+    producer_worker: &mut RegionWorker,
+    consumer: RegionId,
+    producer: RegionId,
+) {
+    single.restart_region_from_save_record(consumer).unwrap();
+    single.restart_region_from_save_record(producer).unwrap();
+    consumer_worker
+        .restart_region_from_save_record(consumer)
+        .unwrap();
+    producer_worker
+        .restart_region_from_save_record(producer)
+        .unwrap();
+}
+
+fn drain_workers_with_barrier(workers: &mut [&mut RegionWorker]) {
+    for _ in 0..24 {
+        let summary = process_workers_with_deterministic_barrier(workers, 1);
+        assert!(summary.routing_errors.is_empty());
+        if summary
+            .worker_summaries
+            .iter()
+            .all(|summary| summary.processed_regions == 0)
+        {
+            return;
+        }
+    }
+
+    panic!("workers did not drain");
 }

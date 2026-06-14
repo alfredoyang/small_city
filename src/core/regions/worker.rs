@@ -5,7 +5,7 @@
 //! `RegionRuntime`.
 
 use crate::core::regional_types::{
-    RegionCommandResponse, RegionSnapshotResponse, RegionTickResponse,
+    RegionCommandResponse, RegionSnapshotResponse, RegionTickResponse, UiRequestId,
 };
 pub use crate::core::regions::directory::CrossRegionDiscovery;
 use crate::core::regions::directory::RegionDirectory;
@@ -17,9 +17,11 @@ use crate::core::regions::runtime::{
 };
 use crate::core::regions::{
     JobExportGrant, NetworkBorderLink, PowerExportGrant, RegionId, RegionNeighborLink,
-    RegionRoadNetworkId, RegionalAvailabilityHint,
+    RegionRoadNetworkId, RegionState, RegionalAvailabilityHint,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// Stable identity for one single-threaded worker scheduler.
@@ -56,14 +58,166 @@ impl RegionAddError {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default)]
 /// Summary returned after one worker scheduling pass.
 pub struct WorkerRunSummary {
     pub processed_regions: usize,
     pub routing_errors: Vec<WorkerRoutingError>,
+    pub forwarded_events: Vec<ForwardedRegionEvent>,
     pub command_replies: Vec<RegionCommandResponse>,
     pub tick_replies: Vec<RegionTickResponse>,
     pub snapshot_replies: Vec<RegionSnapshotResponse>,
+}
+
+#[derive(Debug)]
+/// Coordinator-owned routing table from region IDs to worker IDs.
+///
+/// M3 keeps this table separate from `RegionDirectory`: the directory answers
+/// "which regional road networks are connected?", while this table answers
+/// "which worker owns the target region inbox?".
+pub struct RegionOwnerDirectory {
+    owners: Mutex<HashMap<RegionId, WorkerId>>,
+}
+
+impl RegionOwnerDirectory {
+    pub fn new() -> Self {
+        Self {
+            owners: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn owner_of(&self, region_id: RegionId) -> Option<WorkerId> {
+        self.owners
+            .lock()
+            .expect("region owner directory lock poisoned")
+            .get(&region_id)
+            .copied()
+    }
+
+    fn register_region(
+        &self,
+        region_id: RegionId,
+        worker_id: WorkerId,
+    ) -> Result<(), WorkerRoutingError> {
+        let mut owners = self
+            .owners
+            .lock()
+            .expect("region owner directory lock poisoned");
+        if owners
+            .get(&region_id)
+            .is_some_and(|existing| *existing != worker_id)
+        {
+            return Err(WorkerRoutingError::DuplicateRegion { region_id });
+        }
+        owners.insert(region_id, worker_id);
+        Ok(())
+    }
+
+    fn unregister_region(&self, region_id: RegionId, worker_id: WorkerId) {
+        let mut owners = self
+            .owners
+            .lock()
+            .expect("region owner directory lock poisoned");
+        if owners.get(&region_id) == Some(&worker_id) {
+            owners.remove(&region_id);
+        }
+    }
+}
+
+impl Default for RegionOwnerDirectory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug)]
+/// One event that must cross from one worker to another at the M3 barrier.
+pub struct ForwardedRegionEvent {
+    pub target_worker: WorkerId,
+    pub target_region: RegionId,
+    order_key: ForwardedEventOrderKey,
+    event: RegionEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Stable merge key for cross-worker delivery.
+///
+/// Requests reaching a producer must not depend on thread timing. The barrier
+/// sorts by target first (producer inbox), then caller/source and request token:
+///
+/// ```text
+/// Worker A outbound ┐
+/// Worker B outbound ├─ collect ─ sort key ─ deliver to target inboxes
+/// Worker C outbound ┘
+/// ```
+struct ForwardedEventOrderKey {
+    target_region: RegionId,
+    source_region: RegionId,
+    request_id: UiRequestId,
+    token: u32,
+    resource_rank: u8,
+    event_rank: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionRoutingMode {
+    /// Normal single-worker behavior: owned target inboxes receive events now.
+    Immediate,
+    /// M3 barrier behavior: all region-to-region events wait for stable ordering.
+    Barrier,
+}
+
+#[derive(Debug, Default)]
+/// Combined result from one deterministic multi-worker barrier step.
+pub struct DeterministicBarrierSummary {
+    pub worker_summaries: Vec<WorkerRunSummary>,
+    pub routing_errors: Vec<WorkerRoutingError>,
+}
+
+/// Runs each worker's local pass, then deterministically delivers region events.
+///
+/// Local runtime processing stays single-threaded per worker. During a barrier
+/// pass, every region-to-region export control event is collected, ordered by
+/// `ForwardedEventOrderKey`, and only then pushed into target inboxes. That
+/// includes same-worker targets; otherwise a local caller could beat a lower-key
+/// remote caller to the same producer just because it bypassed the merge point.
+pub fn process_workers_with_deterministic_barrier(
+    workers: &mut [&mut RegionWorker],
+    max_events_per_region: usize,
+) -> DeterministicBarrierSummary {
+    let mut summaries = Vec::new();
+    let mut forwarded = Vec::new();
+    let mut routing_errors = Vec::new();
+
+    for worker in workers.iter_mut() {
+        let mut summary = worker.process_region_events_for_barrier(max_events_per_region);
+        forwarded.append(&mut summary.forwarded_events);
+        routing_errors.extend(summary.routing_errors.iter().copied());
+        summaries.push(summary);
+    }
+
+    forwarded.sort_by_key(|event| event.order_key);
+    for forwarded_event in forwarded {
+        let Some(target_worker) = workers
+            .iter_mut()
+            .find(|worker| worker.id() == forwarded_event.target_worker)
+        else {
+            routing_errors.push(WorkerRoutingError::MissingTargetRegion {
+                target_region: forwarded_event.target_region,
+            });
+            continue;
+        };
+        if let Err(error) =
+            target_worker.push_event(forwarded_event.target_region, forwarded_event.event)
+        {
+            routing_errors.push(error);
+        }
+    }
+
+    DeterministicBarrierSummary {
+        worker_summaries: summaries,
+        routing_errors,
+    }
 }
 
 #[derive(Debug)]
@@ -72,6 +226,7 @@ pub struct RegionWorker {
     id: WorkerId,
     regions: Vec<RegionRuntime>,
     directory: Arc<RegionDirectory>,
+    owners: Arc<RegionOwnerDirectory>,
 }
 
 impl RegionWorker {
@@ -80,10 +235,19 @@ impl RegionWorker {
     }
 
     pub fn with_directory(id: WorkerId, directory: Arc<RegionDirectory>) -> Self {
+        Self::with_directory_and_owners(id, directory, Arc::new(RegionOwnerDirectory::default()))
+    }
+
+    pub fn with_directory_and_owners(
+        id: WorkerId,
+        directory: Arc<RegionDirectory>,
+        owners: Arc<RegionOwnerDirectory>,
+    ) -> Self {
         Self {
             id,
             regions: Vec::new(),
             directory,
+            owners,
         }
     }
 
@@ -96,6 +260,12 @@ impl RegionWorker {
         if self.region(region_id).is_some() {
             return Err(RegionAddError {
                 error: WorkerRoutingError::DuplicateRegion { region_id },
+                runtime: Box::new(runtime),
+            });
+        }
+        if let Err(error) = self.owners.register_region(region_id, self.id) {
+            return Err(RegionAddError {
+                error,
                 runtime: Box::new(runtime),
             });
         }
@@ -116,7 +286,27 @@ impl RegionWorker {
 
         let runtime = self.regions.remove(position);
         self.publish_region_summary(region_id, Vec::new(), Vec::new());
+        self.owners.unregister_region(region_id, self.id);
         Some(runtime)
+    }
+
+    /// Restarts one owned region through the same save-record boundary used by saves.
+    ///
+    /// This is a safe-point operation: callers should drain work first because
+    /// queued runtime events and transient export allocations are intentionally
+    /// not durable save truth.
+    pub fn restart_region_from_save_record(
+        &mut self,
+        region_id: RegionId,
+    ) -> Result<(), WorkerRoutingError> {
+        let Some(runtime) = self.remove_region(region_id) else {
+            return Err(WorkerRoutingError::MissingTargetRegion {
+                target_region: region_id,
+            });
+        };
+        let state = RegionState::from_save_record(runtime.into_state().into_save_record());
+        self.add_region(RegionRuntime::new(state))
+            .map_err(|error| error.routing_error())
     }
 
     pub fn region(&self, region_id: RegionId) -> Option<&RegionRuntime> {
@@ -186,6 +376,21 @@ impl RegionWorker {
     /// slice. This keeps one region from creating same-pass work for another
     /// region that has not yet had its turn.
     pub fn process_region_events(&mut self, max_events_per_region: usize) -> WorkerRunSummary {
+        self.process_region_events_with_mode(max_events_per_region, RegionRoutingMode::Immediate)
+    }
+
+    fn process_region_events_for_barrier(
+        &mut self,
+        max_events_per_region: usize,
+    ) -> WorkerRunSummary {
+        self.process_region_events_with_mode(max_events_per_region, RegionRoutingMode::Barrier)
+    }
+
+    fn process_region_events_with_mode(
+        &mut self,
+        max_events_per_region: usize,
+        routing_mode: RegionRoutingMode,
+    ) -> WorkerRunSummary {
         if max_events_per_region == 0 {
             return WorkerRunSummary::default();
         }
@@ -219,6 +424,7 @@ impl RegionWorker {
         }
 
         let mut routing_errors = Vec::new();
+        let mut forwarded_events = Vec::new();
         let mut command_replies = Vec::new();
         let mut tick_replies = Vec::new();
         let mut snapshot_replies = Vec::new();
@@ -238,10 +444,14 @@ impl RegionWorker {
             });
 
         for (source_region, message) in release_outbound.into_iter().chain(other_outbound) {
-            match self.route_outbound(source_region, message) {
+            match self.route_outbound(source_region, message, routing_mode) {
                 Ok(WorkerRoutedMessage::CommandReply(reply)) => command_replies.push(reply),
                 Ok(WorkerRoutedMessage::TickReply(reply)) => tick_replies.push(reply),
                 Ok(WorkerRoutedMessage::SnapshotReply(reply)) => snapshot_replies.push(reply),
+                Ok(WorkerRoutedMessage::Forwarded(event)) => forwarded_events.push(event),
+                Ok(WorkerRoutedMessage::ForwardedMany(mut events)) => {
+                    forwarded_events.append(&mut events);
+                }
                 Ok(WorkerRoutedMessage::None) => {}
                 Err(error) => routing_errors.push(error),
             }
@@ -250,6 +460,7 @@ impl RegionWorker {
         WorkerRunSummary {
             processed_regions,
             routing_errors,
+            forwarded_events,
             command_replies,
             tick_replies,
             snapshot_replies,
@@ -260,6 +471,7 @@ impl RegionWorker {
         &mut self,
         source_region: RegionId,
         message: OutboundMessage,
+        routing_mode: RegionRoutingMode,
     ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
         match message {
             OutboundMessage::RegionCommandCompleted(reply) => {
@@ -272,28 +484,22 @@ impl RegionWorker {
                 Ok(WorkerRoutedMessage::SnapshotReply(reply))
             }
             OutboundMessage::PowerExportRequested(request) => {
-                self.route_export_request::<PowerExport>(request)?;
-                Ok(WorkerRoutedMessage::None)
+                self.route_export_request::<PowerExport>(request, routing_mode)
             }
             OutboundMessage::PowerExportRequestCompleted { request, grant } => {
-                self.route_export_request_result::<PowerExport>(request, grant)?;
-                Ok(WorkerRoutedMessage::None)
+                self.route_export_request_result::<PowerExport>(request, grant, routing_mode)
             }
             OutboundMessage::PowerExportAllocationsReleased(release) => {
-                self.route_export_allocation_release::<PowerExport>(release)?;
-                Ok(WorkerRoutedMessage::None)
+                self.route_export_allocation_release::<PowerExport>(release, routing_mode)
             }
             OutboundMessage::JobExportRequested(request) => {
-                self.route_export_request::<JobExport>(request)?;
-                Ok(WorkerRoutedMessage::None)
+                self.route_export_request::<JobExport>(request, routing_mode)
             }
             OutboundMessage::JobExportRequestCompleted { request, grant } => {
-                self.route_export_request_result::<JobExport>(request, grant)?;
-                Ok(WorkerRoutedMessage::None)
+                self.route_export_request_result::<JobExport>(request, grant, routing_mode)
             }
             OutboundMessage::JobExportAllocationsReleased(release) => {
-                self.route_export_allocation_release::<JobExport>(release)?;
-                Ok(WorkerRoutedMessage::None)
+                self.route_export_allocation_release::<JobExport>(release, routing_mode)
             }
             OutboundMessage::RuntimeError(error) => Err(WorkerRoutingError::RuntimeError {
                 source_region,
@@ -310,7 +516,8 @@ impl RegionWorker {
     fn route_export_request<R: ExportResource>(
         &mut self,
         request: R::Request,
-    ) -> Result<(), WorkerRoutingError> {
+        routing_mode: RegionRoutingMode,
+    ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
         let candidates = {
             let discovery = self.directory.discovery_snapshot();
             discovery
@@ -329,21 +536,24 @@ impl RegionWorker {
         };
 
         if candidates.is_empty() {
-            return self.deny_export_request::<R>(&request);
+            return self.deny_export_request::<R>(&request, routing_mode);
         }
 
         let target_region = candidates[0].region;
-        if self.region(target_region).is_none() {
-            return self.deny_export_request::<R>(&request);
+        if self.owners.owner_of(target_region).is_none() {
+            return self.deny_export_request::<R>(&request, routing_mode);
         }
 
-        self.push_event(
+        self.route_region_event(
             target_region,
+            R::caller_region(&request),
             R::process_request_event(ExportAllocationRequest {
-                request,
+                request: request.clone(),
                 candidates,
                 candidate_index: 0,
             }),
+            R::request_order_key(&request, target_region, 1),
+            routing_mode,
         )
     }
 
@@ -353,63 +563,108 @@ impl RegionWorker {
         &mut self,
         mut request: ExportAllocationRequest<R::Request>,
         grant: R::Grant,
-    ) -> Result<(), WorkerRoutingError> {
+        routing_mode: RegionRoutingMode,
+    ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
         if R::granted(&grant) {
-            return self.push_event(
+            return self.route_region_event(
+                R::caller_region(&request.request),
                 R::caller_region(&request.request),
                 R::apply_grant_event(grant),
+                R::request_order_key(&request.request, R::caller_region(&request.request), 2),
+                routing_mode,
             );
         }
 
         request.candidate_index += 1;
         if request.candidate_index >= request.candidates.len() {
-            return self.push_event(
+            return self.route_region_event(
+                R::caller_region(&request.request),
                 R::caller_region(&request.request),
                 R::apply_grant_event(grant),
+                R::request_order_key(&request.request, R::caller_region(&request.request), 2),
+                routing_mode,
             );
         }
 
         let target_region = request.candidates[request.candidate_index].region;
-        if self.region(target_region).is_none() {
-            return self.deny_export_request::<R>(&request.request);
+        if self.owners.owner_of(target_region).is_none() {
+            return self.deny_export_request::<R>(&request.request, routing_mode);
         }
 
-        self.push_event(target_region, R::process_request_event(request))
+        let order_key = R::request_order_key(&request.request, target_region, 1);
+        self.route_region_event(
+            target_region,
+            R::caller_region(&request.request),
+            R::process_request_event(request),
+            order_key,
+            routing_mode,
+        )
     }
 
-    /// Broadcasts a caller's new-generation release to every other owned region so
-    /// producers drop the caller's prior reservations. Shared (CR3R).
+    /// Routes a caller's new-generation release to producers that granted before.
     fn route_export_allocation_release<R: ExportResource>(
         &mut self,
         release: ExportAllocationRelease,
-    ) -> Result<(), WorkerRoutingError> {
-        // TODO(CR2 scale): this broadcasts to every owned region today. Narrow it to
-        // producers that may hold the caller's old allocations by tracking the
-        // producer regions of granted replies. Tracked in
-        // docs/regional-multi-worker-plan.md (M3), where cross-worker routing
-        // reshapes release delivery anyway; the message cost only bites at scale.
-        let target_regions = self
-            .regions
-            .iter()
-            .map(RegionRuntime::region_id)
-            .filter(|region_id| *region_id != release.caller_region)
-            .collect::<Vec<_>>();
+        routing_mode: RegionRoutingMode,
+    ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
+        let mut forwarded = Vec::new();
+        let target_regions = release.producer_regions.clone();
 
         for target_region in target_regions {
-            self.push_event(target_region, R::release_event(release))?;
+            match self.route_region_event(
+                target_region,
+                release.caller_region,
+                R::release_event(release.clone()),
+                R::release_order_key(&release, target_region),
+                routing_mode,
+            )? {
+                WorkerRoutedMessage::Forwarded(event) => forwarded.push(event),
+                WorkerRoutedMessage::None => {}
+                other => return Ok(other),
+            }
         }
 
-        Ok(())
+        Ok(WorkerRoutedMessage::ForwardedMany(forwarded))
     }
 
     fn deny_export_request<R: ExportResource>(
         &mut self,
         request: &R::Request,
-    ) -> Result<(), WorkerRoutingError> {
-        self.push_event(
+        routing_mode: RegionRoutingMode,
+    ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
+        self.route_region_event(
+            R::caller_region(request),
             R::caller_region(request),
             R::apply_grant_event(R::deny_grant(request)),
+            R::request_order_key(request, R::caller_region(request), 2),
+            routing_mode,
         )
+    }
+
+    fn route_region_event(
+        &mut self,
+        target_region: RegionId,
+        source_region: RegionId,
+        event: RegionEvent,
+        mut order_key: ForwardedEventOrderKey,
+        routing_mode: RegionRoutingMode,
+    ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
+        if routing_mode == RegionRoutingMode::Immediate && self.region(target_region).is_some() {
+            self.push_event(target_region, event)?;
+            return Ok(WorkerRoutedMessage::None);
+        }
+
+        let Some(target_worker) = self.owners.owner_of(target_region) else {
+            return Err(WorkerRoutingError::MissingTargetRegion { target_region });
+        };
+        order_key.target_region = target_region;
+        order_key.source_region = source_region;
+        Ok(WorkerRoutedMessage::Forwarded(ForwardedRegionEvent {
+            target_worker,
+            target_region,
+            order_key,
+            event,
+        }))
     }
 
     fn publish_region_summary(
@@ -486,9 +741,41 @@ trait ExportResource {
     fn has_spare(hint: &RegionalAvailabilityHint) -> bool;
     fn granted(grant: &Self::Grant) -> bool;
     fn deny_grant(request: &Self::Request) -> Self::Grant;
+    fn request_id(request: &Self::Request) -> UiRequestId;
+    fn token(request: &Self::Request) -> u32;
+    fn resource_rank() -> u8;
     fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent;
     fn apply_grant_event(grant: Self::Grant) -> RegionEvent;
     fn release_event(release: ExportAllocationRelease) -> RegionEvent;
+
+    fn request_order_key(
+        request: &Self::Request,
+        target_region: RegionId,
+        event_rank: u8,
+    ) -> ForwardedEventOrderKey {
+        ForwardedEventOrderKey {
+            target_region,
+            source_region: Self::caller_region(request),
+            request_id: Self::request_id(request),
+            token: Self::token(request),
+            resource_rank: Self::resource_rank(),
+            event_rank,
+        }
+    }
+
+    fn release_order_key(
+        release: &ExportAllocationRelease,
+        target_region: RegionId,
+    ) -> ForwardedEventOrderKey {
+        ForwardedEventOrderKey {
+            target_region,
+            source_region: release.caller_region,
+            request_id: release.request_id,
+            token: 0,
+            resource_rank: Self::resource_rank(),
+            event_rank: 0,
+        }
+    }
 }
 
 /// Power: capacity hint, demand-carrying request, region-only grant.
@@ -516,6 +803,15 @@ impl ExportResource for PowerExport {
             granted: false,
             source_region: None,
         }
+    }
+    fn request_id(request: &Self::Request) -> UiRequestId {
+        request.request_id
+    }
+    fn token(request: &Self::Request) -> u32 {
+        request.token
+    }
+    fn resource_rank() -> u8 {
+        0
     }
     fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent {
         RegionEvent::ProcessPowerExportRequest(request)
@@ -557,6 +853,15 @@ impl ExportResource for JobExport {
             salary: 0,
         }
     }
+    fn request_id(request: &Self::Request) -> UiRequestId {
+        request.request_id
+    }
+    fn token(request: &Self::Request) -> u32 {
+        request.token
+    }
+    fn resource_rank() -> u8 {
+        1
+    }
     fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent {
         RegionEvent::ProcessJobExportRequest(request)
     }
@@ -570,6 +875,8 @@ impl ExportResource for JobExport {
 
 enum WorkerRoutedMessage {
     None,
+    Forwarded(ForwardedRegionEvent),
+    ForwardedMany(Vec<ForwardedRegionEvent>),
     CommandReply(RegionCommandResponse),
     TickReply(RegionTickResponse),
     SnapshotReply(RegionSnapshotResponse),
@@ -603,8 +910,12 @@ mod tests {
             demand: 1,
         };
 
-        worker.route_export_request::<PowerExport>(first).unwrap();
-        worker.route_export_request::<PowerExport>(second).unwrap();
+        worker
+            .route_export_request::<PowerExport>(first, RegionRoutingMode::Immediate)
+            .unwrap();
+        worker
+            .route_export_request::<PowerExport>(second, RegionRoutingMode::Immediate)
+            .unwrap();
 
         assert_eq!(directory.rebuild_count(), 0);
     }
@@ -634,6 +945,7 @@ mod tests {
                 granted: false,
                 source_region: None,
             },
+            RegionRoutingMode::Immediate,
         );
 
         assert!(result.is_ok());

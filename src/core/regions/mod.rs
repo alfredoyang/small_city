@@ -27,6 +27,7 @@
 
 use crate::core::components::{Position, PowerSource, WorkplaceAssignment, WorkplaceSource};
 use crate::core::entity::Entity;
+use crate::core::resources::CityStats;
 use crate::core::simulation::{
     TickJobPhase, TickPowerPhase, begin_tick_power_phase, continue_to_job_phase,
     finish_tick_after_job_phase, refresh_derived_state_for_world,
@@ -292,6 +293,14 @@ impl RegionState {
     /// Returns a UI-safe snapshot without exposing this region's ECS world.
     pub fn view(&self) -> GameView {
         view_world(&self.world)
+    }
+
+    /// Returns owned derived stats without exposing this region's ECS world.
+    ///
+    /// This is a core-facing inspection surface for scheduler/parity checks.
+    /// UI code should continue to read stats through `GameView`.
+    pub fn stats_snapshot(&self) -> CityStats {
+        self.world.stats.clone()
     }
 
     /// Returns a UI-safe snapshot using the requested map overlay.

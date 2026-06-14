@@ -159,14 +159,20 @@ pub type PowerExportAllocationRequest = ExportAllocationRequest<PowerExportReque
 /// Producer-side job allocation request (one consumer request + candidates).
 pub type JobExportAllocationRequest = ExportAllocationRequest<JobExportRequest>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Producer-side marker that a caller started a new tick export-resolution
-/// generation, so producers may drop the caller's prior reservations.
+/// generation, so producers may drop the caller's prior allocations.
 ///
 /// Shared by power and jobs: the release shape and routing are identical (CR3R).
 pub struct ExportAllocationRelease {
     pub caller_region: RegionId,
     pub request_id: UiRequestId,
+    /// Producers that granted this caller in the previous generation.
+    ///
+    /// M3 routes release only to known producers instead of broadcasting to every
+    /// region. The set is transient runtime coordination and is intentionally not
+    /// saved.
+    pub producer_regions: Vec<RegionId>,
 }
 
 /// Power flavor of the shared export allocation release.
@@ -242,6 +248,8 @@ pub struct RegionRuntime {
     tick_state: TickState,
     power_export_allocations: ExportAllocations<i32>,
     job_export_allocations: ExportAllocations<Entity>,
+    power_export_producers: Vec<RegionId>,
+    job_export_producers: Vec<RegionId>,
     handle: RegionHandle,
     receiver: RegionEventReceiver,
 }
@@ -454,6 +462,13 @@ impl<U: Copy> ExportAllocations<U> {
     }
 }
 
+fn insert_sorted_unique(regions: &mut Vec<RegionId>, region: RegionId) {
+    match regions.binary_search(&region) {
+        Ok(_) => {}
+        Err(index) => regions.insert(index, region),
+    }
+}
+
 impl RegionRuntime {
     /// Creates a runtime that owns one region and an empty inbox.
     pub fn new(state: RegionState) -> Self {
@@ -463,6 +478,8 @@ impl RegionRuntime {
             tick_state: TickState::Idle,
             power_export_allocations: ExportAllocations::new(),
             job_export_allocations: ExportAllocations::new(),
+            power_export_producers: Vec::new(),
+            job_export_producers: Vec::new(),
             handle,
             receiver,
         }
@@ -561,6 +578,22 @@ impl RegionRuntime {
         }
     }
 
+    fn remember_power_export_producer(&mut self, grant: &PowerExportGrant) {
+        if grant.granted {
+            if let Some(source_region) = grant.source_region {
+                insert_sorted_unique(&mut self.power_export_producers, source_region);
+            }
+        }
+    }
+
+    fn remember_job_export_producer(&mut self, grant: &JobExportGrant) {
+        if grant.granted {
+            if let Some(source_region) = grant.source_region {
+                insert_sorted_unique(&mut self.job_export_producers, source_region);
+            }
+        }
+    }
+
     fn pop_next_runnable_event(&mut self) -> Option<RegionEvent> {
         if !self.tick_state.is_waiting() {
             return self.receiver.pop_event();
@@ -604,10 +637,12 @@ impl RegionRuntime {
         request_id: UiRequestId,
         phase: RegionalTickPowerPhase,
     ) -> Vec<OutboundMessage> {
+        let producer_regions = std::mem::take(&mut self.power_export_producers);
         let release =
             OutboundMessage::PowerExportAllocationsReleased(PowerExportAllocationRelease {
                 caller_region: self.region_id(),
                 request_id,
+                producer_regions,
             });
         if phase.power_demands.is_empty() {
             // No exported power needed; advance straight to the job phase.
@@ -681,6 +716,7 @@ impl RegionRuntime {
         let release = OutboundMessage::JobExportAllocationsReleased(JobExportAllocationRelease {
             caller_region: self.region_id(),
             request_id,
+            producer_regions: std::mem::take(&mut self.job_export_producers),
         });
         if phase.job_demands.is_empty() {
             return vec![
@@ -841,6 +877,11 @@ impl RegionRuntime {
     }
 
     fn apply_power_export_grant(&mut self, grant: PowerExportGrant) -> Vec<OutboundMessage> {
+        // The producer reserved capacity as soon as it emitted a granted reply.
+        // Remember that producer even if this caller later ignores the grant
+        // because its local demand disappeared or was already powered; the next
+        // release must still reach the producer and clear that allocation.
+        self.remember_power_export_producer(&grant);
         // A grant only applies to a paused tick. Take the continuation out and
         // fall back to `Idle`; an unrelated grant restores the prior state below.
         let TickState::WaitingForPowerExports(mut continuation) =
@@ -870,6 +911,10 @@ impl RegionRuntime {
     }
 
     fn apply_job_export_grant(&mut self, grant: JobExportGrant) -> Vec<OutboundMessage> {
+        // Same producer-owned allocation invariant as power: a granted reply
+        // means the producer may hold a transient slot allocation even if this
+        // caller no longer applies it locally.
+        self.remember_job_export_producer(&grant);
         // A job grant only applies while waiting for job exports; ignore it
         // otherwise (idle or still in the power phase).
         let TickState::WaitingForJobExports(mut continuation) =
