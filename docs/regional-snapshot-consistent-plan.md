@@ -69,8 +69,7 @@ Kept / reused:
 
 - **Adopt the one-tick-stale model** over both the live-barrier model and the attempt to
   optimize that model's per-tick churn in place. (For why optimizing the strong-consistency
-  model is harder -- a distributed cache-coherence problem -- see "Change-driven
-  export-allocation reconciliation" in the multi-worker plan.)
+  model is harder -- a distributed cache-coherence problem -- see the appendix below.)
 - **Double-spend: B1 (authoritative by shared recompute).** Every region computes the
   *same* deterministic allocation function over the *same* frozen snapshot -- spare filled
   in a stable order (region, network, then the M3 order-key fields) until exhausted -- and
@@ -134,20 +133,28 @@ same frozen inputs the function's allocation equals what the live eager path gra
 proving the function faithfully reimplements the allocation semantics *before* the tick
 switches to it.
 
-### Patch OB3: Straight-through tick reads the snapshot (the model switch)
+### Patch OB3: Feed the derived pass from the snapshot (the model switch)
 
-Goal: a consumer tick resolves its imports by calling the allocation function over the
-**previous step's** snapshot instead of pausing for grants. Retire the `TickState`
-pause/resume and the multi-pass-per-tick drain for the export path.
+Goal: cross-region imports resolve from the **previous step's** frozen snapshot instead of
+pausing for live grants. The local step structure (`derived pass -> time pass`) is owned by
+[derived-state-vs-time-pass-plan.md](derived-state-vs-time-pass-plan.md); OB3 changes only
+the **cross-region input** to that derived pass and adds the snapshot **publish** at the
+step boundary. It does not re-describe or re-do the tick collapse -- that is the derived/time
+plan's job.
 
-- `simulation.rs`: collapse `begin_tick_power_phase` / `continue_to_job_phase` /
-  `finish_tick_after_*` into a straight-through tick that reads imports from the snapshot;
-  `RegionRuntime` drops the `WaitingFor*` states.
+- Point the derived pass's import inputs at OB2's allocation result over the previous step's
+  published summaries, rather than live request/grant. The derived pass never waits on a
+  cross-region value, so the `TickState` pause/resume and the multi-pass-per-tick drain
+  retire for the export path.
+- Publish the region's new summaries into the next snapshot at the step boundary (M2 swap).
 - **This is the behavior change:** introduces the one-tick lag, applied uniformly so
   single-worker adopts the same rule. Revises the "no single-worker behavior change"
   Non-Goal in the multi-worker plan.
 - The request/grant/release events and producer ledger may still *exist* here (now unused)
   to keep OB3's diff bounded; OB4 deletes them.
+- **Depends on** the derived/time split (DT1-DT4) having established the derived pass. If
+  that lands first, OB3 is a thin input-swap + publish; if not, OB3 absorbs the tick collapse
+  too (larger, and duplicates the derived/time work -- so land DT first).
 
 Tests: the parity reference shifts to the stale model -- a guard that single-worker(stale)
 == multi-worker(stale) over a scripted run. **Plus a documented characterization** of how
@@ -202,3 +209,92 @@ assignment-independent.
   flips the tick over.
 - The one-tick behavior change is documented via an explicit eager-vs-stale
   characterization, not landed silently.
+
+## Appendix: the rejected alternative -- optimizing strong consistency in place
+
+Before choosing this model, we considered keeping strong (within-tick) consistency and
+merely skipping the per-tick allocation churn for regions that did not change. It is
+recorded here as the reasoning that led to the snapshot model: the optimization turns out
+to be a distributed cache-coherence problem, which is what tipped the decision toward
+changing the consistency model instead of optimizing the old one. (It also tracked the
+`runtime/mod.rs` `TODO(CR allocation lifecycle)` on `reconcile_power_export_allocations` /
+`reconcile_job_export_allocations` -- code that OB4 deletes outright, making the TODO
+moot.)
+
+Today reconciliation is **eager**: every tick (power) / daily tick (jobs) a caller
+releases all its previous-generation allocations and re-requests all current demands.
+Correct by construction -- a full teardown+rebuild in deterministic order can never go
+stale -- but it churns allocations every tick even when nothing changed. The goal was to
+skip that churn for regions that did not change. Two granularities were considered.
+
+### Region/component dirty-recompute (the better of the two)
+
+Detect which regions had a producer- or consumer-affecting change this step, and re-run
+the *whole* export reconciliation only for those regions (and the regions a change
+ripples into), leaving quiescent regions' allocations untouched.
+
+Why this granularity, not per-allocation:
+
+- It keeps **correct-by-construction within a region**: a dirty region still does a
+  full teardown+rebuild of its own exports, so there is no partial stale allocation
+  state -- we only skip *whole regions* that did not change. That is far less
+  error-prone than surgically invalidating individual allocations.
+- The "did this region change?" signal already exists: R5 invalidates the registry
+  cache at the mutation chokepoints, and the directory (M1/M2) already tracks component
+  membership and per-region summaries.
+- **Producer-owned allocation makes invalidation natural.** The producer holds the
+  reservation ledger keyed by caller, so it *already knows its consumers*. When a
+  producer's capacity changes -- a local event the producer sees directly -- it drops
+  over-committed reservations and notifies exactly those consumers. Consumers do **not**
+  need to track which producer each allocation depends on; the producer drives it.
+
+What this still does not avoid (the genuinely hard parts, identical at any granularity):
+
+- **Cross-region / cross-worker invalidation.** A consumer's reconcile depends on a
+  producer's spare that lives in another region's `World` (post-M3, another thread), so
+  the producer -> consumer notification still rides the M3 barrier and has the same
+  silent-determinism-bug failure mode as the R5 cache if one is dropped.
+- **Ripple to a fixed point.** A change in region B that re-takes capacity from producer
+  A shrinks A's spare, which can invalidate consumer C *even though C did not change*. So
+  the dirty set propagates B -> A -> C ... possibly across the whole component, and must
+  reach a fixed point. Eager avoids this by rebuilding everything in one deterministic
+  pass; any change-driven scheme must reproduce that fixed point in a deterministic,
+  cross-worker order and prove it matches eager.
+
+Workload caveat: the win is proportional to how many regions are **quiescent**. In an
+active city, producer/consumer state shifts almost every tick (population growth, rising
+consumption, business upgrades), so the dirty set can be most of the active regions and
+the scheme collapses toward eager with extra bookkeeping. The payoff is in a **mature
+city** -- many settled regions plus a few growing on the frontier.
+
+### Per-allocation incremental (rejected as worse)
+
+Tracking each allocation's producer dependency and surgically invalidating single
+allocations is finer-grained but strictly harder and more bug-prone: it reintroduces
+partial stale state inside a region, and it needs consumer-side dependency tracking that
+the producer-owned ledger otherwise gives us for free. It does not reduce the two hard
+parts above, so it buys nothing over region/component dirty-recompute.
+
+### Why there is no safe "consumer-only" shortcut
+
+It is tempting to skip a caller's release+re-request whenever *its own* demand set and
+reachable component are unchanged -- all locally observable, no cross-region protocol.
+**This is unsafe on its own.** The grant being reused depends on the producer's spare,
+which the consumer cannot see. If the consumer skips its release, the producer never bumps
+the generation and keeps the old reservation; should the producer's capacity have dropped
+meanwhile (it added local consumers, or granted another caller), the producer is now
+over-committed and the consumer silently keeps a stale grant -- staying powered when eager
+would have re-resolved and denied it. A stale grant is safe only if the producer is *also*
+unchanged, and the consumer cannot know that without the producer -> consumer notification.
+So the minimal *correct* increment is the pair: (1) a consumer skips only while its local
+demand/component are unchanged **and** it has received no producer invalidation, and (2) a
+producer, on a capacity change, detects over-commitment and revokes/notifies the affected
+consumers. (1) without (2) is a determinism bug.
+
+### Why we changed models instead
+
+The two hard parts above -- cross-region/cross-worker invalidation and the ripple to a
+fixed point -- are irreducible *under strong consistency*. Accepting a one-tick lag
+dissolves them rather than solving them: a frozen snapshot has nothing to invalidate and
+no within-tick ripple. That is why this plan changes the consistency model instead of
+optimizing the old one.

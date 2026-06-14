@@ -25,9 +25,7 @@ shipped under**. M1 (coordinator directory) and M2 (published double-buffered sn
 are kept and reused by the new model; **M3 (the determinism barrier) shipped as a
 checkpoint, but its barrier, the producer-owned live ledger, and the `TickState`
 pause-tick machine are retired by the new model.** The staged patches **M4-M6 below are
-superseded** by the new plan's OB patches. Everything from here down is historical, except
-the "Change-driven export-allocation reconciliation" note (which records why optimizing
-this model in place was harder than switching models).
+superseded** by the new plan's OB patches. Everything from here down is historical.
 
 ## Why this is separate work
 
@@ -271,118 +269,15 @@ a move never strands a pending export (it is denied or carried, never lost); a r
 removed/moved leaves no pinned reservation on any producer; repeated balance passes do
 not oscillate a region.
 
-## Deferred optimizations (only if profiling at scale shows they matter)
+## Deferred optimizations
 
-These are not scheduled patches. They are recorded so the corresponding code TODOs
-are tracked rather than dangling. Attempt them only after M1-M3 exist and only if
-measurement shows the cost is real -- the current simple versions are correct and
-cheap at small region counts.
-
-### Change-driven export-allocation reconciliation
-
-Tracks `runtime/mod.rs` `TODO(CR allocation lifecycle)` on
-`reconcile_power_export_allocations` and `reconcile_job_export_allocations`.
-
-Today reconciliation is **eager**: every tick (power) / daily tick (jobs) a caller
-releases all its previous-generation allocations and re-requests all current demands.
-This is correct by construction -- a full teardown+rebuild in deterministic order
-can never go stale -- but it churns allocations every tick even when nothing changed.
-
-The goal is to skip that churn for regions that did not change. There are two
-granularities for doing so; the **region/component-grained** one below is the
-recommended shape, and **per-allocation incremental** is recorded only to say why we
-do *not* pick it.
-
-#### Recommended: region/component dirty-recompute
-
-Detect which regions had a producer- or consumer-affecting change this step, and re-run
-the *whole* export reconciliation only for those regions (and the regions a change
-ripples into), leaving quiescent regions' allocations untouched.
-
-Why this granularity, not per-allocation:
-
-- It keeps **correct-by-construction within a region**: a dirty region still does a
-  full teardown+rebuild of its own exports, so there is no partial stale allocation
-  state -- we only skip *whole regions* that did not change. That is far less
-  error-prone than surgically invalidating individual allocations.
-- The "did this region change?" signal already exists: R5 invalidates the registry
-  cache at the mutation chokepoints, and the directory (M1/M2) already tracks component
-  membership and per-region summaries.
-- **Producer-owned allocation makes invalidation natural.** The producer holds the
-  reservation ledger keyed by caller, so it *already knows its consumers*. When a
-  producer's capacity changes -- a local event the producer sees directly -- it drops
-  over-committed reservations and notifies exactly those consumers. Consumers do **not**
-  need to track which producer each allocation depends on; the producer drives it.
-
-What this still does not avoid (the genuinely hard parts, identical at any granularity):
-
-- **Cross-region / cross-worker invalidation.** A consumer's reconcile depends on a
-  producer's spare that lives in another region's `World` (post-M3, another thread), so
-  the producer -> consumer notification still rides the M3 barrier and has the same
-  silent-determinism-bug failure mode as the R5 cache if one is dropped.
-- **Ripple to a fixed point.** A change in region B that re-takes capacity from producer
-  A shrinks A's spare, which can invalidate consumer C *even though C did not change*. So
-  the dirty set propagates B -> A -> C ... possibly across the whole component, and must
-  reach a fixed point. Eager avoids this by rebuilding everything in one deterministic
-  pass; any change-driven scheme must reproduce that fixed point in a deterministic,
-  cross-worker order and prove it matches eager.
-
-Workload caveat: the win is proportional to how many regions are **quiescent**. In an
-active city, producer/consumer state shifts almost every tick (population growth, rising
-consumption, business upgrades), so the dirty set can be most of the active regions and
-the scheme collapses toward eager with extra bookkeeping. The payoff is in a **mature
-city** -- many settled regions plus a few growing on the frontier. Only profiling tells
-us the stable fraction is large enough to matter.
-
-#### Not chosen: per-allocation incremental
-
-Tracking each allocation's producer dependency and surgically invalidating single
-allocations is finer-grained but strictly harder and more bug-prone: it reintroduces
-partial stale state inside a region, and it needs consumer-side dependency tracking that
-the producer-owned ledger otherwise gives us for free. It does not reduce the two hard
-parts above, so it buys nothing over region/component dirty-recompute.
-
-#### Shared requirements (either way)
-
-- Prerequisites: M1 (directory, for component-change signals) and M3 (cross-worker
-  routing, for the producer -> consumer invalidation notification).
-- Gate: an **eager-vs-change-driven parity guard** (change-driven result == eager result
-  at every step), mirroring R5's parity guard.
-- Keep the eager version as the reference implementation and the fallback.
-
-#### Why there is no safe "consumer-only" shortcut
-
-It is tempting to skip a caller's release+re-request whenever *its own* demand set and
-reachable component are unchanged -- all locally observable, no cross-region protocol.
-**This is unsafe on its own and must not ship alone.** The grant being reused depends on
-the producer's spare, which the consumer cannot see. If the consumer skips its release,
-the producer never bumps the generation and keeps the old reservation; should the
-producer's capacity have dropped meanwhile (it added local consumers, or granted another
-caller), the producer is now over-committed and the consumer silently keeps a stale grant
--- staying powered when eager would have re-resolved and denied it. That is a direct
-divergence from eager, exactly what the parity guard catches.
-
-A stale grant is safe only if the producer is *also* unchanged, and the consumer cannot
-know that without the producer -> consumer notification -- the expensive half. So the
-consumer-local skip cannot be decoupled from it. The minimal *correct* increment is the
-pair:
-
-1. a consumer skips its release+re-request only while its local demand/component are
-   unchanged **and** it has received no invalidation from any producer it holds an
-   allocation on, and
-2. a producer, on a local capacity change, detects over-commitment and revokes/notifies
-   the affected consumers (which re-enter reconciliation and ripple to a fixed point).
-
-Both halves land together or not at all; (1) without (2) is a determinism bug.
-
-Everything above optimizes *within* this live-consistency model: cross-region effects
-resolve **within the same tick**, exactly as a single thread would, which is what forces
-the barrier, the eager teardown, and the fixed-point ripple. Relaxing that -- accepting a
-one-tick lag -- *dissolves* the churn problem rather than optimizing it, and is the
-direction ultimately chosen (2026-06-14). That snapshot-consistent model and its staged
-patches now live in
-[regional-snapshot-consistent-plan.md](regional-snapshot-consistent-plan.md); the
-change-driven analysis above is retained as the reasoning that led there.
+The change-driven export-allocation reconciliation analysis (the attempt to skip the
+eager per-tick churn while keeping strong consistency, and why it is a distributed
+cache-coherence problem) was the reasoning that led to the snapshot model. It has moved
+to the appendix of
+[regional-snapshot-consistent-plan.md](regional-snapshot-consistent-plan.md). The
+`runtime/mod.rs` `TODO(CR allocation lifecycle)` it tracked is deleted outright by that
+plan's OB4, not optimized.
 
 ## Non-Goals
 
