@@ -74,6 +74,113 @@ The "Target shape", "The determinism problem", and the M3 description further do
 describe the **superseded** live-barrier model; they are retained for history. The
 authoritative target is this section plus the Option B writeup.
 
+## Option B staged patches (the active plan)
+
+This replaces the old M3-M6 staging. Each patch is independently shippable, small
+(~5 files / ~400 lines; split if larger), and gated on tests. The big behavior change
+(the one-tick lag) lands in exactly one patch, OB3; everything before it is additive and
+behavior-preserving, everything after it is dead-code removal.
+
+**Two design choices baked in:**
+
+- **Double-spend (B1, authoritative-by-recompute):** every region computes the *same*
+  allocation function over the *same* frozen snapshot and reads off its own slice. No
+  producer arbitration messages, no double-spend (identical inputs -> identical result),
+  one-tick lag. The redundant per-region recompute of a component's allocation is
+  deterministic and embarrassingly parallel; accepted over the alternative
+  (producer publishes the result -> a second tick of lag).
+- **Chained dependencies:** the allocation function resolves a **whole road component**
+  from the snapshot in one shot, so a multi-hop effect (A->B->C) still lags only **one**
+  tick total, not one per hop. (Cost: more compute per step; revisit only if profiling
+  bites.)
+
+### Patch OB1: Publish quantitative cross-region summaries
+
+Goal: extend the directory's published per-region summary from boolean `has_spare` hints
+to the quantities the allocation function needs -- per regional road-network: producer
+**spare capacity** (power units, job slots) and consumer **import demand**.
+
+- `RegionalAvailabilityHint` grows (or is replaced by a `RegionalNetworkSummary`) with
+  `spare_power: i32`, `spare_job_slots: u32`, `power_demand`, `job_demand`, computed in
+  `RegionState::availability_hints` from the cached registry. Reuses M2's double-buffer.
+- **No behavior change:** the new fields are published but unconsumed; the live export
+  path still drives allocation.
+
+Tests: a region's published summary carries correct per-network spare and demand; all
+existing cross-region tests green unchanged.
+
+### Patch OB2: Snapshot allocation function (pure, offline)
+
+Goal: a pure `fn allocate_power(component_snapshot) -> map<(region, network), units>` and
+the job analog, resolving a whole component deterministically -- spare filled in stable
+order (region, network, then the M3 order key fields) until exhausted. No `World` access,
+no messages, not yet wired into the tick.
+
+- New module `core/regions/snapshot_allocation.rs` with the function and its tests.
+- **No behavior change:** the function exists, unused in production.
+
+Tests (the correctness anchor): characterization cases, **plus a cross-check that for the
+same frozen inputs the function's allocation equals what the live eager path grants** --
+proving the function faithfully reimplements the allocation semantics *before* the tick
+switches to it.
+
+### Patch OB3: Straight-through tick reads the snapshot (the model switch)
+
+Goal: a consumer tick resolves its imports by calling the allocation function over the
+**previous step's** snapshot instead of pausing for grants. Retire the `TickState`
+pause/resume and the multi-pass-per-tick drain for the export path.
+
+- `simulation.rs`: collapse `begin_tick_power_phase` / `continue_to_job_phase` /
+  `finish_tick_after_*` into a straight-through tick that reads imports from the snapshot;
+  `RegionRuntime` drops the `WaitingFor*` states.
+- **This is the behavior change:** introduces the one-tick lag, applied uniformly so
+  single-worker adopts the same rule. Revises the "no single-worker behavior change"
+  Non-Goal.
+- The request/grant/release events and producer ledger may still *exist* here (now
+  unused) to keep OB3's diff bounded; OB4 deletes them.
+
+Tests: the parity reference shifts to the stale model -- a guard that
+single-worker(stale) == multi-worker(stale) over a scripted run. **Plus a documented
+characterization** of how the stale model differs from the old eager model on a known
+scenario, so the behavior change is explicit and reviewed, not silent. Add a damping rule
+if oscillation (powered/unpowered flip on stale numbers) shows up.
+
+### Patch OB4: Retire the message-passing export path
+
+Goal: delete the now-unused choreography -- `*ExportRequested/Completed/Released` events,
+the producer-owned `ExportAllocations` ledger, `apply_*_export_grant`,
+`process_*_export_request`, and the `producer_regions` release fan-out. The barrier's
+export-event handling goes; cross-worker forwarding survives for commands/ticks/snapshots.
+
+- `runtime/mod.rs`, `worker.rs`, `mod.rs` (`*ExportGrant` / `Pending*Demand` types).
+- **No behavior change:** removing code OB3 made unreachable.
+
+Tests: stale-parity guard stays green; a test/grep asserting no export events remain.
+
+### Patch OB5: Step-level join and N workers
+
+Goal: replace barrier-driven multi-pass scheduling with the coarse **step join** -- each
+worker ticks all its regions against the frozen snapshot and publishes new summaries; at
+the step boundary the next snapshot becomes active via M2's swap -- and spawn N workers
+sharing regions (folds in the old M4).
+
+- `worker.rs` / `threaded.rs` scheduling, `regional_game_runner` (spawn N + own the
+  snapshot swap point).
+- **No behavior change** vs OB3/OB4: the join only changes how the same computation is
+  parallelized.
+
+Tests: an N-region game on K workers == 1 worker, identical over the stale-parity script;
+assignment-independent (the old M4/M5 parity-over-setup).
+
+### Carried forward (unchanged intent, re-scoped to no barrier)
+
+- **Configurable worker setup from a file** (old M5): still a performance knob, still
+  assignment-independent -- now trivially so, since the result is a function of the
+  snapshot, not of scheduling.
+- **Live region reassignment** (old M6): simpler under Option B -- a moved region just
+  starts publishing/reading on its new worker at a step boundary; there is no in-flight
+  export allocation to strand (there are no allocations).
+
 ## Why this is separate work
 
 The cross-region patches (CR1-CR6) all run on a single `RegionWorker`:
@@ -163,7 +270,11 @@ before delivery, so the producer sees a thread-timing-independent order. This tr
 some parallel overlap for reproducibility. M3 must land with a parity guard
 (multi-worker result == single-worker result over a scripted run) exactly like R5's.
 
-## Staged patches
+## Staged patches (SUPERSEDED -- live-barrier model, retained for history)
+
+> Superseded by the 2026-06-14 direction change. M1 and M2 shipped and are kept; M3
+> shipped as a checkpoint but its barrier is retired under Option B; M4-M6 below are
+> replaced by the "Option B staged patches" section above. Retained for history.
 
 Each patch is independently shippable, behavior-preserving where marked, and gated on
 tests. Keep diffs within the repo's ~5 files / ~400 line guideline; split if larger.
@@ -462,16 +573,22 @@ hard pieces at once:
   and if its local inputs and the frozen import figures it reads are unchanged, it skips
   -- there is no hidden live dependency that can shift underneath it.
 
-The one knob still to decide -- double-spend. Staleness fixes consistency, not
-arbitration: two consumers reading the same published spare could both claim it.
+Double-spend -- **resolved: B1 (authoritative by shared recompute)** (decided
+2026-06-14). Staleness fixes consistency, not arbitration: two consumers reading the same
+published spare could both claim it. B1 resolves this **without any arbitration
+messages**: every region computes the *same* deterministic allocation function over the
+*same* frozen snapshot -- spare filled in a stable order (region, network, then the M3
+order key fields) until exhausted -- and reads off its own slice. Identical inputs produce
+an identical result on every worker, so there is no over-subscription and nothing to
+deliver or order. The redundant per-region recompute of a component's allocation is
+deterministic and embarrassingly parallel; it is what lets OB4 delete the request / grant
+/ release path entirely.
 
-- **B1 (authoritative, recommended):** the producer still arbitrates who gets its real
-  capacity, but once per step against a *frozen, sortable* request set (sort by the M3
-  order key offline), not via a live barrier. Deterministic, no over-subscription, and it
-  still deletes the barrier and the fixed-point. The sweet spot.
-- **B2 (optimistic):** consumers take against the published spare; the producer detects
-  over-subscription and corrects it next step. Simplest to build, but allows one tick of
-  over-spend (too much imported power for a tick).
+Rejected alternative -- **B2 (optimistic):** consumers take against the published spare
+and the producer corrects over-subscription next step. Simpler still, but it allows one
+tick of over-spend (too much imported power for a tick). We prefer B1's
+no-over-subscription guarantee; the recompute cost is negligible at the region counts in
+play.
 
 The cost is real and is a **balance decision, not a free optimization**. A one-tick lag
 on imported power/jobs is observable, so to preserve (A) the single-worker path must
