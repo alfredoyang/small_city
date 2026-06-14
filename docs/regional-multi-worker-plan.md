@@ -13,6 +13,67 @@ For the vocabulary (`World`, `RegionState`, `RegionRuntime`, `RegionWorker`,
 discovery, export allocation, hints, generations) see
 [regional-terminology.md](regional-terminology.md).
 
+## Direction (decided 2026-06-14): adopt the one-tick-stale cross-region model
+
+We are switching the target cross-region model from **live, strongly-consistent**
+resolution to **snapshot-consistent, one-tick-stale** resolution ("Option B", written up
+in full under [Deferred optimizations](#deferred-optimizations-only-if-profiling-at-scale-shows-they-matter)
+-- now promoted from a deferred alternative to the chosen direction).
+
+**What changes.** Each region resolves its cross-region imports against the directory
+snapshot **as published at the end of the previous step**, not against live cross-region
+state. A neighbor's change is reflected one tick later. This keeps determinism
+(reproducibility / assignment-independence) and drops only within-tick synchronicity --
+see the Option B writeup for why a uniform staleness rule stays deterministic.
+
+**Why.** It collapses most of the cross-region machinery. Allocation becomes a
+deterministic function of a frozen shared snapshot that every region computes the same
+way, so the following are **retired**:
+
+- the M3 **determinism barrier** (nothing to order -- delivery order stops mattering),
+- the **request / grant / release** export event choreography,
+- the **producer-owned live allocation ledger** (and the `producer_regions` release
+  fan-out),
+- the **`TickState` pause-tick machine** (a tick never waits on a cross-region value --
+  it reads the snapshot and runs straight through), and
+- the **multi-pass-per-tick drain** (one tick = one pass again).
+
+**What is kept / reused:**
+
+- **M1 + M2** -- the coordinator `RegionDirectory` and especially its **double-buffered
+  `Mutex<Arc>` snapshot** are exactly the read-frozen / write-next primitive this model
+  needs. M2 is now load-bearing, not just cross-thread-ready storage.
+- the **region->worker ownership map** and general cross-worker forwarding (for
+  commands / ticks / snapshots -- needed by any multi-worker model),
+- the **stable order key** (M3), repurposed as the deterministic tiebreak *inside* the
+  allocation function,
+- a coarse **step-level join** (all regions tick against the frozen snapshot, then their
+  new summaries become the next snapshot) -- a simple phase boundary, not a per-tick
+  state machine.
+
+**Accepted cost (a balance decision, not a free optimization):**
+
+- A one-tick lag on imported power/jobs. To preserve determinism the **single-worker
+  path adopts the same stale rule**, so this revises the Non-Goal "no change to the
+  single-worker observable behavior."
+- Chained cross-region effects (A->B->C) lag one tick **per hop** unless the allocation
+  function resolves a whole component from the snapshot in one shot (a lag-vs-compute
+  knob).
+- Watch for **oscillation** (a consumer flipping powered/unpowered each tick reacting to
+  stale numbers); add a damping rule if it shows up.
+
+**Status of the in-flight patches.** M1 and M2 are committed and are kept as-is. **M3
+(the barrier) is in the working tree and is now superseded by this decision** -- its
+barrier, the live ledger, and the pause-tick are things this model deletes rather than
+extends. Whether to still commit M3 as a checkpoint, or to pivot directly to Option B, is
+called out as an open decision below; the directory/ownership-map/order-key parts of M3
+survive regardless. The staged patches M4-M6 are re-scoped to the new model (spawn N
+workers + step join; configurable setup; live moves) and no longer carry the barrier.
+
+The "Target shape", "The determinism problem", and the M3 description further down
+describe the **superseded** live-barrier model; they are retained for history. The
+authoritative target is this section plus the Option B writeup.
+
 ## Why this is separate work
 
 The cross-region patches (CR1-CR6) all run on a single `RegionWorker`:
@@ -256,7 +317,7 @@ are tracked rather than dangling. Attempt them only after M1-M3 exist and only i
 measurement shows the cost is real -- the current simple versions are correct and
 cheap at small region counts.
 
-### Incremental export-allocation reconciliation
+### Change-driven export-allocation reconciliation
 
 Tracks `runtime/mod.rs` `TODO(CR allocation lifecycle)` on
 `reconcile_power_export_allocations` and `reconcile_job_export_allocations`.
@@ -266,19 +327,171 @@ releases all its previous-generation allocations and re-requests all current dem
 This is correct by construction -- a full teardown+rebuild in deterministic order
 can never go stale -- but it churns allocations every tick even when nothing changed.
 
-Going **incremental** (re-reconcile only when local demand, producer capacity, or road
-components change) is a **distributed cache-coherence problem**, not a local one. The
-hard trigger is *producer-capacity change*: it happens in another region's `World`, so
-the producer must notify every consumer holding an allocation on it, and consumers must
-track which producer each allocation depends on. That is a new cross-region (and, post
-M3, cross-worker) invalidation event with the same silent-determinism-bug failure mode
-as the R5 registry cache, but spanning regions you do not own.
+The goal is to skip that churn for regions that did not change. There are two
+granularities for doing so; the **region/component-grained** one below is the
+recommended shape, and **per-allocation incremental** is recorded only to say why we
+do *not* pick it.
+
+#### Recommended: region/component dirty-recompute
+
+Detect which regions had a producer- or consumer-affecting change this step, and re-run
+the *whole* export reconciliation only for those regions (and the regions a change
+ripples into), leaving quiescent regions' allocations untouched.
+
+Why this granularity, not per-allocation:
+
+- It keeps **correct-by-construction within a region**: a dirty region still does a
+  full teardown+rebuild of its own exports, so there is no partial stale allocation
+  state -- we only skip *whole regions* that did not change. That is far less
+  error-prone than surgically invalidating individual allocations.
+- The "did this region change?" signal already exists: R5 invalidates the registry
+  cache at the mutation chokepoints, and the directory (M1/M2) already tracks component
+  membership and per-region summaries.
+- **Producer-owned allocation makes invalidation natural.** The producer holds the
+  reservation ledger keyed by caller, so it *already knows its consumers*. When a
+  producer's capacity changes -- a local event the producer sees directly -- it drops
+  over-committed reservations and notifies exactly those consumers. Consumers do **not**
+  need to track which producer each allocation depends on; the producer drives it.
+
+What this still does not avoid (the genuinely hard parts, identical at any granularity):
+
+- **Cross-region / cross-worker invalidation.** A consumer's reconcile depends on a
+  producer's spare that lives in another region's `World` (post-M3, another thread), so
+  the producer -> consumer notification still rides the M3 barrier and has the same
+  silent-determinism-bug failure mode as the R5 cache if one is dropped.
+- **Ripple to a fixed point.** A change in region B that re-takes capacity from producer
+  A shrinks A's spare, which can invalidate consumer C *even though C did not change*. So
+  the dirty set propagates B -> A -> C ... possibly across the whole component, and must
+  reach a fixed point. Eager avoids this by rebuilding everything in one deterministic
+  pass; any change-driven scheme must reproduce that fixed point in a deterministic,
+  cross-worker order and prove it matches eager.
+
+Workload caveat: the win is proportional to how many regions are **quiescent**. In an
+active city, producer/consumer state shifts almost every tick (population growth, rising
+consumption, business upgrades), so the dirty set can be most of the active regions and
+the scheme collapses toward eager with extra bookkeeping. The payoff is in a **mature
+city** -- many settled regions plus a few growing on the frontier. Only profiling tells
+us the stable fraction is large enough to matter.
+
+#### Not chosen: per-allocation incremental
+
+Tracking each allocation's producer dependency and surgically invalidating single
+allocations is finer-grained but strictly harder and more bug-prone: it reintroduces
+partial stale state inside a region, and it needs consumer-side dependency tracking that
+the producer-owned ledger otherwise gives us for free. It does not reduce the two hard
+parts above, so it buys nothing over region/component dirty-recompute.
+
+#### Shared requirements (either way)
 
 - Prerequisites: M1 (directory, for component-change signals) and M3 (cross-worker
   routing, for the producer -> consumer invalidation notification).
-- Gate: an **eager-vs-incremental parity guard** (incremental result == eager result at
-  every step), mirroring R5's parity guard.
+- Gate: an **eager-vs-change-driven parity guard** (change-driven result == eager result
+  at every step), mirroring R5's parity guard.
 - Keep the eager version as the reference implementation and the fallback.
+
+#### Why there is no safe "consumer-only" shortcut
+
+It is tempting to skip a caller's release+re-request whenever *its own* demand set and
+reachable component are unchanged -- all locally observable, no cross-region protocol.
+**This is unsafe on its own and must not ship alone.** The grant being reused depends on
+the producer's spare, which the consumer cannot see. If the consumer skips its release,
+the producer never bumps the generation and keeps the old reservation; should the
+producer's capacity have dropped meanwhile (it added local consumers, or granted another
+caller), the producer is now over-committed and the consumer silently keeps a stale grant
+-- staying powered when eager would have re-resolved and denied it. That is a direct
+divergence from eager, exactly what the parity guard catches.
+
+A stale grant is safe only if the producer is *also* unchanged, and the consumer cannot
+know that without the producer -> consumer notification -- the expensive half. So the
+consumer-local skip cannot be decoupled from it. The minimal *correct* increment is the
+pair:
+
+1. a consumer skips its release+re-request only while its local demand/component are
+   unchanged **and** it has received no invalidation from any producer it holds an
+   allocation on, and
+2. a producer, on a local capacity change, detects over-commitment and revokes/notifies
+   the affected consumers (which re-enter reconciliation and ripple to a fixed point).
+
+Both halves land together or not at all; (1) without (2) is a determinism bug.
+
+Everything above optimizes *within* the current consistency model: cross-region effects
+resolve **within the same tick**, exactly as a single thread would. That within-tick
+consistency is what forces the M3 barrier, the eager teardown, and the fixed-point
+ripple. The next subsection records the alternative of relaxing it.
+
+### Option B: snapshot-consistent (one-tick-stale) cross-region resolution -- CHOSEN (2026-06-14)
+
+This is now the **chosen target model** (see "Direction" near the top), not a deferred
+alternative. The change-driven reconciliation subsections above are retained for context
+on why the strong-consistency optimization was harder; they are no longer the plan.
+
+A different model, not just an optimization of the one above. Each region resolves its
+imports against the directory snapshot **as published at the end of the previous step**,
+not against live cross-region state. A neighbor's capacity change is reflected in your
+import *next* tick, not this one.
+
+The key is that this drops *synchronicity* without dropping *determinism*. Two properties
+are usually bundled under "deterministic":
+
+- **(A) Reproducibility / assignment-independence** -- same inputs produce the same
+  outputs regardless of worker count, region->worker assignment, or thread timing. This
+  is non-negotiable: lose it and the parity guard is meaningless and replays diverge.
+- **(B) Within-tick synchronous consistency** -- a neighbor's change is visible to you
+  the same tick, with no lag.
+
+The eager+barrier design enforces both. Option B keeps **(A)** and drops **(B)**. A
+one-tick lag is still fully deterministic *as long as the staleness rule is uniform and
+well defined* -- "resolve against the previous step's published snapshot" is a pure
+function of prior state, independent of who owns what, applied identically on one worker
+or many. So single-worker still equals multi-worker; the shared reference just shifts by
+one tick.
+
+Why this is dramatically simpler -- reading a *frozen* prior snapshot removes the three
+hard pieces at once:
+
+- **No barrier-for-correctness.** The M3 barrier exists to give live cross-worker
+  resolution a canonical within-step order. A frozen snapshot is order-independent --
+  there is nothing to order.
+- **No within-tick fixed-point.** Each region resolves its imports once, against last
+  step's numbers; the B->A->C ripple cannot form because B's change this step does not
+  affect A this step.
+- **No synchronous invalidation.** The producer just publishes its new capacity (it
+  already publishes summaries for hints); consumers read it next step. This is eventual
+  consistency and reuses the stale-tolerant directory directly.
+- Change-driven skipping becomes *safe*: a region recomputes against the latest snapshot,
+  and if its local inputs and the frozen import figures it reads are unchanged, it skips
+  -- there is no hidden live dependency that can shift underneath it.
+
+The one knob still to decide -- double-spend. Staleness fixes consistency, not
+arbitration: two consumers reading the same published spare could both claim it.
+
+- **B1 (authoritative, recommended):** the producer still arbitrates who gets its real
+  capacity, but once per step against a *frozen, sortable* request set (sort by the M3
+  order key offline), not via a live barrier. Deterministic, no over-subscription, and it
+  still deletes the barrier and the fixed-point. The sweet spot.
+- **B2 (optimistic):** consumers take against the published spare; the producer detects
+  over-subscription and corrects it next step. Simplest to build, but allows one tick of
+  over-spend (too much imported power for a tick).
+
+The cost is real and is a **balance decision, not a free optimization**. A one-tick lag
+on imported power/jobs is observable, so to preserve (A) the single-worker path must
+adopt the *same* stale rule -- which means Option B **revises the Non-Goal "no change to
+the single-worker observable behavior"** below. A 1-tick delay is usually fine and even
+realistic for a city sim, but watch for **oscillation**: a consumer that flips
+powered/unpowered every tick because it always reacts to stale numbers (bounded, but may
+want a damping rule).
+
+Relationship and gate:
+
+- Option B and the change-driven reconciliation above are *alternatives*, not layers:
+  change-driven keeps strong consistency and optimizes the churn; Option B changes the
+  consistency model so the churn problem largely dissolves. Pick one consistency model.
+- Gate: a parity guard against the **stale-model reference** (snapshot-consistent result
+  matches a single-worker run that uses the same one-tick rule), not against eager --
+  eager is a *different* model under Option B, so it is no longer the oracle.
+- Prerequisite: M1/M2 (the published per-step snapshot is exactly the directory product).
+  Option B notably does **not** need the M3 barrier for correctness, though M3's order key
+  is still the stable tiebreak for B1's offline arbitration.
 
 ## Non-Goals
 
@@ -286,6 +499,9 @@ as the R5 registry cache, but spanning regions you do not own.
   channels only.
 - No cross-region transit-capacity model (still binary connectivity, as before).
 - No change to the resolution math, balance, or the single-worker observable behavior.
+  (Exception: Option B in Deferred optimizations would deliberately revise this, trading
+  a one-tick cross-region lag for a much simpler model -- a balance decision, gated
+  separately.)
 - M6 (live moves) is explicitly optional and may never be needed.
 
 ## Review focus
