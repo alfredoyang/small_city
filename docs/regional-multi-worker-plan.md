@@ -13,173 +13,21 @@ For the vocabulary (`World`, `RegionState`, `RegionRuntime`, `RegionWorker`,
 discovery, export allocation, hints, generations) see
 [regional-terminology.md](regional-terminology.md).
 
-## Direction (decided 2026-06-14): adopt the one-tick-stale cross-region model
+## Status: superseded as the forward plan (2026-06-14)
 
-We are switching the target cross-region model from **live, strongly-consistent**
-resolution to **snapshot-consistent, one-tick-stale** resolution ("Option B", written up
-in full under [Deferred optimizations](#deferred-optimizations-only-if-profiling-at-scale-shows-they-matter)
--- now promoted from a deferred alternative to the chosen direction).
+The cross-region consistency model was changed on 2026-06-14 from the **live,
+strongly-consistent** barrier model described in this document to a
+**snapshot-consistent, one-tick-stale** model. The active forward plan now lives in
+[regional-snapshot-consistent-plan.md](regional-snapshot-consistent-plan.md).
 
-**What changes.** Each region resolves its cross-region imports against the directory
-snapshot **as published at the end of the previous step**, not against live cross-region
-state. A neighbor's change is reflected one tick later. This keeps determinism
-(reproducibility / assignment-independence) and drops only within-tick synchronicity --
-see the Option B writeup for why a uniform staleness rule stays deterministic.
-
-**Why.** It collapses most of the cross-region machinery. Allocation becomes a
-deterministic function of a frozen shared snapshot that every region computes the same
-way, so the following are **retired**:
-
-- the M3 **determinism barrier** (nothing to order -- delivery order stops mattering),
-- the **request / grant / release** export event choreography,
-- the **producer-owned live allocation ledger** (and the `producer_regions` release
-  fan-out),
-- the **`TickState` pause-tick machine** (a tick never waits on a cross-region value --
-  it reads the snapshot and runs straight through), and
-- the **multi-pass-per-tick drain** (one tick = one pass again).
-
-**What is kept / reused:**
-
-- **M1 + M2** -- the coordinator `RegionDirectory` and especially its **double-buffered
-  `Mutex<Arc>` snapshot** are exactly the read-frozen / write-next primitive this model
-  needs. M2 is now load-bearing, not just cross-thread-ready storage.
-- the **region->worker ownership map** and general cross-worker forwarding (for
-  commands / ticks / snapshots -- needed by any multi-worker model),
-- the **stable order key** (M3), repurposed as the deterministic tiebreak *inside* the
-  allocation function,
-- a coarse **step-level join** (all regions tick against the frozen snapshot, then their
-  new summaries become the next snapshot) -- a simple phase boundary, not a per-tick
-  state machine.
-
-**Accepted cost (a balance decision, not a free optimization):**
-
-- A one-tick lag on imported power/jobs. To preserve determinism the **single-worker
-  path adopts the same stale rule**, so this revises the Non-Goal "no change to the
-  single-worker observable behavior."
-- Chained cross-region effects (A->B->C) lag one tick **per hop** unless the allocation
-  function resolves a whole component from the snapshot in one shot (a lag-vs-compute
-  knob).
-- Watch for **oscillation** (a consumer flipping powered/unpowered each tick reacting to
-  stale numbers); add a damping rule if it shows up.
-
-**Status of the in-flight patches.** M1 and M2 are committed and are kept as-is. **M3
-(the barrier) is in the working tree and is now superseded by this decision** -- its
-barrier, the live ledger, and the pause-tick are things this model deletes rather than
-extends. Whether to still commit M3 as a checkpoint, or to pivot directly to Option B, is
-called out as an open decision below; the directory/ownership-map/order-key parts of M3
-survive regardless. The staged patches M4-M6 are re-scoped to the new model (spawn N
-workers + step join; configurable setup; live moves) and no longer carry the barrier.
-
-The "Target shape", "The determinism problem", and the M3 description further down
-describe the **superseded** live-barrier model; they are retained for history. The
-authoritative target is this section plus the Option B writeup.
-
-## Option B staged patches (the active plan)
-
-This replaces the old M3-M6 staging. Each patch is independently shippable, small
-(~5 files / ~400 lines; split if larger), and gated on tests. The big behavior change
-(the one-tick lag) lands in exactly one patch, OB3; everything before it is additive and
-behavior-preserving, everything after it is dead-code removal.
-
-**Two design choices baked in:**
-
-- **Double-spend (B1, authoritative-by-recompute):** every region computes the *same*
-  allocation function over the *same* frozen snapshot and reads off its own slice. No
-  producer arbitration messages, no double-spend (identical inputs -> identical result),
-  one-tick lag. The redundant per-region recompute of a component's allocation is
-  deterministic and embarrassingly parallel; accepted over the alternative
-  (producer publishes the result -> a second tick of lag).
-- **Chained dependencies:** the allocation function resolves a **whole road component**
-  from the snapshot in one shot, so a multi-hop effect (A->B->C) still lags only **one**
-  tick total, not one per hop. (Cost: more compute per step; revisit only if profiling
-  bites.)
-
-### Patch OB1: Publish quantitative cross-region summaries
-
-Goal: extend the directory's published per-region summary from boolean `has_spare` hints
-to the quantities the allocation function needs -- per regional road-network: producer
-**spare capacity** (power units, job slots) and consumer **import demand**.
-
-- `RegionalAvailabilityHint` grows (or is replaced by a `RegionalNetworkSummary`) with
-  `spare_power: i32`, `spare_job_slots: u32`, `power_demand`, `job_demand`, computed in
-  `RegionState::availability_hints` from the cached registry. Reuses M2's double-buffer.
-- **No behavior change:** the new fields are published but unconsumed; the live export
-  path still drives allocation.
-
-Tests: a region's published summary carries correct per-network spare and demand; all
-existing cross-region tests green unchanged.
-
-### Patch OB2: Snapshot allocation function (pure, offline)
-
-Goal: a pure `fn allocate_power(component_snapshot) -> map<(region, network), units>` and
-the job analog, resolving a whole component deterministically -- spare filled in stable
-order (region, network, then the M3 order key fields) until exhausted. No `World` access,
-no messages, not yet wired into the tick.
-
-- New module `core/regions/snapshot_allocation.rs` with the function and its tests.
-- **No behavior change:** the function exists, unused in production.
-
-Tests (the correctness anchor): characterization cases, **plus a cross-check that for the
-same frozen inputs the function's allocation equals what the live eager path grants** --
-proving the function faithfully reimplements the allocation semantics *before* the tick
-switches to it.
-
-### Patch OB3: Straight-through tick reads the snapshot (the model switch)
-
-Goal: a consumer tick resolves its imports by calling the allocation function over the
-**previous step's** snapshot instead of pausing for grants. Retire the `TickState`
-pause/resume and the multi-pass-per-tick drain for the export path.
-
-- `simulation.rs`: collapse `begin_tick_power_phase` / `continue_to_job_phase` /
-  `finish_tick_after_*` into a straight-through tick that reads imports from the snapshot;
-  `RegionRuntime` drops the `WaitingFor*` states.
-- **This is the behavior change:** introduces the one-tick lag, applied uniformly so
-  single-worker adopts the same rule. Revises the "no single-worker behavior change"
-  Non-Goal.
-- The request/grant/release events and producer ledger may still *exist* here (now
-  unused) to keep OB3's diff bounded; OB4 deletes them.
-
-Tests: the parity reference shifts to the stale model -- a guard that
-single-worker(stale) == multi-worker(stale) over a scripted run. **Plus a documented
-characterization** of how the stale model differs from the old eager model on a known
-scenario, so the behavior change is explicit and reviewed, not silent. Add a damping rule
-if oscillation (powered/unpowered flip on stale numbers) shows up.
-
-### Patch OB4: Retire the message-passing export path
-
-Goal: delete the now-unused choreography -- `*ExportRequested/Completed/Released` events,
-the producer-owned `ExportAllocations` ledger, `apply_*_export_grant`,
-`process_*_export_request`, and the `producer_regions` release fan-out. The barrier's
-export-event handling goes; cross-worker forwarding survives for commands/ticks/snapshots.
-
-- `runtime/mod.rs`, `worker.rs`, `mod.rs` (`*ExportGrant` / `Pending*Demand` types).
-- **No behavior change:** removing code OB3 made unreachable.
-
-Tests: stale-parity guard stays green; a test/grep asserting no export events remain.
-
-### Patch OB5: Step-level join and N workers
-
-Goal: replace barrier-driven multi-pass scheduling with the coarse **step join** -- each
-worker ticks all its regions against the frozen snapshot and publishes new summaries; at
-the step boundary the next snapshot becomes active via M2's swap -- and spawn N workers
-sharing regions (folds in the old M4).
-
-- `worker.rs` / `threaded.rs` scheduling, `regional_game_runner` (spawn N + own the
-  snapshot swap point).
-- **No behavior change** vs OB3/OB4: the join only changes how the same computation is
-  parallelized.
-
-Tests: an N-region game on K workers == 1 worker, identical over the stale-parity script;
-assignment-independent (the old M4/M5 parity-over-setup).
-
-### Carried forward (unchanged intent, re-scoped to no barrier)
-
-- **Configurable worker setup from a file** (old M5): still a performance knob, still
-  assignment-independent -- now trivially so, since the result is a function of the
-  snapshot, not of scheduling.
-- **Live region reassignment** (old M6): simpler under Option B -- a moved region just
-  starts publishing/reading on its new worker at a step boundary; there is no in-flight
-  export allocation to strand (there are no allocations).
+This document is retained as the record of the live-barrier model that patches **M1-M3
+shipped under**. M1 (coordinator directory) and M2 (published double-buffered snapshot)
+are kept and reused by the new model; **M3 (the determinism barrier) shipped as a
+checkpoint, but its barrier, the producer-owned live ledger, and the `TickState`
+pause-tick machine are retired by the new model.** The staged patches **M4-M6 below are
+superseded** by the new plan's OB patches. Everything from here down is historical, except
+the "Change-driven export-allocation reconciliation" note (which records why optimizing
+this model in place was harder than switching models).
 
 ## Why this is separate work
 
@@ -273,8 +121,10 @@ some parallel overlap for reproducibility. M3 must land with a parity guard
 ## Staged patches (SUPERSEDED -- live-barrier model, retained for history)
 
 > Superseded by the 2026-06-14 direction change. M1 and M2 shipped and are kept; M3
-> shipped as a checkpoint but its barrier is retired under Option B; M4-M6 below are
-> replaced by the "Option B staged patches" section above. Retained for history.
+> shipped as a checkpoint but its barrier is retired by the snapshot-consistent model;
+> M4-M6 below are replaced by the OB patches in
+> [regional-snapshot-consistent-plan.md](regional-snapshot-consistent-plan.md). Retained
+> for history.
 
 Each patch is independently shippable, behavior-preserving where marked, and gated on
 tests. Keep diffs within the repo's ~5 files / ~400 line guideline; split if larger.
@@ -525,90 +375,14 @@ pair:
 
 Both halves land together or not at all; (1) without (2) is a determinism bug.
 
-Everything above optimizes *within* the current consistency model: cross-region effects
-resolve **within the same tick**, exactly as a single thread would. That within-tick
-consistency is what forces the M3 barrier, the eager teardown, and the fixed-point
-ripple. The next subsection records the alternative of relaxing it.
-
-### Option B: snapshot-consistent (one-tick-stale) cross-region resolution -- CHOSEN (2026-06-14)
-
-This is now the **chosen target model** (see "Direction" near the top), not a deferred
-alternative. The change-driven reconciliation subsections above are retained for context
-on why the strong-consistency optimization was harder; they are no longer the plan.
-
-A different model, not just an optimization of the one above. Each region resolves its
-imports against the directory snapshot **as published at the end of the previous step**,
-not against live cross-region state. A neighbor's capacity change is reflected in your
-import *next* tick, not this one.
-
-The key is that this drops *synchronicity* without dropping *determinism*. Two properties
-are usually bundled under "deterministic":
-
-- **(A) Reproducibility / assignment-independence** -- same inputs produce the same
-  outputs regardless of worker count, region->worker assignment, or thread timing. This
-  is non-negotiable: lose it and the parity guard is meaningless and replays diverge.
-- **(B) Within-tick synchronous consistency** -- a neighbor's change is visible to you
-  the same tick, with no lag.
-
-The eager+barrier design enforces both. Option B keeps **(A)** and drops **(B)**. A
-one-tick lag is still fully deterministic *as long as the staleness rule is uniform and
-well defined* -- "resolve against the previous step's published snapshot" is a pure
-function of prior state, independent of who owns what, applied identically on one worker
-or many. So single-worker still equals multi-worker; the shared reference just shifts by
-one tick.
-
-Why this is dramatically simpler -- reading a *frozen* prior snapshot removes the three
-hard pieces at once:
-
-- **No barrier-for-correctness.** The M3 barrier exists to give live cross-worker
-  resolution a canonical within-step order. A frozen snapshot is order-independent --
-  there is nothing to order.
-- **No within-tick fixed-point.** Each region resolves its imports once, against last
-  step's numbers; the B->A->C ripple cannot form because B's change this step does not
-  affect A this step.
-- **No synchronous invalidation.** The producer just publishes its new capacity (it
-  already publishes summaries for hints); consumers read it next step. This is eventual
-  consistency and reuses the stale-tolerant directory directly.
-- Change-driven skipping becomes *safe*: a region recomputes against the latest snapshot,
-  and if its local inputs and the frozen import figures it reads are unchanged, it skips
-  -- there is no hidden live dependency that can shift underneath it.
-
-Double-spend -- **resolved: B1 (authoritative by shared recompute)** (decided
-2026-06-14). Staleness fixes consistency, not arbitration: two consumers reading the same
-published spare could both claim it. B1 resolves this **without any arbitration
-messages**: every region computes the *same* deterministic allocation function over the
-*same* frozen snapshot -- spare filled in a stable order (region, network, then the M3
-order key fields) until exhausted -- and reads off its own slice. Identical inputs produce
-an identical result on every worker, so there is no over-subscription and nothing to
-deliver or order. The redundant per-region recompute of a component's allocation is
-deterministic and embarrassingly parallel; it is what lets OB4 delete the request / grant
-/ release path entirely.
-
-Rejected alternative -- **B2 (optimistic):** consumers take against the published spare
-and the producer corrects over-subscription next step. Simpler still, but it allows one
-tick of over-spend (too much imported power for a tick). We prefer B1's
-no-over-subscription guarantee; the recompute cost is negligible at the region counts in
-play.
-
-The cost is real and is a **balance decision, not a free optimization**. A one-tick lag
-on imported power/jobs is observable, so to preserve (A) the single-worker path must
-adopt the *same* stale rule -- which means Option B **revises the Non-Goal "no change to
-the single-worker observable behavior"** below. A 1-tick delay is usually fine and even
-realistic for a city sim, but watch for **oscillation**: a consumer that flips
-powered/unpowered every tick because it always reacts to stale numbers (bounded, but may
-want a damping rule).
-
-Relationship and gate:
-
-- Option B and the change-driven reconciliation above are *alternatives*, not layers:
-  change-driven keeps strong consistency and optimizes the churn; Option B changes the
-  consistency model so the churn problem largely dissolves. Pick one consistency model.
-- Gate: a parity guard against the **stale-model reference** (snapshot-consistent result
-  matches a single-worker run that uses the same one-tick rule), not against eager --
-  eager is a *different* model under Option B, so it is no longer the oracle.
-- Prerequisite: M1/M2 (the published per-step snapshot is exactly the directory product).
-  Option B notably does **not** need the M3 barrier for correctness, though M3's order key
-  is still the stable tiebreak for B1's offline arbitration.
+Everything above optimizes *within* this live-consistency model: cross-region effects
+resolve **within the same tick**, exactly as a single thread would, which is what forces
+the barrier, the eager teardown, and the fixed-point ripple. Relaxing that -- accepting a
+one-tick lag -- *dissolves* the churn problem rather than optimizing it, and is the
+direction ultimately chosen (2026-06-14). That snapshot-consistent model and its staged
+patches now live in
+[regional-snapshot-consistent-plan.md](regional-snapshot-consistent-plan.md); the
+change-driven analysis above is retained as the reasoning that led there.
 
 ## Non-Goals
 
@@ -616,9 +390,8 @@ Relationship and gate:
   channels only.
 - No cross-region transit-capacity model (still binary connectivity, as before).
 - No change to the resolution math, balance, or the single-worker observable behavior.
-  (Exception: Option B in Deferred optimizations would deliberately revise this, trading
-  a one-tick cross-region lag for a much simpler model -- a balance decision, gated
-  separately.)
+  (This was deliberately revised by the snapshot-consistent model -- see
+  [regional-snapshot-consistent-plan.md](regional-snapshot-consistent-plan.md).)
 - M6 (live moves) is explicitly optional and may never be needed.
 
 ## Review focus
