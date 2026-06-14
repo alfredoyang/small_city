@@ -27,7 +27,7 @@ use crate::core::resource_registry::{
 use crate::core::resources::{CityResources, CityStats, LocalEffectsMap};
 use crate::core::systems::road_network_analysis::RoadNetworkAnalysis;
 use crate::interface::input::BuildingKind;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct World {
@@ -44,6 +44,14 @@ pub(crate) struct World {
     pub road_analysis: RoadNetworkAnalysis,
     #[serde(skip, default)]
     registry_cache: RefCell<ResourceRegistryCache>,
+    // DT1: marks the applied derived state (powered flags, stats, pollution,
+    // local effects, happiness) out of date after a config change. Unlike the
+    // registry cache above (which stores derived *resolution data* recomputed
+    // lazily on read), the derived pass *writes* into `&mut World`, so it cannot
+    // run behind a shared borrow; the flag lets the `&mut` step/read boundaries
+    // recompute it. A `Cell` so the `&self` invalidation chokepoints can set it.
+    #[serde(skip, default)]
+    derived_dirty: Cell<bool>,
     pub positions: HashMap<Entity, Position>,
     pub buildings: HashMap<Entity, Building>,
     pub populations: HashMap<Entity, Population>,
@@ -79,6 +87,7 @@ impl World {
             local_effects: LocalEffectsMap::new(width, height),
             road_analysis: RoadNetworkAnalysis::default(),
             registry_cache: RefCell::default(),
+            derived_dirty: Cell::new(false),
             positions: HashMap::new(),
             buildings: HashMap::new(),
             populations: HashMap::new(),
@@ -180,6 +189,29 @@ impl World {
     /// Mark only job entries dirty after citizen or workplace-effect changes.
     pub(crate) fn invalidate_jobs_registry(&self) {
         self.registry_cache.borrow_mut().invalidate_jobs();
+    }
+
+    /// Marks the applied derived state stale after an out-of-tick config change (DT1).
+    ///
+    /// `derived_dirty` is set **only** by player commands (the `RegionState`
+    /// command wrappers), not by `invalidate_*`. That keeps it false during a tick:
+    /// tick-internal mutations (citizen growth, business auto-upgrade, an applied
+    /// cross-region grant) invalidate the registry but must keep their existing
+    /// one-tick lag, and a recompute-on-read mid-tick would wipe in-flight imported
+    /// power. So the flag means precisely "a command changed config since the last
+    /// derived recompute", which is exactly when a view/tick must recompute.
+    pub(crate) fn mark_derived_dirty(&self) {
+        self.derived_dirty.set(true);
+    }
+
+    /// Whether the applied derived state is stale (DT1).
+    pub(crate) fn is_derived_dirty(&self) -> bool {
+        self.derived_dirty.get()
+    }
+
+    /// Marks the applied derived state current after the derived pass has run.
+    pub(crate) fn clear_derived_dirty(&self) {
+        self.derived_dirty.set(false);
     }
 
     /// Return cached local power resolution, recomputing lazily when dirty.

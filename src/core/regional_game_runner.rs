@@ -354,13 +354,16 @@ impl RecoveredRegionalGame {
     }
 
     pub fn region_snapshot(
-        &self,
+        &mut self,
         region_id: RegionId,
     ) -> Result<RegionViewSnapshot, RegionalGameRunnerError> {
+        // DT1: bring the derived pass current first, so a recovered runtime that
+        // ended on a paused command returns current state, not stale derived data.
         let runtime = self
             .worker
-            .region(region_id)
+            .region_mut(region_id)
             .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })?;
+        runtime.ensure_derived_state();
         let view = runtime.state().view();
 
         Ok(RegionViewSnapshot::from_view(region_id, view))

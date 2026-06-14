@@ -73,6 +73,9 @@ fn availability_hints_report_spare_registry_capacity_without_ecs_identity() {
     assert!(region.build(1, 0, BuildingKind::Commercial).success);
     assert!(region.build(4, 2, BuildingKind::Road).success);
 
+    // DT1: availability hints gate on applied power, so bring the derived pass
+    // current after the paused builds (the worker does this before reading hints).
+    region.ensure_derived_state();
     let hints = region.availability_hints();
     let copied = hints.clone();
 

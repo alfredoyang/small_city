@@ -30,7 +30,7 @@ use crate::core::entity::Entity;
 use crate::core::resources::CityStats;
 use crate::core::simulation::{
     TickJobPhase, TickPowerPhase, begin_tick_power_phase, continue_to_job_phase,
-    finish_tick_after_job_phase, refresh_derived_state_for_world,
+    ensure_derived_state, finish_tick_after_job_phase, refresh_derived_state_for_world,
 };
 use crate::core::systems::{build, bulldoze, economy, replace, road_connectivity, upgrade};
 use crate::core::world::World;
@@ -252,9 +252,15 @@ impl RegionState {
     }
 
     /// Applies one player build command through the core systems.
+    ///
+    /// DT1: the build only mutates config (which marks the derived state dirty);
+    /// the derived pass is recomputed lazily at the next view/inspect/tick read,
+    /// so a paused build still updates the view without advancing time.
     pub fn build(&mut self, x: usize, y: usize, kind: BuildingKind) -> CommandResult {
         let result = build::build(&mut self.world, x, y, kind);
-        refresh_derived_state_for_world(&mut self.world);
+        if result.success {
+            self.world.mark_derived_dirty();
+        }
         result
     }
 
@@ -267,7 +273,7 @@ impl RegionState {
     pub fn bulldoze(&mut self, x: usize, y: usize) -> CommandResult {
         let result = bulldoze::bulldoze(&mut self.world, x, y);
         if result.success {
-            refresh_derived_state_for_world(&mut self.world);
+            self.world.mark_derived_dirty();
         }
         result
     }
@@ -276,7 +282,7 @@ impl RegionState {
     pub fn replace(&mut self, x: usize, y: usize, kind: BuildingKind) -> CommandResult {
         let result = replace::replace(&mut self.world, x, y, kind);
         if result.success {
-            refresh_derived_state_for_world(&mut self.world);
+            self.world.mark_derived_dirty();
         }
         result
     }
@@ -285,12 +291,32 @@ impl RegionState {
     pub fn upgrade(&mut self, x: usize, y: usize) -> CommandResult {
         let result = upgrade::upgrade(&mut self.world, x, y);
         if result.success {
-            refresh_derived_state_for_world(&mut self.world);
+            self.world.mark_derived_dirty();
         }
         result
     }
 
+    /// Recomputes the derived pass if a config change has marked it dirty (DT1).
+    ///
+    /// Read boundaries that hold `&mut RegionState` call this before reading the
+    /// world so a paused command (which only marks dirty) is reflected. The tick
+    /// path recomputes via `begin_tick_power_phase` instead. Derived-summary reads
+    /// that gate on applied power (`availability_hints`, `regional_spare_capacity`,
+    /// `spare_job_slots_on_network`) require the caller to bring derived state
+    /// current first; the worker does this before publishing summaries.
+    pub fn ensure_derived_state(&mut self) {
+        ensure_derived_state(&mut self.world);
+    }
+
     /// Returns a UI-safe snapshot without exposing this region's ECS world.
+    ///
+    /// This is a pure read of already-applied derived state. Because regions are
+    /// shared for reading through immutable `RegionRuntime::state()`/`region()`
+    /// accessors, and the derived pass needs `&mut` to write applied state, the
+    /// DT1 recompute-on-read happens at the owning `&mut` boundary (the runtime
+    /// snapshot/inspect handlers and the worker before publishing summaries), not
+    /// here. A direct caller reading after a paused command must call
+    /// `ensure_derived_state` first.
     pub fn view(&self) -> GameView {
         view_world(&self.world)
     }
@@ -859,6 +885,29 @@ mod tests {
     }
 
     #[test]
+    fn ensure_derived_state_makes_a_paused_build_visible_to_a_direct_view() {
+        // RegionState::view() is a pure read (the derived pass runs at the owning
+        // &mut boundary). A direct caller reading after a paused command brings the
+        // derived state current via ensure_derived_state, then sees the new config.
+        let mut region = RegionState::new(RegionId(21), 4, 4);
+        assert!(region.build(0, 0, BuildingKind::PowerPlant).success);
+        assert!(region.build(0, 1, BuildingKind::Road).success);
+        assert!(region.build(1, 1, BuildingKind::Road).success);
+        assert!(region.build(1, 0, BuildingKind::Commercial).success);
+
+        region.ensure_derived_state();
+        let powered = region
+            .view()
+            .map
+            .cells
+            .iter()
+            .find(|cell| cell.x == 1 && cell.y == 0)
+            .and_then(|cell| cell.powered);
+        assert_eq!(powered, Some(true), "paused build is visible after ensure");
+        assert_eq!(region.view().status.turn, 0, "no tick advanced time");
+    }
+
+    #[test]
     fn regional_spare_capacity_matches_local_registry_remaining_capacity() {
         let mut region = RegionState::new(RegionId(5), 5, 3);
         assert!(region.build(0, 0, BuildingKind::PowerPlant).success);
@@ -868,6 +917,9 @@ mod tests {
         assert!(region.build(1, 0, BuildingKind::Commercial).success);
         assert!(region.build(2, 0, BuildingKind::Industrial).success);
 
+        // DT1: spare capacity is a derived-state read; bring the derived pass
+        // current after the paused builds (the worker does this before reading).
+        region.ensure_derived_state();
         assert_eq!(
             region.regional_spare_capacity(),
             RegionalSpareCapacity {

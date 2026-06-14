@@ -255,7 +255,7 @@ impl RegionWorker {
         self.id
     }
 
-    pub fn add_region(&mut self, runtime: RegionRuntime) -> Result<(), RegionAddError> {
+    pub fn add_region(&mut self, mut runtime: RegionRuntime) -> Result<(), RegionAddError> {
         let region_id = runtime.region_id();
         if self.region(region_id).is_some() {
             return Err(RegionAddError {
@@ -270,6 +270,10 @@ impl RegionWorker {
             });
         }
 
+        // DT1: a region built up via commands before being added would carry a
+        // dirty derived state; recompute it so the first published summaries are
+        // accurate.
+        runtime.ensure_derived_state();
         let links = runtime.state().network_border_links();
         let hints = runtime.state().availability_hints();
         self.regions.push(runtime);
@@ -312,6 +316,14 @@ impl RegionWorker {
     pub fn region(&self, region_id: RegionId) -> Option<&RegionRuntime> {
         self.regions
             .iter()
+            .find(|runtime| runtime.region_id() == region_id)
+    }
+
+    /// Mutable access to one owned runtime, so a derived-state read (DT1 inspect)
+    /// can recompute the derived pass before reading it.
+    pub fn region_mut(&mut self, region_id: RegionId) -> Option<&mut RegionRuntime> {
+        self.regions
+            .iter_mut()
             .find(|runtime| runtime.region_id() == region_id)
     }
 
@@ -412,6 +424,10 @@ impl RegionWorker {
                     .into_iter()
                     .map(|message| (source_region, message)),
             );
+            // DT1: a processed command (build/bulldoze) only marked the region
+            // dirty; recompute the derived pass before reading the summaries it
+            // feeds, so published hints reflect the latest config.
+            runtime.ensure_derived_state();
             changed_summaries.push((
                 source_region,
                 runtime.state().network_border_links(),

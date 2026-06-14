@@ -493,6 +493,27 @@ impl RegionRuntime {
         &self.state
     }
 
+    /// Inspects one cell, recomputing the derived pass first if a paused command
+    /// left it dirty (DT1), so inspect reflects the latest config like the view.
+    pub fn inspect(&mut self, x: usize, y: usize) -> crate::interface::view::InspectView {
+        self.ensure_derived_state();
+        self.state.inspect(x, y)
+    }
+
+    /// Recomputes the derived pass if a paused command left it dirty (DT1).
+    ///
+    /// The worker calls this after a scheduling slice and before reading the
+    /// region's published summaries (border links, availability hints), which
+    /// depend on derived state (effective workplaces gate on applied power).
+    ///
+    /// Safe to call mid-tick: `derived_dirty` is only set by out-of-tick commands
+    /// (see `World::mark_derived_dirty`), so a paused cross-region tick leaves it
+    /// false and this is a no-op -- it never re-runs `power::run` to wipe in-flight
+    /// imported power.
+    pub(crate) fn ensure_derived_state(&mut self) {
+        self.state.ensure_derived_state();
+    }
+
     pub(crate) fn into_state(self) -> RegionState {
         self.state
     }
@@ -977,10 +998,15 @@ impl RegionRuntime {
     }
 
     fn build_snapshot(
-        &self,
+        &mut self,
         request_id: UiRequestId,
         overlay: MapOverlayInput,
     ) -> RegionSnapshotResponse {
+        // DT1: a snapshot is a derived-state read. Recompute the derived pass first
+        // if a prior paused command left it dirty, so a snapshot taken with no tick
+        // in between reflects the build/bulldoze. (`view_with_overlay` is a pure
+        // read; the recompute is owned by this `&mut` boundary.)
+        self.ensure_derived_state();
         let view = self.state.view_with_overlay(overlay);
         RegionSnapshotResponse {
             request_id,
@@ -1280,6 +1306,9 @@ mod tick_state_tests {
         // citizens both "hold" the job). Regression guard for the CR3R network-scoped
         // exclusion bug.
         let mut runtime = RegionRuntime::new(bridge_producer_region(RegionId(2)));
+        // DT1: producer-side reads gate on applied power; bring the derived pass
+        // current after the paused builds (the worker does this before reading).
+        runtime.ensure_derived_state();
 
         // Both disconnected networks expose the single bridge slot.
         let networks: Vec<RegionRoadNetworkId> = runtime

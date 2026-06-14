@@ -697,6 +697,56 @@ fn cross_region_power_export_resolves_before_population_growth() {
 }
 
 #[test]
+fn derived_read_during_a_paused_power_handshake_does_not_wipe_imported_power() {
+    // DT1 mid-tick-safety regression. While a consumer's tick is paused waiting on
+    // a cross-region power grant -- imported power already applied to its
+    // residential -- a derived-state read (here `inspect`, also the worker's own
+    // between-pass hint publish) must NOT recompute the derived pass: `power::run`
+    // resolves only LOCAL power and would wipe the imported grant, leaving the
+    // residential unpowered so population never grows.
+    //
+    // The protection is that `derived_dirty` is set only by out-of-tick commands,
+    // so it stays false throughout a tick and the read is a no-op. If a future
+    // change marks it dirty inside a tick (e.g. from an applied grant or an
+    // `invalidate_*` call), this test fails where the plain population-growth test
+    // might still pass on timing.
+    let consumer = power_export_growth_region(RegionId(50));
+    let producer = power_export_producer_region(RegionId(51));
+    let mut worker = worker_with_region_states(WorkerId(60), vec![consumer, producer]);
+    worker.set_region_topology(vec![neighbor(50, BorderEdge::East, 51)]);
+
+    for request_id in 1..=48 {
+        worker.push_event(RegionId(50), tick(request_id)).unwrap();
+        worker
+            .push_event(RegionId(51), tick(request_id + 100))
+            .unwrap();
+        // Drain pass-by-pass, forcing a derived read between every pass so one lands
+        // while the consumer tick is mid-handshake.
+        for _ in 0..16 {
+            if worker.process_region_events(1).processed_regions == 0 {
+                break;
+            }
+            let _ = worker
+                .region_mut(RegionId(50))
+                .expect("consumer")
+                .inspect(0, 0);
+        }
+    }
+
+    assert!(
+        worker
+            .region(RegionId(50))
+            .expect("consumer")
+            .state()
+            .view()
+            .status
+            .population
+            > 0,
+        "imported power must survive derived reads taken mid-handshake"
+    );
+}
+
+#[test]
 fn cross_region_power_export_does_not_overwrite_a_paused_tick() {
     let consumer = power_export_consumer_region(RegionId(35));
     let producer = power_export_producer_region(RegionId(36));

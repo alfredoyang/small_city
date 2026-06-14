@@ -53,6 +53,11 @@ impl TickJobPhase {
 /// Regional runtimes can pause after this phase to request producer-exported
 /// power, then call `finish_tick_after_power_phase` once export grants apply.
 pub(crate) fn begin_tick_power_phase(world: &mut World) -> TickPowerPhase {
+    // DT1 derived-before-time: bring the derived pass current before the time
+    // pass reads it. A paused config change (build/bulldoze) only marks the world
+    // dirty; this is where that change is applied for the running step, matching
+    // the timing of the old eager per-command refresh.
+    ensure_derived_state(world);
     let before = TickSummarySnapshot::from_world(world);
     let before_time = world.resources.time;
     world.resources.time.advance_hours(1);
@@ -179,6 +184,35 @@ pub(crate) fn finish_tick_after_job_phase(
     CommandResult::success_events(events)
 }
 
+/// Recomputes the derived pass only when a config change has marked it dirty (DT1).
+///
+/// This is the lazy entry point: config commands (build/bulldoze/replace/upgrade)
+/// now only mark the world dirty instead of eagerly recomputing, so the derived
+/// pass runs once at the next `&mut` boundary that reads it -- a tick (via
+/// `begin_tick_power_phase`) or a view/inspect read -- and not once per command.
+///
+/// ```text
+///   build (paused) --> world.derived_dirty = true        (no recompute yet)
+///        |
+///        v   next tick OR view/inspect read
+///   ensure_derived_state: if dirty { run_derived_pass; clear }
+/// ```
+pub(crate) fn ensure_derived_state(world: &mut World) {
+    if world.is_derived_dirty() {
+        refresh_derived_state_for_world(world);
+        world.clear_derived_dirty();
+    }
+}
+
+/// The derived pass: the instantaneous state that is a pure function of the
+/// current config (buildings/roads/citizens), recomputed on change, not on time.
+///
+/// DT1 covers the already-derived systems: power, road analysis, stats, pollution,
+/// and local effects. `update_happiness`/`happiness::run` are included here because
+/// today's behavior recomputes them on a config change and `population::run` reads
+/// the result on the next tick; the happiness *target vs actual* split is deferred
+/// to DT2, so for now happiness rides along unchanged (its recompute is idempotent
+/// -- a direct assignment, not a time-eased accumulator).
 pub(crate) fn refresh_derived_state_for_world(world: &mut World) {
     power::run(world);
     road_network_analysis::run(world);

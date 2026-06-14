@@ -186,7 +186,7 @@ fn run_worker(mut worker: RegionWorker, commands: Receiver<ThreadedWorkerCommand
                 y,
                 reply,
             } => {
-                let _ = reply.send(inspect_from_worker(&worker, region_id, x, y));
+                let _ = reply.send(inspect_from_worker(&mut worker, region_id, x, y));
             }
             ThreadedWorkerCommand::Shutdown { mode, reply } => {
                 let final_pass = match mode {
@@ -203,14 +203,14 @@ fn run_worker(mut worker: RegionWorker, commands: Receiver<ThreadedWorkerCommand
 }
 
 fn inspect_from_worker(
-    worker: &RegionWorker,
+    worker: &mut RegionWorker,
     region_id: RegionId,
     x: usize,
     y: usize,
 ) -> Option<InspectView> {
     worker
-        .region(region_id)
-        .map(|runtime| runtime.state().inspect(x, y))
+        .region_mut(region_id)
+        .map(|runtime| runtime.inspect(x, y))
 }
 
 #[cfg(test)]

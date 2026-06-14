@@ -53,7 +53,7 @@ fn runner_shutdown_recovers_authoritative_region_state() {
     let runner = RegionalGameRunner::start(vec![RegionState::new(RegionId(4), 2, 2)]).unwrap();
 
     runner.tick_region(UiRequestId(21), RegionId(4)).unwrap();
-    let recovered = runner.shutdown().unwrap();
+    let mut recovered = runner.shutdown().unwrap();
     let snapshot = recovered.region_snapshot(RegionId(4)).unwrap();
 
     assert_eq!(snapshot.region_id, RegionId(4));
