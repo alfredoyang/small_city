@@ -102,9 +102,8 @@ pub struct Population {
 ///
 /// Citizens do not occupy map cells. Stable citizen-only state is grouped here to keep the custom
 /// ECS simple: `home` links to a residential building, `workplace_assignment`
-/// stores the current derived local-or-remote job, and `happiness` is updated by
-/// the citizen system from home conditions plus persistent morale changes such
-/// as daily decay.
+/// stores the current derived local-or-remote job, and `morale` keeps the DT2
+/// derived/time happiness boundary in one nested value.
 /// Future movement/pathfinding state should remain in separate reusable components instead of
 /// growing this record.
 pub struct Citizen {
@@ -118,14 +117,39 @@ pub struct Citizen {
     /// buildings, citizens, road components, and producer export allocations.
     #[serde(default, skip)]
     pub workplace_assignment: Option<WorkplaceAssignment>,
-    pub happiness: i32,
     #[serde(default)]
-    pub happiness_decay: i32,
+    pub morale: Morale,
     #[serde(default)]
     pub money: i32,
-    /// Set by the economy system when rent cannot be paid; happiness reads it as rent stress.
-    #[serde(default)]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Citizen morale, organized by the DT2 derived/time boundary.
+///
+/// ```text
+/// conditions (home, work, power, amenities, pollution) --derived--> target
+/// target - decay - rent_stress                         --time-----> actual
+/// ```
+///
+/// `target` intentionally stores the raw, unclamped condition score so actual
+/// happiness can preserve the old single-clamp formula. Views clamp target for
+/// display.
+pub struct Morale {
+    pub actual: i32,
+    pub target: i32,
+    pub decay: i32,
     pub rent_stress: i32,
+}
+
+impl Default for Morale {
+    fn default() -> Self {
+        Self {
+            actual: 50,
+            target: 50,
+            decay: 0,
+            rent_stress: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

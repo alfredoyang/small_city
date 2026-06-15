@@ -43,6 +43,7 @@ pub(crate) fn view_world_with_overlay(world: &World, overlay: MapOverlayInput) -
             pollution: world.stats.pollution,
             happiness: world.stats.happiness,
             average_citizen_happiness: citizens::average_happiness(world),
+            average_citizen_happiness_target: citizens::average_happiness_target(world),
             average_citizen_money: citizens::average_money(world),
             demand: calculate_demand(
                 world.stats.population,
@@ -165,6 +166,9 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 max_population: population.map(|population| population.max).unwrap_or(0),
                 citizens: citizens::citizen_count_for_home(world, entity),
                 average_happiness: citizens::average_happiness_for_home(world, entity),
+                average_happiness_target: citizens::average_happiness_target_for_home(
+                    world, entity,
+                ),
                 average_money: citizens::average_money_for_home(world, entity),
                 job_assignments: job_assignment_views_for_home(world, entity),
             }

@@ -46,13 +46,14 @@ fn inspect_residential_shows_powered_state_and_population() {
             max_population: 5,
             citizens: 0,
             average_happiness: None,
+            average_happiness_target: None,
             average_money: None,
             job_assignments: Vec::new(),
         })
     );
     assert_eq!(
         format_inspect(&inspect),
-        "(1, 0) Residential | Powered: Yes | Demand: 1 | Road: Yes | Level: 1 | Maintenance: 0 | Rent: 2 | Population: 0/5 | Citizens: 0 | Avg Happiness: None | Avg Money: None | Jobs: none"
+        "(1, 0) Residential | Powered: Yes | Demand: 1 | Road: Yes | Level: 1 | Maintenance: 0 | Rent: 2 | Population: 0/5 | Citizens: 0 | Avg Happiness: None | Target: None | Avg Money: None | Jobs: none"
     );
 }
 

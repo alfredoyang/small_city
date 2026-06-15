@@ -257,7 +257,7 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::World;
-    use crate::core::components::{Building, BuildingData, Citizen, Population, Position};
+    use crate::core::components::{Building, BuildingData, Citizen, Morale, Population, Position};
     use crate::interface::input::BuildingKind;
 
     #[test]
@@ -296,10 +296,8 @@ mod tests {
                 age: 0,
                 home: residential,
                 workplace_assignment: None,
-                happiness: 50,
-                happiness_decay: 0,
+                morale: Morale::default(),
                 money: 0,
-                rent_stress: 0,
             },
         );
 

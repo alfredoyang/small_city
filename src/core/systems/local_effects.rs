@@ -53,9 +53,9 @@ pub(crate) fn run(world: &mut World) {
                     continue;
                 }
 
-                if citizen.happiness >= 60 {
+                if citizen.morale.actual >= 60 {
                     effects.land_value += 1;
-                } else if citizen.happiness < 40 {
+                } else if citizen.morale.actual < 40 {
                     effects.pollution_pressure += 1;
                     effects.land_value -= 1;
                 }

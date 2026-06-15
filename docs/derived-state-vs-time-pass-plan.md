@@ -147,27 +147,78 @@ powered/jobs view with no tick.
 
 ### Patch DT2: Happiness H2 split
 
-Extract `happiness_target` (derived, from conditions) into the derived layer; keep
-`happiness_decay` / `rent_stress` accumulation and the actual-happiness relaxation in the
-time pass; expose `happiness_target` in the view.
+Split citizen morale into a derived **target** (a pure function of conditions) and a
+time-driven **actual** (the target net of accumulated decay/stress), and expose the target
+in the view.
 
-- **No behavior change** (running): actual happiness per tick is unchanged.
+**Group the four morale fields into one `Morale` struct on `Citizen`**, so the
+derived/time boundary is documented once at the type level instead of spread across loose
+`i32`s:
+
+```rust
+/// Citizen morale, organized by the DT2 derived/time boundary.
+///   conditions (home, work, power, amenities, pollution) --derived--> target
+///   target - decay - rent_stress                         --time-----> actual
+/// - target: DERIVED, recomputed in the derived pass (moves while paused).
+/// - actual: TIME-DRIVEN, advances only on a tick (frozen while paused).
+/// - decay, rent_stress: TIME accumulators that hold actual below target.
+pub struct Morale { pub actual: i32, pub target: i32, pub decay: i32, pub rent_stress: i32 }
+```
+
+`Citizen` holds `pub morale: Morale`; reads become `citizen.morale.target` / `.actual`
+etc., making the intent obvious at every call site (economy touches `decay`/`rent_stress`,
+the derived pass writes `target`, the time pass writes `actual`).
+
+- **Save compatibility is intentionally not preserved** (dev branch): the morale fields
+  change shape; `#[serde(default)]` on `Morale` so old saves load with defaults and the
+  first derived pass recomputes `target`. No backward-compat serde gymnastics.
+- **No behavior change** (running): actual happiness per tick must be **identical** to
+  today. Watch the **single-clamp invariant**: the old formula summed all terms
+  (conditions, decay, rent_stress) and clamped to `[0,100]` **once** at the end. `actual`
+  must do the same -- `clamp(target_unclamped - decay - rent_stress, 0, 100)` -- *not*
+  clamp the target first and subtract after. Clamping the target before subtracting drops
+  the decay-buffer that high-amenity homes (conditions > 100) rely on and reads ~5 points
+  low; that is a balance change, not allowed here. Keep `target` as the raw conditions
+  score for the `actual` computation, and clamp only for display.
 - New behavior (additive): the target updates in a paused view.
 
-Tests: parity on actual happiness over a scripted run; new -- paused amenity/power change
-moves `happiness_target` without a tick.
+Tests: parity on actual happiness over a scripted run, **including a high-amenity home
+(conditions > 100) with nonzero decay** -- the case the single-clamp invariant protects;
+new -- a paused amenity/power change moves the morale target without a tick.
 
 ### Patch DT3: Split economy into derived assignment vs time-driven money
 
-Separate `economy::run`: the job-assignment/matching becomes part of the derived pass
+Separate `economy::run`: local job-assignment/matching becomes part of the derived pass
 (visible while paused -- "job apply" updates immediately), while salary, tax, and business
 income stay in the time pass (frozen while paused).
 
-- **No behavior change** (running): money and assignments per tick unchanged.
-- New behavior (additive): a paused workplace build updates job assignments in the view.
+**This is a function split, not a data-struct grouping** (unlike DT2's `Morale`). Economy's
+derived and time halves are two *separate concerns*, not two facets of one value, and the
+data is already well-shaped: `workplace_assignment` is already a struct (derived) and
+`money` is a single accumulator field (time). So DT3 splits the *functions* -- a derived
+`assign_jobs` run in the derived pass vs a time `settle_economy` (salary/tax/income) run in
+the time pass -- and does not introduce a new type.
 
-Tests: parity on money and assignments; new -- paused workplace build updates the job
-assignment view without a tick.
+- **No behavior change** (running), and here is *why it holds*:
+  - **Money settles against the daily-boundary assignment.** Salary/tax read the job
+    assignment; with assignment in the derived pass and money in the time pass, the
+    **derived-before-time** ordering (DT1) guarantees `settle_economy` reads the current
+    assignment at the daily settlement -- the same value as today.
+  - **Assignment recomputing more often must not change the daily result.** Assignment is a
+    pure function of config, so recomputing it on a config change / paused read just
+    surfaces it earlier in the view; the value money settles against at the daily boundary
+    is unchanged.
+  - **Local vs remote assignment have different freeze semantics.** Local assignment is
+    derived/immediate; *remote* (imported) assignment stays tied to the cross-region step
+    and becomes one-tick-stale under
+    [regional-snapshot-consistent-plan.md](regional-snapshot-consistent-plan.md). Keep that
+    seam explicit so DT3 composes with OB: the derived pass owns local matching only.
+- New behavior (additive): a paused workplace build updates local job assignments in the
+  view.
+
+Tests: parity on money and assignments over a scripted run; a guard that a mid-day config
+change does not change the day's settled money (only when the daily boundary settles); new
+-- a paused workplace build updates the local job-assignment view without a tick.
 
 ### Patch DT4: Purify the time pass and document the dependency DAG
 

@@ -1,6 +1,6 @@
 //! Citizen entity support, including home links, happiness, and aggregate population sync.
 
-use crate::core::components::Citizen;
+use crate::core::components::{Citizen, Morale};
 use crate::core::entity::Entity;
 use crate::core::systems::{road_connectivity, road_network_analysis};
 use crate::core::world::World;
@@ -16,10 +16,8 @@ pub(crate) fn spawn_for_home(world: &mut World, residential: Entity, count: i32)
                 age: 0,
                 home: residential,
                 workplace_assignment: None,
-                happiness: 50,
-                happiness_decay: 0,
+                morale: Morale::default(),
                 money: 0,
-                rent_stress: 0,
             },
         );
     }
@@ -46,7 +44,7 @@ pub(crate) fn apply_daily_happiness_decay(world: &mut World) {
 
     for citizen in citizens {
         if let Some(citizen) = world.citizens.get_mut(&citizen) {
-            citizen.happiness_decay = (citizen.happiness_decay + DAILY_HAPPINESS_DECAY).min(100);
+            citizen.morale.decay = (citizen.morale.decay + DAILY_HAPPINESS_DECAY).min(100);
         }
     }
 }
@@ -56,9 +54,27 @@ pub(crate) fn update_happiness(world: &mut World) {
     citizens.sort_by_key(|citizen| citizen.0);
 
     for citizen in citizens {
-        let happiness = citizen_happiness(world, citizen);
+        let happiness = actual_happiness(world, citizen);
         if let Some(citizen) = world.citizens.get_mut(&citizen) {
-            citizen.happiness = happiness;
+            citizen.morale.actual = happiness;
+        }
+    }
+}
+
+/// Recomputes the derived, conditions-only happiness target.
+///
+/// ```text
+/// roads/power/jobs/amenities/pollution -> happiness_target
+/// daily decay + rent stress             -> actual happiness on tick
+/// ```
+pub(crate) fn update_happiness_targets(world: &mut World) {
+    let mut citizens: Vec<_> = world.citizens.keys().copied().collect();
+    citizens.sort_by_key(|citizen| citizen.0);
+
+    for citizen in citizens {
+        let target = citizen_happiness_target(world, citizen);
+        if let Some(citizen) = world.citizens.get_mut(&citizen) {
+            citizen.morale.target = target;
         }
     }
 }
@@ -82,7 +98,7 @@ pub(crate) fn average_happiness_for_home(world: &World, residential: Entity) -> 
         if citizen.home != residential {
             continue;
         }
-        total += citizen.happiness;
+        total += citizen.morale.actual;
         count += 1;
     }
 
@@ -98,7 +114,35 @@ pub(crate) fn average_happiness(world: &World) -> Option<i32> {
     let total: i32 = world
         .citizens
         .values()
-        .map(|citizen| citizen.happiness)
+        .map(|citizen| citizen.morale.actual)
+        .sum();
+    Some(total / count)
+}
+
+pub(crate) fn average_happiness_target_for_home(world: &World, residential: Entity) -> Option<i32> {
+    let mut total = 0;
+    let mut count = 0;
+    for citizen in world.citizens.values() {
+        if citizen.home != residential {
+            continue;
+        }
+        total += display_happiness(citizen.morale.target);
+        count += 1;
+    }
+
+    if count > 0 { Some(total / count) } else { None }
+}
+
+pub(crate) fn average_happiness_target(world: &World) -> Option<i32> {
+    let count = world.citizens.len() as i32;
+    if count == 0 {
+        return None;
+    }
+
+    let total: i32 = world
+        .citizens
+        .values()
+        .map(|citizen| display_happiness(citizen.morale.target))
         .sum();
     Some(total / count)
 }
@@ -127,12 +171,25 @@ pub(crate) fn average_money(world: &World) -> Option<i32> {
     Some(total / count)
 }
 
-fn citizen_happiness(world: &World, citizen: Entity) -> i32 {
+fn actual_happiness(world: &World, citizen: Entity) -> i32 {
+    let Some(citizen) = world.citizens.get(&citizen) else {
+        return 50;
+    };
+
+    let mut happiness = citizen.morale.target - citizen.morale.decay;
+    if world.positions.contains_key(&citizen.home) {
+        happiness -= citizen.morale.rent_stress * 10;
+    }
+
+    display_happiness(happiness)
+}
+
+fn citizen_happiness_target(world: &World, citizen: Entity) -> i32 {
     let Some(citizen) = world.citizens.get(&citizen) else {
         return 50;
     };
     let Some(position) = world.positions.get(&citizen.home) else {
-        return (50 - citizen.happiness_decay).clamp(0, 100);
+        return 50;
     };
 
     let effects = world.local_effects.get(position.x, position.y);
@@ -152,25 +209,31 @@ fn citizen_happiness(world: &World, citizen: Entity) -> i32 {
     if road_access.nearest_shop_distance.is_none() {
         happiness -= 2;
     }
-    happiness -= citizen.rent_stress * 10;
     if !powered {
         happiness -= 15;
     }
     if !road_connected {
         happiness -= 10;
     }
-    happiness -= citizen.happiness_decay;
 
+    happiness
+}
+
+fn display_happiness(happiness: i32) -> i32 {
     happiness.clamp(0, 100)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_daily_happiness_decay, average_happiness_for_home, citizen_count_for_home,
-        spawn_for_home, update_happiness,
+        apply_daily_happiness_decay, average_happiness_for_home, average_happiness_target_for_home,
+        citizen_count_for_home, spawn_for_home, update_happiness, update_happiness_targets,
     };
+    use crate::core::components::PowerConsumer;
+    use crate::core::resources::LocalEffects;
+    use crate::core::systems::placement;
     use crate::core::world::World;
+    use crate::interface::input::BuildingKind;
 
     #[test]
     fn spawning_citizens_links_them_to_home() {
@@ -191,9 +254,14 @@ mod tests {
         spawn_for_home(&mut world, residential, 1);
 
         apply_daily_happiness_decay(&mut world);
+        update_happiness_targets(&mut world);
         update_happiness(&mut world);
 
         assert_eq!(average_happiness_for_home(&world, residential), Some(49));
+        assert_eq!(
+            average_happiness_target_for_home(&world, residential),
+            Some(50)
+        );
     }
 
     #[test]
@@ -204,9 +272,54 @@ mod tests {
 
         for _ in 0..150 {
             apply_daily_happiness_decay(&mut world);
+            update_happiness_targets(&mut world);
             update_happiness(&mut world);
         }
 
         assert_eq!(average_happiness_for_home(&world, residential), Some(0));
+    }
+
+    #[test]
+    fn high_amenity_target_uses_single_final_clamp_for_actual_happiness() {
+        let mut world = World::new(1, 1);
+        placement::place_building(&mut world, 0, 0, BuildingKind::Residential);
+        let residential = world.grid.get(0, 0).expect("residential");
+        world.power_consumers.insert(
+            residential,
+            PowerConsumer {
+                demand: 1,
+                powered: true,
+                source: None,
+            },
+        );
+        world.local_effects.cells[0] = LocalEffects {
+            land_value: 4,
+            pollution_pressure: 0,
+            accessibility: 20,
+            desirability: 20,
+        };
+        spawn_for_home(&mut world, residential, 1);
+        let citizen = *world.citizens.keys().next().expect("citizen");
+        world
+            .citizens
+            .get_mut(&citizen)
+            .expect("citizen")
+            .morale
+            .decay = 60;
+
+        update_happiness_targets(&mut world);
+        update_happiness(&mut world);
+
+        let raw_target = world.citizens.get(&citizen).expect("citizen").morale.target;
+        assert!(raw_target > 100, "fixture must exercise an over-100 target");
+        assert_eq!(
+            average_happiness_target_for_home(&world, residential),
+            Some(100)
+        );
+        assert_eq!(
+            average_happiness_for_home(&world, residential),
+            Some(raw_target - 60),
+            "actual happiness must clamp once after subtracting decay"
+        );
     }
 }

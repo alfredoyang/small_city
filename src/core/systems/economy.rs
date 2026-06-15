@@ -168,11 +168,11 @@ pub(crate) fn run(world: &mut World, exported_job_slots: &[Entity]) -> EconomyBr
             if citizen.money >= rent {
                 citizen.money -= rent;
                 rent_income += rent;
-                citizen.rent_stress = 0;
+                citizen.morale.rent_stress = 0;
             } else {
                 rent_failures += 1;
-                citizen.rent_stress = 1;
-                citizen.happiness -= MISSED_RENT_HAPPINESS_PENALTY;
+                citizen.morale.rent_stress = 1;
+                citizen.morale.actual -= MISSED_RENT_HAPPINESS_PENALTY;
             }
 
             // Shopping is optional and capacity-limited by commercial buildings.
@@ -185,7 +185,7 @@ pub(crate) fn run(world: &mut World, exported_job_slots: &[Entity]) -> EconomyBr
                 citizen.money -= shopping.cost;
                 commercial_sales_tax += shopping.sales_tax;
                 shoppers_served += 1;
-                citizen.happiness += shopping.happiness_bonus;
+                citizen.morale.actual += shopping.happiness_bonus;
                 if shopping.local_goods {
                     recover_happiness_from_shopping(citizen, LOCAL_SHOPPING_DECAY_RECOVERY);
                     local_goods_sold += 1;
@@ -199,10 +199,10 @@ pub(crate) fn run(world: &mut World, exported_job_slots: &[Entity]) -> EconomyBr
                         Some((shopping.commercial, COMMERCIAL_IMPORTED_GOOD_PROFIT));
                 }
             } else {
-                citizen.happiness -= MISSED_SHOPPING_HAPPINESS_PENALTY;
+                citizen.morale.actual -= MISSED_SHOPPING_HAPPINESS_PENALTY;
             }
 
-            citizen.happiness = citizen.happiness.clamp(0, 100);
+            citizen.morale.actual = citizen.morale.actual.clamp(0, 100);
         }
         if let Some(commercial) = sold_local_good_from {
             consume_local_good(world, commercial);
@@ -621,9 +621,9 @@ fn consume_local_good(world: &mut World, commercial: Entity) {
 }
 
 fn recover_happiness_from_shopping(citizen: &mut Citizen, amount: i32) {
-    let recovered = citizen.happiness_decay.min(amount.max(0));
-    citizen.happiness_decay -= recovered;
-    citizen.happiness += recovered;
+    let recovered = citizen.morale.decay.min(amount.max(0));
+    citizen.morale.decay -= recovered;
+    citizen.morale.actual += recovered;
 }
 
 fn add_commercial_goods(world: &mut World, commercial: Entity, amount: i32) {
@@ -888,7 +888,7 @@ mod tests {
         let citizen = *world.citizens.keys().next().expect("citizen");
         if let Some(citizen) = world.citizens.get_mut(&citizen) {
             citizen.money = 10;
-            citizen.happiness_decay = 10;
+            citizen.morale.decay = 10;
         }
         world.power_consumers.get_mut(&commercial).unwrap().powered = true;
         if with_local_goods {
@@ -901,18 +901,14 @@ mod tests {
 
     fn set_citizen_decay(world: &mut World, citizen: Entity, decay: i32) {
         let citizen = world.citizens.get_mut(&citizen).expect("citizen");
-        citizen.happiness_decay = decay;
+        citizen.morale.decay = decay;
     }
 
     fn citizen_decay(world: &World, citizen: Entity) -> i32 {
-        world
-            .citizens
-            .get(&citizen)
-            .expect("citizen")
-            .happiness_decay
+        world.citizens.get(&citizen).expect("citizen").morale.decay
     }
 
     fn citizen_happiness(world: &World, citizen: Entity) -> i32 {
-        world.citizens.get(&citizen).expect("citizen").happiness
+        world.citizens.get(&citizen).expect("citizen").morale.actual
     }
 }

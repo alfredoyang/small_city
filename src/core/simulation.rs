@@ -104,6 +104,7 @@ pub(crate) fn continue_to_job_phase(
     if is_daily {
         population::run(world);
     }
+    citizens::update_happiness_targets(world);
     citizens::update_happiness(world);
     local_effects::run(world);
     if is_daily {
@@ -208,19 +209,16 @@ pub(crate) fn ensure_derived_state(world: &mut World) {
 /// current config (buildings/roads/citizens), recomputed on change, not on time.
 ///
 /// DT1 covers the already-derived systems: power, road analysis, stats, pollution,
-/// and local effects. `update_happiness`/`happiness::run` are included here because
-/// today's behavior recomputes them on a config change and `population::run` reads
-/// the result on the next tick; the happiness *target vs actual* split is deferred
-/// to DT2, so for now happiness rides along unchanged (its recompute is idempotent
-/// -- a direct assignment, not a time-eased accumulator).
+/// and local effects. DT2 keeps actual citizen happiness in the time pass while
+/// exposing the conditions-only `happiness_target` from this derived pass.
 pub(crate) fn refresh_derived_state_for_world(world: &mut World) {
     power::run(world);
     road_network_analysis::run(world);
     stats::refresh_population_and_jobs(world);
     pollution::run(world);
-    citizens::update_happiness(world);
-    happiness::run(world);
     local_effects::run(world);
+    citizens::update_happiness_targets(world);
+    happiness::run(world);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -328,6 +326,7 @@ mod tests {
             .values()
             .next()
             .expect("citizen")
-            .happiness_decay
+            .morale
+            .decay
     }
 }

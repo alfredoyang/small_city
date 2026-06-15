@@ -106,3 +106,92 @@ fn paused_commands_do_not_advance_the_time_pass() {
     assert!(game.tick().success);
     assert_eq!(game.view().status.turn, 1);
 }
+
+/// DT2 splits derived happiness target from actual happiness. Paused config
+/// changes can move the target immediately, but actual citizen happiness remains
+/// a time-pass value and changes only when a tick runs.
+#[test]
+fn paused_amenity_change_moves_happiness_target_without_actual_happiness() {
+    let mut game = SingleRegionTestGame::new(5, 4);
+    build_growth_city(&mut game);
+    advance_one_day(&mut game);
+
+    let before = game.view();
+    assert!(
+        before.status.citizens > 0,
+        "the fixture must have a citizen before testing happiness"
+    );
+    let before_actual = before
+        .status
+        .average_citizen_happiness
+        .expect("actual happiness");
+    let before_target = before
+        .status
+        .average_citizen_happiness_target
+        .expect("target happiness");
+
+    assert!(game.build(1, 2, BuildingKind::Park).success);
+
+    let after = game.view();
+    assert_eq!(after.status.turn, before.status.turn);
+    assert_eq!(
+        after.status.average_citizen_happiness,
+        Some(before_actual),
+        "actual happiness must not move while paused"
+    );
+    let after_target = after
+        .status
+        .average_citizen_happiness_target
+        .expect("target after");
+    assert!(
+        after_target > before_target,
+        "adding an amenity should raise the derived happiness target, before {before_target}, after {after_target}"
+    );
+}
+
+/// DT2 should not change actual happiness during normal ticking. This pins a
+/// scripted run where a citizen grows, a paused amenity changes only the target,
+/// then the next daily tick applies the same actual-happiness formula as before:
+/// target minus accumulated daily decay.
+#[test]
+fn actual_happiness_matches_scripted_tick_values_after_h2_split() {
+    let mut game = SingleRegionTestGame::new(5, 4);
+    build_growth_city(&mut game);
+
+    advance_one_day(&mut game);
+    assert_happiness(&game.view(), Some(75), Some(76));
+
+    assert!(game.build(1, 2, BuildingKind::Park).success);
+    assert_happiness(&game.view(), Some(75), Some(92));
+
+    advance_one_day(&mut game);
+    assert_happiness(&game.view(), Some(85), Some(87));
+}
+
+fn build_growth_city(game: &mut SingleRegionTestGame) {
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(0, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 1, BuildingKind::Road).success);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(2, 0, BuildingKind::Commercial).success);
+}
+
+fn assert_happiness(view: &GameView, actual: Option<i32>, target: Option<i32>) {
+    assert_eq!(
+        view.status.average_citizen_happiness, actual,
+        "actual happiness mismatch at turn {}",
+        view.status.turn
+    );
+    assert_eq!(
+        view.status.average_citizen_happiness_target, target,
+        "target happiness mismatch at turn {}",
+        view.status.turn
+    );
+}
+
+fn advance_one_day(game: &mut SingleRegionTestGame) {
+    for _ in 0..24 {
+        assert!(game.tick().success);
+    }
+}
