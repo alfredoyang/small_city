@@ -175,6 +175,24 @@ fn money_and_assignments_match_scripted_tick_values_after_dt3_split() {
     assert_eq!(game.view().status.money, 71);
 }
 
+/// DT4 is an audit/ordering cleanup, so a longer running script should keep the
+/// same time outputs: turn, money, population, and assignment count.
+#[test]
+fn long_scripted_run_pins_time_outputs_after_dt4_audit() {
+    let mut game = SingleRegionTestGame::new(5, 4);
+    build_growth_city(&mut game);
+
+    for _ in 0..14 {
+        advance_one_day(&mut game);
+    }
+
+    let view = game.view();
+    assert_eq!(view.status.turn, 336);
+    assert_eq!(view.status.population, 2);
+    assert_eq!(view.status.money, 143);
+    assert_eq!(assignment_count(&view, 1, 0), 2);
+}
+
 /// DT2 splits derived happiness target from actual happiness. Paused config
 /// changes can move the target immediately, but actual citizen happiness remains
 /// a time-pass value and changes only when a tick runs.

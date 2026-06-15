@@ -3,6 +3,38 @@
 //! This module owns world-level simulation ordering that is shared by the
 //! regional `RegionState`. It remains crate-local so UI code cannot receive or
 //! manipulate ECS `World` storage directly.
+//!
+//! DT4 derived -> time dependency graph for one local tick:
+//!
+//! ```text
+//! config/citizens
+//!   -> derived: power -> roads -> stats -> pollution -> local effects
+//!   -> derived: local job assignment -> morale target
+//!   -> time:    clock, daily morale decay, population growth, actual morale
+//!   -> time:    remote job grants, economy money/goods, weekly reinvestment
+//!   -> derived summary refresh for the tick event and next paused read
+//! ```
+//!
+//! Audit notes:
+//! - `population::run` reads derived power/roads/jobs/local effects and writes
+//!   citizen/population accumulators only. It creates a time -> derived edge
+//!   because newly spawned citizens are counted by the following summary refresh.
+//! - `business_growth::run` is a weekly time step: it reads derived demand/stats
+//!   and durable business cash, then mutates building levels. The post-step
+//!   summary refresh makes that time output visible without running another time
+//!   system.
+//! - `local_effects::run` intentionally reads `Citizen::morale.actual`, a time
+//!   output. This creates a one-step feedback loop:
+//!
+//! ```text
+//! morale.actual -> local_effects -> morale.target -> next morale.actual
+//! ```
+//!
+//!   The tick runs local effects before target/actual happiness and again after,
+//!   so target reads the previous applied actual morale; the next refresh observes
+//!   the updated actual. Paused derived refreshes are idempotent because actual
+//!   morale is frozen while paused.
+//! - `Citizen::age` is durable state, but no aging system exists yet.
 
 use crate::core::regions::RegionId;
 use crate::core::resources::{GameTime, is_new_day, is_new_week};
@@ -268,7 +300,9 @@ fn game_time_view(time: GameTime) -> GameTimeView {
 #[cfg(test)]
 mod tests {
     use super::{refresh_derived_state_for_world, tick_world};
+    use crate::core::components::WorkplaceAssignment;
     use crate::core::regions::RegionId;
+    use crate::core::resources::{CityStats, LocalEffectsMap};
     use crate::core::systems::citizens;
     use crate::core::systems::placement;
     use crate::core::world::World;
@@ -314,6 +348,55 @@ mod tests {
         assert_eq!(world.stats.population, 1);
     }
 
+    #[test]
+    fn paused_derived_refresh_does_not_advance_money_population_or_age() {
+        let mut world = World::new(3, 3);
+        placement::place_building(&mut world, 0, 0, BuildingKind::Residential);
+        let residential = world.grid.get(0, 0).expect("residential");
+        citizens::spawn_for_home(&mut world, residential, 1);
+        let citizen = *world.citizens.keys().next().expect("citizen");
+        world.citizens.get_mut(&citizen).expect("citizen").age = 12;
+        refresh_derived_state_for_world(&mut world, RegionId(1));
+
+        placement::place_building(&mut world, 1, 0, BuildingKind::Park);
+        let money_after_command = world.resources.money;
+        let population_before_refresh = world.stats.population;
+        let turn_before_refresh = world.resources.turn;
+        let time_before_refresh = world.resources.time;
+        let age_before_refresh = world.citizens.get(&citizen).expect("citizen").age;
+
+        refresh_derived_state_for_world(&mut world, RegionId(1));
+
+        assert_eq!(world.resources.money, money_after_command);
+        assert_eq!(world.stats.population, population_before_refresh);
+        assert_eq!(world.resources.turn, turn_before_refresh);
+        assert_eq!(world.resources.time, time_before_refresh);
+        assert_eq!(
+            world.citizens.get(&citizen).expect("citizen").age,
+            age_before_refresh
+        );
+    }
+
+    #[test]
+    fn paused_derived_refresh_is_idempotent_for_applied_derived_state() {
+        let mut world = World::new(4, 3);
+        placement::place_building(&mut world, 0, 0, BuildingKind::PowerPlant);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Residential);
+        placement::place_building(&mut world, 2, 0, BuildingKind::Commercial);
+        for x in 0..=2 {
+            placement::place_building(&mut world, x, 1, BuildingKind::Road);
+        }
+        let residential = world.grid.get(1, 0).expect("residential");
+        citizens::spawn_for_home(&mut world, residential, 1);
+
+        refresh_derived_state_for_world(&mut world, RegionId(1));
+        let once = DerivedSnapshot::from_world(&world);
+        refresh_derived_state_for_world(&mut world, RegionId(1));
+        let twice = DerivedSnapshot::from_world(&world);
+
+        assert_eq!(twice, once);
+    }
+
     fn world_with_one_citizen() -> (World, crate::core::entity::Entity) {
         let mut world = World::new(1, 1);
         let residential = world.spawn();
@@ -330,5 +413,38 @@ mod tests {
             .expect("citizen")
             .morale
             .decay
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DerivedSnapshot {
+        stats: CityStats,
+        local_effects: LocalEffectsMap,
+        morale_targets: Vec<(u32, i32)>,
+        assignments: Vec<(u32, Option<WorkplaceAssignment>)>,
+    }
+
+    impl DerivedSnapshot {
+        fn from_world(world: &World) -> Self {
+            let mut morale_targets = world
+                .citizens
+                .iter()
+                .map(|(entity, citizen)| (entity.0, citizen.morale.target))
+                .collect::<Vec<_>>();
+            morale_targets.sort_by_key(|(entity, _)| *entity);
+
+            let mut assignments = world
+                .citizens
+                .iter()
+                .map(|(entity, citizen)| (entity.0, citizen.workplace_assignment))
+                .collect::<Vec<_>>();
+            assignments.sort_by_key(|(entity, _)| *entity);
+
+            Self {
+                stats: world.stats.clone(),
+                local_effects: world.local_effects.clone(),
+                morale_targets,
+                assignments,
+            }
+        }
     }
 }
