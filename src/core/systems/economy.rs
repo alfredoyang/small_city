@@ -55,18 +55,34 @@ pub(crate) struct EconomyBreakdown {
     pub net: i32,
 }
 
-/// Resolves and applies local workplace assignments for the daily economy.
+/// Resolves and applies local workplace assignments for the derived pass.
 ///
-/// This runs before any cross-region job export phase so a citizen left without
-/// a reachable local slot becomes a candidate for an imported (remote) workplace.
-/// It also clears any prior remote-workplace assignment so it is recomputed each
-/// day from authoritative state.
+/// Local assignments are pure derived state and can update while paused. Existing
+/// remote assignments are preserved here because remote work is owned by the
+/// cross-region tick phase and intentionally stays frozen until that phase runs.
+///
+/// TODO(paused remote jobs): remote/exported job assignment does not update while
+/// paused -- it only resolves during the daily cross-region request/grant/release
+/// phase, which needs a tick. So a paused jobless citizen cannot gain a new remote
+/// job, and existing remote allocations are not re-resolved. Under the
+/// snapshot-consistent model (docs/regional-snapshot-consistent-plan.md), remote
+/// assignment becomes a pure function of the previous step's frozen snapshot and
+/// could be derived here too (against that stale snapshot), making it paused-visible
+/// like local assignment. Revisit when OB lands.
 pub(crate) fn assign_local_jobs(world: &mut World, local_region: RegionId) {
+    let job_resolution = world.cached_job_resolution();
+    apply_workplace_assignments(world, local_region, &job_resolution.assignments);
+}
+
+/// Starts a daily local/remote job resolution from authoritative local state.
+///
+/// Daily ticks clear all prior assignments first so remote jobs can be requested
+/// again from producer regions after local matching has taken its current slots.
+pub(crate) fn assign_local_jobs_for_daily_tick(world: &mut World, local_region: RegionId) {
     for citizen in world.citizens.values_mut() {
         citizen.workplace_assignment = None;
     }
-    let job_resolution = world.cached_job_resolution();
-    apply_workplace_assignments(world, local_region, &job_resolution.assignments);
+    assign_local_jobs(world, local_region);
 }
 
 /// Runs the daily economy after job assignment (local in `assign_local_jobs`,
@@ -347,7 +363,15 @@ fn apply_workplace_assignments(
             })
         });
         if let Some(citizen) = world.citizens.get_mut(&assignment.citizen) {
-            citizen.workplace_assignment = workplace_assignment;
+            match (citizen.workplace_assignment, workplace_assignment) {
+                (Some(existing), _)
+                    if matches!(existing.source, WorkplaceSource::Remote { .. }) => {}
+                // Paused derived refresh owns local matching only. Remote work
+                // is frozen until the explicit daily job-export phase clears and
+                // rebuilds assignments, which also releases producer allocations
+                // before routing new requests.
+                (_, next) => citizen.workplace_assignment = next,
+            }
         }
     }
 }
@@ -781,7 +805,8 @@ pub(crate) fn maintenance_for_building(kind: BuildingKind, level: u8) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{EconomyIndex, run};
+    use super::{EconomyIndex, assign_local_jobs, run};
+    use crate::core::components::{Position, WorkplaceAssignment, WorkplaceSource};
     use crate::core::entity::Entity;
     use crate::core::regions::RegionId;
     use crate::core::systems::{citizens, placement, road_network_analysis};
@@ -810,6 +835,45 @@ mod tests {
         assert_eq!(index.workplace_slots.len(), 5);
         assert_eq!(index.shopping_slots, vec![commercial; 4]);
         assert_eq!(index.maintenance_cost, 2);
+    }
+
+    #[test]
+    fn derived_local_assignment_preserves_existing_remote_job_until_daily_phase() {
+        let mut world = World::new(4, 3);
+        placement::place_building(&mut world, 0, 0, BuildingKind::Residential);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Commercial);
+        placement::place_building(&mut world, 0, 1, BuildingKind::Road);
+        placement::place_building(&mut world, 1, 1, BuildingKind::Road);
+        let residential = world.grid.get(0, 0).expect("residential");
+        let commercial = world.grid.get(1, 0).expect("commercial");
+        world.power_consumers.get_mut(&commercial).unwrap().powered = true;
+        road_network_analysis::run(&mut world);
+        citizens::spawn_for_home(&mut world, residential, 1);
+        let citizen = *world.citizens.keys().next().expect("citizen");
+        world
+            .citizens
+            .get_mut(&citizen)
+            .unwrap()
+            .workplace_assignment = Some(WorkplaceAssignment {
+            region: RegionId(2),
+            position: Position { x: 3, y: 0 },
+            salary: 4,
+            source: WorkplaceSource::Remote { slot_id: 7 },
+        });
+
+        assign_local_jobs(&mut world, RegionId(1));
+
+        let assignment = world
+            .citizens
+            .get(&citizen)
+            .expect("citizen")
+            .workplace_assignment
+            .expect("assignment");
+        assert_eq!(assignment.region, RegionId(2));
+        assert!(matches!(
+            assignment.source,
+            WorkplaceSource::Remote { slot_id: 7 }
+        ));
     }
 
     #[test]

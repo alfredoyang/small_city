@@ -32,7 +32,7 @@ use crate::core::simulation::{
     TickJobPhase, TickPowerPhase, begin_tick_power_phase, continue_to_job_phase,
     ensure_derived_state, finish_tick_after_job_phase, refresh_derived_state_for_world,
 };
-use crate::core::systems::{build, bulldoze, economy, replace, road_connectivity, upgrade};
+use crate::core::systems::{build, bulldoze, replace, road_connectivity, upgrade};
 use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
 use crate::interface::events::CommandResult;
@@ -246,7 +246,7 @@ impl RegionState {
 
     /// Advances only this region's local simulation using the shared tick order.
     pub fn tick_local(&mut self) -> CommandResult {
-        let phase = begin_tick_power_phase(&mut self.world);
+        let phase = begin_tick_power_phase(&mut self.world, self.id);
         let job_phase = continue_to_job_phase(&mut self.world, self.id, phase);
         finish_tick_after_job_phase(&mut self.world, job_phase, &[])
     }
@@ -305,7 +305,7 @@ impl RegionState {
     /// `spare_job_slots_on_network`) require the caller to bring derived state
     /// current first; the worker does this before publishing summaries.
     pub fn ensure_derived_state(&mut self) {
-        ensure_derived_state(&mut self.world);
+        ensure_derived_state(&mut self.world, self.id);
     }
 
     /// Returns a UI-safe snapshot without exposing this region's ECS world.
@@ -460,7 +460,7 @@ impl RegionState {
     }
 
     pub(crate) fn begin_tick_power_demand_phase(&mut self) -> RegionalTickPowerPhase {
-        let phase = begin_tick_power_phase(&mut self.world);
+        let phase = begin_tick_power_phase(&mut self.world, self.id);
         let power_demands = self.pending_power_demands();
         RegionalTickPowerPhase {
             phase,
@@ -636,8 +636,7 @@ impl RegionState {
 
     pub(crate) fn from_world(id: RegionId, mut world: World) -> Self {
         world.rebuild_entity_records();
-        refresh_derived_state_for_world(&mut world);
-        economy::assign_local_jobs(&mut world, id);
+        refresh_derived_state_for_world(&mut world, id);
 
         Self { id, world }
     }

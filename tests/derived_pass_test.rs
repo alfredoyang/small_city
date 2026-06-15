@@ -107,6 +107,74 @@ fn paused_commands_do_not_advance_the_time_pass() {
     assert_eq!(game.view().status.turn, 1);
 }
 
+/// DT3 moves local job matching into the derived pass. A paused workplace build
+/// should therefore update the citizen's local assignment in the view without
+/// settling salary, taxes, rent, or maintenance.
+#[test]
+fn paused_workplace_build_updates_local_job_assignment_without_a_tick() {
+    let mut game = SingleRegionTestGame::new(5, 4);
+    build_growth_city(&mut game);
+    advance_one_day(&mut game);
+    assert_eq!(assignment_count(&game.view(), 1, 0), 1);
+
+    assert!(game.bulldoze(2, 0).success);
+    assert_eq!(assignment_count(&game.view(), 1, 0), 0);
+
+    let money_before = game.view().status.money;
+    assert!(game.build(2, 0, BuildingKind::Commercial).success);
+
+    let view = game.view();
+    assert_eq!(view.status.turn, 24);
+    assert_eq!(assignment_count(&view, 1, 0), 1);
+    assert!(
+        view.status.money < money_before,
+        "building cost is the only paused money change"
+    );
+}
+
+/// A mid-day workplace config change may update derived assignments immediately,
+/// but salary/tax/rent/maintenance stay frozen until the next daily boundary.
+#[test]
+fn midday_workplace_change_does_not_settle_money_until_daily_boundary() {
+    let mut game = SingleRegionTestGame::new(5, 4);
+    build_growth_city(&mut game);
+    advance_one_day(&mut game);
+
+    assert!(game.bulldoze(2, 0).success);
+    assert!(game.build(2, 0, BuildingKind::Commercial).success);
+    let after_build_money = game.view().status.money;
+
+    assert!(game.tick().success);
+    let after_midday_tick = game.view();
+    assert_eq!(after_midday_tick.status.turn, 25);
+    assert_eq!(after_midday_tick.status.money, after_build_money);
+
+    for _ in 0..23 {
+        assert!(game.tick().success);
+    }
+    assert_ne!(
+        game.view().status.money,
+        after_build_money,
+        "daily economy should settle at the next day boundary"
+    );
+}
+
+/// DT3 should keep the running simulation stable: the assignment visible before
+/// economy settlement is the one salary/tax uses at the next daily boundary.
+#[test]
+fn money_and_assignments_match_scripted_tick_values_after_dt3_split() {
+    let mut game = SingleRegionTestGame::new(5, 4);
+    build_growth_city(&mut game);
+
+    advance_one_day(&mut game);
+    assert_eq!(assignment_count(&game.view(), 1, 0), 1);
+    assert_eq!(game.view().status.money, 65);
+
+    advance_one_day(&mut game);
+    assert_eq!(assignment_count(&game.view(), 1, 0), 2);
+    assert_eq!(game.view().status.money, 71);
+}
+
 /// DT2 splits derived happiness target from actual happiness. Paused config
 /// changes can move the target immediately, but actual citizen happiness remains
 /// a time-pass value and changes only when a tick runs.
@@ -188,6 +256,15 @@ fn assert_happiness(view: &GameView, actual: Option<i32>, target: Option<i32>) {
         "target happiness mismatch at turn {}",
         view.status.turn
     );
+}
+
+fn assignment_count(view: &GameView, x: usize, y: usize) -> usize {
+    view.map
+        .cells
+        .iter()
+        .find(|cell| cell.x == x && cell.y == y)
+        .map(|cell| cell.job_assignments.len())
+        .unwrap_or(0)
 }
 
 fn advance_one_day(game: &mut SingleRegionTestGame) {

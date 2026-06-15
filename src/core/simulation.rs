@@ -16,7 +16,7 @@ use crate::interface::view::GameTimeView;
 
 #[cfg(test)]
 pub(crate) fn tick_world(world: &mut World) -> CommandResult {
-    let phase = begin_tick_power_phase(world);
+    let phase = begin_tick_power_phase(world, RegionId(1));
     finish_tick_after_power_phase(world, RegionId(1), phase)
 }
 
@@ -52,12 +52,12 @@ impl TickJobPhase {
 ///
 /// Regional runtimes can pause after this phase to request producer-exported
 /// power, then call `finish_tick_after_power_phase` once export grants apply.
-pub(crate) fn begin_tick_power_phase(world: &mut World) -> TickPowerPhase {
+pub(crate) fn begin_tick_power_phase(world: &mut World, local_region: RegionId) -> TickPowerPhase {
     // DT1 derived-before-time: bring the derived pass current before the time
     // pass reads it. A paused config change (build/bulldoze) only marks the world
     // dirty; this is where that change is applied for the running step, matching
     // the timing of the old eager per-command refresh.
-    ensure_derived_state(world);
+    ensure_derived_state(world, local_region);
     let before = TickSummarySnapshot::from_world(world);
     let before_time = world.resources.time;
     world.resources.time.advance_hours(1);
@@ -108,7 +108,7 @@ pub(crate) fn continue_to_job_phase(
     citizens::update_happiness(world);
     local_effects::run(world);
     if is_daily {
-        economy::assign_local_jobs(world, local_region);
+        economy::assign_local_jobs_for_daily_tick(world, local_region);
     }
 
     TickJobPhase {
@@ -198,9 +198,9 @@ pub(crate) fn finish_tick_after_job_phase(
 ///        v   next tick OR view/inspect read
 ///   ensure_derived_state: if dirty { run_derived_pass; clear }
 /// ```
-pub(crate) fn ensure_derived_state(world: &mut World) {
+pub(crate) fn ensure_derived_state(world: &mut World, local_region: RegionId) {
     if world.is_derived_dirty() {
-        refresh_derived_state_for_world(world);
+        refresh_derived_state_for_world(world, local_region);
         world.clear_derived_dirty();
     }
 }
@@ -211,12 +211,13 @@ pub(crate) fn ensure_derived_state(world: &mut World) {
 /// DT1 covers the already-derived systems: power, road analysis, stats, pollution,
 /// and local effects. DT2 keeps actual citizen happiness in the time pass while
 /// exposing the conditions-only `happiness_target` from this derived pass.
-pub(crate) fn refresh_derived_state_for_world(world: &mut World) {
+pub(crate) fn refresh_derived_state_for_world(world: &mut World, local_region: RegionId) {
     power::run(world);
     road_network_analysis::run(world);
     stats::refresh_population_and_jobs(world);
     pollution::run(world);
     local_effects::run(world);
+    economy::assign_local_jobs(world, local_region);
     citizens::update_happiness_targets(world);
     happiness::run(world);
 }
@@ -267,6 +268,7 @@ fn game_time_view(time: GameTime) -> GameTimeView {
 #[cfg(test)]
 mod tests {
     use super::{refresh_derived_state_for_world, tick_world};
+    use crate::core::regions::RegionId;
     use crate::core::systems::citizens;
     use crate::core::systems::placement;
     use crate::core::world::World;
@@ -316,7 +318,7 @@ mod tests {
         let mut world = World::new(1, 1);
         let residential = world.spawn();
         citizens::spawn_for_home(&mut world, residential, 1);
-        refresh_derived_state_for_world(&mut world);
+        refresh_derived_state_for_world(&mut world, RegionId(1));
         (world, residential)
     }
 
