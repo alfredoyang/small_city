@@ -1,8 +1,9 @@
 //! Integration tests for the threaded regional game runner boundary.
 
-use small_city::core::regional_game::{UiReply, UiRequestId};
+use small_city::core::regional_game::{RegionCommand, UiReply, UiRequestId};
 use small_city::core::regional_game_runner::{RegionalGameRunner, RegionalGameRunnerError};
 use small_city::core::regions::{BorderEdge, RegionId, RegionNeighborLink, RegionState};
+use small_city::interface::input::BuildingKind;
 
 #[test]
 fn runner_starts_one_threaded_worker_and_processes_regional_tick() {
@@ -83,6 +84,120 @@ fn runner_can_start_two_workers_and_recover_each_region() {
             .turn,
         1
     );
+}
+
+#[test]
+fn two_worker_runner_routes_commands_by_region_owner() {
+    let runner = RegionalGameRunner::start_with_worker_count(
+        vec![
+            RegionState::new(RegionId(31), 3, 3),
+            RegionState::new(RegionId(32), 3, 3),
+        ],
+        2,
+    )
+    .unwrap();
+
+    runner
+        .run_region_command(
+            UiRequestId(31),
+            RegionId(31),
+            RegionCommand::Build {
+                x: 1,
+                y: 1,
+                kind: BuildingKind::Road,
+            },
+        )
+        .unwrap();
+    runner
+        .run_region_command(
+            UiRequestId(32),
+            RegionId(32),
+            RegionCommand::Build {
+                x: 2,
+                y: 1,
+                kind: BuildingKind::Road,
+            },
+        )
+        .unwrap();
+
+    let left = runner
+        .request_region_snapshot(UiRequestId(33), RegionId(31))
+        .unwrap();
+    let right = runner
+        .request_region_snapshot(UiRequestId(34), RegionId(32))
+        .unwrap();
+    let UiReply::RegionSnapshotReady { snapshot: left, .. } = left;
+    let UiReply::RegionSnapshotReady {
+        snapshot: right, ..
+    } = right;
+
+    assert_eq!(left.view.map.cells[4].building, Some(BuildingKind::Road));
+    assert_eq!(right.view.map.cells[5].building, Some(BuildingKind::Road));
+    runner.shutdown().unwrap();
+}
+
+#[test]
+fn two_worker_runner_batches_ticks_and_returns_one_result_per_region() {
+    let runner = RegionalGameRunner::start_with_worker_count(
+        vec![
+            RegionState::new(RegionId(41), 2, 2),
+            RegionState::new(RegionId(42), 2, 2),
+        ],
+        2,
+    )
+    .unwrap();
+
+    let results = runner
+        .tick_regions(&[
+            (UiRequestId(41), RegionId(41)),
+            (UiRequestId(42), RegionId(42)),
+        ])
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|result| result.success));
+    let left = runner
+        .request_region_snapshot(UiRequestId(43), RegionId(41))
+        .unwrap();
+    let right = runner
+        .request_region_snapshot(UiRequestId(44), RegionId(42))
+        .unwrap();
+    let UiReply::RegionSnapshotReady { snapshot: left, .. } = left;
+    let UiReply::RegionSnapshotReady {
+        snapshot: right, ..
+    } = right;
+
+    assert_eq!(left.view.status.turn, 1);
+    assert_eq!(right.view.status.turn, 1);
+    runner.shutdown().unwrap();
+}
+
+#[test]
+fn tick_batch_validates_all_regions_before_enqueueing_any_tick() {
+    let runner =
+        RegionalGameRunner::start_with_worker_count(vec![RegionState::new(RegionId(51), 2, 2)], 1)
+            .unwrap();
+
+    let error = runner
+        .tick_regions(&[
+            (UiRequestId(51), RegionId(51)),
+            (UiRequestId(52), RegionId(99)),
+        ])
+        .expect_err("unknown region should reject the whole batch");
+    assert_eq!(
+        error,
+        RegionalGameRunnerError::UnknownRegion {
+            region_id: RegionId(99)
+        }
+    );
+
+    let reply = runner
+        .request_region_snapshot(UiRequestId(53), RegionId(51))
+        .unwrap();
+    let UiReply::RegionSnapshotReady { snapshot, .. } = reply;
+
+    assert_eq!(snapshot.view.status.turn, 0);
+    runner.shutdown().unwrap();
 }
 
 #[test]

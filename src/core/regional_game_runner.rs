@@ -166,16 +166,28 @@ impl RegionalGameRunner {
         request_id: UiRequestId,
         region_id: RegionId,
     ) -> Result<CommandResult, RegionalGameRunnerError> {
-        let handle = self
-            .handle_for(region_id)
-            .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })?;
+        Ok(self.tick_regions(&[(request_id, region_id)])?.remove(0))
+    }
 
+    pub fn tick_regions(
+        &self,
+        requests: &[(UiRequestId, RegionId)],
+    ) -> Result<Vec<CommandResult>, RegionalGameRunnerError> {
         let _operation = self
             .operation_lock
             .lock()
             .expect("regional runner operation lock poisoned");
-        handle.send(crate::core::regions::runtime::RegionEvent::Tick { request_id });
-        self.wait_for_tick_reply(request_id, region_id)
+        let handles = requests
+            .iter()
+            .map(|(_, region_id)| self.handle_for_owned_region(*region_id))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for ((request_id, _), handle) in requests.iter().zip(handles) {
+            handle.send(crate::core::regions::runtime::RegionEvent::Tick {
+                request_id: *request_id,
+            });
+        }
+        self.wait_for_tick_replies(requests)
     }
 
     pub fn run_region_command(
@@ -184,18 +196,16 @@ impl RegionalGameRunner {
         region_id: RegionId,
         command: RegionCommand,
     ) -> Result<RegionCommandReply, RegionalGameRunnerError> {
-        let handle = self
-            .handle_for(region_id)
-            .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })?;
-
         let _operation = self
             .operation_lock
             .lock()
             .expect("regional runner operation lock poisoned");
-        handle.send(crate::core::regions::runtime::RegionEvent::RunCommand {
-            request_id,
-            command,
-        });
+        self.handle_for_owned_region(region_id)?.send(
+            crate::core::regions::runtime::RegionEvent::RunCommand {
+                request_id,
+                command,
+            },
+        );
         self.wait_for_command_reply(request_id, region_id)
     }
 
@@ -213,18 +223,16 @@ impl RegionalGameRunner {
         region_id: RegionId,
         overlay: MapOverlayInput,
     ) -> Result<UiReply, RegionalGameRunnerError> {
-        let handle = self
-            .handle_for(region_id)
-            .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })?;
-
         let _operation = self
             .operation_lock
             .lock()
             .expect("regional runner operation lock poisoned");
-        handle.send(crate::core::regions::runtime::RegionEvent::BuildSnapshot {
-            request_id,
-            overlay,
-        });
+        self.handle_for_owned_region(region_id)?.send(
+            crate::core::regions::runtime::RegionEvent::BuildSnapshot {
+                request_id,
+                overlay,
+            },
+        );
         let snapshot = self.wait_for_snapshot_reply(request_id, region_id)?;
 
         Ok(UiReply::RegionSnapshotReady {
@@ -260,6 +268,15 @@ impl RegionalGameRunner {
         }
 
         Ok(RecoveredRegionalGame { workers })
+    }
+
+    fn handle_for_owned_region(
+        &self,
+        region_id: RegionId,
+    ) -> Result<&RegionHandle, RegionalGameRunnerError> {
+        self.worker_for_region(region_id)?;
+        self.handle_for(region_id)
+            .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })
     }
 
     fn handle_for(&self, region_id: RegionId) -> Option<&RegionHandle> {
@@ -363,25 +380,39 @@ impl RegionalGameRunner {
         })
     }
 
-    fn wait_for_tick_reply(
+    fn wait_for_tick_replies(
         &self,
-        request_id: UiRequestId,
-        region_id: RegionId,
-    ) -> Result<CommandResult, RegionalGameRunnerError> {
-        // Ticks use the same correlation rule as commands and snapshots. This is
-        // important once more than one tick can be queued for the same region.
+        requests: &[(UiRequestId, RegionId)],
+    ) -> Result<Vec<CommandResult>, RegionalGameRunnerError> {
+        let mut results = vec![None; requests.len()];
+        let mut pending = requests.to_vec();
+
         for _ in 0..MAX_REPLY_PASSES {
             let summary = self.process_one_reply_pass()?;
-            if let Some(reply) = summary
-                .tick_replies
-                .into_iter()
-                .find(|reply| reply.request_id == request_id && reply.region_id == region_id)
-            {
+            for reply in summary.tick_replies {
+                if let Some(request_position) =
+                    requests.iter().position(|(request_id, region_id)| {
+                        *request_id == reply.request_id && *region_id == reply.region_id
+                    })
+                {
+                    results[request_position] = Some(reply.result);
+                }
+                if let Some(position) = pending.iter().position(|(request_id, region_id)| {
+                    *request_id == reply.request_id && *region_id == reply.region_id
+                }) {
+                    pending.remove(position);
+                }
+            }
+            if pending.is_empty() {
                 self.process_worker_until_drained()?;
-                return Ok(reply.result);
+                return Ok(results
+                    .into_iter()
+                    .map(|result| result.expect("all pending tick replies were collected"))
+                    .collect());
             }
         }
 
+        let (request_id, region_id) = pending[0];
         Err(RegionalGameRunnerError::TickReplyMissing {
             request_id,
             region_id,

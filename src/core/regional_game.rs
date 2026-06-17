@@ -343,9 +343,13 @@ impl RegionalGame {
     }
 
     pub fn tick_all_regions(&self) -> Result<(), RegionalGameError> {
-        for region_id in &self.region_ids {
-            self.tick_region(*region_id)?;
-        }
+        let requests = self
+            .region_ids
+            .iter()
+            .copied()
+            .map(|region_id| (self.next_request_id(), region_id))
+            .collect::<Vec<_>>();
+        self.runner.tick_regions(&requests)?;
         Ok(())
     }
 

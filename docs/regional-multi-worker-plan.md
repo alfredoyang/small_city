@@ -128,6 +128,10 @@ Tests:
 
 Goal: make commands, ticks, snapshots, save/load operations use the owner directory.
 
+Status: implemented for UI command/tick/snapshot/inspect/recovery routing. Tick-all now
+batches requests before collecting correlated replies. Cross-worker import delivery remains
+blocked by the MW2 topology guard until MW4.
+
 - Selected-region command goes to the selected region's worker.
 - Tick-all fans out to all workers and collects correlated replies.
 - Snapshot/view reads go through UI-safe view models from the owning worker.
