@@ -36,6 +36,15 @@ pub enum RegionalGameRunnerError {
     InvalidWorkerCount {
         worker_count: usize,
     },
+    InvalidWorkerAssignmentCount {
+        region_count: usize,
+        assignment_count: usize,
+    },
+    InvalidWorkerAssignment {
+        region_index: usize,
+        worker_index: usize,
+        worker_count: usize,
+    },
     DuplicateRegion {
         region_id: RegionId,
     },
@@ -91,6 +100,19 @@ impl RegionalGameRunner {
         Self::start_with_topology_and_worker_count(regions, Vec::new(), worker_count)
     }
 
+    pub fn start_with_worker_assignments(
+        regions: Vec<RegionState>,
+        worker_count: usize,
+        region_worker_indexes: Vec<usize>,
+    ) -> Result<Self, RegionalGameRunnerError> {
+        Self::start_with_topology_and_worker_assignments(
+            regions,
+            Vec::new(),
+            worker_count,
+            region_worker_indexes,
+        )
+    }
+
     pub fn start_with_topology(
         regions: Vec<RegionState>,
         topology: Vec<RegionNeighborLink>,
@@ -103,9 +125,39 @@ impl RegionalGameRunner {
         topology: Vec<RegionNeighborLink>,
         worker_count: usize,
     ) -> Result<Self, RegionalGameRunnerError> {
+        Self::start_with_topology_and_optional_worker_assignments(
+            regions,
+            topology,
+            worker_count,
+            None,
+        )
+    }
+
+    pub fn start_with_topology_and_worker_assignments(
+        regions: Vec<RegionState>,
+        topology: Vec<RegionNeighborLink>,
+        worker_count: usize,
+        region_worker_indexes: Vec<usize>,
+    ) -> Result<Self, RegionalGameRunnerError> {
+        Self::start_with_topology_and_optional_worker_assignments(
+            regions,
+            topology,
+            worker_count,
+            Some(region_worker_indexes),
+        )
+    }
+
+    fn start_with_topology_and_optional_worker_assignments(
+        regions: Vec<RegionState>,
+        topology: Vec<RegionNeighborLink>,
+        worker_count: usize,
+        region_worker_indexes: Option<Vec<usize>>,
+    ) -> Result<Self, RegionalGameRunnerError> {
         if worker_count == 0 || worker_count > u32::MAX as usize {
             return Err(RegionalGameRunnerError::InvalidWorkerCount { worker_count });
         }
+        let region_worker_indexes =
+            validate_region_worker_indexes(regions.len(), worker_count, region_worker_indexes)?;
 
         let directory = Arc::new(RegionDirectory::new(topology));
         let owners = Arc::new(RegionOwnerDirectory::new());
@@ -122,7 +174,7 @@ impl RegionalGameRunner {
         let mut handles = Vec::new();
 
         for (index, region) in regions.into_iter().enumerate() {
-            let worker_index = index % workers.len();
+            let worker_index = region_worker_indexes[index];
             let runtime = RegionRuntime::new(region);
             let handle = runtime.handle();
 
@@ -475,6 +527,37 @@ impl RegionalGameRunner {
             region_id,
         })
     }
+}
+
+fn validate_region_worker_indexes(
+    region_count: usize,
+    worker_count: usize,
+    region_worker_indexes: Option<Vec<usize>>,
+) -> Result<Vec<usize>, RegionalGameRunnerError> {
+    let Some(region_worker_indexes) = region_worker_indexes else {
+        return Ok((0..region_count)
+            .map(|index| index % worker_count)
+            .collect());
+    };
+
+    if region_worker_indexes.len() != region_count {
+        return Err(RegionalGameRunnerError::InvalidWorkerAssignmentCount {
+            region_count,
+            assignment_count: region_worker_indexes.len(),
+        });
+    }
+
+    for (region_index, worker_index) in region_worker_indexes.iter().copied().enumerate() {
+        if worker_index >= worker_count {
+            return Err(RegionalGameRunnerError::InvalidWorkerAssignment {
+                region_index,
+                worker_index,
+                worker_count,
+            });
+        }
+    }
+
+    Ok(region_worker_indexes)
 }
 
 #[derive(Debug)]

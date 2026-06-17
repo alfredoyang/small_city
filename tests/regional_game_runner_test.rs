@@ -42,6 +42,38 @@ fn runner_rejects_invalid_worker_count() {
 }
 
 #[test]
+fn runner_rejects_invalid_explicit_worker_setup_before_thread_start() {
+    let count_error = RegionalGameRunner::start_with_worker_assignments(
+        vec![RegionState::new(RegionId(14), 2, 2)],
+        2,
+        vec![0, 1],
+    )
+    .expect_err("assignment count must match region count");
+    let index_error = RegionalGameRunner::start_with_worker_assignments(
+        vec![RegionState::new(RegionId(15), 2, 2)],
+        2,
+        vec![2],
+    )
+    .expect_err("assignment worker index must exist");
+
+    assert_eq!(
+        count_error,
+        RegionalGameRunnerError::InvalidWorkerAssignmentCount {
+            region_count: 1,
+            assignment_count: 2,
+        }
+    );
+    assert_eq!(
+        index_error,
+        RegionalGameRunnerError::InvalidWorkerAssignment {
+            region_index: 0,
+            worker_index: 2,
+            worker_count: 2,
+        }
+    );
+}
+
+#[test]
 fn runner_can_start_two_workers_and_recover_each_region() {
     let runner = RegionalGameRunner::start_with_worker_count(
         vec![
@@ -227,6 +259,16 @@ fn two_worker_runner_routes_cross_worker_power_export() {
 }
 
 #[test]
+fn explicit_worker_setups_keep_simulation_visible_results_identical() {
+    let one_worker = run_configurable_setup_script(1, None);
+    let balanced = run_configurable_setup_script(2, None);
+    let uneven = run_configurable_setup_script(2, Some(vec![0, 0, 1]));
+
+    assert_eq!(one_worker, balanced);
+    assert_eq!(one_worker, uneven);
+}
+
+#[test]
 fn runner_returns_owned_snapshot_for_requested_region() {
     let runner = RegionalGameRunner::start(vec![
         RegionState::new(RegionId(2), 2, 2),
@@ -336,4 +378,45 @@ fn cross_worker_power_producer_region(region_id: RegionId) -> RegionState {
     assert!(region.build(1, 0, BuildingKind::Road).success);
     assert!(region.build(1, 1, BuildingKind::PowerPlant).success);
     region
+}
+
+fn run_configurable_setup_script(
+    worker_count: usize,
+    assignments: Option<Vec<usize>>,
+) -> Vec<(RegionId, u32)> {
+    let regions = vec![
+        RegionState::new(RegionId(61), 2, 2),
+        RegionState::new(RegionId(62), 2, 2),
+        RegionState::new(RegionId(63), 2, 2),
+    ];
+    let runner = match assignments {
+        Some(assignments) => {
+            RegionalGameRunner::start_with_worker_assignments(regions, worker_count, assignments)
+        }
+        None => RegionalGameRunner::start_with_worker_count(regions, worker_count),
+    }
+    .unwrap();
+
+    let results = runner
+        .tick_regions(&[
+            (UiRequestId(61), RegionId(61)),
+            (UiRequestId(62), RegionId(62)),
+            (UiRequestId(63), RegionId(63)),
+        ])
+        .unwrap();
+    assert!(results.iter().all(|result| result.success));
+
+    let snapshots = [RegionId(61), RegionId(62), RegionId(63)]
+        .into_iter()
+        .enumerate()
+        .map(|(index, region_id)| {
+            let reply = runner
+                .request_region_snapshot(UiRequestId(70 + index as u64), region_id)
+                .unwrap();
+            let UiReply::RegionSnapshotReady { snapshot, .. } = reply;
+            (region_id, snapshot.view.status.turn)
+        })
+        .collect();
+    runner.shutdown().unwrap();
+    snapshots
 }

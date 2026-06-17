@@ -171,6 +171,11 @@ Tests:
 Goal: make worker count and region assignment configurable without making it gameplay
 state.
 
+Status: implemented. Existing worker-count entry points keep automatic round-robin
+assignment. Explicit setup is available as a region-input-order vector where each
+entry names the target worker index; invalid setup is rejected before worker threads
+start.
+
 - Reuse existing serialization dependencies; do not add a new production dependency.
 - Support default automatic assignment when no setup is provided.
 - Validate explicit setup before spawning workers:
