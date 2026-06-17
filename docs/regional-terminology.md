@@ -180,16 +180,20 @@ registry cache is `Send`, not `Sync`).
   of work, then route everything they emitted. Reservation **releases are routed
   before requests** in a pass, so a producer frees a caller's stale generation
   before evaluating anyone's fresh request.
-- **`TickState`** — explicit tick lifecycle on each runtime: `Idle` or
-  `WaitingForPowerExports(TickPowerContinuation)` (CR3 adds `WaitingForJobExports`).
-- **paused tick** (`TickState::WaitingForPowerExports`) — a tick that ran local
-  power, found unpowered border consumers, and is waiting for export grants before
-  running downstream systems (population, economy, …). While paused, the runtime
-  only dequeues export control events (`ApplyPowerExportGrant`,
-  `ProcessPowerExportRequest`, `ReleasePowerExportAllocations`) so it can both
-  finish its own tick and serve neighbors — the latter prevents two
-  mutually-importing regions from deadlocking. A second `Tick` is deferred in the
-  inbox until the paused tick finishes.
+- **`TickState`** — explicit tick lifecycle on each runtime: `Idle`,
+  `WaitingForPowerExports(TickPowerContinuation)`, or
+  `WaitingForJobExports(TickJobContinuation)`.
+- **import-wait tick phase** — a time-advancing tick continuation that has run a
+  local derived phase, found cross-region demand, and is waiting for producer
+  grants before running downstream systems (population, economy, ...). This is
+  not a paused UI view refresh: paused commands/views refresh local derived state
+  from local truth plus last applied imports and do not wait on remote producers.
+  While in an import-wait phase, the runtime still dequeues import control events
+  (`ApplyPowerExportGrant`, `ApplyJobExportGrant`,
+  `ProcessPowerExportRequest`, `ProcessJobExportRequest`,
+  `ReleasePowerExportAllocations`, `ReleaseJobExportAllocations`) so it can both
+  finish its own tick and serve neighbors. A second `Tick` is deferred in the
+  inbox until the waiting tick continuation finishes.
 - **`RegionEvent`** (inbox) — `Tick`, `ProcessPowerExportRequest`,
   `ReleasePowerExportAllocations`, `ApplyPowerExportGrant`,
   `ProcessJobExportRequest`, `ReleaseJobExportAllocations`,

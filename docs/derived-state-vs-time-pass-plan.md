@@ -10,16 +10,16 @@ This plan splits the simulation `tick` into two distinct concepts:
 It generalizes what R5 already did for power and jobs (cache the resolution, recompute on
 mutation, not every tick) into an explicit model boundary, and extends it to happiness and
 the UI. It is a **local** simulation-structure change, largely independent of the
-cross-region model, but it composes with
-[regional-snapshot-consistent-plan.md](regional-snapshot-consistent-plan.md) (see
+cross-region model, but it composes with the producer-authoritative import plan in
+[regional-cross-region-import-plan.md](regional-cross-region-import-plan.md) (see
 "Composition" below).
 
 > **This plan owns the canonical local step model** -- the `derived pass -> time pass`
 > structure of one simulation step. Other plans that restructure the step define their
-> changes *on top of* this boundary rather than redefining it: the snapshot plan's OB3
-> only swaps the derived pass's cross-region input to the frozen snapshot and adds the
-> publish at the step boundary; it does not re-collapse the tick. For that reason this
-> split is recommended to land **first**, as the foundation (see "Composition").
+> changes *on top of* this boundary rather than redefining it: the regional import plan
+> may pause a time-advancing tick between local derived sub-phases while it waits for
+> producer grants, then resumes into this plan's time pass. For that reason this split is
+> recommended to land **first**, as the foundation (see "Composition").
 
 ## The model
 
@@ -107,25 +107,24 @@ move when you build a park or restore power without advancing time). No balance 
 This is exactly the requested behavior: "in pause mode we can see power/job/happiness change
 without a tick; economy does not change while paused."
 
-## Composition with the snapshot-consistent plan
+## Composition with the producer-authoritative import plan
 
 The two plans are consistent and reinforce each other:
 
 - **Local** derived state recomputes immediately from current config (this plan).
-- **Cross-region** derived state (imported power/jobs) is also derived, but its input is the
-  *previous step's frozen snapshot* (the snapshot plan), so it carries the one-tick lag and
-  does not change while paused (no step -> no new snapshot).
-- A **step** is then: derived recompute (local config + frozen cross-region snapshot) ->
-  time pass -> publish the new snapshot. The snapshot plan's OB3 ("straight-through tick")
-  and this plan's "time pass" describe the same collapsed step from two angles: OB3 says the
-  tick no longer pauses for grants; this plan says *what is left in the tick* (only the time
-  accumulators).
+- **Cross-region** derived state (imported power/jobs) is producer-authoritative. The local
+  derived phase can discover demand and send requests, but the consumer applies imported
+  powered/job state only after the producer grants it.
+- A **time-advancing step** is then: local derived work -> optional import wait/apply ->
+  time pass. The wait belongs to the tick continuation, not to paused local view refresh.
+- **Paused reads** recompute local derived state from local config and last applied imports;
+  they do not wait for remote producer grants.
 
 Recommended sequencing: do this derived/time split **first** as a local, mostly
-behavior-preserving foundation -- it clarifies what the tick contains and makes OB3 a thin
-change (swap the cross-region input source into the already-isolated derived pass). The two
-plans both touch `simulation.rs`, so whichever lands second must respect the other. They are
-**separate missions** (one at a time).
+behavior-preserving foundation -- it clarifies what belongs to local derived work, what
+belongs to import continuations, and what remains in the time pass. The two plans both touch
+tick orchestration, so whichever lands second must respect the other. They are **separate
+missions** (one at a time).
 
 ## Staged patches
 
@@ -208,11 +207,12 @@ the time pass -- and does not introduce a new type.
     pure function of config, so recomputing it on a config change / paused read just
     surfaces it earlier in the view; the value money settles against at the daily boundary
     is unchanged.
-  - **Local vs remote assignment have different freeze semantics.** Local assignment is
-    derived/immediate; *remote* (imported) assignment stays tied to the cross-region step
-    and becomes one-tick-stale under
-    [regional-snapshot-consistent-plan.md](regional-snapshot-consistent-plan.md). Keep that
-    seam explicit so DT3 composes with OB: the derived pass owns local matching only.
+  - **Local vs remote assignment have different wait semantics.** Local assignment is
+    derived/immediate; *remote* (imported) assignment stays tied to the cross-region tick
+    continuation and is applied only after a producer grant under
+    [regional-cross-region-import-plan.md](regional-cross-region-import-plan.md). Keep that
+    seam explicit: the local derived pass owns local matching, and the regional import
+    continuation owns producer-confirmed remote matches.
 - New behavior (additive): a paused workplace build updates local job assignments in the
   view.
 
@@ -241,8 +241,9 @@ travel exists today.
 
 ## Determinism and gates
 
-- The derived pass is a **pure function** of config (+ the frozen cross-region snapshot
-  under the snapshot plan); deterministic by construction.
+- The derived pass is a **pure function** of local config plus the already-applied imported
+  state. New imported state enters through producer-authoritative events in the regional
+  import plan.
 - The time pass is deterministic and reads the derived pass; the **derived-before-time**
   order is fixed.
 - Every patch is gated by a **parity guard** against today's behavior for the running sim
@@ -263,6 +264,6 @@ travel exists today.
 
 - No balance change. H2 preserves happiness inertia; all parity guards hold for the running
   sim.
-- No new cross-region mechanism -- that is the snapshot plan's job; this plan only fixes
-  what is derived vs time-integrated locally.
+- No new cross-region mechanism -- that is the regional import plan's job; this plan only
+  fixes what is derived vs time-integrated locally.
 - No travel implementation (DT5 is a placeholder).

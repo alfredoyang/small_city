@@ -1,298 +1,225 @@
 # Regional Multi-Worker Plan
 
-This plan stages the move from **one** region worker thread to **several**, so a
-large city (many regions) can simulate in parallel. It builds on the cross-region
-mechanism already shipped in
-[regional-resource-registry-plan.md](regional-resource-registry-plan.md)
-(registry -> discovery -> producer-owned export allocation), which was deliberately
-designed to be *correct under* multi-worker but does not yet spin up a second
-worker. That earlier plan lists "true parallelism" as a Non-Goal; this plan is where
-that work lives.
+This is the active plan for running **N regions on M worker threads**. It composes with the
+producer-authoritative import model in
+[regional-cross-region-import-plan.md](regional-cross-region-import-plan.md).
 
-For the vocabulary (`World`, `RegionState`, `RegionRuntime`, `RegionWorker`,
-discovery, export allocation, hints, generations) see
-[regional-terminology.md](regional-terminology.md).
+The previous "snapshot allocation" direction is rejected. Multi-worker execution still
+uses directories and snapshots, but only as stale-tolerant routing hints. Cross-region
+power/jobs remain producer-authoritative request/grant flows.
 
-## Status: superseded as the forward plan (2026-06-14)
+For vocabulary (`World`, `RegionState`, `RegionRuntime`, `RegionWorker`, directory,
+snapshot, hints, export grants) see [regional-terminology.md](regional-terminology.md).
 
-The cross-region consistency model was changed on 2026-06-14 from the **live,
-strongly-consistent** barrier model described in this document to a
-**snapshot-consistent, one-tick-stale** model. The active forward plan now lives in
-[regional-snapshot-consistent-plan.md](regional-snapshot-consistent-plan.md).
+## Current State
 
-This document is retained as the record of the live-barrier model that patches **M1-M3
-shipped under**. M1 (coordinator directory) and M2 (published double-buffered snapshot)
-are kept and reused by the new model; **M3 (the determinism barrier) shipped as a
-checkpoint, but its barrier, the producer-owned live ledger, and the `TickState`
-pause-tick machine are retired by the new model.** The staged patches **M4-M6 below are
-superseded** by the new plan's OB patches. Everything from here down is historical.
+The codebase already has most of the single-worker foundation:
 
-## Why this is separate work
+- `World` is owned by one `RegionState` and is not exposed to UI.
+- `RegionRuntime` owns one region's state and inbox.
+- `RegionWorker` schedules multiple runtimes on one thread.
+- `ThreadedRegionWorker` wraps a worker in an OS thread.
+- `RegionalGameRunner` exposes the UI-safe runner API.
+- `RegionDirectory` / owner directory style data exists as the right place for topology,
+  hints, and region ownership.
 
-The cross-region patches (CR1-CR6) all run on a single `RegionWorker`:
+The missing production step is that `RegionalGameRunner` still effectively behaves as a
+single-worker runner for normal play. This plan makes worker count a deployment choice
+without changing UI access rules.
 
-- discovery is computed by walking the regions one worker owns
-  (`cross_region_discovery` over `self.regions`),
-- authoritative routing only reaches regions that worker owns (a target it does not
-  own becomes `MissingTargetRegion`, gracefully denied),
-- the whole tick/event schedule is one deterministic FIFO drain on one thread.
-
-None of that is wrong -- it is the correct single-worker collapse of a design meant
-to scale. Multi-worker is a distinct mission with its own central risk
-(**cross-thread determinism**), so it gets its own plan rather than bloating the
-foundation.
-
-## Current state (what already supports this)
-
-- **Ownership model is ready.** `World` is `Send` (movable to a thread) but not
-  `Sync` (never shared); each region's `World`/cache is owned by exactly one thread.
-- **Only owned summaries cross boundaries.** Hints and export request/grant/release
-  are owned data with no ECS identity, already routed as `RegionEvent`s /
-  `OutboundMessage`s.
-- **The directory product exists.** `CrossRegionDiscovery { components,
-  availability_hints }` is already the thing a coordinator would own; today it is
-  recomputed per pass on the single worker.
-- **Scaffolding exists, unused.** `load_manager.rs` (`WorkerLoad`, `RegionMove`) is
-  the seed of region->worker assignment and reassignment.
-
-## Target shape
+## Target Shape
 
 ```text
-              RegionalGameRunner
-                   | owns
-        +----------v-----------+        +------------------------+
-        | RegionDirectory       |<------| region -> worker map    |
-        |  (coordinator)        |       | (who owns whom)         |
-        |  component graph,     |       +-----------+------------+
-        |  per-network hints    |                   | route by owner
-        |  Arc + lock/atomic    |                   |
-        +---^-------------^-----+                   |
-   publish  | hint   read | candidates              |
-        +---+----+   +----+---+   cross-worker event channel
-        |Worker 1|   |Worker 2| <----------------------+
-        | Reg A,B|   | Reg C,D|
-        +--------+   +--------+
-   each worker = one OS thread, owns a disjoint set of regions (Worlds pinned)
+                         RegionalGame
+                              |
+                              v
+                      RegionalGameRunner
+                              |
+          +-------------------+-------------------+
+          |                                       |
+          v                                       v
+  RegionOwnerDirectory                    RegionDirectory
+  region -> worker                        topology + hints
+          |
+          | route command/tick/snapshot/import events
+          v
+  +-------------------+       +-------------------+       +-------------------+
+  | ThreadedWorker 0  |       | ThreadedWorker 1  |       | ThreadedWorker M  |
+  | RegionRuntime A   |       | RegionRuntime C   |       | RegionRuntime ... |
+  | RegionRuntime B   |       | RegionRuntime D   |       |                   |
+  +-------------------+       +-------------------+       +-------------------+
+          |                           ^
+          | import request/grant      |
+          +---------------------------+
 ```
 
-The coordinator owns the **directory** (small owned summaries), never the regions'
-`World`s. Regions publish hints *up*; discovery reads candidates *down*; the
-authoritative claim still rides the event flow and is re-validated at the producer's
-`ExportAllocations` ledger. Determinism lives in the event flow, not the directory.
+Each worker owns a disjoint set of regions. A region's `World` is touched only by its
+owning worker thread. Cross-worker communication is owned data over channels.
 
-## Decision Record
+## Routing Rules
 
-- The coordinator owns discovery (component graph + hints) only. Worlds stay sharded
-  on worker threads. "Owns all regions" means owns their published summaries and the
-  routing map, not their ECS.
-- The hint stays tiny and stale-tolerant; cross-thread reads need no barrier. A wrong
-  guess costs one declined request, never a wrong allocation.
-- Cross-worker routing forwards an authoritative event to the owning worker; it does
-  not read or copy the target's `World`.
-- Determinism is a hard requirement, not an afterthought: the multi-worker schedule
-  must produce identical results to the single-worker schedule for the same inputs,
-  or the difference must be a documented, intentional contract. This gates M3+.
-- No new external dependencies (no async runtime, no rayon); use `std::thread` and
-  channels as the existing `ThreadedRegionWorker` already does.
+- UI commands route to the worker that owns the selected region.
+- Ticks route to each owned region, or to all workers for tick-all behavior.
+- Snapshot/view requests route to the selected region's owner and return UI-safe view
+  models only.
+- Cross-region import requests route to the producer region's owning worker.
+- Cross-region import replies route back to the consumer region's owning worker.
+- Directory hints can be stale. The producer runtime is the authority that grants or
+  denies.
 
-## The determinism problem (the gating risk)
+## Coordination Rules
 
-Single-worker today is deterministic because every region ticks and every event is
-processed in one FIFO order on one thread. With several threads, two questions arise:
+No global snapshot allocator is introduced. No worker reads another worker's ECS.
 
-1. **Within one logical step (e.g. one `tick_all`), do regions on different threads
-   observe each other's exports identically regardless of thread timing?** The export
-   allocation is already authoritative and producer-serialized, and the hint is
-   stale-tolerant, so a single producer's grants are deterministic. The risk is the
-   *interleaving* of cross-worker requests reaching a producer in a
-   timing-dependent order.
-2. **Is the cross-worker delivery order itself deterministic?** Channels deliver in
-   send order per sender, but merge order across senders can vary by thread timing.
+The minimum coordination required for correctness:
 
-The plan's answer is a **deterministic barrier per logical step**: workers run their
-local pass, then a coordinator-driven merge point collects and orders cross-worker
-events by a stable key (e.g. `(target_region, caller_region, request_id, token)`)
-before delivery, so the producer sees a thread-timing-independent order. This trades
-some parallel overlap for reproducibility. M3 must land with a parity guard
-(multi-worker result == single-worker result over a scripted run) exactly like R5's.
+- A region cannot begin tick `N + 1` while its tick `N` continuation is waiting for
+  power/job import replies.
+- A worker must keep pumping control events while one of its regions waits, so it can serve
+  producer-side requests for other regions and receive replies for the waiting region.
+- Cross-worker message ordering must be deterministic for a given input and worker setup.
+  If multiple senders target the same producer in one scheduling pass, merge them by a
+  stable key such as `(target_region, caller_region, request_id, token)` before the producer
+  mutates its ledger.
+- Save/load/shutdown must handle pending continuations and producer reservations
+  deliberately. They cannot silently drop in-flight import state.
 
-## Staged patches (SUPERSEDED -- live-barrier model, retained for history)
+This keeps local determinism strict while allowing cross-region information to arrive
+later through the event flow.
 
-> Superseded by the 2026-06-14 direction change. M1 and M2 shipped and are kept; M3
-> shipped as a checkpoint but its barrier is retired by the snapshot-consistent model;
-> M4-M6 below are replaced by the OB patches in
-> [regional-snapshot-consistent-plan.md](regional-snapshot-consistent-plan.md). Retained
-> for history.
+## Staged Patches
 
-Each patch is independently shippable, behavior-preserving where marked, and gated on
-tests. Keep diffs within the repo's ~5 files / ~400 line guideline; split if larger.
+Each patch should be small and independently reviewable. Split a patch if it touches more
+than about five production files or grows past roughly 400 changed lines excluding tests.
 
-### Patch M1: Extract the coordinator directory (single worker, behavior-preserving)
+### Patch MW1: Refresh Contracts And Test Scaffolding
 
-Goal: move discovery out of `RegionWorker` into a `RegionDirectory` owned by
-`RegionalGameRunner`, shared into the worker. Still one worker; the worker reads the
-directory instead of computing discovery inline.
+Goal: make the active docs and tests describe M workers with producer-authoritative
+imports.
 
-- Add `RegionDirectory` owning `topology` + the built `CrossRegionDiscovery`.
-- `RegionWorker` borrows the directory for routing/candidate selection instead of
-  calling `cross_region_discovery` on itself.
-- **Subsumes `worker.rs:316 TODO(CR2 perf)`** (discovery rebuilt per export request).
-  Today `route_export_request` calls `cross_region_discovery` for every request;
-  routing is topology-stable within a pass, so the directory is built once and reused
-  for all requests in that pass (and later refreshed only on topology change). Post-R5
-  the registry resolves behind the hints are already cached, so the rebuild that
-  remains is `network_border_links` road-network discovery + the union-find graph --
-  which the directory removes from the per-request path.
-- No behavior change: the existing CR2/CR3 suites must pass unchanged (the proof).
+- Remove stale "multi-worker is superseded" wording.
+- Keep the UI boundary rule: UI talks through `RegionalGame`, never worker/runtime/ECS.
+- Identify existing single-worker parity scripts that should become worker-count
+  parameterized.
 
-Tests: existing cross-region tests green; a unit test that the directory yields the
-same components/candidates the worker computed before, built once per pass rather
-than once per export request.
+Tests: no production behavior change; docs-only if this patch only updates plans.
 
-### Patch M2: Publish hints into the directory on change
+### Patch MW2: Runner Owns Multiple Threaded Workers
 
-Goal: stop recomputing hints by walking owned regions every pass; have each region
-publish its `RegionalAvailabilityHint`s into the directory when they change.
+Goal: change `RegionalGameRunner` from one threaded worker to a collection of workers,
+while still defaulting to one worker.
 
-- Publish on registry recompute (tie into the R5 invalidation chokepoints) or once
-  per scheduling pass; store behind a double-buffer/atomic for stale-tolerant reads.
-- Still one worker, so still trivially consistent; this is the cross-thread-ready
-  storage shape, proven first in the easy case.
-
-Tests: a stale hint still yields a correct (re-validated) grant or a clean decline;
-publishing is idempotent; reads never block writers.
-
-### Patch M3: Cross-worker event routing + the determinism barrier
-
-Goal: route an authoritative event to the worker that owns the target region, with a
-deterministic merge point. **This is the gating patch.**
-
-- Add the region->worker map (owned by the runner/coordinator).
-- Replace `MissingTargetRegion -> deny` with forward-to-owning-worker over a
-  cross-worker channel.
-- Insert the per-step barrier that orders cross-worker events by a stable key before
-  delivery.
-- **Narrow the allocation-release fan-out** (subsumes `worker.rs:388 TODO(CR2
-  scale)`). Today a caller's `ExportAllocationRelease` is broadcast to every owned
-  region; cross-worker that would mean broadcasting to every region on every worker.
-  Instead, the caller tracks the producer regions it received `granted` replies from
-  (recorded in `apply_*_export_grant` on every granted reply, *not* only on grants it
-  locally applies -- a producer reserves on grant even when the caller's apply
-  early-returns), carries that set on the release, and the worker routes the release
-  only to those producers. Invariant: the targeted set must be a superset of
-  producers holding the caller's stale allocations, or a forgotten producer pins a
-  reservation forever (a silent leak). Adding a `Vec<RegionId>` to
-  `ExportAllocationRelease` drops its `Copy` derive -- clone it per target at the
-  routing call site.
-- Still may run two workers only in tests here; production can stay one worker until
-  M4.
-
-Tests (the hard gate): a **parity guard** -- run a scripted multi-region sequence
-(builds, ticks, cross-region power and jobs, save/load) on 1 worker and on 2 workers
-and assert identical `powered`, job assignments, and `world.stats` at every step.
-Any divergence is a determinism bug.
-
-Plus, for the narrowed release fan-out: a **silent-leak regression test** -- a
-producer grants an allocation, the caller's local apply rejects it (e.g. the
-consumer is already powered), and the next-generation release must still reach that
-producer so its reservation is dropped, not pinned. This is the test that proves the
-"record on every granted reply" invariant above.
-
-### Patch M4: Spawn N workers and assign regions
-
-Goal: the runner starts several `ThreadedRegionWorker`s and shards regions across
-them at startup/load.
-
-- Use `WorkerLoad` to pick an assignment (e.g. balanced region count, or border-aware
-  grouping so same-component regions tend to share a worker and cut cross-worker
-  traffic).
-- Assignment is fixed for the session in this patch (no live moves yet).
-
-Tests: an N-region game on K workers round-trips and matches the 1-worker result
-(reuse the M3 parity guard with K>1); assignment is deterministic.
-
-### Patch M5: Configurable worker setup from a file
-
-Goal: let an operator choose the number of worker threads and how regions are
-distributed across them (including *uneven* per-worker counts) from a setup file,
-instead of only the programmatic assignment M4 picks.
-
-Crucial invariant: **the setup is a performance knob, never a gameplay input.** The
-M3 determinism barrier orders cross-worker events by a stable key, not by thread or
-worker, so the simulation result is identical for *any* worker count and *any* valid
-assignment. The setup file therefore changes only how work is parallelized, not what
-happens in the city. It is also **separate from the game save**: a save carries the
-regions and their state; the worker setup is a per-machine deployment choice, so the
-same save runs identically whether loaded on a 2-thread laptop or a 16-thread server.
-
-- Reuse `serde_json` (already a dependency for saves) -- no new external crate. The
-  file gives `worker_count` and an assignment: either an explicit
-  `region -> worker_index` map or per-worker region lists, so workers may own
-  different numbers of regions.
-- Validate before spawning (mirroring the save-layout validation): `worker_count >=
-  1`, every region assigned to exactly one in-range worker, no region omitted or
-  doubled. A malformed setup is rejected with a clear error, never silently
-  half-applied.
-- When the file is absent, fall back to M4's default auto-assignment, so the setup
-  file is optional.
+- Add a worker-count setup path with default `1`.
+- Start `Vec<ThreadedRegionWorker>`.
+- Build a `RegionOwnerDirectory` mapping every region to exactly one worker.
+- Keep current UI behavior identical under the default setup.
 
 Tests:
 
-- the same scripted run under several setups -- 1 worker; K workers balanced; K
-  workers *uneven*; a different `region -> worker` map -- all produce identical
-  `powered`, job assignments, and `world.stats` (parameterize the M3 parity guard
-  over the setup, proving results are assignment-independent).
-- invalid setups (worker_count 0, an unassigned region, an out-of-range worker,
-  a region assigned twice) are rejected before any worker spawns.
-- an absent setup file uses the default assignment and still matches.
+- default one-worker game behaves as before,
+- invalid worker counts are rejected,
+- every region is assigned exactly once.
 
-### Patch M6 (optional, later): Live region reassignment
+### Patch MW3: Route UI Operations By Region Owner
 
-Goal: move a region (its `World`) from one worker to another at a safe point, for
-load balancing.
+Goal: make commands, ticks, snapshots, save/load operations use the owner directory.
 
-- Use `RegionMove`; move at a step boundary so no in-flight export allocation is
-  stranded (drain or transfer the region's paused-tick state and its inbound events).
-- Re-point the region->worker map and the directory.
-- **Subsumes `runtime/mod.rs` `TODO(CR2 lifecycle)`**: today export reservations only
-  clear when the caller starts a new generation, so a region that is removed,
-  reassigned, or stops ticking would leave its reservations pinned on producers. M6
-  must explicitly release a moved/removed region's allocations (and drop allocations
-  held *for* it) at the move boundary. Not reachable single-worker (regions are never
-  removed and all tick together), which is why it is deferred to here.
-- **Subsumes `load_manager.rs` `TODO(multi-worker)`**: when reassignment is wired to a
-  scheduler, add a post-move balance check so repeated `RegionMove`s cannot oscillate a
-  region between workers.
+- Selected-region command goes to the selected region's worker.
+- Tick-all fans out to all workers and collects correlated replies.
+- Snapshot/view reads go through UI-safe view models from the owning worker.
+- No UI module imports worker/runtime/ECS types.
 
-Tests: a move at a safe point preserves all state and keeps the parity guard green;
-a move never strands a pending export (it is denied or carried, never lost); a region
-removed/moved leaves no pinned reservation on any producer; repeated balance passes do
-not oscillate a region.
+Tests:
 
-## Deferred optimizations
+- two regions on two workers can each receive commands,
+- tick-all returns one result per region or a clearly aggregated result,
+- UI contract tests still forbid ECS/runtime imports.
 
-The change-driven export-allocation reconciliation analysis (the attempt to skip the
-eager per-tick churn while keeping strong consistency, and why it is a distributed
-cache-coherence problem) was the reasoning that led to the snapshot model. It has moved
-to the appendix of
-[regional-snapshot-consistent-plan.md](regional-snapshot-consistent-plan.md). The
-`runtime/mod.rs` `TODO(CR allocation lifecycle)` it tracked is deleted outright by that
-plan's OB4, not optimized.
+### Patch MW4: Cross-Worker Import Routing
+
+Goal: make power/job import request/grant/release events work when producer and consumer
+are on different workers.
+
+- Request routes consumer -> producer owner.
+- Grant/deny routes producer -> consumer owner.
+- Release routes consumer -> known producer owner.
+- If producer tracking is missing for a legacy path, broadcast is allowed only as a
+  temporary conservative fallback with a TODO.
+- Merge same-producer inbound requests deterministically before producer ledger mutation.
+
+Tests:
+
+- region A on worker 0 consumes power from region B on worker 1,
+- residents in region A can work in jobs in region B,
+- two consumers racing for one producer capacity resolve in deterministic stable order,
+- a denied or stale-hint request does not mutate consumer derived state.
+
+### Patch MW5: Configurable Worker Setup
+
+Goal: make worker count and region assignment configurable without making it gameplay
+state.
+
+- Reuse existing serialization dependencies; do not add a new production dependency.
+- Support default automatic assignment when no setup is provided.
+- Validate explicit setup before spawning workers:
+  - worker count >= 1,
+  - every region assigned exactly once,
+  - all worker indexes in range.
+- Keep setup outside the save file unless there is a separate reviewed reason to persist
+  it.
+
+Tests:
+
+- same save runs under one worker, balanced M workers, and uneven M workers,
+- invalid setups fail before any worker starts,
+- simulation-visible results are identical for deterministic test scripts.
+
+### Patch MW6: Save, Load, And Shutdown Across M Workers
+
+Goal: make lifecycle operations safe when regions are distributed.
+
+- Save collects all region snapshots through owner workers.
+- Load builds region ownership before starting normal scheduling.
+- Shutdown drains or rejects pending continuations predictably.
+- Producer reservations are released or serialized deliberately.
+
+Tests:
+
+- save/load round-trip with regions spread across workers,
+- shutdown during an import wait does not hang,
+- no producer reservation remains pinned after load/shutdown cleanup.
+
+### Patch MW7: Optional Live Reassignment
+
+Goal: move a region from one worker to another at a safe boundary.
+
+This is optional and later. It is not required for "M workers run N regions."
+
+- Move only when the region is not in the middle of a tick continuation, or serialize and
+  transfer that continuation explicitly.
+- Update region owner directory and directory hints at the same boundary.
+- Release or transfer producer reservations deliberately.
+
+Tests:
+
+- moving a region preserves its state,
+- pending import state is not lost,
+- repeated balancing does not oscillate one region between workers.
 
 ## Non-Goals
 
-- No async runtime, no work-stealing scheduler, no lock-free exotica; `std::thread` +
-  channels only.
-- No cross-region transit-capacity model (still binary connectivity, as before).
-- No change to the resolution math, balance, or the single-worker observable behavior.
-  (This was deliberately revised by the snapshot-consistent model -- see
-  [regional-snapshot-consistent-plan.md](regional-snapshot-consistent-plan.md).)
-- M6 (live moves) is explicitly optional and may never be needed.
+- No snapshot-authoritative allocation.
+- No direct ECS sharing across workers.
+- No async runtime, rayon, or new production dependency.
+- No promise that cross-region visible timing exactly matches old single-worker eager
+  behavior.
+- No transit-capacity model.
 
-## Review focus
+## Review Focus
 
-- The coordinator owns summaries and the routing map, never a region's `World`.
-- Determinism: the multi-worker result equals the single-worker result, proven by the
-  M3 parity guard; the merge-point ordering key is stable and documented.
-- Stale hints only misdirect a request; they never produce a wrong allocation.
-- No region reads another region's ECS across a thread boundary.
+- The UI boundary remains intact.
+- Every `World` has exactly one owning worker.
+- Cross-worker routing uses owned messages only.
+- Producer regions remain authoritative for power/job grants.
+- Request ordering at a producer is deterministic for a given setup.
+- A waiting tick is an explicit continuation state, not an implicit blocked thread.
