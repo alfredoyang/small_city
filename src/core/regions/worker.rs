@@ -10,7 +10,6 @@ use crate::core::regional_types::{
 pub use crate::core::regions::directory::CrossRegionDiscovery;
 use crate::core::regions::directory::RegionDirectory;
 use crate::core::regions::handle::RegionHandle;
-use crate::core::regions::load_manager::WorkerLoad;
 use crate::core::regions::runtime::{
     ExportAllocationRelease, ExportAllocationRequest, JobExportRequest, OutboundMessage,
     PowerExportRequest, RegionEvent, RegionRuntime, RegionRuntimeError,
@@ -331,21 +330,6 @@ impl RegionWorker {
         self.region(region_id).map(RegionRuntime::handle)
     }
 
-    pub fn load(&self) -> WorkerLoad {
-        let region_ids = self
-            .regions
-            .iter()
-            .map(RegionRuntime::region_id)
-            .collect::<Vec<_>>();
-        let queued_events = self
-            .regions
-            .iter()
-            .map(RegionRuntime::pending_event_count)
-            .sum();
-
-        WorkerLoad::new(self.id, region_ids, queued_events)
-    }
-
     pub fn set_region_topology(&mut self, topology: Vec<RegionNeighborLink>) {
         // Compatibility shim for direct worker tests. Production routing receives
         // topology through the shared `RegionDirectory` owned by the runner.
@@ -361,11 +345,15 @@ impl RegionWorker {
         // Compatibility shim for the integration test suite. Production routing
         // reads the shared directory snapshot instead of allocating this
         // throwaway directory.
-        let directory = RegionDirectory::from_summaries(
-            topology.to_vec(),
-            self.network_border_links(),
-            self.availability_hints(),
-        );
+        let directory = RegionDirectory::new(topology.to_vec());
+        for runtime in &self.regions {
+            let state = runtime.state();
+            directory.publish_region(
+                runtime.region_id(),
+                state.network_border_links(),
+                state.availability_hints(),
+            );
+        }
         (*directory.discovery_snapshot()).clone()
     }
 
@@ -690,20 +678,6 @@ impl RegionWorker {
         hints: Vec<RegionalAvailabilityHint>,
     ) {
         self.directory.publish_region(region_id, links, hints);
-    }
-
-    fn network_border_links(&self) -> Vec<NetworkBorderLink> {
-        self.regions
-            .iter()
-            .flat_map(|runtime| runtime.state().network_border_links())
-            .collect()
-    }
-
-    fn availability_hints(&self) -> Vec<RegionalAvailabilityHint> {
-        self.regions
-            .iter()
-            .flat_map(|runtime| runtime.state().availability_hints())
-            .collect()
     }
 }
 

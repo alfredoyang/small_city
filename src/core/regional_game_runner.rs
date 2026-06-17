@@ -68,9 +68,6 @@ pub enum RegionalGameRunnerError {
 pub struct RegionalGameRunner {
     worker: ThreadedRegionWorker,
     handles: Vec<RegionHandle>,
-    // M1 keeps a coordinator-owned directory handle so later multi-worker
-    // patches can publish/read discovery without exposing worker internals.
-    _directory: Arc<RegionDirectory>,
     operation_lock: Mutex<()>,
 }
 
@@ -109,7 +106,6 @@ impl RegionalGameRunner {
         let runner = Self {
             worker: ThreadedRegionWorker::start(worker),
             handles,
-            _directory: directory,
             operation_lock: Mutex::new(()),
         };
         runner.process_worker_until_drained()?;
@@ -469,7 +465,6 @@ mod tests {
             RegionalGameRunner {
                 worker: ThreadedRegionWorker::start(worker),
                 handles: vec![handle.clone()],
-                _directory: Arc::new(RegionDirectory::default()),
                 operation_lock: Mutex::new(()),
             },
             handle,

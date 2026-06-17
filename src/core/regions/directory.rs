@@ -119,23 +119,6 @@ impl RegionDirectory {
         self.rebuild_discovery(&state);
     }
 
-    pub fn refresh(
-        &self,
-        links: Vec<NetworkBorderLink>,
-        availability_hints: Vec<RegionalAvailabilityHint>,
-    ) {
-        // Compatibility helper for test shims that still build a complete
-        // discovery snapshot in one call. Production M2 publishing goes through
-        // `publish_region` so unchanged region summaries do not rebuild.
-        let mut state = self
-            .publish_state
-            .lock()
-            .expect("region directory publish state lock poisoned");
-        state.region_links = group_links_by_region(links);
-        state.region_hints = group_hints_by_region(availability_hints);
-        self.rebuild_discovery(&state);
-    }
-
     /// Publishes one region's owned discovery summaries.
     ///
     /// Publishing is idempotent: if the normalized summaries are unchanged, the
@@ -199,16 +182,6 @@ impl RegionDirectory {
     pub(crate) fn rebuild_count(&self) -> usize {
         self.rebuild_count.load(Ordering::Relaxed)
     }
-
-    pub(crate) fn from_summaries(
-        topology: Vec<RegionNeighborLink>,
-        links: Vec<NetworkBorderLink>,
-        availability_hints: Vec<RegionalAvailabilityHint>,
-    ) -> Self {
-        let directory = Self::new(topology);
-        directory.refresh(links, availability_hints);
-        directory
-    }
 }
 
 fn set_or_remove<T>(map: &mut HashMap<RegionId, Vec<T>>, region: RegionId, values: Vec<T>) {
@@ -217,32 +190,6 @@ fn set_or_remove<T>(map: &mut HashMap<RegionId, Vec<T>>, region: RegionId, value
     } else {
         map.insert(region, values);
     }
-}
-
-fn group_links_by_region(
-    links: Vec<NetworkBorderLink>,
-) -> HashMap<RegionId, Vec<NetworkBorderLink>> {
-    let mut grouped: HashMap<RegionId, Vec<NetworkBorderLink>> = HashMap::new();
-    for link in links {
-        grouped.entry(link.network.region).or_default().push(link);
-    }
-    for values in grouped.values_mut() {
-        *values = normalize_links(std::mem::take(values));
-    }
-    grouped
-}
-
-fn group_hints_by_region(
-    hints: Vec<RegionalAvailabilityHint>,
-) -> HashMap<RegionId, Vec<RegionalAvailabilityHint>> {
-    let mut grouped: HashMap<RegionId, Vec<RegionalAvailabilityHint>> = HashMap::new();
-    for hint in hints {
-        grouped.entry(hint.network.region).or_default().push(hint);
-    }
-    for values in grouped.values_mut() {
-        *values = normalize_hints(std::mem::take(values));
-    }
-    grouped
 }
 
 fn normalize_links(mut links: Vec<NetworkBorderLink>) -> Vec<NetworkBorderLink> {
@@ -429,15 +376,13 @@ mod tests {
                 offset: 0,
             },
         };
-        let directory = RegionDirectory::from_summaries(
-            vec![RegionNeighborLink::new(
-                RegionId(1),
-                BorderEdge::East,
-                RegionId(2),
-            )],
-            vec![left, right],
-            Vec::new(),
-        );
+        let directory = RegionDirectory::new(vec![RegionNeighborLink::new(
+            RegionId(1),
+            BorderEdge::East,
+            RegionId(2),
+        )]);
+        directory.publish_region(RegionId(1), vec![left], Vec::new());
+        directory.publish_region(RegionId(2), vec![right], Vec::new());
 
         assert_eq!(
             directory.discovery_snapshot().component_of(network(1, 0)),

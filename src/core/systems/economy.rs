@@ -61,14 +61,9 @@ pub(crate) struct EconomyBreakdown {
 /// remote assignments are preserved here because remote work is owned by the
 /// cross-region tick phase and intentionally stays frozen until that phase runs.
 ///
-/// TODO(paused remote jobs): remote/exported job assignment does not update while
-/// paused -- it only resolves during the daily cross-region request/grant/release
-/// phase, which needs a tick. So a paused jobless citizen cannot gain a new remote
-/// job, and existing remote allocations are not re-resolved. Under the
-/// snapshot-consistent model (docs/regional-snapshot-consistent-plan.md), remote
-/// assignment becomes a pure function of the previous step's frozen snapshot and
-/// could be derived here too (against that stale snapshot), making it paused-visible
-/// like local assignment. Revisit when OB lands.
+/// Remote/exported job assignment does not update while paused: it resolves
+/// during the daily producer-authoritative request/grant/release phase, which
+/// needs a tick. Paused reads keep the last confirmed remote assignment.
 pub(crate) fn assign_local_jobs(world: &mut World, local_region: RegionId) {
     let job_resolution = world.cached_job_resolution();
     apply_workplace_assignments(world, local_region, &job_resolution.assignments);

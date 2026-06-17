@@ -152,16 +152,15 @@ The terminal frontends now run on a regional model where several regions simulat
 
 Layers, from lowest to highest:
 
-- `RegionState`: owns one private `World` plus a rebuildable imported-resource cache, and exposes core command/view operations to its runtime.
-- `RegionRuntime`: an actor-style event loop around one `RegionState`. It processes owned events (tick, run command, build snapshot, imported-resource work) in FIFO order and returns owned reply messages.
+- `RegionState`: owns one private `World` and exposes core command/view operations to its runtime.
+- `RegionRuntime`: an actor-style event loop around one `RegionState`. It processes owned events (tick, run command, build snapshot, producer-owned export work) in FIFO order and returns owned reply messages.
 - `RegionWorker`: schedules several runtimes fairly on one thread and routes messages between region mailboxes without ever reading ECS state.
 - `RegionHandle`: a cloneable mailbox endpoint that the runner and neighboring regions use to send events.
 - `ThreadedRegionWorker`: runs one `RegionWorker` on its own OS thread, controlled through a command channel with deterministic shutdown.
 - `RegionalGameRunner`: starts exactly one threaded worker, keeps the handles private, and exposes narrow UI-safe operations (tick, command, snapshot, inspect, shutdown/recover).
 - `RegionalGame`: the UI-facing facade. The UI talks only to this facade, never to the worker, runtime, or `World`.
-- `LoadManager`: a deterministic, not-yet-wired policy for moving a region between workers based on simple load summaries.
 
-Cross-region resources are modeled as imported offers with origin, kind, generation, remaining capacity, hop count, and max hops. Offers are treated as rebuildable cache: they are propagated at runtime, not saved as permanent truth.
+Cross-region resources use producer-owned power/job export requests. Directory summaries are stale-tolerant routing hints; the producer runtime grants or denies capacity.
 
 Today the terminal frontends start a two-region default game through this facade. Single-region behavior remains covered by parity-style tests that drive the regional facade through the same player-visible command and view surface used by older single-city tests.
 
