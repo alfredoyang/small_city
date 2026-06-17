@@ -4,6 +4,7 @@
 //! path. It starts worker threads, keeps worker handles private, and
 //! exposes only narrow UI-safe operations.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::core::regional_types::{
@@ -16,7 +17,8 @@ use crate::core::regions::threaded::{
     ThreadedRegionWorker, ThreadedWorkerError, ThreadedWorkerShutdown,
 };
 use crate::core::regions::worker::{
-    RegionOwnerDirectory, RegionWorker, WorkerId, WorkerRoutingError, WorkerRunSummary,
+    ForwardedRegionEvent, RegionOwnerDirectory, RegionWorker, WorkerId, WorkerRoutingError,
+    WorkerRunSummary, sort_forwarded_events,
 };
 use crate::core::regions::{RegionId, RegionNeighborLink, RegionState};
 use crate::interface::events::CommandResult;
@@ -32,9 +34,6 @@ const MAX_REPLY_PASSES: usize = 64;
 /// Deterministic errors returned by the regional game runner.
 pub enum RegionalGameRunnerError {
     InvalidWorkerCount {
-        worker_count: usize,
-    },
-    CrossWorkerTopologyUnsupported {
         worker_count: usize,
     },
     DuplicateRegion {
@@ -106,11 +105,6 @@ impl RegionalGameRunner {
     ) -> Result<Self, RegionalGameRunnerError> {
         if worker_count == 0 || worker_count > u32::MAX as usize {
             return Err(RegionalGameRunnerError::InvalidWorkerCount { worker_count });
-        }
-        if worker_count > 1 && !topology.is_empty() {
-            // ponytail: MW4 wires cross-worker import delivery; until then,
-            // multi-worker runners are only valid for independent regions.
-            return Err(RegionalGameRunnerError::CrossWorkerTopologyUnsupported { worker_count });
         }
 
         let directory = Arc::new(RegionDirectory::new(topology));
@@ -300,12 +294,22 @@ impl RegionalGameRunner {
             .ok_or(RegionalGameRunnerError::WorkerStopped { worker_id })
     }
 
+    /// Pumps every worker once while a synchronous runner call waits for its reply.
+    ///
+    /// This does not mean "produce exactly one reply." Region runtimes are event
+    /// loops: the requested command/tick/snapshot may sit behind older events, or
+    /// may need cross-region export request/grant events before its final reply
+    /// exists. One pass gives each region at most one event of work, collects any
+    /// replies produced along the way, then delivers forwarded cross-worker
+    /// events through the deterministic barrier. The `wait_for_*` helpers repeat
+    /// this bounded pass until the matching `(request_id, region_id)` reply is
+    /// found or the safety cap is reached.
     fn process_one_reply_pass(&self) -> Result<WorkerRunSummary, RegionalGameRunnerError> {
         let mut combined = WorkerRunSummary::default();
 
         for worker in &self.workers {
             let mut summary = worker
-                .process_region_events(1)
+                .process_region_events_for_barrier(1)
                 .map_err(RegionalGameRunnerError::from)?;
 
             if let Some(error) = summary.routing_errors.first().copied() {
@@ -327,18 +331,46 @@ impl RegionalGameRunner {
                 .forwarded_events
                 .append(&mut summary.forwarded_events);
         }
-        if !combined.forwarded_events.is_empty() {
-            // ponytail: fail loudly instead of dropping cross-worker events. MW4
-            // replaces this with deterministic delivery through the barrier.
-            return Err(RegionalGameRunnerError::WorkerRoutingFailed {
-                worker_id: combined.forwarded_events[0].target_worker,
-                error: WorkerRoutingError::MissingTargetRegion {
-                    target_region: combined.forwarded_events[0].target_region,
-                },
-            });
-        }
+        self.deliver_forwarded_events(std::mem::take(&mut combined.forwarded_events))?;
 
         Ok(combined)
+    }
+
+    fn deliver_forwarded_events(
+        &self,
+        mut events: Vec<ForwardedRegionEvent>,
+    ) -> Result<(), RegionalGameRunnerError> {
+        sort_forwarded_events(&mut events);
+
+        let mut by_worker: BTreeMap<WorkerId, Vec<ForwardedRegionEvent>> = BTreeMap::new();
+        for event in events {
+            by_worker
+                .entry(event.target_worker)
+                .or_default()
+                .push(event);
+        }
+
+        for (worker_id, worker_events) in by_worker {
+            let target_region = worker_events[0].target_region;
+            let Some(worker) = self
+                .workers
+                .iter()
+                .find(|worker| worker.worker_id() == worker_id)
+            else {
+                return Err(RegionalGameRunnerError::WorkerRoutingFailed {
+                    worker_id,
+                    error: WorkerRoutingError::MissingTargetRegion { target_region },
+                });
+            };
+            let errors = worker
+                .deliver_forwarded_events(worker_events)
+                .map_err(RegionalGameRunnerError::from)?;
+            if let Some(error) = errors.into_iter().next() {
+                return Err(RegionalGameRunnerError::WorkerRoutingFailed { worker_id, error });
+            }
+        }
+
+        Ok(())
     }
 
     fn process_worker_until_drained(&self) -> Result<(), RegionalGameRunnerError> {

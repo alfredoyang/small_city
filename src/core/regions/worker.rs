@@ -195,7 +195,7 @@ pub fn process_workers_with_deterministic_barrier(
         summaries.push(summary);
     }
 
-    forwarded.sort_by_key(|event| event.order_key);
+    sort_forwarded_events(&mut forwarded);
     for forwarded_event in forwarded {
         let Some(target_worker) = workers
             .iter_mut()
@@ -217,6 +217,11 @@ pub fn process_workers_with_deterministic_barrier(
         worker_summaries: summaries,
         routing_errors,
     }
+}
+
+/// Sorts forwarded region events by the stable M3 merge key.
+pub fn sort_forwarded_events(events: &mut [ForwardedRegionEvent]) {
+    events.sort_by_key(|event| event.order_key);
 }
 
 #[derive(Debug)]
@@ -379,11 +384,26 @@ impl RegionWorker {
         self.process_region_events_with_mode(max_events_per_region, RegionRoutingMode::Immediate)
     }
 
-    fn process_region_events_for_barrier(
+    pub fn process_region_events_for_barrier(
         &mut self,
         max_events_per_region: usize,
     ) -> WorkerRunSummary {
         self.process_region_events_with_mode(max_events_per_region, RegionRoutingMode::Barrier)
+    }
+
+    pub fn deliver_forwarded_events(
+        &mut self,
+        events: Vec<ForwardedRegionEvent>,
+    ) -> Vec<WorkerRoutingError> {
+        let mut errors = Vec::new();
+        for forwarded_event in events {
+            if let Err(error) =
+                self.push_event(forwarded_event.target_region, forwarded_event.event)
+            {
+                errors.push(error);
+            }
+        }
+        errors
     }
 
     fn process_region_events_with_mode(

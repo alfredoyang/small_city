@@ -9,7 +9,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use crate::core::regions::RegionId;
-use crate::core::regions::worker::{RegionWorker, WorkerId, WorkerRunSummary};
+use crate::core::regions::worker::{
+    ForwardedRegionEvent, RegionWorker, WorkerId, WorkerRoutingError, WorkerRunSummary,
+};
 use crate::interface::view::InspectView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +70,48 @@ impl ThreadedRegionWorker {
         self.commands
             .send(ThreadedWorkerCommand::Process {
                 max_events_per_region,
+                reply: reply_sender,
+            })
+            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
+                worker_id: self.worker_id,
+            })?;
+
+        reply_receiver
+            .recv()
+            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
+                worker_id: self.worker_id,
+            })
+    }
+
+    pub fn process_region_events_for_barrier(
+        &self,
+        max_events_per_region: usize,
+    ) -> Result<WorkerRunSummary, ThreadedWorkerError> {
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.commands
+            .send(ThreadedWorkerCommand::ProcessBarrier {
+                max_events_per_region,
+                reply: reply_sender,
+            })
+            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
+                worker_id: self.worker_id,
+            })?;
+
+        reply_receiver
+            .recv()
+            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
+                worker_id: self.worker_id,
+            })
+    }
+
+    pub fn deliver_forwarded_events(
+        &self,
+        events: Vec<ForwardedRegionEvent>,
+    ) -> Result<Vec<WorkerRoutingError>, ThreadedWorkerError> {
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.commands
+            .send(ThreadedWorkerCommand::DeliverForwarded {
+                events,
                 reply: reply_sender,
             })
             .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
@@ -154,17 +198,67 @@ impl ThreadedRegionWorker {
     }
 }
 
+/// Private control messages sent from `ThreadedRegionWorker` to its worker thread.
+///
+/// Region events still enter regions through `RegionHandle`; this enum is only
+/// for scheduler/control operations that must run on the worker-owning thread.
 enum ThreadedWorkerCommand {
+    /// Run the normal single-worker scheduler.
+    ///
+    /// Same-worker outbound events are delivered immediately. This is kept for
+    /// direct threaded-worker tests and single-worker utility calls; the
+    /// multi-worker runner uses `ProcessBarrier` instead.
     Process {
         max_events_per_region: usize,
         reply: Sender<WorkerRunSummary>,
     },
+    /// Run one deterministic-barrier scheduler pass.
+    ///
+    /// Purpose: make competing cross-region export requests deterministic across
+    /// worker threads. A normal `Process` pass immediately delivers same-worker
+    /// events, so a region on the producer's worker could reach the producer
+    /// before a lower-key request from another worker. `ProcessBarrier` avoids
+    /// that shortcut: every region-to-region outbound event, including
+    /// same-worker targets, is returned as a `ForwardedRegionEvent`. The runner
+    /// then merges all workers' events, sorts them by the stable routing key,
+    /// and sends them back with `DeliverForwarded`.
+    ///
+    /// ```text
+    /// Worker A              runner barrier              Worker B
+    /// ────────              ──────────────              ────────
+    /// ProcessBarrier ──┐
+    ///                  ├─ collect all forwarded events
+    /// ProcessBarrier ──┘
+    ///                    sort by deterministic key
+    ///                         ├─ DeliverForwarded -> target worker
+    ///                         └─ DeliverForwarded -> target worker
+    /// ```
+    ProcessBarrier {
+        max_events_per_region: usize,
+        reply: Sender<WorkerRunSummary>,
+    },
+    /// Push already-sorted forwarded events into this worker's owned region inboxes.
+    ///
+    /// The runner sorts and groups events before sending this command; the worker
+    /// only validates that each target region is owned here and enqueues it.
+    DeliverForwarded {
+        events: Vec<ForwardedRegionEvent>,
+        reply: Sender<Vec<WorkerRoutingError>>,
+    },
+    /// Read an inspect view from one owned runtime on the worker thread.
+    ///
+    /// This keeps UI-facing reads out of ECS internals while avoiding direct
+    /// access to `RegionRuntime` from the runner thread.
     Inspect {
         region_id: RegionId,
         x: usize,
         y: usize,
         reply: Sender<Option<InspectView>>,
     },
+    /// Stop the worker thread and return the owned `RegionWorker`.
+    ///
+    /// The shutdown mode decides whether pending events are rejected or one final
+    /// bounded pass is run before ownership returns to the caller.
     Shutdown {
         mode: ThreadedWorkerShutdown,
         reply: Sender<ThreadedWorkerShutdownResult>,
@@ -179,6 +273,15 @@ fn run_worker(mut worker: RegionWorker, commands: Receiver<ThreadedWorkerCommand
                 reply,
             } => {
                 let _ = reply.send(worker.process_region_events(max_events_per_region));
+            }
+            ThreadedWorkerCommand::ProcessBarrier {
+                max_events_per_region,
+                reply,
+            } => {
+                let _ = reply.send(worker.process_region_events_for_barrier(max_events_per_region));
+            }
+            ThreadedWorkerCommand::DeliverForwarded { events, reply } => {
+                let _ = reply.send(worker.deliver_forwarded_events(events));
             }
             ThreadedWorkerCommand::Inspect {
                 region_id,

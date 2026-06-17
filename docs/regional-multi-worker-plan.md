@@ -111,7 +111,7 @@ while still defaulting to one worker.
 
 Status: implemented. The runner can start multiple threaded workers and assigns regions
 round-robin through `RegionOwnerDirectory`. UI behavior still defaults to one worker.
-Cross-worker import event delivery remains MW4; MW2 only establishes ownership.
+Cross-worker import event delivery is implemented in MW4; MW2 only establishes ownership.
 
 - Add a worker-count setup path with default `1`.
 - Start `Vec<ThreadedRegionWorker>`.
@@ -129,8 +129,8 @@ Tests:
 Goal: make commands, ticks, snapshots, save/load operations use the owner directory.
 
 Status: implemented for UI command/tick/snapshot/inspect/recovery routing. Tick-all now
-batches requests before collecting correlated replies. Cross-worker import delivery remains
-blocked by the MW2 topology guard until MW4.
+batches requests before collecting correlated replies. Cross-worker import delivery is
+handled by the MW4 deterministic barrier.
 
 - Selected-region command goes to the selected region's worker.
 - Tick-all fans out to all workers and collects correlated replies.
@@ -147,6 +147,10 @@ Tests:
 
 Goal: make power/job import request/grant/release events work when producer and consumer
 are on different workers.
+
+Status: implemented. Threaded runner passes use the deterministic barrier: worker
+outbound events are collected, sorted by the stable forwarded-event key, then delivered
+to the owning worker inbox before the next processing pass.
 
 - Request routes consumer -> producer owner.
 - Grant/deny routes producer -> consumer owner.

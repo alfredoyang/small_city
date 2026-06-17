@@ -4,6 +4,7 @@ use small_city::core::regional_game::{RegionCommand, UiReply, UiRequestId};
 use small_city::core::regional_game_runner::{RegionalGameRunner, RegionalGameRunnerError};
 use small_city::core::regions::{BorderEdge, RegionId, RegionNeighborLink, RegionState};
 use small_city::interface::input::BuildingKind;
+use small_city::interface::view::InspectDetailsView;
 
 #[test]
 fn runner_starts_one_threaded_worker_and_processes_regional_tick() {
@@ -201,25 +202,28 @@ fn tick_batch_validates_all_regions_before_enqueueing_any_tick() {
 }
 
 #[test]
-fn two_worker_runner_rejects_topology_until_cross_worker_import_routing_exists() {
-    let error = RegionalGameRunner::start_with_topology_and_worker_count(
+fn two_worker_runner_routes_cross_worker_power_export() {
+    let consumer = cross_worker_power_consumer_region(RegionId(21));
+    let producer = cross_worker_power_producer_region(RegionId(22));
+    let runner = RegionalGameRunner::start_with_topology_and_worker_count(
+        vec![consumer, producer],
         vec![
-            RegionState::new(RegionId(21), 2, 2),
-            RegionState::new(RegionId(22), 2, 2),
+            RegionNeighborLink::new(RegionId(21), BorderEdge::East, RegionId(22)),
+            RegionNeighborLink::new(RegionId(22), BorderEdge::West, RegionId(21)),
         ],
-        vec![RegionNeighborLink::new(
-            RegionId(21),
-            BorderEdge::East,
-            RegionId(22),
-        )],
         2,
     )
-    .expect_err("MW2 should not drop cross-worker import events");
+    .unwrap();
 
-    assert_eq!(
-        error,
-        RegionalGameRunnerError::CrossWorkerTopologyUnsupported { worker_count: 2 }
-    );
+    let result = runner.tick_region(UiRequestId(21), RegionId(21)).unwrap();
+    let inspect = runner.inspect_region(RegionId(21), 0, 0).unwrap();
+
+    assert!(result.success);
+    assert!(matches!(
+        inspect.details,
+        Some(InspectDetailsView::Residential { powered: true, .. })
+    ));
+    runner.shutdown().unwrap();
 }
 
 #[test]
@@ -315,4 +319,21 @@ fn ui_facing_code_can_use_runner_without_worker_or_runtime_types() {
 
     assert_eq!(request_turn_snapshot(&runner, RegionId(7)).unwrap(), 1);
     runner.shutdown().unwrap();
+}
+
+fn cross_worker_power_consumer_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 5, 3);
+    assert!(region.build(0, 0, BuildingKind::Residential).success);
+    for x in 1..5 {
+        assert!(region.build(x, 0, BuildingKind::Road).success);
+    }
+    region
+}
+
+fn cross_worker_power_producer_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 5, 3);
+    assert!(region.build(0, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 1, BuildingKind::PowerPlant).success);
+    region
 }

@@ -708,9 +708,6 @@ impl From<RegionalGameRunnerError> for RegionalGameError {
                 Self::UnknownRegion { region_id }
             }
             RegionalGameRunnerError::InvalidWorkerCount { .. } => Self::RegionAttachFailed,
-            RegionalGameRunnerError::CrossWorkerTopologyUnsupported { .. } => {
-                Self::RegionAttachFailed
-            }
             RegionalGameRunnerError::RegionAddFailed { .. } => Self::RegionAttachFailed,
             RegionalGameRunnerError::CommandReplyMissing {
                 request_id,
