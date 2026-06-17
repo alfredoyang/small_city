@@ -109,6 +109,10 @@ Tests: no production behavior change; docs-only if this patch only updates plans
 Goal: change `RegionalGameRunner` from one threaded worker to a collection of workers,
 while still defaulting to one worker.
 
+Status: implemented. The runner can start multiple threaded workers and assigns regions
+round-robin through `RegionOwnerDirectory`. UI behavior still defaults to one worker.
+Cross-worker import event delivery remains MW4; MW2 only establishes ownership.
+
 - Add a worker-count setup path with default `1`.
 - Start `Vec<ThreadedRegionWorker>`.
 - Build a `RegionOwnerDirectory` mapping every region to exactly one worker.

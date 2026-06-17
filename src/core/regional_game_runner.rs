@@ -1,7 +1,7 @@
 //! Threaded execution owner for regional simulation.
 //!
 //! `RegionalGameRunner` is the first production owner above the regional worker
-//! path. It starts exactly one worker thread, keeps worker handles private, and
+//! path. It starts worker threads, keeps worker handles private, and
 //! exposes only narrow UI-safe operations.
 
 use std::sync::{Arc, Mutex};
@@ -15,7 +15,9 @@ use crate::core::regions::runtime::RegionRuntime;
 use crate::core::regions::threaded::{
     ThreadedRegionWorker, ThreadedWorkerError, ThreadedWorkerShutdown,
 };
-use crate::core::regions::worker::{RegionWorker, WorkerId, WorkerRoutingError};
+use crate::core::regions::worker::{
+    RegionOwnerDirectory, RegionWorker, WorkerId, WorkerRoutingError, WorkerRunSummary,
+};
 use crate::core::regions::{RegionId, RegionNeighborLink, RegionState};
 use crate::interface::events::CommandResult;
 use crate::interface::input::MapOverlayInput;
@@ -29,6 +31,12 @@ const MAX_REPLY_PASSES: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Deterministic errors returned by the regional game runner.
 pub enum RegionalGameRunnerError {
+    InvalidWorkerCount {
+        worker_count: usize,
+    },
+    CrossWorkerTopologyUnsupported {
+        worker_count: usize,
+    },
     DuplicateRegion {
         region_id: RegionId,
     },
@@ -64,10 +72,11 @@ pub enum RegionalGameRunnerError {
 }
 
 #[derive(Debug)]
-/// Public threaded runner that owns one regional worker thread.
+/// Public threaded runner that owns regional worker threads.
 pub struct RegionalGameRunner {
-    worker: ThreadedRegionWorker,
+    workers: Vec<ThreadedRegionWorker>,
     handles: Vec<RegionHandle>,
+    owners: Arc<RegionOwnerDirectory>,
     operation_lock: Mutex<()>,
 }
 
@@ -76,25 +85,60 @@ impl RegionalGameRunner {
         Self::start_with_topology(regions, Vec::new())
     }
 
+    pub fn start_with_worker_count(
+        regions: Vec<RegionState>,
+        worker_count: usize,
+    ) -> Result<Self, RegionalGameRunnerError> {
+        Self::start_with_topology_and_worker_count(regions, Vec::new(), worker_count)
+    }
+
     pub fn start_with_topology(
         regions: Vec<RegionState>,
         topology: Vec<RegionNeighborLink>,
     ) -> Result<Self, RegionalGameRunnerError> {
+        Self::start_with_topology_and_worker_count(regions, topology, 1)
+    }
+
+    pub fn start_with_topology_and_worker_count(
+        regions: Vec<RegionState>,
+        topology: Vec<RegionNeighborLink>,
+        worker_count: usize,
+    ) -> Result<Self, RegionalGameRunnerError> {
+        if worker_count == 0 || worker_count > u32::MAX as usize {
+            return Err(RegionalGameRunnerError::InvalidWorkerCount { worker_count });
+        }
+        if worker_count > 1 && !topology.is_empty() {
+            // ponytail: MW4 wires cross-worker import delivery; until then,
+            // multi-worker runners are only valid for independent regions.
+            return Err(RegionalGameRunnerError::CrossWorkerTopologyUnsupported { worker_count });
+        }
+
         let directory = Arc::new(RegionDirectory::new(topology));
-        let mut worker = RegionWorker::with_directory(INITIAL_WORKER_ID, Arc::clone(&directory));
+        let owners = Arc::new(RegionOwnerDirectory::new());
+        let mut workers = (0..worker_count)
+            .map(|index| {
+                let worker_id = WorkerId(INITIAL_WORKER_ID.0 + index as u32);
+                RegionWorker::with_directory_and_owners(
+                    worker_id,
+                    Arc::clone(&directory),
+                    Arc::clone(&owners),
+                )
+            })
+            .collect::<Vec<_>>();
         let mut handles = Vec::new();
 
-        for region in regions {
+        for (index, region) in regions.into_iter().enumerate() {
+            let worker_index = index % workers.len();
             let runtime = RegionRuntime::new(region);
             let handle = runtime.handle();
 
-            if let Err(error) = worker.add_region(runtime) {
+            if let Err(error) = workers[worker_index].add_region(runtime) {
                 return Err(match error.routing_error() {
                     WorkerRoutingError::DuplicateRegion { region_id } => {
                         RegionalGameRunnerError::DuplicateRegion { region_id }
                     }
                     error => RegionalGameRunnerError::RegionAddFailed {
-                        worker_id: worker.id(),
+                        worker_id: workers[worker_index].id(),
                         error,
                     },
                 });
@@ -104,8 +148,12 @@ impl RegionalGameRunner {
         }
 
         let runner = Self {
-            worker: ThreadedRegionWorker::start(worker),
+            workers: workers
+                .into_iter()
+                .map(ThreadedRegionWorker::start)
+                .collect(),
             handles,
+            owners,
             operation_lock: Mutex::new(()),
         };
         runner.process_worker_until_drained()?;
@@ -196,21 +244,22 @@ impl RegionalGameRunner {
             .operation_lock
             .lock()
             .expect("regional runner operation lock poisoned");
-        self.worker
+        self.worker_for_region(region_id)?
             .inspect_region(region_id, x, y)
             .map_err(RegionalGameRunnerError::from)?
             .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })
     }
 
     pub fn shutdown(self) -> Result<RecoveredRegionalGame, RegionalGameRunnerError> {
-        let shutdown = self
-            .worker
-            .shutdown(ThreadedWorkerShutdown::RejectPending)
-            .map_err(RegionalGameRunnerError::from)?;
+        let mut workers = Vec::new();
+        for worker in self.workers {
+            let shutdown = worker
+                .shutdown(ThreadedWorkerShutdown::RejectPending)
+                .map_err(RegionalGameRunnerError::from)?;
+            workers.push(shutdown.worker);
+        }
 
-        Ok(RecoveredRegionalGame {
-            worker: shutdown.worker,
-        })
+        Ok(RecoveredRegionalGame { workers })
     }
 
     fn handle_for(&self, region_id: RegionId) -> Option<&RegionHandle> {
@@ -219,22 +268,60 @@ impl RegionalGameRunner {
             .find(|handle| handle.region_id() == region_id)
     }
 
-    fn process_one_reply_pass(
+    fn worker_for_region(
         &self,
-    ) -> Result<crate::core::regions::worker::WorkerRunSummary, RegionalGameRunnerError> {
-        let summary = self
-            .worker
-            .process_region_events(1)
-            .map_err(RegionalGameRunnerError::from)?;
+        region_id: RegionId,
+    ) -> Result<&ThreadedRegionWorker, RegionalGameRunnerError> {
+        let worker_id = self
+            .owners
+            .owner_of(region_id)
+            .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })?;
 
-        if let Some(error) = summary.routing_errors.first().copied() {
+        self.workers
+            .iter()
+            .find(|worker| worker.worker_id() == worker_id)
+            .ok_or(RegionalGameRunnerError::WorkerStopped { worker_id })
+    }
+
+    fn process_one_reply_pass(&self) -> Result<WorkerRunSummary, RegionalGameRunnerError> {
+        let mut combined = WorkerRunSummary::default();
+
+        for worker in &self.workers {
+            let mut summary = worker
+                .process_region_events(1)
+                .map_err(RegionalGameRunnerError::from)?;
+
+            if let Some(error) = summary.routing_errors.first().copied() {
+                return Err(RegionalGameRunnerError::WorkerRoutingFailed {
+                    worker_id: worker.worker_id(),
+                    error,
+                });
+            }
+
+            combined.processed_regions += summary.processed_regions;
+            combined
+                .command_replies
+                .append(&mut summary.command_replies);
+            combined.tick_replies.append(&mut summary.tick_replies);
+            combined
+                .snapshot_replies
+                .append(&mut summary.snapshot_replies);
+            combined
+                .forwarded_events
+                .append(&mut summary.forwarded_events);
+        }
+        if !combined.forwarded_events.is_empty() {
+            // ponytail: fail loudly instead of dropping cross-worker events. MW4
+            // replaces this with deterministic delivery through the barrier.
             return Err(RegionalGameRunnerError::WorkerRoutingFailed {
-                worker_id: self.worker.worker_id(),
-                error,
+                worker_id: combined.forwarded_events[0].target_worker,
+                error: WorkerRoutingError::MissingTargetRegion {
+                    target_region: combined.forwarded_events[0].target_region,
+                },
             });
         }
 
-        Ok(summary)
+        Ok(combined)
     }
 
     fn process_worker_until_drained(&self) -> Result<(), RegionalGameRunnerError> {
@@ -330,7 +417,7 @@ impl RegionalGameRunner {
 #[derive(Debug)]
 /// Authoritative regional state recovered after runner shutdown.
 pub struct RecoveredRegionalGame {
-    worker: RegionWorker,
+    workers: Vec<RegionWorker>,
 }
 
 impl RecoveredRegionalGame {
@@ -342,8 +429,9 @@ impl RecoveredRegionalGame {
             .iter()
             .copied()
             .filter_map(|region_id| {
-                self.worker
-                    .remove_region(region_id)
+                self.workers
+                    .iter_mut()
+                    .find_map(|worker| worker.remove_region(region_id))
                     .map(RegionRuntime::into_state)
             })
             .collect()
@@ -356,8 +444,9 @@ impl RecoveredRegionalGame {
         // DT1: bring the derived pass current first, so a recovered runtime that
         // ended on a paused command returns current state, not stale derived data.
         let runtime = self
-            .worker
-            .region_mut(region_id)
+            .workers
+            .iter_mut()
+            .find_map(|worker| worker.region_mut(region_id))
             .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })?;
         runtime.ensure_derived_state();
         let view = runtime.state().view();
@@ -458,13 +547,20 @@ mod tests {
         let handle = runtime.handle();
         handle.send(event);
 
-        let mut worker = RegionWorker::new(INITIAL_WORKER_ID);
+        let directory = Arc::new(RegionDirectory::default());
+        let owners = Arc::new(RegionOwnerDirectory::new());
+        let mut worker = RegionWorker::with_directory_and_owners(
+            INITIAL_WORKER_ID,
+            Arc::clone(&directory),
+            Arc::clone(&owners),
+        );
         worker.add_region(runtime).unwrap();
 
         (
             RegionalGameRunner {
-                worker: ThreadedRegionWorker::start(worker),
+                workers: vec![ThreadedRegionWorker::start(worker)],
                 handles: vec![handle.clone()],
+                owners,
                 operation_lock: Mutex::new(()),
             },
             handle,

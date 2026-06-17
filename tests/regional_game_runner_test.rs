@@ -2,7 +2,7 @@
 
 use small_city::core::regional_game::{UiReply, UiRequestId};
 use small_city::core::regional_game_runner::{RegionalGameRunner, RegionalGameRunnerError};
-use small_city::core::regions::{RegionId, RegionState};
+use small_city::core::regions::{BorderEdge, RegionId, RegionNeighborLink, RegionState};
 
 #[test]
 fn runner_starts_one_threaded_worker_and_processes_regional_tick() {
@@ -25,6 +25,86 @@ fn runner_starts_one_threaded_worker_and_processes_regional_tick() {
     assert_eq!(region_id, RegionId(1));
     assert_eq!(snapshot.view.status.turn, 1);
     runner.shutdown().unwrap();
+}
+
+#[test]
+fn runner_rejects_invalid_worker_count() {
+    let error =
+        RegionalGameRunner::start_with_worker_count(vec![RegionState::new(RegionId(10), 2, 2)], 0)
+            .expect_err("zero workers cannot own regions");
+
+    assert_eq!(
+        error,
+        RegionalGameRunnerError::InvalidWorkerCount { worker_count: 0 }
+    );
+}
+
+#[test]
+fn runner_can_start_two_workers_and_recover_each_region() {
+    let runner = RegionalGameRunner::start_with_worker_count(
+        vec![
+            RegionState::new(RegionId(11), 2, 2),
+            RegionState::new(RegionId(12), 3, 2),
+            RegionState::new(RegionId(13), 4, 2),
+        ],
+        2,
+    )
+    .unwrap();
+
+    runner.tick_region(UiRequestId(11), RegionId(11)).unwrap();
+    runner.tick_region(UiRequestId(12), RegionId(12)).unwrap();
+    runner.tick_region(UiRequestId(13), RegionId(13)).unwrap();
+
+    let mut recovered = runner.shutdown().unwrap();
+    assert_eq!(
+        recovered
+            .region_snapshot(RegionId(11))
+            .unwrap()
+            .view
+            .status
+            .turn,
+        1
+    );
+    assert_eq!(
+        recovered
+            .region_snapshot(RegionId(12))
+            .unwrap()
+            .view
+            .status
+            .turn,
+        1
+    );
+    assert_eq!(
+        recovered
+            .region_snapshot(RegionId(13))
+            .unwrap()
+            .view
+            .status
+            .turn,
+        1
+    );
+}
+
+#[test]
+fn two_worker_runner_rejects_topology_until_cross_worker_import_routing_exists() {
+    let error = RegionalGameRunner::start_with_topology_and_worker_count(
+        vec![
+            RegionState::new(RegionId(21), 2, 2),
+            RegionState::new(RegionId(22), 2, 2),
+        ],
+        vec![RegionNeighborLink::new(
+            RegionId(21),
+            BorderEdge::East,
+            RegionId(22),
+        )],
+        2,
+    )
+    .expect_err("MW2 should not drop cross-worker import events");
+
+    assert_eq!(
+        error,
+        RegionalGameRunnerError::CrossWorkerTopologyUnsupported { worker_count: 2 }
+    );
 }
 
 #[test]
