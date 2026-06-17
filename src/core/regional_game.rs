@@ -194,6 +194,8 @@ pub struct RegionalGame {
     runner: RegionalGameRunner,
     region_ids: Vec<RegionId>,
     layout: RegionalLayoutSave,
+    worker_count: usize,
+    region_worker_indexes: Option<Vec<usize>>,
     selected_region: Option<RegionId>,
     next_request_id: AtomicU64,
 }
@@ -217,20 +219,65 @@ impl RegionalGame {
         Self::from_regions_with_layout(regions, layout)
     }
 
+    pub fn from_regions_with_worker_count(
+        regions: Vec<RegionState>,
+        worker_count: usize,
+    ) -> Result<Self, RegionalGameError> {
+        let layout = infer_layout_for_region_count(regions.len());
+        Self::from_regions_with_layout_and_worker_setup(regions, layout, worker_count, None)
+    }
+
+    pub fn from_regions_with_worker_assignments(
+        regions: Vec<RegionState>,
+        worker_count: usize,
+        region_worker_indexes: Vec<usize>,
+    ) -> Result<Self, RegionalGameError> {
+        let layout = infer_layout_for_region_count(regions.len());
+        Self::from_regions_with_layout_and_worker_setup(
+            regions,
+            layout,
+            worker_count,
+            Some(region_worker_indexes),
+        )
+    }
+
     fn from_regions_with_layout(
         regions: Vec<RegionState>,
         layout: RegionalLayoutSave,
+    ) -> Result<Self, RegionalGameError> {
+        Self::from_regions_with_layout_and_worker_setup(regions, layout, 1, None)
+    }
+
+    fn from_regions_with_layout_and_worker_setup(
+        regions: Vec<RegionState>,
+        layout: RegionalLayoutSave,
+        worker_count: usize,
+        region_worker_indexes: Option<Vec<usize>>,
     ) -> Result<Self, RegionalGameError> {
         let region_ids = regions.iter().map(RegionState::id).collect::<Vec<_>>();
         validate_layout(region_ids.len(), layout)?;
         let topology = derive_topology(&region_ids, layout);
         let selected_region = region_ids.first().copied();
-        let runner = RegionalGameRunner::start_with_topology(regions, topology)?;
+        let runner = match region_worker_indexes.clone() {
+            Some(indexes) => RegionalGameRunner::start_with_topology_and_worker_assignments(
+                regions,
+                topology,
+                worker_count,
+                indexes,
+            )?,
+            None => RegionalGameRunner::start_with_topology_and_worker_count(
+                regions,
+                topology,
+                worker_count,
+            )?,
+        };
 
         let game = Self {
             runner,
             region_ids,
             layout,
+            worker_count,
+            region_worker_indexes,
             selected_region,
             next_request_id: AtomicU64::new(1),
         };
@@ -547,6 +594,8 @@ impl RegionalGame {
         let selected_region = self.selected_region;
         let region_ids = self.region_ids.clone();
         let layout = self.layout;
+        let worker_count = self.worker_count;
+        let region_worker_indexes = self.region_worker_indexes.clone();
         let recovered = self
             .shutdown()
             .map_err(|error| RegionalGameSaveFailure::Unrecoverable(error.into()))?;
@@ -562,14 +611,26 @@ impl RegionalGame {
 
         let file = match File::create(path) {
             Ok(file) => file,
-            Err(error) => return Self::recover_save_failure(save, error.into()),
+            Err(error) => {
+                return Self::recover_save_failure(
+                    save,
+                    worker_count,
+                    region_worker_indexes,
+                    error.into(),
+                );
+            }
         };
 
         if let Err(error) = serde_json::to_writer_pretty(file, &save) {
-            return Self::recover_save_failure(save, error.into());
+            return Self::recover_save_failure(
+                save,
+                worker_count,
+                region_worker_indexes,
+                error.into(),
+            );
         }
 
-        Self::from_save(save)
+        Self::from_save_with_worker_setup(save, worker_count, region_worker_indexes)
             .map_err(RegionalGameSaveError::from)
             .map_err(RegionalGameSaveFailure::Unrecoverable)
     }
@@ -580,12 +641,25 @@ impl RegionalGame {
     }
 
     fn from_save(save: RegionalGameSave) -> Result<Self, RegionalGameError> {
+        Self::from_save_with_worker_setup(save, 1, None)
+    }
+
+    fn from_save_with_worker_setup(
+        save: RegionalGameSave,
+        worker_count: usize,
+        region_worker_indexes: Option<Vec<usize>>,
+    ) -> Result<Self, RegionalGameError> {
         let regions = save
             .regions
             .into_iter()
             .map(RegionState::from_save_record)
             .collect::<Vec<_>>();
-        let mut game = Self::from_regions_with_layout(regions, save.layout)?;
+        let mut game = Self::from_regions_with_layout_and_worker_setup(
+            regions,
+            save.layout,
+            worker_count,
+            region_worker_indexes,
+        )?;
         game.selected_region = save.selected_region;
         Ok(game)
     }
@@ -611,9 +685,11 @@ impl RegionalGame {
 
     fn recover_save_failure(
         save: RegionalGameSave,
+        worker_count: usize,
+        region_worker_indexes: Option<Vec<usize>>,
         error: RegionalGameSaveError,
     ) -> Result<Self, RegionalGameSaveFailure> {
-        let game = Self::from_save(save)
+        let game = Self::from_save_with_worker_setup(save, worker_count, region_worker_indexes)
             .map_err(RegionalGameSaveError::from)
             .map_err(RegionalGameSaveFailure::Unrecoverable)?;
         Err(RegionalGameSaveFailure::Recoverable {

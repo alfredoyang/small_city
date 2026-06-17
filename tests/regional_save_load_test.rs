@@ -29,6 +29,44 @@ fn multi_region_game_round_trips_with_identical_views() {
 }
 
 #[test]
+fn multi_worker_regional_game_save_restart_and_load_are_safe_points() {
+    let path = save_path("regional-multi-worker-roundtrip");
+    let game = RegionalGame::from_regions_with_worker_assignments(
+        vec![
+            RegionState::new(RegionId(1), 3, 2),
+            RegionState::new(RegionId(2), 3, 2),
+        ],
+        2,
+        vec![0, 1],
+    )
+    .unwrap();
+    build_cross_region_power_fixture(&game);
+
+    assert!(game.tick_region(RegionId(2)).unwrap().success);
+    assert!(region_cell_powered(&game, RegionId(2), 1, 0));
+    let before = game.view().unwrap();
+
+    let restarted = game.save_to_file(&path).unwrap();
+    let save_text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !save_text.contains("worker"),
+        "worker setup is transient runtime configuration, not save data"
+    );
+    assert_eq!(
+        turn(&restarted, RegionId(2)),
+        turn_from_view(&before, RegionId(2))
+    );
+    assert!(restarted.tick_region(RegionId(2)).unwrap().success);
+    assert!(region_cell_powered(&restarted, RegionId(2), 1, 0));
+
+    let loaded = RegionalGame::load_from_file(&path).unwrap();
+    assert!(loaded.tick_region(RegionId(2)).unwrap().success);
+    assert!(region_cell_powered(&loaded, RegionId(2), 1, 0));
+
+    remove_save_file(path);
+}
+
+#[test]
 fn roundtrip_preserves_non_sorted_region_order() {
     let path = save_path("regional-order");
     let game = regional_game_with_regions_in_order([RegionId(2), RegionId(1)]);

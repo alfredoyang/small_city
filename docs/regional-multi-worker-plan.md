@@ -195,6 +195,11 @@ Tests:
 
 Goal: make lifecycle operations safe when regions are distributed.
 
+Status: implemented. Save shuts down all threaded workers, recovers regions in
+stable region order, writes only authoritative regional state/layout, and restarts
+the live returned game with the same transient worker setup. Load keeps using the
+default setup unless the caller starts from explicit regions with worker setup.
+
 - Save collects all region snapshots through owner workers.
 - Load builds region ownership before starting normal scheduling.
 - Shutdown drains or rejects pending continuations predictably.
