@@ -7,8 +7,8 @@
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::path::Path;
-use std::sync::Mutex;
 
 use serde_json::{Map, Value, json};
 use small_city::core::regional_game::{
@@ -27,13 +27,13 @@ pub type SingleRegionTestGameError = RegionalGameSaveError;
 
 #[derive(Debug)]
 pub struct SingleRegionTestGame {
-    inner: Mutex<Option<RegionalGame>>,
+    inner: RefCell<Option<RegionalGame>>,
 }
 
 impl SingleRegionTestGame {
     pub fn new(width: usize, height: usize) -> Self {
         Self {
-            inner: Mutex::new(Some(
+            inner: RefCell::new(Some(
                 RegionalGame::single_region(width, height).expect("single-region test game"),
             )),
         }
@@ -94,7 +94,7 @@ impl SingleRegionTestGame {
     }
 
     pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<(), SingleRegionTestGameError> {
-        let mut guard = self.inner.lock().expect("test game lock");
+        let mut guard = self.inner.borrow_mut();
         let game = guard.take().expect("test game exists");
 
         match game.save_to_file(path) {
@@ -112,12 +112,12 @@ impl SingleRegionTestGame {
 
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, SingleRegionTestGameError> {
         Ok(Self {
-            inner: Mutex::new(Some(RegionalGame::load_from_file(path)?)),
+            inner: RefCell::new(Some(RegionalGame::load_from_file(path)?)),
         })
     }
 
     fn with_game<T>(&self, run: impl FnOnce(&RegionalGame) -> T) -> T {
-        let guard = self.inner.lock().expect("test game lock");
+        let guard = self.inner.borrow();
         run(guard.as_ref().expect("test game exists"))
     }
 }
