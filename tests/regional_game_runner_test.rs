@@ -259,6 +259,61 @@ fn two_worker_runner_routes_cross_worker_power_export() {
 }
 
 #[test]
+fn three_worker_runner_routes_cross_worker_job_export_in_3x3_region_grid() {
+    let region_ids = [
+        RegionId(31),
+        RegionId(32),
+        RegionId(33),
+        RegionId(34),
+        RegionId(35),
+        RegionId(36),
+        RegionId(37),
+        RegionId(38),
+        RegionId(39),
+    ];
+    let consumer = RegionId(31);
+    let producer = RegionId(39);
+    let regions = region_ids
+        .into_iter()
+        .map(|region_id| match region_id {
+            id if id == consumer => cross_worker_power_and_job_consumer_region(id),
+            id if id == RegionId(32) => east_west_bridge_region(id),
+            id if id == RegionId(33) => west_south_bridge_region(id),
+            id if id == RegionId(36) => north_south_bridge_region(id),
+            id if id == producer => cross_worker_job_producer_region(id),
+            id => RegionState::new(id, 2, 2),
+        })
+        .collect();
+    let runner = RegionalGameRunner::start_with_topology_and_worker_assignments(
+        regions,
+        grid_3x3_topology(region_ids),
+        3,
+        vec![0, 1, 2, 0, 1, 2, 0, 1, 2],
+    )
+    .unwrap();
+
+    run_cross_worker_job_days(&runner, consumer, producer, 10);
+    let inspect = runner.inspect_region(consumer, 0, 0).unwrap();
+    let Some(InspectDetailsView::Residential {
+        powered,
+        job_assignments,
+        ..
+    }) = inspect.details
+    else {
+        panic!("expected residential inspect");
+    };
+
+    assert!(powered, "region 31 should import power from region 39");
+    let assignment = job_assignments
+        .first()
+        .copied()
+        .expect("remote job assignment");
+    assert_eq!(assignment.region, producer);
+    assert!(assignment.is_remote);
+    runner.shutdown().unwrap();
+}
+
+#[test]
 fn explicit_worker_setups_keep_simulation_visible_results_identical() {
     let one_worker = run_configurable_setup_script(1, None);
     let balanced = run_configurable_setup_script(2, None);
@@ -378,6 +433,91 @@ fn cross_worker_power_producer_region(region_id: RegionId) -> RegionState {
     assert!(region.build(1, 0, BuildingKind::Road).success);
     assert!(region.build(1, 1, BuildingKind::PowerPlant).success);
     region
+}
+
+fn cross_worker_power_and_job_consumer_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 6, 3);
+    assert!(region.build(0, 0, BuildingKind::Residential).success);
+    assert!(region.build(0, 1, BuildingKind::Park).success);
+    for x in 1..=5 {
+        assert!(region.build(x, 0, BuildingKind::Road).success);
+    }
+    // Local unreachable jobs let population grow once imported power arrives;
+    // the residents still need remote reachable jobs from region 39.
+    assert!(region.build(1, 2, BuildingKind::Industrial).success);
+    assert!(region.build(2, 2, BuildingKind::Road).success);
+    assert!(region.build(3, 2, BuildingKind::Road).success);
+    assert!(region.build(4, 2, BuildingKind::PowerPlant).success);
+    region
+}
+
+fn cross_worker_job_producer_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 2, 2);
+    assert!(region.build(0, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 0, BuildingKind::Road).success);
+    assert!(region.build(0, 1, BuildingKind::Industrial).success);
+    assert!(region.build(1, 1, BuildingKind::PowerPlant).success);
+    region
+}
+
+fn east_west_bridge_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 2, 2);
+    assert!(region.build(0, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 0, BuildingKind::Road).success);
+    region
+}
+
+fn west_south_bridge_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 2, 2);
+    assert!(region.build(0, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 1, BuildingKind::Road).success);
+    region
+}
+
+fn north_south_bridge_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 2, 2);
+    assert!(region.build(1, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 1, BuildingKind::Road).success);
+    region
+}
+
+fn grid_3x3_topology(region_ids: [RegionId; 9]) -> Vec<RegionNeighborLink> {
+    let mut topology = Vec::new();
+    for row in 0..3 {
+        for column in 0..3 {
+            let index = row * 3 + column;
+            let region = region_ids[index];
+            if column + 1 < 3 {
+                let east = region_ids[index + 1];
+                topology.push(RegionNeighborLink::new(region, BorderEdge::East, east));
+                topology.push(RegionNeighborLink::new(east, BorderEdge::West, region));
+            }
+            if row + 1 < 3 {
+                let south = region_ids[index + 3];
+                topology.push(RegionNeighborLink::new(region, BorderEdge::South, south));
+                topology.push(RegionNeighborLink::new(south, BorderEdge::North, region));
+            }
+        }
+    }
+    topology
+}
+
+fn run_cross_worker_job_days(
+    runner: &RegionalGameRunner,
+    consumer: RegionId,
+    producer: RegionId,
+    days: u64,
+) {
+    for hour in 0..(days * 24) {
+        let results = runner
+            .tick_regions(&[
+                (UiRequestId(10_000 + hour * 2), consumer),
+                (UiRequestId(10_001 + hour * 2), producer),
+            ])
+            .unwrap();
+        assert!(results.iter().all(|result| result.success));
+    }
 }
 
 fn run_configurable_setup_script(
