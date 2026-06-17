@@ -83,7 +83,7 @@ impl CityDriver {
     }
 
     pub fn regional_with_size(width: usize, height: usize) -> Result<Self, CityDriverError> {
-        let game = Box::new(RegionalGame::two_region_default(width, height)?);
+        let game = Box::new(RegionalGame::three_by_three_default(width, height)?);
         let last_view = game.selected_region_view()?;
         Ok(Self {
             backend: CityBackend::RegionalMultiRegion(game),
@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(view.map.width, 3);
         assert_eq!(view.map.height, 3);
         assert_eq!(view.map.cells[4].building, Some(BuildingKind::Residential));
-        assert!(driver.region_label().contains("1/2"));
+        assert!(driver.region_label().contains("1/9"));
     }
 
     #[test]

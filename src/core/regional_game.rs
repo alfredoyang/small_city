@@ -300,6 +300,21 @@ impl RegionalGame {
         )
     }
 
+    pub fn three_by_three_default(width: usize, height: usize) -> Result<Self, RegionalGameError> {
+        let regions = (1..=9)
+            .map(|id| RegionState::new(RegionId(id), width, height))
+            .collect();
+        Self::from_regions_with_layout_and_worker_setup(
+            regions,
+            RegionalLayoutSave {
+                rows: 3,
+                columns: 3,
+            },
+            3,
+            None,
+        )
+    }
+
     pub fn select_next_region(&mut self) -> Result<RegionId, RegionalGameError> {
         self.select_region_offset(1)
     }
@@ -879,5 +894,21 @@ mod tests {
                 region_count: 2,
             })
         );
+    }
+
+    #[test]
+    fn three_by_three_default_uses_nine_regions_and_three_workers() {
+        let game = RegionalGame::three_by_three_default(4, 4).unwrap();
+
+        assert_eq!(game.region_ids, (1..=9).map(RegionId).collect::<Vec<_>>());
+        assert_eq!(
+            game.layout,
+            RegionalLayoutSave {
+                rows: 3,
+                columns: 3,
+            }
+        );
+        assert_eq!(game.worker_count, 3);
+        assert_eq!(game.selected_region_position().unwrap(), (1, 9));
     }
 }

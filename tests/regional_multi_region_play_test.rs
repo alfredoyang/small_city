@@ -19,7 +19,7 @@ fn player_can_build_in_two_regions_through_ui_driver() {
         CityDriver::new(CityLaunchMode::RegionalMultiRegion).expect("regional UI driver");
 
     assert!(driver.build(1, 1, BuildingKind::Residential).success);
-    assert!(driver.region_label().contains("1/2"));
+    assert!(driver.region_label().contains("1/9"));
     let initial_region_a = driver.view();
     assert!(
         initial_region_a.map.cells[1 + initial_region_a.map.width]
@@ -28,7 +28,7 @@ fn player_can_build_in_two_regions_through_ui_driver() {
     );
 
     let switched = driver.select_next_region();
-    assert!(switched.contains("2/2"));
+    assert!(switched.contains("2/9"));
     assert!(driver.build(2, 1, BuildingKind::Park).success);
     let region_b = driver.view();
 
@@ -39,7 +39,7 @@ fn player_can_build_in_two_regions_through_ui_driver() {
     assert_eq!(region_b.map.cells[1 + region_b.map.width].building, None);
 
     let switched_back = driver.select_previous_region();
-    assert!(switched_back.contains("1/2"));
+    assert!(switched_back.contains("1/9"));
     let region_a = driver.view();
 
     assert_eq!(
