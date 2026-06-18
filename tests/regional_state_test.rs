@@ -89,6 +89,22 @@ fn availability_hints_report_spare_registry_capacity_without_ecs_identity() {
     assert!(hints[1].spare_job_slot_ids.is_empty());
 }
 
+#[test]
+fn availability_hints_publish_exportable_goods_units() {
+    let mut region = RegionState::new(RegionId(12), 3, 2);
+    assert!(region.build(0, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 0, BuildingKind::Road).success);
+    assert!(region.build(0, 1, BuildingKind::PowerPlant).success);
+    assert!(region.build(1, 1, BuildingKind::Industrial).success);
+
+    region.ensure_derived_state();
+    let hints = region.availability_hints();
+
+    assert_eq!(hints.len(), 1);
+    assert_eq!(hints[0].network, network(12, 0));
+    assert_eq!(hints[0].spare_goods_units, 4);
+}
+
 fn network(region: u32, road_network: u32) -> RegionRoadNetworkId {
     RegionRoadNetworkId {
         region: RegionId(region),

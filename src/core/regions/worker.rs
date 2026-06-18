@@ -11,12 +11,12 @@ pub use crate::core::regions::directory::CrossRegionDiscovery;
 use crate::core::regions::directory::RegionDirectory;
 use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::runtime::{
-    ExportAllocationRelease, ExportAllocationRequest, JobExportRequest, OutboundMessage,
-    PowerExportRequest, RegionEvent, RegionRuntime, RegionRuntimeError,
+    ExportAllocationRelease, ExportAllocationRequest, GoodsExportRequest, JobExportRequest,
+    OutboundMessage, PowerExportRequest, RegionEvent, RegionRuntime, RegionRuntimeError,
 };
 use crate::core::regions::{
-    JobExportGrant, NetworkBorderLink, PowerExportGrant, RegionId, RegionNeighborLink,
-    RegionRoadNetworkId, RegionState, RegionalAvailabilityHint,
+    GoodsExportGrant, JobExportGrant, NetworkBorderLink, PowerExportGrant, RegionId,
+    RegionNeighborLink, RegionRoadNetworkId, RegionState, RegionalAvailabilityHint,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -481,14 +481,15 @@ impl RegionWorker {
         // Allocation releases are causal cleanup for the next export cycle.
         // Route them before new requests so runtime traversal order cannot make
         // a producer deny a fresh caller with capacity allocated by an older
-        // caller generation in the same worker pass. Both power and job releases
-        // share this ordering rule.
+        // caller generation in the same worker pass. All export resources share
+        // this ordering rule.
         let (release_outbound, other_outbound): (Vec<_>, Vec<_>) =
             outbound.into_iter().partition(|(_, message)| {
                 matches!(
                     message,
                     OutboundMessage::PowerExportAllocationsReleased(_)
                         | OutboundMessage::JobExportAllocationsReleased(_)
+                        | OutboundMessage::GoodsExportAllocationsReleased(_)
                 )
             });
 
@@ -549,6 +550,15 @@ impl RegionWorker {
             }
             OutboundMessage::JobExportAllocationsReleased(release) => {
                 self.route_export_allocation_release::<JobExport>(release, routing_mode)
+            }
+            OutboundMessage::GoodsExportRequested(request) => {
+                self.route_export_request::<GoodsExport>(request, routing_mode)
+            }
+            OutboundMessage::GoodsExportRequestCompleted { request, grant } => {
+                self.route_export_request_result::<GoodsExport>(request, grant, routing_mode)
+            }
+            OutboundMessage::GoodsExportAllocationsReleased(release) => {
+                self.route_export_allocation_release::<GoodsExport>(release, routing_mode)
             }
             OutboundMessage::RuntimeError(error) => Err(WorkerRoutingError::RuntimeError {
                 source_region,
@@ -942,6 +952,53 @@ impl ExportResource for JobExport {
     }
 }
 
+/// Goods: fungible-unit hint, batch request, region+unit grant.
+struct GoodsExport;
+
+impl ExportResource for GoodsExport {
+    type Request = GoodsExportRequest;
+    type Grant = GoodsExportGrant;
+
+    fn caller_region(request: &Self::Request) -> RegionId {
+        request.caller_region
+    }
+    fn caller_network(request: &Self::Request) -> RegionRoadNetworkId {
+        request.caller_network
+    }
+    fn has_spare(hint: &RegionalAvailabilityHint) -> bool {
+        hint.spare_goods_units > 0
+    }
+    fn granted(grant: &Self::Grant) -> bool {
+        grant.granted
+    }
+    fn deny_grant(request: &Self::Request) -> Self::Grant {
+        GoodsExportGrant {
+            token: request.token,
+            granted: false,
+            source_region: None,
+            units: 0,
+        }
+    }
+    fn request_id(request: &Self::Request) -> UiRequestId {
+        request.request_id
+    }
+    fn token(request: &Self::Request) -> u32 {
+        request.token
+    }
+    fn resource_rank() -> u8 {
+        2
+    }
+    fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent {
+        RegionEvent::ProcessGoodsExportRequest(request)
+    }
+    fn apply_grant_event(grant: Self::Grant) -> RegionEvent {
+        RegionEvent::ApplyGoodsExportGrant(grant)
+    }
+    fn release_event(release: ExportAllocationRelease) -> RegionEvent {
+        RegionEvent::ReleaseGoodsExportAllocations(release)
+    }
+}
+
 enum WorkerRoutedMessage {
     None,
     Forwarded(ForwardedRegionEvent),
@@ -1025,6 +1082,62 @@ mod tests {
                 .pending_event_count(),
             1
         );
+    }
+
+    #[test]
+    fn goods_export_request_routes_to_producer_and_back_to_caller() {
+        let mut worker = RegionWorker::new(WorkerId(101));
+        let mut caller = RegionState::new(RegionId(1), 2, 1);
+        assert!(
+            caller
+                .build(1, 0, crate::interface::input::BuildingKind::Road)
+                .success
+        );
+        let mut producer = RegionState::new(RegionId(2), 2, 2);
+        assert!(
+            producer
+                .build(0, 0, crate::interface::input::BuildingKind::Road)
+                .success
+        );
+        assert!(
+            producer
+                .build(1, 0, crate::interface::input::BuildingKind::Road)
+                .success
+        );
+        assert!(
+            producer
+                .build(0, 1, crate::interface::input::BuildingKind::PowerPlant)
+                .success
+        );
+        assert!(
+            producer
+                .build(1, 1, crate::interface::input::BuildingKind::Industrial)
+                .success
+        );
+        worker.add_region(RegionRuntime::new(caller)).unwrap();
+        worker.add_region(RegionRuntime::new(producer)).unwrap();
+        worker.set_region_topology(vec![RegionNeighborLink::new(
+            RegionId(1),
+            crate::core::regions::BorderEdge::East,
+            RegionId(2),
+        )]);
+
+        worker
+            .route_export_request::<GoodsExport>(
+                GoodsExportRequest {
+                    request_id: UiRequestId(1),
+                    caller_region: RegionId(1),
+                    caller_network: network(1, 0),
+                    token: 0,
+                    units: 1,
+                },
+                RegionRoutingMode::Immediate,
+            )
+            .unwrap();
+        let summary = worker.process_region_events(1);
+
+        assert!(summary.routing_errors.is_empty());
+        assert_eq!(worker.region(RegionId(1)).unwrap().pending_event_count(), 1);
     }
 
     fn network(region: u32, road_network: u32) -> RegionRoadNetworkId {

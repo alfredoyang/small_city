@@ -32,7 +32,7 @@ use crate::core::simulation::{
     TickJobPhase, TickPowerPhase, begin_tick_power_phase, continue_to_job_phase,
     ensure_derived_state, finish_tick_after_job_phase, refresh_derived_state_for_world,
 };
-use crate::core::systems::{build, bulldoze, replace, road_connectivity, upgrade};
+use crate::core::systems::{build, bulldoze, economy, replace, road_connectivity, upgrade};
 use crate::core::world::World;
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
 use crate::interface::events::CommandResult;
@@ -154,6 +154,12 @@ pub struct RegionalAvailabilityHint {
     /// Consumers only use these for stale capacity counting; actual assignment
     /// still comes from the producer runtime's authoritative export grant.
     pub spare_job_slot_ids: Vec<u32>,
+    /// Exportable industrial goods left after local commercial storage is filled.
+    ///
+    /// Goods are fungible, so a scalar per road network is enough; producer-side
+    /// allocation still authoritatively reserves units before consumers can use
+    /// them.
+    pub spare_goods_units: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +179,14 @@ pub(crate) struct PendingJobDemand {
     pub caller_network: RegionRoadNetworkId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Caller-local commercial goods demand that may need producer-exported units.
+pub(crate) struct PendingGoodsDemand {
+    pub token: u32,
+    pub units: u32,
+    pub caller_network: RegionRoadNetworkId,
+}
+
 #[derive(Debug)]
 /// Paused tick state after local power and before downstream systems.
 pub(crate) struct RegionalTickPowerPhase {
@@ -185,6 +199,13 @@ pub(crate) struct RegionalTickPowerPhase {
 pub(crate) struct RegionalTickJobPhase {
     phase: TickJobPhase,
     pub job_demands: Vec<PendingJobDemand>,
+}
+
+#[derive(Debug)]
+/// Paused tick state after job exports and before future goods exports.
+pub(crate) struct RegionalTickGoodsPhase {
+    phase: RegionalTickJobPhase,
+    pub goods_demands: Vec<PendingGoodsDemand>,
 }
 
 impl RegionalTickJobPhase {
@@ -215,6 +236,15 @@ pub struct JobExportGrant {
     pub position: Option<Position>,
     pub slot_id: Option<u32>,
     pub salary: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result of an authoritative producer-owned goods export allocation request.
+pub struct GoodsExportGrant {
+    pub token: u32,
+    pub granted: bool,
+    pub source_region: Option<RegionId>,
+    pub units: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -446,6 +476,10 @@ impl RegionState {
                     network,
                     has_spare_power: capacity.remaining_capacity > 0,
                     spare_job_slot_ids,
+                    spare_goods_units: economy::exportable_goods_units_on_network(
+                        &self.world,
+                        network.road_network,
+                    ),
                 }
             })
             .collect::<Vec<_>>();
@@ -471,6 +505,13 @@ impl RegionState {
             .find(|capacity| capacity.road_network == network.road_network)
             .map(|capacity| capacity.remaining_capacity)
             .unwrap_or(0)
+    }
+
+    pub(crate) fn goods_network_remaining_units(&self, network: RegionRoadNetworkId) -> u32 {
+        if network.region != self.id {
+            return 0;
+        }
+        economy::exportable_goods_units_on_network(&self.world, network.road_network)
     }
 
     pub(crate) fn begin_tick_power_demand_phase(&mut self) -> RegionalTickPowerPhase {
@@ -512,6 +553,27 @@ impl RegionState {
         exported_job_slots: &[Entity],
     ) -> CommandResult {
         finish_tick_after_job_phase(&mut self.world, phase.phase, exported_job_slots)
+    }
+
+    pub(crate) fn continue_tick_to_goods_demand_phase(
+        &mut self,
+        job_phase: RegionalTickJobPhase,
+    ) -> RegionalTickGoodsPhase {
+        // G1 only wires the goods export phase. G2 will replace this empty demand
+        // set with commercial storage needs that would otherwise hit the edge
+        // market.
+        RegionalTickGoodsPhase {
+            phase: job_phase,
+            goods_demands: Vec::new(),
+        }
+    }
+
+    pub(crate) fn finish_tick_goods_demand_phase(
+        &mut self,
+        phase: RegionalTickGoodsPhase,
+        exported_job_slots: &[Entity],
+    ) -> CommandResult {
+        self.finish_tick_job_demand_phase(phase.phase, exported_job_slots)
     }
 
     pub(crate) fn apply_power_export_grant(

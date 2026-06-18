@@ -6,6 +6,8 @@
 //! `EconomyBreakdown` so UI layers can explain the money change without reading
 //! ECS internals.
 
+use std::collections::HashMap;
+
 use crate::core::components::{
     BuildingData, BusinessFinance, Citizen, WorkplaceAssignment, WorkplaceSource,
 };
@@ -430,6 +432,70 @@ fn distribute_local_goods(
         manufacturing_tax,
         export_tax,
     }
+}
+
+pub(crate) fn exportable_goods_units_on_network(world: &World, network_id: u32) -> u32 {
+    // ponytail: G1 visibility estimate only. G2 must derive consumable export
+    // capacity from the real GoodsFlow surplus or a shared distribution helper,
+    // otherwise post-local-storage reads can over-report goods already absorbed
+    // by local shops.
+    let mut productive_industrials = Vec::new();
+    let mut productive_commercials = Vec::new();
+
+    let mut workplaces = world
+        .buildings
+        .iter()
+        .filter_map(|(entity, building)| {
+            is_effective_workplace(world, *entity).then_some((*entity, building.kind))
+        })
+        .collect::<Vec<_>>();
+    workplaces.sort_by_key(|(entity, _kind)| {
+        world
+            .positions
+            .get(entity)
+            .map(|position| (position.y, position.x, entity.0))
+            .unwrap_or((usize::MAX, usize::MAX, entity.0))
+    });
+
+    for (entity, kind) in workplaces {
+        if road_network_analysis::access_for(world, entity).network_id != Some(network_id) {
+            continue;
+        }
+        match kind {
+            BuildingKind::Industrial => productive_industrials.push(entity),
+            BuildingKind::Commercial => productive_commercials.push(entity),
+            _ => {}
+        }
+    }
+
+    let mut commercial_free_capacity = productive_commercials
+        .iter()
+        .map(|commercial| {
+            let capacity = commercial_goods_capacity_for_entity(world, *commercial);
+            let stored = commercial_goods_stored(world, *commercial);
+            (*commercial, (capacity - stored).max(0))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut exportable = 0;
+    for industrial in productive_industrials {
+        let mut remaining_goods = industrial_goods_production(world, industrial);
+        for commercial in nearest_commercials_for_goods(world, industrial, &productive_commercials)
+        {
+            let Some(free_capacity) = commercial_free_capacity.get_mut(&commercial) else {
+                continue;
+            };
+            let supplied = (*free_capacity).min(remaining_goods);
+            *free_capacity -= supplied;
+            remaining_goods -= supplied;
+            if remaining_goods == 0 {
+                break;
+            }
+        }
+        exportable += remaining_goods.max(0);
+    }
+
+    exportable as u32
 }
 
 fn sort_entities_by_position(world: &World, entities: &mut [Entity]) {

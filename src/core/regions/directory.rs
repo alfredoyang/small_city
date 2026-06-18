@@ -397,6 +397,7 @@ mod tests {
             network: network(1, 0),
             has_spare_power: true,
             spare_job_slot_ids: Vec::new(),
+            spare_goods_units: 0,
         };
 
         assert!(directory.publish_region(RegionId(1), Vec::new(), vec![hint.clone()]));
@@ -416,16 +417,19 @@ mod tests {
             network: network(1, 0),
             has_spare_power: true,
             spare_job_slot_ids: Vec::new(),
+            spare_goods_units: 0,
         };
         let second = RegionalAvailabilityHint {
             network: network(1, 0),
             has_spare_power: false,
             spare_job_slot_ids: vec![1],
+            spare_goods_units: 1,
         };
         let third = RegionalAvailabilityHint {
             network: network(1, 0),
             has_spare_power: true,
             spare_job_slot_ids: vec![1],
+            spare_goods_units: 1,
         };
         assert!(directory.publish_region(RegionId(1), Vec::new(), vec![first.clone()]));
         let reader_snapshot = directory.discovery_snapshot();

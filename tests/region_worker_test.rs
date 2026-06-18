@@ -346,6 +346,7 @@ fn stale_spare_power_hint_routes_to_producer_but_denies_cleanly() {
             network: network(81, 0),
             has_spare_power: true,
             spare_job_slot_ids: Vec::new(),
+            spare_goods_units: 0,
         }],
     );
 
