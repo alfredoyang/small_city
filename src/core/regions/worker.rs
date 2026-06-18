@@ -18,7 +18,7 @@ use crate::core::regions::{
     JobExportGrant, NetworkBorderLink, PowerExportGrant, RegionId, RegionNeighborLink,
     RegionRoadNetworkId, RegionState, RegionalAvailabilityHint,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -331,6 +331,25 @@ impl RegionWorker {
             .find(|runtime| runtime.region_id() == region_id)
     }
 
+    pub(crate) fn refresh_importable_remote_jobs(&mut self, region_id: RegionId) {
+        let Some(index) = self
+            .regions
+            .iter()
+            .position(|runtime| runtime.region_id() == region_id)
+        else {
+            return;
+        };
+        let importable_remote_jobs = {
+            let runtime = &self.regions[index];
+            importable_remote_jobs_for_region(
+                &self.directory.discovery_snapshot(),
+                runtime.region_id(),
+                &runtime.state().network_border_links(),
+            )
+        };
+        self.regions[index].set_importable_remote_jobs(importable_remote_jobs);
+    }
+
     pub fn handle_for(&self, region_id: RegionId) -> Option<RegionHandle> {
         self.region(region_id).map(RegionRuntime::handle)
     }
@@ -425,6 +444,12 @@ impl RegionWorker {
             }
 
             processed_regions += 1;
+            let importable_remote_jobs = importable_remote_jobs_for_region(
+                &self.directory.discovery_snapshot(),
+                runtime.region_id(),
+                &runtime.state().network_border_links(),
+            );
+            runtime.set_importable_remote_jobs(importable_remote_jobs);
             let source_region = runtime.region_id();
             outbound.extend(
                 runtime
@@ -701,6 +726,40 @@ impl RegionWorker {
     }
 }
 
+fn importable_remote_jobs_for_region(
+    discovery: &CrossRegionDiscovery,
+    region_id: RegionId,
+    border_links: &[NetworkBorderLink],
+) -> i32 {
+    let mut remote_networks = BTreeSet::new();
+    for link in border_links {
+        if link.network.region != region_id {
+            continue;
+        }
+        for network in discovery.component_of(link.network).unwrap_or(&[]) {
+            if network.region != region_id {
+                remote_networks.insert(*network);
+            }
+        }
+    }
+
+    let mut remote_slots = BTreeSet::new();
+    for network in remote_networks {
+        let Some(hint) = discovery
+            .availability_hints
+            .iter()
+            .find(|hint| hint.network == network)
+        else {
+            continue;
+        };
+        for slot_id in &hint.spare_job_slot_ids {
+            remote_slots.insert((network.region, *slot_id));
+        }
+    }
+
+    remote_slots.len() as i32
+}
+
 /// The variable bits of one cross-region export resource for the shared routing.
 ///
 /// Everything in `route_export_request*` / `route_export_allocation_release` is
@@ -715,7 +774,7 @@ impl RegionWorker {
 ///                  │                                   release ordering …
 ///                  ▼  calls back into R = PowerExport | JobExport for:
 ///        ┌──────────────────────────────────────────────────────────────┐
-///        │  has_spare(hint)        → has_spare_power | has_spare_jobs      │
+///        │  has_spare(hint)        → has_spare_power | slot ids non-empty  │
 ///        │  process_request_event  → ProcessPowerExportRequest | …Job…    │
 ///        │  apply_grant_event      → ApplyPowerExportGrant | …Job…        │
 ///        │  deny_grant(request)    → PowerExportGrant{..} | JobExportGrant │
@@ -732,7 +791,7 @@ impl RegionWorker {
 ///   |
 ///   +-- PowerExport -> has_spare_power -> ProcessPowerExportRequest
 ///   |
-///   +-- JobExport   -> has_spare_jobs  -> ProcessJobExportRequest
+///   +-- JobExport   -> slot ids non-empty -> ProcessJobExportRequest
 ///                                       |
 ///                                       v
 ///                          Producer ExportAllocations<U>
@@ -848,7 +907,7 @@ impl ExportResource for JobExport {
         request.caller_network
     }
     fn has_spare(hint: &RegionalAvailabilityHint) -> bool {
-        hint.has_spare_jobs
+        !hint.spare_job_slot_ids.is_empty()
     }
     fn granted(grant: &Self::Grant) -> bool {
         grant.granted

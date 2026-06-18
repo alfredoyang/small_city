@@ -83,10 +83,10 @@ fn availability_hints_report_spare_registry_capacity_without_ecs_identity() {
     assert_eq!(hints.len(), 2);
     assert_eq!(hints[0].network, network(9, 0));
     assert!(hints[0].has_spare_power);
-    assert!(hints[0].has_spare_jobs);
+    assert_eq!(hints[0].spare_job_slot_ids.len(), 2);
     assert_eq!(hints[1].network, network(9, 1));
     assert!(!hints[1].has_spare_power);
-    assert!(hints[1].has_spare_jobs);
+    assert!(hints[1].spare_job_slot_ids.is_empty());
 }
 
 fn network(region: u32, road_network: u32) -> RegionRoadNetworkId {

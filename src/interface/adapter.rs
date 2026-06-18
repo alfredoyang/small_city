@@ -2,7 +2,7 @@
 
 use crate::core::components::WorkplaceSource;
 use crate::core::systems::{
-    business_growth, citizens, economy, power, road_connectivity, road_network_analysis,
+    business_growth, citizens, economy, population, power, road_connectivity, road_network_analysis,
 };
 use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
@@ -266,8 +266,11 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
         }
         BuildingKind::Residential => {
             explain_road_and_power(world, entity, road_connected, &mut explanations);
+            // TODO(cross-region display): this commute note is local-only. Cross-region
+            // access already affects simulation through regional job exports; teaching
+            // this display helper about neighbor regions is a separate UI mission.
             explain_road_access(world, entity, building.kind, &mut explanations);
-            let available_jobs = (world.stats.jobs - world.stats.population).max(0);
+            let available_jobs = population::available_jobs_for_growth(world);
             if available_jobs == 0 {
                 explanations.push(
                     "Population growth is blocked because no jobs are available.".to_string(),

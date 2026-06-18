@@ -44,6 +44,8 @@ pub(crate) struct World {
     pub road_analysis: RoadNetworkAnalysis,
     #[serde(skip, default)]
     registry_cache: RefCell<ResourceRegistryCache>,
+    #[serde(skip, default)]
+    pub(crate) importable_remote_jobs: i32,
     // DT1: marks the applied derived state (powered flags, stats, pollution,
     // local effects, happiness) out of date after a config change. Unlike the
     // registry cache above (which stores derived *resolution data* recomputed
@@ -87,6 +89,7 @@ impl World {
             local_effects: LocalEffectsMap::new(width, height),
             road_analysis: RoadNetworkAnalysis::default(),
             registry_cache: RefCell::default(),
+            importable_remote_jobs: 0,
             derived_dirty: Cell::new(false),
             positions: HashMap::new(),
             buildings: HashMap::new(),

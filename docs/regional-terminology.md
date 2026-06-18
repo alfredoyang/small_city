@@ -79,12 +79,27 @@ The registry is the local source of truth that discovery and sharing read from.
 - **`PowerNetworkCapacity { road_network, remaining_capacity }`** — a road
   network's spare power **after** local consumers are served. The basis for
   whether a region can export.
-- **`RegionalAvailabilityHint { network, has_spare_power, has_spare_jobs }`** — a
+- **`RegionalAvailabilityHint { network, has_spare_power, spare_job_slot_ids }`** — a
   tiny, **stale-tolerant** summary published per network so other workers can
   cheaply guess where to ask. It is only a hint: a producer may have gone empty
   since it was published, so a grant can still be denied (the consumer then tries
   the next candidate). Authoritative truth lives in the request/grant flow, never
   in the hint.
+- **`spare_job_slot_ids: Vec<u32>`** — the producer-owned ids of the spare
+  workplace slots reachable on this one network (from `spare_job_slots_on_network`).
+  Opaque `u32` keys, never remote ECS handles, so a consumer counts capacity
+  without touching a neighbor's `World`. Job spare is carried as the id set (not a
+  bare count) so a slot reachable via two networks can be **deduped by
+  `(region, slot_id)`** and counted once. "Has spare jobs" is just
+  `!spare_job_slot_ids.is_empty()`.
+- **`importable_remote_jobs`** — a consumer region's transient (`#[serde(skip)]`)
+  count of distinct remote slots it can reach across its borders, computed by
+  `importable_remote_jobs_for_region` from the discovery snapshot and set on the
+  `World` **before** the region ticks or is inspected. Feeds the population growth
+  gate (`available_jobs_for_growth = local remaining_slots + importable_remote_jobs`).
+  One-tick-stale and over-countable across *different* consumers reading the same
+  producer — the authoritative `JobExportGrant` resolves contention, the hint only
+  guesses.
 
 ---
 
@@ -132,7 +147,7 @@ the consumer (it *imports* a job), the workplace's region is the producer (it
 and accrues the resulting tax and business profit. The type vocabulary mirrors §4
 one-to-one — `JobExportRequest`, `JobExportAllocationRequest`, `JobExportGrant`,
 `JobExportAllocation` (+ `JobExportAllocationKey`), `JobExportAllocationRelease` —
-and reuses CR1 discovery (the same component graph and the `has_spare_jobs` hint)
+and reuses CR1 discovery (the same component graph and the `spare_job_slot_ids` hint)
 and the `caller_generation` release lifecycle.
 
 Four things differ from power and are **not** a blind rename:
@@ -148,6 +163,41 @@ Four things differ from power and are **not** a blind rename:
    power first because it sets `powered`, which jobs and economy then read.
 4. **No partial grants** — one citizen fills one whole slot, like one building
    draws its whole demand.
+
+### How `spare_job_slot_ids` feeds population growth
+
+The hint path is *capacity guessing* (stale-tolerant); the request/grant path
+(above) is the *authoritative hookup*. They meet at the growth gate:
+
+```
+PRODUCER (Region 2, network N2)            CONSUMER (Region 1, border network N1)
+─────────────────────────────             ──────────────────────────────────────
+availability_hints()                       importable_remote_jobs_for_region()
+  spare_job_slots_on_network(N2)             component_of(N1) = [N1, N2]
+    = [entity 6, entity 7]                     └ drop own region → remote = {N2}
+        │ map(.0).sort()                     gather + dedup by (region, slot_id):
+        ▼                                      {(2,6), (2,7)}   ← bridged slot
+  Hint{ N2, spare_job_slot_ids:[6,7] }         counted once, not twice
+        │ publish_region_summary                     │
+        ▼                                            ▼
+   ┌─────────────────────────────┐            importable_remote_jobs = 2
+   │ CrossRegionDiscovery snapshot│───read───►  set on World BEFORE tick/inspect
+   │  hints:[{N2:[6,7]}]          │ (1-tick           │
+   │  components: N1 ── N2        │  stale)           ▼
+   └─────────────────────────────┘     available_jobs_for_growth =
+                                          local remaining_slots + importable(2)
+                                                       │
+                                                       ▼
+                                         residents spawn & seek work; the actual
+                                         slot is reserved by JobExportGrant, which
+                                         may grant fewer if another consumer won it
+```
+
+Why ids and not a bare count: dedup (one physical slot on two networks → counted
+once), opacity (`u32` keys, never a remote ECS handle), and stale-safety (a guess
+that self-corrects next tick when the producer republishes after grants reserve
+slots). Known ceiling: two *different* consumers reading the same `[6,7]` each
+count it fully — cross-consumer contention is resolved by the grant, not the hint.
 
 ---
 

@@ -396,10 +396,10 @@ mod tests {
         let hint = RegionalAvailabilityHint {
             network: network(1, 0),
             has_spare_power: true,
-            has_spare_jobs: false,
+            spare_job_slot_ids: Vec::new(),
         };
 
-        assert!(directory.publish_region(RegionId(1), Vec::new(), vec![hint]));
+        assert!(directory.publish_region(RegionId(1), Vec::new(), vec![hint.clone()]));
         assert_eq!(directory.rebuild_count(), 1);
         assert!(!directory.publish_region(RegionId(1), Vec::new(), vec![hint]));
         assert_eq!(directory.rebuild_count(), 1);
@@ -415,23 +415,23 @@ mod tests {
         let first = RegionalAvailabilityHint {
             network: network(1, 0),
             has_spare_power: true,
-            has_spare_jobs: false,
+            spare_job_slot_ids: Vec::new(),
         };
         let second = RegionalAvailabilityHint {
             network: network(1, 0),
             has_spare_power: false,
-            has_spare_jobs: true,
+            spare_job_slot_ids: vec![1],
         };
         let third = RegionalAvailabilityHint {
             network: network(1, 0),
             has_spare_power: true,
-            has_spare_jobs: true,
+            spare_job_slot_ids: vec![1],
         };
-        assert!(directory.publish_region(RegionId(1), Vec::new(), vec![first]));
+        assert!(directory.publish_region(RegionId(1), Vec::new(), vec![first.clone()]));
         let reader_snapshot = directory.discovery_snapshot();
 
         assert!(directory.publish_region(RegionId(1), Vec::new(), vec![second]));
-        assert!(directory.publish_region(RegionId(1), Vec::new(), vec![third]));
+        assert!(directory.publish_region(RegionId(1), Vec::new(), vec![third.clone()]));
 
         assert_eq!(directory.rebuild_count(), 3);
         assert_eq!(reader_snapshot.availability_hints, vec![first]);

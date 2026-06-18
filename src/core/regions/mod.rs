@@ -141,14 +141,19 @@ impl RegionNeighborLink {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Stale-tolerant availability hint published for regional discovery.
 ///
 /// Claims still have to be confirmed by the source region runtime.
 pub struct RegionalAvailabilityHint {
     pub network: RegionRoadNetworkId,
     pub has_spare_power: bool,
-    pub has_spare_jobs: bool,
+    /// Opaque producer-owned ids for spare workplace slots reachable on this
+    /// road network.
+    ///
+    /// Consumers only use these for stale capacity counting; actual assignment
+    /// still comes from the producer runtime's authoritative export grant.
+    pub spare_job_slot_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -423,23 +428,33 @@ impl RegionState {
         // road-network discovery over this same world, so their `road_network`
         // ids are stable summary keys for one discovery snapshot.
         let power = self.world.cached_power_resolution();
-        let jobs = self.world.cached_job_resolution();
-        let has_spare_jobs = jobs.remaining_slots > 0;
-
         let mut hints = power
             .network_capacities
             .into_iter()
-            .map(|capacity| RegionalAvailabilityHint {
-                network: RegionRoadNetworkId {
+            .map(|capacity| {
+                let network = RegionRoadNetworkId {
                     region: self.id,
                     road_network: capacity.road_network,
-                },
-                has_spare_power: capacity.remaining_capacity > 0,
-                has_spare_jobs,
+                };
+                let mut spare_job_slot_ids = self
+                    .spare_job_slots_on_network(network)
+                    .into_iter()
+                    .map(|slot| slot.0)
+                    .collect::<Vec<_>>();
+                spare_job_slot_ids.sort();
+                RegionalAvailabilityHint {
+                    network,
+                    has_spare_power: capacity.remaining_capacity > 0,
+                    spare_job_slot_ids,
+                }
             })
             .collect::<Vec<_>>();
         hints.sort_by_key(|hint| hint.network);
         hints
+    }
+
+    pub(crate) fn set_importable_remote_jobs(&mut self, jobs: i32) {
+        self.world.importable_remote_jobs = jobs.max(0);
     }
 
     pub(crate) fn power_network_remaining_capacity(&self, network: RegionRoadNetworkId) -> i32 {
@@ -569,6 +584,7 @@ impl RegionState {
             salary: grant.salary,
             source: WorkplaceSource::Remote { slot_id },
         });
+        self.world.invalidate_jobs_registry();
     }
 
     /// Returns spare local workplace slot entities reachable from one road network.
@@ -859,6 +875,7 @@ mod tests {
         let home = region.world.grid.get(0, 0).expect("home");
         citizens::spawn_for_home(&mut region.world, home, 1);
         let citizen = *region.world.citizens.keys().next().expect("citizen");
+        assert_eq!(region.world.cached_job_counts().unemployment, 1);
 
         region.apply_job_export_grant(
             PendingJobDemand {
@@ -880,6 +897,7 @@ mod tests {
         );
 
         assert_eq!(region.imported_job_slots(), vec![(RegionId(2), 42)]);
+        assert_eq!(region.world.cached_job_counts().unemployment, 0);
     }
 
     #[test]

@@ -49,7 +49,8 @@
 //!        |       repeated by jobs_at_level(level), sorted by map position
 //!        |
 //!        |     register job seekers:
-//!        |       one request per citizen, sorted by stable citizen id
+//!        |       one request per locally-unassigned citizen, sorted by stable
+//!        |       citizen id; remote-assigned citizens keep their producer slot
 //!        |
 //!        |     resolve assignments:
 //!        |       nearest reachable remaining job slot
@@ -64,7 +65,7 @@
 
 use std::collections::HashSet;
 
-use crate::core::components::PowerSource;
+use crate::core::components::{PowerSource, WorkplaceSource};
 use crate::core::entity::Entity;
 use crate::core::systems::road_connectivity::{self, RoadNetwork};
 use crate::core::systems::road_network_analysis;
@@ -466,7 +467,16 @@ fn job_requests_from_world(world: &World) -> Vec<JobRequest> {
     citizen_entities
         .into_iter()
         .filter_map(|citizen| {
-            world.citizens.get(&citizen).map(|citizen_data| JobRequest {
+            let citizen_data = world.citizens.get(&citizen)?;
+            if matches!(
+                citizen_data
+                    .workplace_assignment
+                    .map(|assignment| assignment.source),
+                Some(WorkplaceSource::Remote { .. })
+            ) {
+                return None;
+            }
+            Some(JobRequest {
                 citizen,
                 home: citizen_data.home,
             })

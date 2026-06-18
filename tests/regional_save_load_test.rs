@@ -202,10 +202,15 @@ fn save_load_rebuilds_cross_region_remote_jobs_after_daily_tick() {
     build_cross_region_remote_job_fixture(&game);
     run_regional_days(&game, 10);
 
-    let before = region_view(&game.view().unwrap().regions, RegionId(1))
-        .status
-        .unemployment;
-    assert_eq!(before, 0);
+    let before_view = game.view().unwrap();
+    let before_assignment = region_view(&before_view.regions, RegionId(1))
+        .map
+        .cells
+        .iter()
+        .find(|cell| cell.x == 0 && cell.y == 0)
+        .and_then(|cell| cell.job_assignments.first().copied())
+        .expect("pre-save remote assignment");
+    assert!(before_assignment.is_remote);
 
     game.save_to_file(&path).unwrap();
     let loaded = RegionalGame::load_from_file(&path).unwrap();
@@ -217,8 +222,15 @@ fn save_load_rebuilds_cross_region_remote_jobs_after_daily_tick() {
         loaded_region.status.population > 0,
         "fixture should have residents that need jobs"
     );
-    assert_eq!(
-        loaded_region.status.unemployment, 0,
+    let loaded_assignment = loaded_region
+        .map
+        .cells
+        .iter()
+        .find(|cell| cell.x == 0 && cell.y == 0)
+        .and_then(|cell| cell.job_assignments.first().copied())
+        .expect("loaded remote assignment");
+    assert!(
+        loaded_assignment.is_remote,
         "loaded game should rebuild remote jobs through normal export allocation"
     );
 

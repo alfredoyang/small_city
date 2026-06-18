@@ -165,7 +165,11 @@ fn discovery_publishes_owned_availability_hints() {
     assert_eq!(discovery.availability_hints.len(), 1);
     assert_eq!(discovery.availability_hints[0].network, network(23, 0));
     assert!(discovery.availability_hints[0].has_spare_power);
-    assert!(!discovery.availability_hints[0].has_spare_jobs);
+    assert!(
+        discovery.availability_hints[0]
+            .spare_job_slot_ids
+            .is_empty()
+    );
 }
 
 #[test]
@@ -341,7 +345,7 @@ fn stale_spare_power_hint_routes_to_producer_but_denies_cleanly() {
         vec![RegionalAvailabilityHint {
             network: network(81, 0),
             has_spare_power: true,
-            has_spare_jobs: false,
+            spare_job_slot_ids: Vec::new(),
         }],
     );
 

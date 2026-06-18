@@ -3,6 +3,7 @@
 use small_city::core::regional_game::RegionalGame;
 use small_city::core::regions::RegionId;
 use small_city::interface::input::BuildingKind;
+use small_city::interface::view::InspectDetailsView;
 use small_city::ui::city_driver::{CityDriver, CityLaunchMode};
 
 fn has_generic_imported_resource_note(game: &RegionalGame, region_id: RegionId) -> bool {
@@ -67,6 +68,94 @@ fn selected_region_switching_changes_composed_view_deterministically() {
 }
 
 #[test]
+fn remote_spare_jobs_allow_connected_residential_population_growth() {
+    let game = RegionalGame::two_region_default(4, 3).unwrap();
+    build_connected_remote_job_fixture(&game);
+
+    tick_region_for_one_day(&game, RegionId(1));
+
+    let inspect = game.inspect_region(RegionId(1), 1, 1).unwrap();
+    let Some(InspectDetailsView::Residential {
+        population,
+        job_assignments,
+        ..
+    }) = inspect.details
+    else {
+        panic!("expected residential inspect");
+    };
+
+    assert!(population > 0);
+    let assignment = job_assignments
+        .first()
+        .copied()
+        .expect("remote job assignment");
+    assert_eq!(assignment.region, RegionId(2));
+    assert!(assignment.is_remote);
+}
+
+#[test]
+fn inspect_uses_published_remote_jobs_before_region_ticks() {
+    let game = RegionalGame::two_region_default(4, 3).unwrap();
+    build_connected_remote_job_fixture(&game);
+
+    let inspect = game.inspect_region(RegionId(1), 1, 1).unwrap();
+
+    assert!(
+        !inspect
+            .explanations
+            .iter()
+            .any(|note| note.contains("no jobs are available"))
+    );
+}
+
+#[test]
+fn remote_spare_jobs_without_road_link_do_not_unlock_population_growth() {
+    let game = RegionalGame::two_region_default(4, 3).unwrap();
+    build_disconnected_remote_job_fixture(&game);
+
+    tick_region_for_one_day(&game, RegionId(1));
+
+    let inspect = game.inspect_region(RegionId(1), 1, 1).unwrap();
+    let Some(InspectDetailsView::Residential { population, .. }) = inspect.details else {
+        panic!("expected residential inspect");
+    };
+
+    assert_eq!(population, 0);
+    assert!(
+        inspect
+            .explanations
+            .iter()
+            .any(|note| note.contains("no jobs are available"))
+    );
+}
+
+#[test]
+fn bridged_remote_workplace_is_not_double_counted_for_population_growth() {
+    let game = RegionalGame::two_region_default(6, 4).unwrap();
+    build_bridge_workplace_double_count_fixture(&game);
+
+    tick_region_for_one_day(&game, RegionId(1));
+
+    let inspect = game.inspect_region(RegionId(1), 1, 1).unwrap();
+    let Some(InspectDetailsView::Residential {
+        population,
+        job_assignments,
+        ..
+    }) = inspect.details
+    else {
+        panic!("expected residential inspect");
+    };
+
+    assert_eq!(population, 2);
+    assert_eq!(job_assignments.len(), 2);
+    assert!(
+        job_assignments
+            .iter()
+            .all(|assignment| { assignment.region == RegionId(2) && assignment.is_remote })
+    );
+}
+
+#[test]
 fn two_region_default_wires_topology_for_cross_region_power_export() {
     let game = RegionalGame::two_region_default(3, 2).unwrap();
 
@@ -109,6 +198,66 @@ fn two_region_default_wires_topology_for_cross_region_power_export() {
         .and_then(|cell| cell.powered)
         .unwrap_or(false);
     assert!(powered);
+}
+
+fn build_connected_remote_job_fixture(game: &RegionalGame) {
+    build(game, RegionId(1), 3, 1, BuildingKind::Road);
+    build(game, RegionId(1), 2, 1, BuildingKind::Road);
+    build(game, RegionId(1), 1, 1, BuildingKind::Residential);
+
+    build(game, RegionId(2), 0, 1, BuildingKind::Road);
+    build(game, RegionId(2), 1, 1, BuildingKind::Road);
+    build(game, RegionId(2), 1, 0, BuildingKind::PowerPlant);
+    build(game, RegionId(2), 1, 2, BuildingKind::Commercial);
+}
+
+fn build_disconnected_remote_job_fixture(game: &RegionalGame) {
+    build(game, RegionId(1), 2, 1, BuildingKind::Road);
+    build(game, RegionId(1), 1, 1, BuildingKind::Residential);
+    build(game, RegionId(1), 2, 0, BuildingKind::PowerPlant);
+
+    build(game, RegionId(2), 0, 1, BuildingKind::Road);
+    build(game, RegionId(2), 1, 1, BuildingKind::Road);
+    build(game, RegionId(2), 1, 0, BuildingKind::PowerPlant);
+    build(game, RegionId(2), 1, 2, BuildingKind::Commercial);
+}
+
+fn build_bridge_workplace_double_count_fixture(game: &RegionalGame) {
+    build(game, RegionId(1), 5, 0, BuildingKind::Road);
+    build(game, RegionId(1), 5, 1, BuildingKind::Road);
+    build(game, RegionId(1), 5, 2, BuildingKind::Road);
+    build(game, RegionId(1), 4, 1, BuildingKind::Road);
+    build(game, RegionId(1), 3, 1, BuildingKind::Road);
+    build(game, RegionId(1), 2, 1, BuildingKind::Road);
+    build(game, RegionId(1), 2, 0, BuildingKind::Road);
+    build(game, RegionId(1), 1, 0, BuildingKind::PowerPlant);
+    build(game, RegionId(1), 1, 1, BuildingKind::Residential);
+    build(game, RegionId(1), 0, 1, BuildingKind::Park);
+
+    build(game, RegionId(2), 0, 0, BuildingKind::Road);
+    build(game, RegionId(2), 1, 0, BuildingKind::Road);
+    build(game, RegionId(2), 2, 0, BuildingKind::Road);
+    build(game, RegionId(2), 3, 0, BuildingKind::Road);
+    build(game, RegionId(2), 0, 2, BuildingKind::Road);
+    build(game, RegionId(2), 1, 2, BuildingKind::Road);
+    build(game, RegionId(2), 2, 2, BuildingKind::Road);
+    build(game, RegionId(2), 3, 2, BuildingKind::Road);
+    build(game, RegionId(2), 2, 1, BuildingKind::PowerPlant);
+    build(game, RegionId(2), 1, 1, BuildingKind::Commercial);
+    build(game, RegionId(2), 3, 1, BuildingKind::Commercial);
+    build(game, RegionId(2), 5, 3, BuildingKind::Road);
+    build(game, RegionId(2), 5, 2, BuildingKind::PowerPlant);
+    build(game, RegionId(2), 4, 3, BuildingKind::Commercial);
+}
+
+fn build(game: &RegionalGame, region: RegionId, x: usize, y: usize, kind: BuildingKind) {
+    assert!(game.build(region, x, y, kind).unwrap().success);
+}
+
+fn tick_region_for_one_day(game: &RegionalGame, region: RegionId) {
+    for _ in 0..24 {
+        assert!(game.tick_region(region).unwrap().success);
+    }
 }
 
 #[test]

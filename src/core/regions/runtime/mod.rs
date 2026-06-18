@@ -493,6 +493,10 @@ impl RegionRuntime {
         &self.state
     }
 
+    pub(crate) fn set_importable_remote_jobs(&mut self, jobs: i32) {
+        self.state.set_importable_remote_jobs(jobs);
+    }
+
     /// Inspects one cell, recomputing the derived pass first if a paused command
     /// left it dirty (DT1), so inspect reflects the latest config like the view.
     pub fn inspect(&mut self, x: usize, y: usize) -> crate::interface::view::InspectView {
@@ -1315,7 +1319,7 @@ mod tick_state_tests {
             .state()
             .availability_hints()
             .into_iter()
-            .filter(|hint| hint.has_spare_jobs)
+            .filter(|hint| !hint.spare_job_slot_ids.is_empty())
             .map(|hint| hint.network)
             .collect();
         assert_eq!(
