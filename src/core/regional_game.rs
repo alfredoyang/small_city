@@ -323,6 +323,18 @@ impl RegionalGame {
         self.select_region_offset(self.region_ids.len().saturating_sub(1))
     }
 
+    pub fn select_region_by_id(
+        &mut self,
+        region_id: RegionId,
+    ) -> Result<RegionId, RegionalGameError> {
+        if self.region_ids.contains(&region_id) {
+            self.selected_region = Some(region_id);
+            Ok(region_id)
+        } else {
+            Err(RegionalGameError::UnknownRegion { region_id })
+        }
+    }
+
     pub fn selected_region(&self) -> Result<RegionId, RegionalGameError> {
         self.selected_region_or_first()
     }
@@ -337,6 +349,20 @@ impl RegionalGame {
                 region_id: selected_region,
             })?;
         Ok((index + 1, self.region_ids.len()))
+    }
+
+    pub fn neighbor_region(&self, region_id: RegionId, edge: BorderEdge) -> Option<RegionId> {
+        let index = self.region_ids.iter().position(|id| *id == region_id)?;
+        let row = index / self.layout.columns;
+        let column = index % self.layout.columns;
+        let neighbor_index = match edge {
+            BorderEdge::North if row > 0 => index.checked_sub(self.layout.columns)?,
+            BorderEdge::South if row + 1 < self.layout.rows => index + self.layout.columns,
+            BorderEdge::West if column > 0 => index.checked_sub(1)?,
+            BorderEdge::East if column + 1 < self.layout.columns => index + 1,
+            _ => return None,
+        };
+        self.region_ids.get(neighbor_index).copied()
     }
 
     pub fn view(&self) -> Result<RegionalGameView, RegionalGameError> {

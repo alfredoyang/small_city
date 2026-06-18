@@ -297,14 +297,6 @@ enum IntensityKind {
 }
 
 impl TuiState {
-    /// Moves the cursor while clamping it to the current map dimensions from `GameView`.
-    fn move_cursor(&mut self, dx: isize, dy: isize, view: &GameView) {
-        let max_x = view.map.width.saturating_sub(1);
-        let max_y = view.map.height.saturating_sub(1);
-        self.cursor_x = self.cursor_x.saturating_add_signed(dx).min(max_x);
-        self.cursor_y = self.cursor_y.saturating_add_signed(dy).min(max_y);
-    }
-
     /// Keeps the cursor valid after operations that may change the loaded map size.
     fn clamp_cursor(&mut self, view: &GameView) {
         self.cursor_x = self.cursor_x.min(view.map.width.saturating_sub(1));
@@ -586,7 +578,16 @@ impl TuiRuntime {
 
     fn move_cursor(&mut self, dx: isize, dy: isize) {
         let view = self.game.view_with_overlay(self.state.current_overlay);
-        self.state.move_cursor(dx, dy, &view);
+        let (cursor_x, cursor_y) = self.game.move_cursor_across_region(
+            self.state.cursor_x,
+            self.state.cursor_y,
+            dx,
+            dy,
+            &view,
+        );
+        self.state.cursor_x = cursor_x;
+        self.state.cursor_y = cursor_y;
+        self.state.region_label = self.game.region_label();
     }
 
     fn manual_tick(&mut self) {

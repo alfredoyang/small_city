@@ -10,6 +10,7 @@ use std::path::Path;
 use crate::core::regional_game::{
     RegionalGame, RegionalGameError, RegionalGameSaveError, RegionalGameSaveFailure,
 };
+use crate::core::regions::BorderEdge;
 use crate::interface::events::{CommandResult, GameEventView};
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{BuildPreviewView, GameView, InspectView};
@@ -125,6 +126,40 @@ impl CityDriver {
                 format!("Region: unavailable - {message}")
             }
         }
+    }
+
+    pub fn move_cursor_across_region(
+        &mut self,
+        x: usize,
+        y: usize,
+        dx: isize,
+        dy: isize,
+        view: &GameView,
+    ) -> (usize, usize) {
+        let max_x = view.map.width.saturating_sub(1);
+        let max_y = view.map.height.saturating_sub(1);
+        let crossing = match (dx, dy) {
+            (-1, 0) if x == 0 => Some((BorderEdge::West, max_x, y)),
+            (1, 0) if x == max_x => Some((BorderEdge::East, 0, y)),
+            (0, -1) if y == 0 => Some((BorderEdge::North, x, max_y)),
+            (0, 1) if y == max_y => Some((BorderEdge::South, x, 0)),
+            _ => None,
+        };
+
+        if let Some((edge, next_x, next_y)) = crossing {
+            if self.select_neighbor(edge) {
+                let neighbor_view = self.view();
+                return (
+                    next_x.min(neighbor_view.map.width.saturating_sub(1)),
+                    next_y.min(neighbor_view.map.height.saturating_sub(1)),
+                );
+            }
+        }
+
+        (
+            x.saturating_add_signed(dx).min(max_x),
+            y.saturating_add_signed(dy).min(max_y),
+        )
     }
 
     pub fn view(&mut self) -> GameView {
@@ -278,6 +313,19 @@ impl CityDriver {
         }
     }
 
+    fn select_neighbor(&mut self, edge: BorderEdge) -> bool {
+        let CityBackend::RegionalMultiRegion(game) = &mut self.backend else {
+            return false;
+        };
+        let Ok(current) = game.selected_region() else {
+            return false;
+        };
+        let Some(neighbor) = game.neighbor_region(current, edge) else {
+            return false;
+        };
+        game.select_region_by_id(neighbor).is_ok()
+    }
+
     fn remember_view(&mut self, view: GameView) -> GameView {
         self.last_view = view.clone();
         self.read_error = None;
@@ -360,6 +408,41 @@ mod tests {
         );
         assert!(tick.success);
         assert_eq!(before_turn + 1, after_turn);
+    }
+
+    #[test]
+    fn cursor_crosses_east_edge_into_neighbor_region() {
+        let mut driver = CityDriver::regional_with_size(3, 3).expect("regional UI driver");
+        let view = driver.view();
+
+        let cursor = driver.move_cursor_across_region(2, 1, 1, 0, &view);
+
+        assert_eq!(cursor, (0, 1));
+        assert!(driver.region_label().contains("2/9"));
+    }
+
+    #[test]
+    fn cursor_crosses_west_edge_back_into_neighbor_region() {
+        let mut driver = CityDriver::regional_with_size(3, 3).expect("regional UI driver");
+        let view = driver.view();
+        let _ = driver.move_cursor_across_region(2, 1, 1, 0, &view);
+        let view = driver.view();
+
+        let cursor = driver.move_cursor_across_region(0, 1, -1, 0, &view);
+
+        assert_eq!(cursor, (2, 1));
+        assert!(driver.region_label().contains("1/9"));
+    }
+
+    #[test]
+    fn cursor_at_north_edge_without_neighbor_stays_clamped() {
+        let mut driver = CityDriver::regional_with_size(3, 3).expect("regional UI driver");
+        let view = driver.view();
+
+        let cursor = driver.move_cursor_across_region(1, 0, 0, -1, &view);
+
+        assert_eq!(cursor, (1, 0));
+        assert!(driver.region_label().contains("1/9"));
     }
 
     #[test]
