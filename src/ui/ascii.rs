@@ -229,8 +229,7 @@ fn render_screen(
     writeln!(stdout)?;
     render_map(&mut stdout, view, state)?;
     writeln!(stdout)?;
-    writeln!(stdout, "Selected: {}", format_inspect(inspect))?;
-    render_local_effects(&mut stdout, inspect)?;
+    render_inspect_card(&mut stdout, inspect)?;
     render_inspect_explanations(&mut stdout, inspect)?;
     render_build_preview(&mut stdout, preview)?;
     if !message.is_empty() {
@@ -264,16 +263,12 @@ fn render_inspect_explanations(stdout: &mut impl Write, inspect: &InspectView) -
     writeln!(stdout, "Inspect Notes: {}", inspect.explanations.join("; "))
 }
 
-fn render_local_effects(stdout: &mut impl Write, inspect: &InspectView) -> io::Result<()> {
-    let Some(effects) = inspect.local_effects else {
-        return Ok(());
-    };
-
-    writeln!(
-        stdout,
-        "Local: Land {} | Pollution Pressure {} | Access {} | Desirability {}",
-        effects.land_value, effects.pollution_pressure, effects.accessibility, effects.desirability
-    )
+fn render_inspect_card(stdout: &mut impl Write, inspect: &InspectView) -> io::Result<()> {
+    writeln!(stdout, "Selected:")?;
+    for line in inspect_card_lines(inspect) {
+        writeln!(stdout, "  {line}")?;
+    }
+    Ok(())
 }
 
 fn render_status(stdout: &mut impl Write, view: &GameView) -> io::Result<()> {
@@ -504,19 +499,28 @@ fn parse_key_sequence(bytes: &[u8]) -> UiAction {
 
 /// Formats inspect output from InspectView only, preserving the UI boundary around ECS internals.
 pub fn format_inspect(inspect: &InspectView) -> String {
+    inspect_card_lines(inspect).join("\n")
+}
+
+pub fn inspect_card_lines(inspect: &InspectView) -> Vec<String> {
     let Some(details) = &inspect.details else {
-        return format!("({}, {}) is outside the map", inspect.x, inspect.y);
+        return vec![format!("({}, {}) outside map", inspect.x, inspect.y)];
     };
 
     match details {
         InspectDetailsView::Empty { buildable } => {
-            let buildable = if *buildable { "Yes" } else { "No" };
-            format!(
-                "({}, {}) Empty Land | Buildable: {}",
-                inspect.x, inspect.y, buildable
-            )
+            vec![
+                header_line(inspect, "EMPTY LAND", None),
+                status_line(None, None, None),
+                format!("Buildable {}", yes_no(*buildable)),
+                local_effects_line(inspect),
+            ]
         }
-        InspectDetailsView::Road => format!("({}, {}) Road", inspect.x, inspect.y),
+        InspectDetailsView::Road => vec![
+            header_line(inspect, "ROAD", None),
+            status_line(None, None, None),
+            local_effects_line(inspect),
+        ],
         InspectDetailsView::Residential {
             powered,
             power_demand,
@@ -531,24 +535,33 @@ pub fn format_inspect(inspect: &InspectView) -> String {
             average_happiness_target,
             average_money,
             job_assignments,
-        } => format!(
-            "({}, {}) Residential | Powered: {} | Demand: {} | Road: {} | Level: {} | Maintenance: {} | Rent: {} | Population: {}/{} | Citizens: {} | Avg Happiness: {} | Target: {} | Avg Money: {} | Jobs: {}",
-            inspect.x,
-            inspect.y,
-            yes_no(*powered),
-            power_demand,
-            yes_no(*road_connected),
-            upgrade_level,
-            maintenance_cost,
-            rent_per_citizen,
-            population,
-            max_population,
-            citizens,
-            optional_number(*average_happiness),
-            optional_number(*average_happiness_target),
-            optional_number(*average_money),
-            format_job_assignments(job_assignments)
-        ),
+        } => vec![
+            header_line(inspect, "RESIDENTIAL", Some(*upgrade_level)),
+            status_line(
+                Some((*powered, *power_demand)),
+                Some(*road_connected),
+                Some(*maintenance_cost),
+            ),
+            format!(
+                "People  {} {}/{}  citizens {}",
+                ascii_bar(*population, *max_population, 10),
+                population,
+                max_population,
+                citizens
+            ),
+            format!(
+                "Happy   {} target {}",
+                optional_number(*average_happiness),
+                optional_number(*average_happiness_target)
+            ),
+            format!(
+                "Money   {} per citizen  Rent {}",
+                optional_number(*average_money),
+                rent_per_citizen
+            ),
+            format!("Work    {}", format_job_assignments(job_assignments)),
+            local_effects_line(inspect),
+        ],
         InspectDetailsView::Commercial {
             powered,
             power_demand,
@@ -563,24 +576,32 @@ pub fn format_inspect(inspect: &InspectView) -> String {
             recent_profit,
             upgrade_ready,
             jobs,
-        } => format!(
-            "({}, {}) Commercial | Powered: {} | Demand: {} | Road: {} | Level: {} | Maintenance: {} | Sales Tax: {} | Goods: {}/{} | Business: {}/{} recent {} ready {} | Jobs: {}",
-            inspect.x,
-            inspect.y,
-            yes_no(*powered),
-            power_demand,
-            yes_no(*road_connected),
-            upgrade_level,
-            maintenance_cost,
-            sales_tax_per_shopper,
-            goods_stored,
-            goods_capacity,
-            business_cash,
-            optional_threshold(*upgrade_threshold),
-            recent_profit,
-            yes_no(*upgrade_ready),
-            jobs
-        ),
+        } => vec![
+            header_line(inspect, "COMMERCIAL", Some(*upgrade_level)),
+            status_line(
+                Some((*powered, *power_demand)),
+                Some(*road_connected),
+                Some(*maintenance_cost),
+            ),
+            format!(
+                "Goods   {} {}/{}",
+                ascii_bar(*goods_stored, *goods_capacity, 10),
+                goods_stored,
+                goods_capacity
+            ),
+            format!(
+                "Cash    {} {}/{}  ready {}",
+                ascii_bar(*business_cash, upgrade_threshold.unwrap_or(0), 10),
+                business_cash,
+                optional_threshold(*upgrade_threshold),
+                yes_no(*upgrade_ready)
+            ),
+            format!(
+                "Sales   {} per shopper  Jobs {}  Recent {}",
+                sales_tax_per_shopper, jobs, recent_profit
+            ),
+            local_effects_line(inspect),
+        ],
         InspectDetailsView::Industrial {
             powered,
             power_demand,
@@ -593,54 +614,113 @@ pub fn format_inspect(inspect: &InspectView) -> String {
             recent_profit,
             upgrade_ready,
             jobs,
-        } => format!(
-            "({}, {}) Industrial | Powered: {} | Demand: {} | Road: {} | Level: {} | Maintenance: {} | Goods: {} | Business: {}/{} recent {} ready {} | Jobs: {}",
-            inspect.x,
-            inspect.y,
-            yes_no(*powered),
-            power_demand,
-            yes_no(*road_connected),
-            upgrade_level,
-            maintenance_cost,
-            goods_production,
-            business_cash,
-            optional_threshold(*upgrade_threshold),
-            recent_profit,
-            yes_no(*upgrade_ready),
-            jobs
-        ),
+        } => vec![
+            header_line(inspect, "INDUSTRIAL", Some(*upgrade_level)),
+            status_line(
+                Some((*powered, *power_demand)),
+                Some(*road_connected),
+                Some(*maintenance_cost),
+            ),
+            format!("Output  {} goods/turn", goods_production),
+            format!(
+                "Cash    {} {}/{}  ready {}",
+                ascii_bar(*business_cash, upgrade_threshold.unwrap_or(0), 10),
+                business_cash,
+                optional_threshold(*upgrade_threshold),
+                yes_no(*upgrade_ready)
+            ),
+            format!("Jobs    {}  Recent {}", jobs, recent_profit),
+            local_effects_line(inspect),
+        ],
         InspectDetailsView::PowerPlant {
             road_connected,
             connected_to_road_network,
             upgrade_level,
             maintenance_cost,
             power_capacity,
-        } => format!(
-            "({}, {}) Power Plant | Road: {} | Network: {} | Level: {} | Maintenance: {} | Capacity: {}",
-            inspect.x,
-            inspect.y,
-            yes_no(*road_connected),
-            yes_no(*connected_to_road_network),
-            upgrade_level,
-            maintenance_cost,
-            power_capacity
-        ),
+        } => vec![
+            header_line(inspect, "POWER PLANT", Some(*upgrade_level)),
+            status_line(None, Some(*road_connected), Some(*maintenance_cost)),
+            format!("Output  {} capacity", power_capacity),
+            format!("Network {}", yes_no(*connected_to_road_network)),
+            local_effects_line(inspect),
+        ],
         InspectDetailsView::Park {
             road_connected,
             upgrade_level,
             maintenance_cost,
             happiness_effect,
-        } => format!(
-            "({}, {}) Park | Road: {} | Level: {} | Maintenance: {} | Happiness: +{}",
-            inspect.x,
-            inspect.y,
-            yes_no(*road_connected),
-            upgrade_level,
-            maintenance_cost,
-            happiness_effect
-        ),
-        InspectDetailsView::Unknown => format!("({}, {}) Unknown", inspect.x, inspect.y),
+        } => vec![
+            header_line(inspect, "PARK", Some(*upgrade_level)),
+            status_line(None, Some(*road_connected), Some(*maintenance_cost)),
+            format!("Happy   +{}", happiness_effect),
+            local_effects_line(inspect),
+        ],
+        InspectDetailsView::Unknown => vec![header_line(inspect, "UNKNOWN", None)],
     }
+}
+
+fn header_line(inspect: &InspectView, label: &str, level: Option<u8>) -> String {
+    let level = level
+        .map(|level| format!("Lvl {} {level}/3", ascii_bar(level as i32, 3, 3)))
+        .unwrap_or_else(|| "Lvl ---".to_string());
+    format!(
+        "({:>2}, {:>2}) {:<12} {}",
+        inspect.x, inspect.y, label, level
+    )
+}
+
+fn status_line(
+    power: Option<(bool, i32)>,
+    road_connected: Option<bool>,
+    maintenance_cost: Option<i32>,
+) -> String {
+    let power = power
+        .map(|(powered, demand)| format!("Pwr {} d{}", on_off(powered), demand))
+        .unwrap_or_else(|| "Pwr -".to_string());
+    let road = road_connected
+        .map(|connected| format!("Road {}", check_mark(connected)))
+        .unwrap_or_else(|| "Road -".to_string());
+    let maintenance = maintenance_cost
+        .map(|cost| format!("Maint {cost}"))
+        .unwrap_or_else(|| "Maint -".to_string());
+    format!("{:<12} {:<8} {}", power, road, maintenance)
+}
+
+fn local_effects_line(inspect: &InspectView) -> String {
+    let Some(effects) = inspect.local_effects else {
+        return "Local   Land -  Poll -  Access -  Desir -".to_string();
+    };
+    format!(
+        "Local   Land {}  Poll {}  Access {}  Desir {}",
+        mini_bar(effects.land_value),
+        mini_bar(effects.pollution_pressure),
+        mini_bar(effects.accessibility),
+        mini_bar(effects.desirability)
+    )
+}
+
+fn ascii_bar(value: i32, max: i32, width: usize) -> String {
+    if max <= 0 {
+        return format!("[{}]", ".".repeat(width));
+    }
+    let value = value.clamp(0, max) as usize;
+    let max = max as usize;
+    let filled = (value * width + max / 2) / max;
+    format!("[{}{}]", "#".repeat(filled), ".".repeat(width - filled))
+}
+
+fn mini_bar(value: i32) -> char {
+    const BARS: [char; 8] = ['.', '1', '2', '3', '4', '5', '6', '7'];
+    BARS[(value.clamp(0, 9) * 7 / 9) as usize]
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value { "on" } else { "off" }
+}
+
+fn check_mark(value: bool) -> &'static str {
+    if value { "Y" } else { "N" }
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -752,13 +832,13 @@ impl Drop for KeyModeRestore {
 #[cfg(test)]
 mod tests {
     use super::{
-        AsciiUiState, UiAction, demand_note, overlay_legend, parse_key_sequence, render_status,
-        time_spinner,
+        AsciiUiState, UiAction, demand_note, format_inspect, overlay_legend, parse_key_sequence,
+        render_status, time_spinner,
     };
     use crate::core::regional_game::RegionalGame;
     use crate::core::regions::RegionId;
     use crate::interface::input::{BuildingKind, MapOverlayInput};
-    use crate::interface::view::DemandLevel;
+    use crate::interface::view::{DemandLevel, InspectDetailsView, InspectView, LocalEffectsView};
 
     #[test]
     fn parses_single_key_build_selection_and_actions() {
@@ -804,6 +884,50 @@ mod tests {
 
         state.move_cursor(10, 10, &view);
         assert_eq!((state.cursor_x, state.cursor_y), (2, 1));
+    }
+
+    #[test]
+    fn inspect_formatter_uses_fixed_slots_and_bars() {
+        let inspect = InspectView {
+            x: 12,
+            y: 4,
+            in_bounds: true,
+            cell: None,
+            details: Some(InspectDetailsView::Commercial {
+                powered: true,
+                power_demand: 2,
+                road_connected: true,
+                upgrade_level: 1,
+                maintenance_cost: 3,
+                sales_tax_per_shopper: 1,
+                goods_stored: 4,
+                goods_capacity: 12,
+                business_cash: 30,
+                upgrade_threshold: Some(50),
+                recent_profit: 7,
+                upgrade_ready: false,
+                jobs: 2,
+            }),
+            local_effects: Some(LocalEffectsView {
+                land_value: 3,
+                pollution_pressure: 1,
+                accessibility: 5,
+                desirability: 4,
+            }),
+            explanations: Vec::new(),
+        };
+
+        let output = format_inspect(&inspect);
+
+        assert_eq!(
+            output,
+            "(12,  4) COMMERCIAL   Lvl [#..] 1/3\n\
+Pwr on d2    Road Y   Maint 3\n\
+Goods   [###.......] 4/12\n\
+Cash    [######....] 30/50  ready No\n\
+Sales   1 per shopper  Jobs 2  Recent 7\n\
+Local   Land 2  Poll .  Access 3  Desir 3"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Readable inspect view: fixed slots + visual encodings
 
-Status: proposal (not yet implemented).
+Status: P1 implemented; P2 pending.
 
 The inspect panel is hard to scan. This plan redesigns it as a fixed-slot card
 that **graphs** values (bars, gauges, glyphs) instead of spelling them in a
@@ -94,14 +94,12 @@ notes collapse to a single `⚠`-chip line at the bottom instead of full prose.
 
 ## 5. Implementation plan (UI-only)
 
-- **P1 — layout + bars from existing typed fields.** New `render_inspect_card` in
-  `src/ui/tui.rs` using fixed ratatui `Rows`/`Rect`s; a small
-  `bar(value, max, width)` helper (block chars) plus ratatui `Gauge`/`LineGauge`
-  for the level/happiness gauges. The ASCII fallback (`src/ui/ascii.rs`) renders
-  the same slots with `[####....]` instead of unicode. **No change to
-  `InspectView` / `InspectDetailsView` or anything in `core/`** — it reads the
-  structured fields that already exist. This alone delivers the stable-slots +
-  graphs win.
+- **P1 — layout + bars from existing typed fields.** Shared fixed-slot inspect
+  card lines in `src/ui/ascii.rs`, rendered by both the ASCII fallback and TUI.
+  Bars use plain `[####....]` cells in both frontends for one code path and
+  predictable degradation. **No change to `InspectView` / `InspectDetailsView`
+  or anything in `core/`** — it reads the structured fields that already exist.
+  This alone delivers the stable-slots + graphs win.
 - **P2 — typed diagnostic chips (optional follow-up).** A few statuses still live
   only in `explanations: Vec<String>` (goods-route reachability, "growth blocked:
   no jobs"). To render those as glyphs without fragile string-matching, promote
@@ -114,9 +112,9 @@ notes collapse to a single `⚠`-chip line at the bottom instead of full prose.
 
 - **UI-only and deterministic.** No ECS access — renders from view models, per the
   architecture rule. P1 touches only `tui.rs` + `ascii.rs`.
-- **Graceful degrade.** Unicode block/glyph chars render in the ratatui TUI; the
-  ASCII frontend degrades to plain `[#]` / `x` / `-` so it stays usable in a bare
-  terminal.
+- **Graceful degrade.** P1 uses plain ASCII bars in both frontends. Unicode block
+  gauges can be added later as a TUI-only polish pass if the shared formatter is
+  too plain.
 - **Alignment guard.** Keep a snapshot/golden test of the ASCII `format_inspect`
   output so the fixed-slot alignment cannot silently drift.
 - **No prose parsing.** Bars and glyphs come from typed fields; never regex the

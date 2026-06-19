@@ -904,18 +904,12 @@ fn follow_axis(cursor: usize, viewport: usize, visible: usize, total: usize) -> 
 }
 
 fn render_selected_cell(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView) {
-    // Reuse the ASCII inspect formatter so both terminal frontends describe cells consistently.
-    let mut lines = vec![Line::from(ascii::format_inspect(inspect))];
-
-    if let Some(effects) = inspect.local_effects {
-        lines.push(Line::from(format!(
-            "Land {} | Pollution {} | Access {} | Desirability {}",
-            effects.land_value,
-            effects.pollution_pressure,
-            effects.accessibility,
-            effects.desirability
-        )));
-    }
+    // Reuse the fixed-slot ASCII card so both terminal frontends keep common
+    // inspect fields in stable positions without duplicating layout rules.
+    let mut lines = ascii::inspect_card_lines(inspect)
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
 
     if !inspect.explanations.is_empty() {
         lines.push(Line::from(""));

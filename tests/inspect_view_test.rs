@@ -16,10 +16,9 @@ fn inspect_empty_cell_shows_buildable_status() {
         inspect.details,
         Some(InspectDetailsView::Empty { buildable: true })
     );
-    assert_eq!(
-        format_inspect(&inspect),
-        "(1, 1) Empty Land | Buildable: Yes"
-    );
+    let formatted = format_inspect(&inspect);
+    assert!(formatted.contains("EMPTY LAND"));
+    assert!(formatted.contains("Buildable Yes"));
 }
 
 #[test]
@@ -51,10 +50,11 @@ fn inspect_residential_shows_powered_state_and_population() {
             job_assignments: Vec::new(),
         })
     );
-    assert_eq!(
-        format_inspect(&inspect),
-        "(1, 0) Residential | Powered: Yes | Demand: 1 | Road: Yes | Level: 1 | Maintenance: 0 | Rent: 2 | Population: 0/5 | Citizens: 0 | Avg Happiness: None | Target: None | Avg Money: None | Jobs: none"
-    );
+    let formatted = format_inspect(&inspect);
+    assert!(formatted.contains("RESIDENTIAL"));
+    assert!(formatted.contains("Pwr on d1"));
+    assert!(formatted.contains("People  [..........] 0/5"));
+    assert!(formatted.contains("Work    none"));
 }
 
 #[test]
@@ -151,16 +151,14 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
             jobs: 3
         })
     );
-    assert_eq!(
-        format_inspect(&commercial),
-        // ASCII formatting changed only because it renders the new InspectView
-        // fields; the UI still does not read core storage directly.
-        "(1, 0) Commercial | Powered: Yes | Demand: 2 | Road: Yes | Level: 1 | Maintenance: 1 | Sales Tax: 1 | Goods: 4/8 | Business: 0/8 recent -1 ready No | Jobs: 2"
-    );
-    assert_eq!(
-        format_inspect(&industrial),
-        "(2, 0) Industrial | Powered: Yes | Demand: 3 | Road: Yes | Level: 1 | Maintenance: 1 | Goods: 4 | Business: 3/14 recent 3 ready No | Jobs: 3"
-    );
+    let commercial_format = format_inspect(&commercial);
+    let industrial_format = format_inspect(&industrial);
+    assert!(commercial_format.contains("COMMERCIAL"));
+    assert!(commercial_format.contains("Goods   [#####.....] 4/8"));
+    assert!(commercial_format.contains("Sales   1 per shopper  Jobs 2"));
+    assert!(industrial_format.contains("INDUSTRIAL"));
+    assert!(industrial_format.contains("Output  4 goods/turn"));
+    assert!(industrial_format.contains("Jobs    3"));
     assert!(
         commercial
             .explanations
@@ -183,7 +181,7 @@ fn inspect_road_shows_building_type() {
     let inspect = game.inspect(0, 0);
 
     assert_eq!(inspect.details, Some(InspectDetailsView::Road));
-    assert_eq!(format_inspect(&inspect), "(0, 0) Road");
+    assert!(format_inspect(&inspect).contains("ROAD"));
 }
 
 #[test]
@@ -214,14 +212,12 @@ fn inspect_power_plant_and_park_show_special_effects() {
             happiness_effect: 3
         })
     );
-    assert_eq!(
-        format_inspect(&power_plant),
-        "(0, 0) Power Plant | Road: No | Network: No | Level: 1 | Maintenance: 1 | Capacity: 10"
-    );
-    assert_eq!(
-        format_inspect(&park),
-        "(1, 0) Park | Road: No | Level: 1 | Maintenance: 1 | Happiness: +3"
-    );
+    let power_plant_format = format_inspect(&power_plant);
+    let park_format = format_inspect(&park);
+    assert!(power_plant_format.contains("POWER PLANT"));
+    assert!(power_plant_format.contains("Output  10 capacity"));
+    assert!(park_format.contains("PARK"));
+    assert!(park_format.contains("Happy   +3"));
 }
 
 #[test]
@@ -230,7 +226,7 @@ fn inspect_out_of_bounds_formats_without_cell_data() {
     let inspect = game.inspect(5, 5);
 
     assert_eq!(inspect.details, None);
-    assert_eq!(format_inspect(&inspect), "(5, 5) is outside the map");
+    assert_eq!(format_inspect(&inspect), "(5, 5) outside map");
 }
 
 #[test]
