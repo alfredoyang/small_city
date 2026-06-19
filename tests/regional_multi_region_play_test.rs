@@ -73,7 +73,7 @@ fn regional_view_reports_city_goods_and_city_aware_inspect_notes() {
     build_goods_producer(&game, RegionId(1));
     build_goods_consumer(&game, RegionId(2));
 
-    for _ in 0..(2 * 24) {
+    for _ in 0..(7 * 24) {
         game.tick_all_regions().unwrap();
     }
 
@@ -89,6 +89,16 @@ fn regional_view_reports_city_goods_and_city_aware_inspect_notes() {
     assert_eq!(game.view().unwrap().goods, view.goods);
 
     let inspect = game.inspect_region(RegionId(2), 1, 0).unwrap();
+    let Some(InspectDetailsView::Commercial {
+        goods_sold_from_city,
+        goods_sold_from_outside,
+        ..
+    }) = inspect.details
+    else {
+        panic!("expected commercial inspect");
+    };
+    assert!(goods_sold_from_city > 0);
+    assert_eq!(goods_sold_from_outside, 0);
     assert!(
         inspect
             .explanations
@@ -100,6 +110,33 @@ fn regional_view_reports_city_goods_and_city_aware_inspect_notes() {
             .explanations
             .iter()
             .any(|note| note.contains("local goods"))
+    );
+}
+
+#[test]
+fn commercial_inspect_reports_outside_goods_sales_when_city_supply_missing() {
+    let game = RegionalGame::two_region_default(3, 3).unwrap();
+    build_goods_consumer(&game, RegionId(2));
+
+    for _ in 0..(2 * 24) {
+        game.tick_all_regions().unwrap();
+    }
+
+    let inspect = game.inspect_region(RegionId(2), 1, 0).unwrap();
+    let Some(InspectDetailsView::Commercial {
+        goods_sold_from_city,
+        goods_sold_from_outside,
+        ..
+    }) = inspect.details
+    else {
+        panic!("expected commercial inspect");
+    };
+
+    assert_eq!(goods_sold_from_city, 0);
+    assert!(goods_sold_from_outside > 0);
+    assert_eq!(
+        goods_sold_from_outside,
+        game.view().unwrap().goods.goods_imported_from_outside
     );
 }
 

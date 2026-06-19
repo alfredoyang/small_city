@@ -205,29 +205,35 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 job_assignments: job_assignment_views_for_home(world, entity),
             }
         }
-        BuildingKind::Commercial => InspectDetailsView::Commercial {
-            powered: world
-                .power_consumers
-                .get(&entity)
-                .map(|consumer| consumer.powered)
-                .unwrap_or(false),
-            power_demand: world
-                .power_consumers
-                .get(&entity)
-                .map(|consumer| consumer.demand)
-                .unwrap_or(0),
-            road_connected: road_connectivity::is_road_connected(world, entity),
-            upgrade_level: building.level,
-            maintenance_cost: economy::maintenance_for_building(building.kind, building.level),
-            sales_tax_per_shopper: economy::commercial_sales_tax_for_purchase(world, entity),
-            goods_stored: economy::commercial_goods_stored(world, entity),
-            goods_capacity: economy::commercial_goods_capacity_for_entity(world, entity),
-            business_cash: economy::business_cash(world, entity),
-            upgrade_threshold: business_growth::reinvestment_threshold(building.kind),
-            recent_profit: economy::recent_business_profit(world, entity),
-            upgrade_ready: business_growth::can_reinvest(world, entity, building.kind),
-            jobs: effective_jobs(world, entity, building.kind),
-        },
+        BuildingKind::Commercial => {
+            let (goods_sold_from_city, goods_sold_from_outside) =
+                economy::recent_commercial_goods_sources(world, entity);
+            InspectDetailsView::Commercial {
+                powered: world
+                    .power_consumers
+                    .get(&entity)
+                    .map(|consumer| consumer.powered)
+                    .unwrap_or(false),
+                power_demand: world
+                    .power_consumers
+                    .get(&entity)
+                    .map(|consumer| consumer.demand)
+                    .unwrap_or(0),
+                road_connected: road_connectivity::is_road_connected(world, entity),
+                upgrade_level: building.level,
+                maintenance_cost: economy::maintenance_for_building(building.kind, building.level),
+                sales_tax_per_shopper: economy::commercial_sales_tax_for_purchase(world, entity),
+                goods_stored: economy::commercial_goods_stored(world, entity),
+                goods_capacity: economy::commercial_goods_capacity_for_entity(world, entity),
+                business_cash: economy::business_cash(world, entity),
+                upgrade_threshold: business_growth::reinvestment_threshold(building.kind),
+                recent_profit: economy::recent_business_profit(world, entity),
+                upgrade_ready: business_growth::can_reinvest(world, entity, building.kind),
+                jobs: effective_jobs(world, entity, building.kind),
+                goods_sold_from_city,
+                goods_sold_from_outside,
+            }
+        }
         BuildingKind::Industrial => InspectDetailsView::Industrial {
             powered: world
                 .power_consumers

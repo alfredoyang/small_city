@@ -120,3 +120,83 @@ notes collapse to a single `⚠`-chip line at the bottom instead of full prose.
   output so the fixed-slot alignment cannot silently drift.
 - **No prose parsing.** Bars and glyphs come from typed fields; never regex the
   `explanations` strings to drive layout.
+
+---
+
+## 7. P3 — commercial goods source (city-made vs outside-imported)
+
+Status: planned (not yet implemented).
+
+A commercial building's storage is filled by city industry (this region's or a
+road-connected neighbor's — both count as "city"); when storage is empty, sales
+are served from the abstract outside-city edge market. The inspect card shows
+total goods stored but never the **source split of what the shop actually sold**.
+This adds it.
+
+### Locked display
+
+A new fixed-slot `Source` row in the commercial card, between `Sales` and `Local`:
+
+```
+Source  ▕████▓▓░░░▏  🏭 6 · 🌍 2
+```
+
+- Split bar (`▕…▏`, width 10): `█` = city-made share, `▓` = outside-imported
+  share, of the day's goods sold. Fill proportionally across the full width when
+  there are sales; the all-`░` form is the empty state only:
+  `Source  ▕░░░░░░░░░░▏  no sales today`. (Do not leave a partial `░` tail when
+  sales exist — the tail in the picker mockup was just the empty look.)
+- Counts: `🏭 N` city-made · `🌍 M` from outside.
+- Per **day** (reset each economy settlement, exactly like `last_period_profit`).
+- TUI color: `█` green, `▓` yellow.
+
+### Data path
+
+1. `src/core/systems/economy.rs` — in the sales loop of `run_with_goods_exports`
+   (the site already doing `business_profit_from_sale = Some((shopping.commercial,
+   …))`), tally per-commercial counts: city if `shopping.local_goods`, else
+   outside. Reset to 0 for every productive commercial at the start of the
+   settlement so a shop with no sales reads 0·0 (mirror `last_period_profit`).
+2. `src/core/components.rs` — add to `BusinessFinance`:
+   `last_period_goods_from_city: i32`, `last_period_goods_from_outside: i32`
+   (both `#[serde(default)]`).
+3. `src/interface/view.rs` — add to `InspectDetailsView::Commercial`:
+   `goods_sold_from_city: i32`, `goods_sold_from_outside: i32`.
+4. `src/interface/adapter.rs` — fill those from `BusinessFinance` in the
+   commercial branch of `inspect_details` (same place it reads `recent_profit`).
+
+### Rendering
+
+5. `src/ui/ascii.rs` — add a `split_bar(city, outside, width)` helper
+   (`█`/`▓`/`░`, `▕…▏` brackets) and the `Source` line to the Commercial arm of
+   `inspect_card_lines`. This shared formatter feeds both the ratatui TUI and the
+   bare-ASCII frontend, so emoji + block chars appear in both. Update the golden
+   `inspect_card_layout_is_fixed_slot_aligned` test.
+6. `src/ui/tui.rs` — color the `Source` bar segments (`█` green, `▓` yellow);
+   leave the shared string plain.
+
+### Tests
+
+- Economy: a 2-region city where region A's industry stocks region B's shop, plus
+  a shop forced to edge-import → assert that shop's `goods_sold_from_city > 0` /
+  `goods_sold_from_outside > 0` respectively, and that per-shop `outside` counts
+  sum to the city-wide `goods_imported_from_outside`.
+- `split_bar` unit check: all-city → all `█`; all-outside → all `▓`; 0/0 → all
+  `░`; a mixed case → expected fill.
+- Golden card line updated.
+
+### Constraints / split
+
+- Display-only, deterministic, no balance change (it only counts sales already
+  happening). UI reads view models only — no ECS access outside the adapter.
+- ~8 files, over the 5-file guideline, so split:
+  - **S1**: data + view model + adapter + `ascii.rs` text/bar + tests (emoji included).
+  - **S2**: `tui.rs` color layer.
+- Run `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test -q` after each patch.
+
+### Width note
+
+Emoji are double-width but sit at the line's end (nothing column-aligns to their
+right), so they don't break the left label grid; a bare terminal shows tofu but
+the counts stay readable. To guarantee bare-terminal cleanliness, swap the emoji
+for ASCII markers in `ascii.rs` and keep emoji TUI-only — default is emoji in both.

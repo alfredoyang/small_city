@@ -890,6 +890,7 @@ mod tests {
                     last_period_profit,
                     days_profitable: 1,
                     lifetime_profit: business_cash,
+                    ..BusinessFinance::default()
                 };
             }
             BuildingData::None => panic!("not a business building"),

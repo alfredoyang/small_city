@@ -130,7 +130,9 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
             upgrade_threshold: Some(8),
             recent_profit: -1,
             upgrade_ready: false,
-            jobs: 2
+            jobs: 2,
+            goods_sold_from_city: 0,
+            goods_sold_from_outside: 0,
         })
     );
     assert_eq!(
@@ -367,6 +369,8 @@ fn inspect_card_layout_is_fixed_slot_aligned() {
             recent_profit: 5,
             upgrade_ready: false,
             jobs: 2,
+            goods_sold_from_city: 6,
+            goods_sold_from_outside: 2,
         }),
         local_effects: Some(LocalEffectsView {
             land_value: 6,
@@ -385,6 +389,7 @@ fn inspect_card_layout_is_fixed_slot_aligned() {
          Goods   [#####.....] 4/8\n\
          Cash    [######....] 30/50  ready No\n\
          Sales   1 per shopper  Jobs 2  Recent 5\n\
+         Source  [########::]  🏭 6 city-made · 🌍 2 from outside\n\
          Local   Land 4  Poll .  Access 3  Desir 3"
     );
 }

@@ -584,6 +584,8 @@ pub fn inspect_card_lines(inspect: &InspectView) -> Vec<String> {
             recent_profit,
             upgrade_ready,
             jobs,
+            goods_sold_from_city,
+            goods_sold_from_outside,
         } => with_flag_line(
             inspect,
             vec![
@@ -610,6 +612,16 @@ pub fn inspect_card_lines(inspect: &InspectView) -> Vec<String> {
                     "Sales   {} per shopper  Jobs {}  Recent {}",
                     sales_tax_per_shopper, jobs, recent_profit
                 ),
+                if *goods_sold_from_city + *goods_sold_from_outside > 0 {
+                    format!(
+                        "Source  {}  🏭 {} city-made · 🌍 {} from outside",
+                        ascii_split_bar(*goods_sold_from_city, *goods_sold_from_outside, 10),
+                        goods_sold_from_city,
+                        goods_sold_from_outside
+                    )
+                } else {
+                    format!("Source  {}  no sales today", ascii_split_bar(0, 0, 10))
+                },
                 local_effects_line(inspect),
             ],
         ),
@@ -755,6 +767,16 @@ fn ascii_bar(value: i32, max: i32, width: usize) -> String {
     format!("[{}{}]", "#".repeat(filled), ".".repeat(width - filled))
 }
 
+fn ascii_split_bar(city: i32, outside: i32, width: usize) -> String {
+    let total = city.max(0) + outside.max(0);
+    if total == 0 {
+        return format!("[{}]", ".".repeat(width));
+    }
+    let city_width = (city.max(0) as usize * width + total as usize / 2) / total as usize;
+    let outside_width = width - city_width;
+    format!("[{}{}]", "#".repeat(city_width), ":".repeat(outside_width))
+}
+
 fn mini_bar(value: i32) -> char {
     const BARS: [char; 8] = ['.', '1', '2', '3', '4', '5', '6', '7'];
     BARS[(value.clamp(0, 9) * 7 / 9) as usize]
@@ -877,8 +899,8 @@ impl Drop for KeyModeRestore {
 #[cfg(test)]
 mod tests {
     use super::{
-        AsciiUiState, UiAction, demand_note, format_inspect, overlay_legend, parse_key_sequence,
-        render_status, time_spinner,
+        AsciiUiState, UiAction, ascii_split_bar, demand_note, format_inspect, overlay_legend,
+        parse_key_sequence, render_status, time_spinner,
     };
     use crate::core::regional_game::RegionalGame;
     use crate::core::regions::RegionId;
@@ -954,6 +976,8 @@ mod tests {
                 recent_profit: 7,
                 upgrade_ready: false,
                 jobs: 2,
+                goods_sold_from_city: 6,
+                goods_sold_from_outside: 2,
             }),
             local_effects: Some(LocalEffectsView {
                 land_value: 3,
@@ -974,9 +998,18 @@ Pwr on d2    Road Y   Maint 3\n\
 Goods   [###.......] 4/12\n\
 Cash    [######....] 30/50  ready No\n\
 Sales   1 per shopper  Jobs 2  Recent 7\n\
+Source  [########::]  🏭 6 city-made · 🌍 2 from outside\n\
 Local   Land 2  Poll .  Access 3  Desir 3\n\
 Flags   < neighbor goods"
         );
+    }
+
+    #[test]
+    fn ascii_split_bar_shows_city_outside_and_empty_sales() {
+        assert_eq!(ascii_split_bar(4, 0, 10), "[##########]");
+        assert_eq!(ascii_split_bar(0, 4, 10), "[::::::::::]");
+        assert_eq!(ascii_split_bar(0, 0, 10), "[..........]");
+        assert_eq!(ascii_split_bar(6, 2, 10), "[########::]");
     }
 
     #[test]

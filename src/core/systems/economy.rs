@@ -172,6 +172,7 @@ pub(crate) fn run_with_goods_exports(
 
         let mut sold_local_good_from = None;
         let mut business_profit_from_sale = None;
+        let mut goods_sale_source = None;
         {
             let Some(citizen) = world.citizens.get_mut(&citizen_entity) else {
                 continue;
@@ -215,11 +216,13 @@ pub(crate) fn run_with_goods_exports(
                     sold_local_good_from = Some(shopping.commercial);
                     business_profit_from_sale =
                         Some((shopping.commercial, COMMERCIAL_LOCAL_GOOD_PROFIT));
+                    goods_sale_source = Some((shopping.commercial, true));
                 } else {
                     recover_happiness_from_shopping(citizen, IMPORTED_SHOPPING_DECAY_RECOVERY);
                     imported_goods_sold += 1;
                     business_profit_from_sale =
                         Some((shopping.commercial, COMMERCIAL_IMPORTED_GOOD_PROFIT));
+                    goods_sale_source = Some((shopping.commercial, false));
                 }
             } else {
                 citizen.morale.actual -= MISSED_SHOPPING_HAPPINESS_PENALTY;
@@ -232,6 +235,9 @@ pub(crate) fn run_with_goods_exports(
         }
         if let Some((commercial, profit)) = business_profit_from_sale {
             record_business_profit(world, commercial, profit);
+        }
+        if let Some((commercial, from_city)) = goods_sale_source {
+            record_goods_sale_source(world, commercial, from_city);
         }
     }
 
@@ -855,6 +861,17 @@ pub(crate) fn recent_business_profit(world: &World, entity: Entity) -> i32 {
         .unwrap_or(0)
 }
 
+pub(crate) fn recent_commercial_goods_sources(world: &World, entity: Entity) -> (i32, i32) {
+    business_finance(world, entity)
+        .map(|business| {
+            (
+                business.last_period_goods_from_city,
+                business.last_period_goods_from_outside,
+            )
+        })
+        .unwrap_or((0, 0))
+}
+
 pub(crate) fn spend_business_cash(world: &mut World, entity: Entity, amount: i32) {
     if amount <= 0 {
         return;
@@ -870,10 +887,22 @@ fn record_business_profit(world: &mut World, entity: Entity, gross: i32) {
     }
 }
 
+fn record_goods_sale_source(world: &mut World, entity: Entity, from_city: bool) {
+    if let Some(business) = business_finance_mut(world, entity) {
+        if from_city {
+            business.last_period_goods_from_city += 1;
+        } else {
+            business.last_period_goods_from_outside += 1;
+        }
+    }
+}
+
 fn reset_business_periods(world: &mut World, business_entities: &[Entity]) {
     for entity in business_entities {
         if let Some(business) = business_finance_mut(world, *entity) {
             business.last_period_profit = 0;
+            business.last_period_goods_from_city = 0;
+            business.last_period_goods_from_outside = 0;
         }
     }
 }

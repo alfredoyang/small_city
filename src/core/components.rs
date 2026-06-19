@@ -83,6 +83,10 @@ pub struct BusinessFinance {
     pub days_profitable: i32,
     #[serde(default)]
     pub last_period_profit: i32,
+    #[serde(default)]
+    pub last_period_goods_from_city: i32,
+    #[serde(default)]
+    pub last_period_goods_from_outside: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

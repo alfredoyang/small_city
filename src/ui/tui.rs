@@ -1009,6 +1009,8 @@ fn tui_inspect_card(inspect: &InspectView) -> (String, Vec<String>) {
             recent_profit,
             upgrade_ready,
             jobs,
+            goods_sold_from_city,
+            goods_sold_from_outside,
         } => vec![
             tui_status_line(
                 Some((*powered, *power_demand)),
@@ -1039,6 +1041,16 @@ fn tui_inspect_card(inspect: &InspectView) -> (String, Vec<String>) {
                 "Sales   {}/shopper  recent {}",
                 sales_tax_per_shopper, recent_profit
             ),
+            if *goods_sold_from_city + *goods_sold_from_outside > 0 {
+                format!(
+                    "Source  {}  🏭 {} city-made · 🌍 {} from outside",
+                    split_bar(*goods_sold_from_city, *goods_sold_from_outside, 10),
+                    goods_sold_from_city,
+                    goods_sold_from_outside
+                )
+            } else {
+                format!("Source  {}  no sales today", split_bar(0, 0, 10))
+            },
         ],
         InspectDetailsView::Industrial {
             powered,
@@ -1177,6 +1189,16 @@ fn unicode_bar(value: i32, max: i32, width: usize) -> String {
     let max = max as usize;
     let filled = (value * width + max / 2) / max;
     format!("▕{}{}▏", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+fn split_bar(city: i32, outside: i32, width: usize) -> String {
+    let total = city.max(0) + outside.max(0);
+    if total == 0 {
+        return format!("▕{}▏", "░".repeat(width));
+    }
+    let city_width = (city.max(0) as usize * width + total as usize / 2) / total as usize;
+    let outside_width = width - city_width;
+    format!("▕{}{}▏", "█".repeat(city_width), "▓".repeat(outside_width))
 }
 
 fn level_gauge(level: u8) -> String {
@@ -2970,6 +2992,8 @@ mod tests {
                 recent_profit: 7,
                 upgrade_ready: false,
                 jobs: 2,
+                goods_sold_from_city: 6,
+                goods_sold_from_outside: 2,
             }),
             local_effects: Some(LocalEffectsView {
                 land_value: 6,
@@ -2992,6 +3016,7 @@ mod tests {
         assert!(lines.contains("🛣 ✓"));
         assert!(lines.contains("👷 2 jobs"));
         assert!(lines.contains("Goods   ▕████░░░░░░░░▏ 4/12"));
+        assert!(lines.contains("Source  ▕████████▓▓▏  🏭 6 city-made · 🌍 2 from outside"));
         assert!(lines.contains("⚠ ◀ neighbor goods"));
     }
 

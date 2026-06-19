@@ -207,6 +207,8 @@ pub enum InspectDetailsView {
         recent_profit: i32,
         upgrade_ready: bool,
         jobs: i32,
+        goods_sold_from_city: i32,
+        goods_sold_from_outside: i32,
     },
     Industrial {
         powered: bool,
