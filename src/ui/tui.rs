@@ -909,7 +909,7 @@ fn render_selected_cell(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView
         lines.push("Notes:".to_string());
         lines.extend(inspect.explanations.iter().cloned());
     }
-    let lines = lines.into_iter().map(Line::from).collect::<Vec<_>>();
+    let lines = lines.into_iter().map(tui_inspect_line).collect::<Vec<_>>();
 
     frame.render_widget(
         Paragraph::new(lines)
@@ -917,6 +917,52 @@ fn render_selected_cell(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn tui_inspect_line(line: String) -> Line<'static> {
+    let Some(rest) = line.strip_prefix("Source  ▕") else {
+        return Line::from(line);
+    };
+    let Some(end) = rest.find('▏') else {
+        return Line::from(line);
+    };
+
+    let (bar, tail_with_close) = rest.split_at(end);
+    let tail = tail_with_close.strip_prefix('▏').unwrap_or(tail_with_close);
+    let mut spans = vec![Span::raw("Source  ▕")];
+    spans.extend(styled_source_bar_segments(bar));
+    spans.push(Span::raw(format!("▏{tail}")));
+    Line::from(spans)
+}
+
+fn styled_source_bar_segments(bar: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut chars = bar.chars();
+    let Some(mut current) = chars.next() else {
+        return spans;
+    };
+    let mut segment = String::from(current);
+
+    for ch in chars {
+        if ch == current {
+            segment.push(ch);
+        } else {
+            spans.push(Span::styled(segment, source_bar_style(current)));
+            current = ch;
+            segment = String::from(ch);
+        }
+    }
+    spans.push(Span::styled(segment, source_bar_style(current)));
+    spans
+}
+
+fn source_bar_style(ch: char) -> Style {
+    match ch {
+        '█' => Style::default().fg(Color::Green),
+        '▓' => Style::default().fg(Color::Yellow),
+        '░' => Style::default().fg(Color::DarkGray),
+        _ => Style::default(),
+    }
 }
 
 fn tui_inspect_card(inspect: &InspectView) -> (String, Vec<String>) {
@@ -3018,6 +3064,47 @@ mod tests {
         assert!(lines.contains("Goods   ▕████░░░░░░░░▏ 4/12"));
         assert!(lines.contains("Source  ▕████████▓▓▏  🏭 6 city-made · 🌍 2 from outside"));
         assert!(lines.contains("⚠ ◀ neighbor goods"));
+    }
+
+    #[test]
+    fn tui_source_line_colors_city_and_outside_bar_segments() {
+        let inspect = InspectView {
+            x: 12,
+            y: 4,
+            in_bounds: true,
+            cell: None,
+            details: Some(InspectDetailsView::Commercial {
+                powered: true,
+                power_demand: 2,
+                road_connected: true,
+                upgrade_level: 2,
+                maintenance_cost: 3,
+                sales_tax_per_shopper: 1,
+                goods_stored: 4,
+                goods_capacity: 12,
+                business_cash: 30,
+                upgrade_threshold: Some(50),
+                recent_profit: 7,
+                upgrade_ready: false,
+                jobs: 2,
+                goods_sold_from_city: 6,
+                goods_sold_from_outside: 2,
+            }),
+            local_effects: None,
+            flags: Vec::new(),
+            explanations: Vec::new(),
+        };
+        let (_, body) = tui_inspect_card(&inspect);
+        let source = body
+            .into_iter()
+            .find(|line| line.starts_with("Source  "))
+            .expect("formatted source row");
+        let line = tui_inspect_line(source);
+
+        assert_eq!(line.spans[1].content.as_ref(), "████████");
+        assert_eq!(line.spans[1].style.fg, Some(Color::Green));
+        assert_eq!(line.spans[2].content.as_ref(), "▓▓");
+        assert_eq!(line.spans[2].style.fg, Some(Color::Yellow));
     }
 
     #[test]
