@@ -175,6 +175,8 @@ fn save_load_rebuilds_cross_region_power_export_after_tick_without_saving_grant(
 
     assert!(game.tick_region(RegionId(2)).unwrap().success);
     assert!(region_cell_powered(&game, RegionId(2), 1, 0));
+    let before_turn = turn(&game, RegionId(2));
+    let before_time = region_time(&game, RegionId(2));
 
     game.save_to_file(&path).unwrap();
     let save_text = std::fs::read_to_string(&path).unwrap();
@@ -186,12 +188,46 @@ fn save_load_rebuilds_cross_region_power_export_after_tick_without_saving_grant(
     );
 
     let loaded = RegionalGame::load_from_file(&path).unwrap();
-    assert!(loaded.tick_region(RegionId(2)).unwrap().success);
     assert!(
         region_cell_powered(&loaded, RegionId(2), 1, 0),
-        "loaded topology and hints should allow the normal tick flow to re-request exported power"
+        "load should re-settle imported power before the first post-load tick"
     );
+    assert_eq!(turn(&loaded, RegionId(2)), before_turn);
+    assert_eq!(region_time(&loaded, RegionId(2)), before_time);
 
+    remove_save_file(path);
+}
+
+#[test]
+fn save_load_keeps_local_power_available_immediately() {
+    let path = save_path("regional-local-power-rebuild");
+    let game = RegionalGame::single_region(3, 2).unwrap();
+    assert!(
+        game.build(RegionId(1), 0, 0, BuildingKind::Road)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(1), 1, 0, BuildingKind::Residential)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(1), 0, 1, BuildingKind::PowerPlant)
+            .unwrap()
+            .success
+    );
+    assert!(game.tick_region(RegionId(1)).unwrap().success);
+    assert!(region_cell_powered(&game, RegionId(1), 1, 0));
+    let before_turn = turn(&game, RegionId(1));
+    let before_time = region_time(&game, RegionId(1));
+
+    game.save_to_file(&path).unwrap();
+    let loaded = RegionalGame::load_from_file(&path).unwrap();
+
+    assert!(region_cell_powered(&loaded, RegionId(1), 1, 0));
+    assert_eq!(turn(&loaded, RegionId(1)), before_turn);
+    assert_eq!(region_time(&loaded, RegionId(1)), before_time);
     remove_save_file(path);
 }
 
@@ -554,6 +590,14 @@ fn region_cell_powered(game: &RegionalGame, region_id: RegionId, x: usize, y: us
 fn turn(game: &RegionalGame, region_id: RegionId) -> u32 {
     let view = game.view().unwrap();
     turn_from_view(&view, region_id)
+}
+
+fn region_time(
+    game: &RegionalGame,
+    region_id: RegionId,
+) -> small_city::interface::view::GameTimeView {
+    let view = game.view().unwrap();
+    region_view(&view.regions, region_id).status.time.clone()
 }
 
 fn turn_from_view(

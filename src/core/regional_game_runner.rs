@@ -304,6 +304,22 @@ impl RegionalGameRunner {
             .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })
     }
 
+    pub fn settle_power_imports(
+        &self,
+        request_id: UiRequestId,
+    ) -> Result<(), RegionalGameRunnerError> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .expect("regional runner operation lock poisoned");
+        for handle in &self.handles {
+            handle.send(
+                crate::core::regions::runtime::RegionEvent::SettlePowerImports { request_id },
+            );
+        }
+        self.process_worker_until_drained()
+    }
+
     pub fn shutdown(self) -> Result<RecoveredRegionalGame, RegionalGameRunnerError> {
         let mut workers = Vec::new();
         for worker in self.workers {

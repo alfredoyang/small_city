@@ -109,6 +109,8 @@ pub enum RegionEvent {
         request_id: UiRequestId,
         command: RegionCommand,
     },
+    /// Time-neutral loader refresh for imported power.
+    SettlePowerImports { request_id: UiRequestId },
     /// Authoritative producer-side power export allocation request.
     ProcessPowerExportRequest(PowerExportAllocationRequest),
     /// Producer-side release for a caller's previous power export allocations.
@@ -324,6 +326,7 @@ pub struct RegionRuntime {
 enum TickState {
     Idle,
     WaitingForPowerExports(TickPowerContinuation),
+    WaitingForPowerSettlement(PowerSettlementContinuation),
     WaitingForJobExports(TickJobContinuation),
     WaitingForGoodsExports(TickGoodsContinuation),
 }
@@ -334,6 +337,7 @@ impl TickState {
         matches!(
             self,
             TickState::WaitingForPowerExports(_)
+                | TickState::WaitingForPowerSettlement(_)
                 | TickState::WaitingForJobExports(_)
                 | TickState::WaitingForGoodsExports(_)
         )
@@ -345,6 +349,13 @@ impl TickState {
 struct TickPowerContinuation {
     request_id: UiRequestId,
     phase: RegionalTickPowerPhase,
+    pending_demands: Vec<PendingPowerDemand>,
+}
+
+#[derive(Debug)]
+/// Load-time settlement waiting only for imported power grants; it never
+/// advances time or enters the downstream job/goods/economy phases.
+struct PowerSettlementContinuation {
     pending_demands: Vec<PendingPowerDemand>,
 }
 
@@ -639,6 +650,9 @@ impl RegionRuntime {
                 let response = self.run_command(request_id, command);
                 vec![OutboundMessage::RegionCommandCompleted(response)]
             }
+            RegionEvent::SettlePowerImports { request_id } => {
+                self.start_power_import_settlement(request_id)
+            }
             RegionEvent::ProcessPowerExportRequest(request) => {
                 let grant = self.process_power_export_request(&request);
                 vec![OutboundMessage::PowerExportRequestCompleted { request, grant }]
@@ -724,6 +738,34 @@ impl RegionRuntime {
     fn start_tick_power_phase(&mut self, request_id: UiRequestId) -> Vec<OutboundMessage> {
         let phase = self.state.begin_tick_power_demand_phase();
         self.reconcile_power_export_allocations(request_id, phase)
+    }
+
+    fn start_power_import_settlement(&mut self, request_id: UiRequestId) -> Vec<OutboundMessage> {
+        let producer_regions = std::mem::take(&mut self.power_export_producers);
+        let mut outbound = vec![OutboundMessage::PowerExportAllocationsReleased(
+            PowerExportAllocationRelease {
+                caller_region: self.region_id(),
+                request_id,
+                producer_regions,
+            },
+        )];
+        let pending_demands = self.state.power_import_settlement_demands();
+        if pending_demands.is_empty() {
+            return outbound;
+        }
+
+        outbound.extend(pending_demands.iter().map(|demand| {
+            OutboundMessage::PowerExportRequested(PowerExportRequest {
+                request_id,
+                caller_region: self.region_id(),
+                caller_network: demand.caller_network,
+                token: demand.token,
+                demand: demand.demand,
+            })
+        }));
+        self.tick_state =
+            TickState::WaitingForPowerSettlement(PowerSettlementContinuation { pending_demands });
+        outbound
     }
 
     // Reconciliation currently uses the simple policy:
@@ -1110,30 +1152,50 @@ impl RegionRuntime {
         self.remember_power_export_producer(&grant);
         // A grant only applies to a paused tick. Take the continuation out and
         // fall back to `Idle`; an unrelated grant restores the prior state below.
-        let TickState::WaitingForPowerExports(mut continuation) =
-            std::mem::replace(&mut self.tick_state, TickState::Idle)
-        else {
-            return Vec::new();
-        };
-        let Some(position) = continuation
-            .pending_demands
-            .iter()
-            .position(|demand| demand.token == grant.token)
-        else {
-            // Unknown token: keep waiting for the demands this tick still expects.
-            self.tick_state = TickState::WaitingForPowerExports(continuation);
-            return Vec::new();
-        };
+        match std::mem::replace(&mut self.tick_state, TickState::Idle) {
+            TickState::WaitingForPowerSettlement(mut continuation) => {
+                let Some(position) = continuation
+                    .pending_demands
+                    .iter()
+                    .position(|demand| demand.token == grant.token)
+                else {
+                    self.tick_state = TickState::WaitingForPowerSettlement(continuation);
+                    return Vec::new();
+                };
 
-        let demand = continuation.pending_demands.remove(position);
-        self.state.apply_power_export_grant(demand, grant);
-        if !continuation.pending_demands.is_empty() {
-            self.tick_state = TickState::WaitingForPowerExports(continuation);
-            return Vec::new();
+                let demand = continuation.pending_demands.remove(position);
+                self.state.apply_power_export_grant(demand, grant);
+                if !continuation.pending_demands.is_empty() {
+                    self.tick_state = TickState::WaitingForPowerSettlement(continuation);
+                }
+                Vec::new()
+            }
+            TickState::WaitingForPowerExports(mut continuation) => {
+                let Some(position) = continuation
+                    .pending_demands
+                    .iter()
+                    .position(|demand| demand.token == grant.token)
+                else {
+                    // Unknown token: keep waiting for the demands this tick still expects.
+                    self.tick_state = TickState::WaitingForPowerExports(continuation);
+                    return Vec::new();
+                };
+
+                let demand = continuation.pending_demands.remove(position);
+                self.state.apply_power_export_grant(demand, grant);
+                if !continuation.pending_demands.is_empty() {
+                    self.tick_state = TickState::WaitingForPowerExports(continuation);
+                    return Vec::new();
+                }
+
+                // Last power demand resolved: advance to the job export phase.
+                self.enter_job_phase(continuation.request_id, continuation.phase)
+            }
+            state => {
+                self.tick_state = state;
+                Vec::new()
+            }
         }
-
-        // Last power demand resolved: advance to the job export phase.
-        self.enter_job_phase(continuation.request_id, continuation.phase)
     }
 
     fn apply_job_export_grant(&mut self, grant: JobExportGrant) -> Vec<OutboundMessage> {

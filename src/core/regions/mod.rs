@@ -33,7 +33,7 @@ use crate::core::simulation::{
     ensure_derived_state, finish_tick_after_goods_phase, finish_tick_after_job_phase,
     refresh_derived_state_for_world,
 };
-use crate::core::systems::{build, bulldoze, economy, replace, road_connectivity, upgrade};
+use crate::core::systems::{build, bulldoze, economy, power, replace, road_connectivity, upgrade};
 use crate::core::world::{CrossRegionGoodsRoutes, World};
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
 use crate::interface::events::CommandResult;
@@ -527,6 +527,14 @@ impl RegionState {
             phase,
             power_demands,
         }
+    }
+
+    pub(crate) fn power_import_settlement_demands(&mut self) -> Vec<PendingPowerDemand> {
+        // Load-time settlement is time-neutral: re-run only local power to clear
+        // transient imported flags, then let the normal producer-owned export
+        // request/grant flow reapply imports.
+        power::run(&mut self.world);
+        self.pending_power_demands()
     }
 
     /// Advances from the resolved power phase into the local job assignment phase.

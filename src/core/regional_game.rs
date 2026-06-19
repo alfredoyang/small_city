@@ -741,6 +741,7 @@ impl RegionalGame {
             region_worker_indexes,
         )?;
         game.selected_region = save.selected_region;
+        game.runner.settle_power_imports(game.next_request_id())?;
         Ok(game)
     }
 
