@@ -18,9 +18,8 @@ use ratatui::{Frame, Terminal};
 
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
-    BuildPreviewView, CellView, DemandLevel, GameView, InspectDetailsView, InspectView,
+    BuildPreviewView, CellView, DemandLevel, GameView, InspectDetailsView, InspectFlag, InspectView,
 };
-use crate::ui::ascii;
 use crate::ui::city_driver::{CityDriver, CityLaunchMode};
 use crate::ui::tui_input::{TuiAction, map_key_event};
 
@@ -904,34 +903,328 @@ fn follow_axis(cursor: usize, viewport: usize, visible: usize, total: usize) -> 
 }
 
 fn render_selected_cell(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView) {
-    // Reuse the fixed-slot ASCII card so both terminal frontends keep common
-    // inspect fields in stable positions without duplicating layout rules.
-    let mut lines = ascii::inspect_card_lines(inspect)
-        .into_iter()
-        .map(Line::from)
-        .collect::<Vec<_>>();
-
+    let (title, mut lines) = tui_inspect_card(inspect);
     if !inspect.explanations.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from("Inspect Notes:"));
-        lines.extend(
-            inspect
-                .explanations
-                .iter()
-                .map(|note| Line::from(note.as_str())),
-        );
+        lines.push(String::new());
+        lines.push("Notes:".to_string());
+        lines.extend(inspect.explanations.iter().cloned());
     }
+    let lines = lines.into_iter().map(Line::from).collect::<Vec<_>>();
 
     frame.render_widget(
         Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title("Selected Cell")
-                    .borders(Borders::ALL),
-            )
+            .block(Block::default().title(title).borders(Borders::ALL))
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn tui_inspect_card(inspect: &InspectView) -> (String, Vec<String>) {
+    let Some(details) = &inspect.details else {
+        return (
+            "Selected Cell".to_string(),
+            vec![format!("({}, {}) outside map", inspect.x, inspect.y)],
+        );
+    };
+
+    let title = match details {
+        InspectDetailsView::Empty { .. } => tui_header_line(inspect, "EMPTY LAND", None),
+        InspectDetailsView::Road => tui_header_line(inspect, "ROAD", None),
+        InspectDetailsView::Residential { upgrade_level, .. } => {
+            tui_header_line(inspect, "RESIDENTIAL", Some(*upgrade_level))
+        }
+        InspectDetailsView::Commercial { upgrade_level, .. } => {
+            tui_header_line(inspect, "COMMERCIAL", Some(*upgrade_level))
+        }
+        InspectDetailsView::Industrial { upgrade_level, .. } => {
+            tui_header_line(inspect, "INDUSTRIAL", Some(*upgrade_level))
+        }
+        InspectDetailsView::PowerPlant { upgrade_level, .. } => {
+            tui_header_line(inspect, "POWER PLANT", Some(*upgrade_level))
+        }
+        InspectDetailsView::Park { upgrade_level, .. } => {
+            tui_header_line(inspect, "PARK", Some(*upgrade_level))
+        }
+        InspectDetailsView::Unknown => tui_header_line(inspect, "UNKNOWN", None),
+    };
+
+    let mut lines = match details {
+        InspectDetailsView::Empty { buildable } => vec![
+            tui_status_line(None, None, None, None),
+            format!("Buildable {}", if *buildable { "✓" } else { "✗" }),
+        ],
+        InspectDetailsView::Road => vec![tui_status_line(None, None, None, None)],
+        InspectDetailsView::Residential {
+            powered,
+            power_demand,
+            road_connected,
+            upgrade_level: _,
+            maintenance_cost,
+            rent_per_citizen,
+            population,
+            max_population,
+            citizens,
+            average_happiness,
+            average_happiness_target,
+            average_money,
+            job_assignments,
+        } => vec![
+            tui_status_line(
+                Some((*powered, *power_demand)),
+                Some(*road_connected),
+                Some(*maintenance_cost),
+                None,
+            ),
+            format!(
+                "People  {} {}/{}  citizens {}",
+                unicode_bar(*population, *max_population, 10),
+                population,
+                max_population,
+                citizens
+            ),
+            format!(
+                "Happy   {} {}  target {}",
+                option_value(*average_happiness),
+                happiness_target_marker(*average_happiness, *average_happiness_target),
+                option_value(*average_happiness_target)
+            ),
+            format!(
+                "Money   § {} /cit  rent {}",
+                option_value(*average_money),
+                rent_per_citizen
+            ),
+            format!("Work    {}", tui_job_summary(job_assignments)),
+        ],
+        InspectDetailsView::Commercial {
+            powered,
+            power_demand,
+            road_connected,
+            upgrade_level: _,
+            maintenance_cost,
+            sales_tax_per_shopper,
+            goods_stored,
+            goods_capacity,
+            business_cash,
+            upgrade_threshold,
+            recent_profit,
+            upgrade_ready,
+            jobs,
+        } => vec![
+            tui_status_line(
+                Some((*powered, *power_demand)),
+                Some(*road_connected),
+                Some(*maintenance_cost),
+                Some(*jobs),
+            ),
+            format!(
+                "Goods   {} {}/{}",
+                unicode_bar(*goods_stored, *goods_capacity, 12),
+                goods_stored,
+                goods_capacity
+            ),
+            format!(
+                "Cash    {} {}/{}  {}",
+                unicode_bar(*business_cash, upgrade_threshold.unwrap_or(0), 12),
+                business_cash,
+                upgrade_threshold
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+                if *upgrade_ready {
+                    "▲ ready"
+                } else {
+                    "▲ later"
+                }
+            ),
+            format!(
+                "Sales   {}/shopper  recent {}",
+                sales_tax_per_shopper, recent_profit
+            ),
+        ],
+        InspectDetailsView::Industrial {
+            powered,
+            power_demand,
+            road_connected,
+            upgrade_level: _,
+            maintenance_cost,
+            goods_production,
+            business_cash,
+            upgrade_threshold,
+            recent_profit,
+            upgrade_ready,
+            jobs,
+        } => vec![
+            tui_status_line(
+                Some((*powered, *power_demand)),
+                Some(*road_connected),
+                Some(*maintenance_cost),
+                Some(*jobs),
+            ),
+            format!("Output  {} city goods/turn", goods_production),
+            format!(
+                "Cash    {} {}/{}  {}",
+                unicode_bar(*business_cash, upgrade_threshold.unwrap_or(0), 12),
+                business_cash,
+                upgrade_threshold
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+                if *upgrade_ready {
+                    "▲ ready"
+                } else {
+                    "▲ later"
+                }
+            ),
+            format!("Recent  {}", recent_profit),
+        ],
+        InspectDetailsView::PowerPlant {
+            road_connected,
+            connected_to_road_network,
+            upgrade_level: _,
+            maintenance_cost,
+            power_capacity,
+        } => vec![
+            tui_status_line(None, Some(*road_connected), Some(*maintenance_cost), None),
+            format!("Output  {} power capacity", power_capacity),
+            format!(
+                "Network {}",
+                if *connected_to_road_network {
+                    "✓ connected"
+                } else {
+                    "✗ none"
+                }
+            ),
+        ],
+        InspectDetailsView::Park {
+            road_connected,
+            upgrade_level: _,
+            maintenance_cost,
+            happiness_effect,
+        } => vec![
+            tui_status_line(None, Some(*road_connected), Some(*maintenance_cost), None),
+            format!("Happy   +{} local happiness", happiness_effect),
+        ],
+        InspectDetailsView::Unknown => Vec::new(),
+    };
+
+    if !lines.is_empty() {
+        lines.insert(1, tui_local_effects_line(inspect));
+        lines.insert(2, "─".repeat(39));
+    }
+
+    (title, with_inspect_footer(inspect, lines))
+}
+
+fn with_inspect_footer(inspect: &InspectView, mut lines: Vec<String>) -> Vec<String> {
+    if !inspect.flags.is_empty() {
+        lines.push(format!(
+            "⚠ {}",
+            inspect
+                .flags
+                .iter()
+                .map(tui_flag_chip)
+                .collect::<Vec<_>>()
+                .join("   ")
+        ));
+    }
+    lines
+}
+
+fn tui_header_line(inspect: &InspectView, label: &str, level: Option<u8>) -> String {
+    let level = level
+        .map(|level| format!("Lvl {} {level}/3", level_gauge(level)))
+        .unwrap_or_else(|| "Lvl —".to_string());
+    format!("({},{}) {:<12} {}", inspect.x, inspect.y, label, level)
+}
+
+fn tui_status_line(
+    power: Option<(bool, i32)>,
+    road_connected: Option<bool>,
+    maintenance_cost: Option<i32>,
+    jobs: Option<i32>,
+) -> String {
+    let power = power
+        .map(|(powered, demand)| format!("⚡ {} d{}", if powered { "on " } else { "off" }, demand))
+        .unwrap_or_else(|| "⚡ —".to_string());
+    let road = road_connected
+        .map(|connected| format!("🛣 {}", if connected { "✓" } else { "✗" }))
+        .unwrap_or_else(|| "🛣 —".to_string());
+    let maintenance = maintenance_cost
+        .map(|cost| format!("🔧 {cost}"))
+        .unwrap_or_else(|| "🔧 —".to_string());
+    let jobs = jobs
+        .map(|jobs| format!("👷 {jobs} jobs"))
+        .unwrap_or_default();
+    format!("{:<11} {:<7} {:<5} {}", power, road, maintenance, jobs)
+}
+
+fn tui_local_effects_line(inspect: &InspectView) -> String {
+    let Some(effects) = inspect.local_effects else {
+        return "Land —  Poll —  Access —  Desir —".to_string();
+    };
+    format!(
+        "Land {}  Poll {}  Access {}  Desir {}",
+        block_meter(effects.land_value),
+        block_meter(effects.pollution_pressure),
+        block_meter(effects.accessibility),
+        block_meter(effects.desirability)
+    )
+}
+
+fn unicode_bar(value: i32, max: i32, width: usize) -> String {
+    if max <= 0 {
+        return format!("▕{}▏", "░".repeat(width));
+    }
+    let value = value.clamp(0, max) as usize;
+    let max = max as usize;
+    let filled = (value * width + max / 2) / max;
+    format!("▕{}{}▏", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+fn level_gauge(level: u8) -> String {
+    let filled = level.clamp(0, 3) as usize;
+    format!("{}{}", "█".repeat(filled), "░".repeat(3 - filled))
+}
+
+fn block_meter(value: i32) -> char {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    BARS[(value.clamp(0, 9) * 7 / 9) as usize]
+}
+
+fn option_value(value: Option<i32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn happiness_target_marker(value: Option<i32>, target: Option<i32>) -> &'static str {
+    match (value, target) {
+        (Some(value), Some(target)) if value < target => "↗",
+        (Some(value), Some(target)) if value > target => "↘",
+        (Some(_), Some(_)) => "→",
+        _ => "—",
+    }
+}
+
+fn tui_job_summary(assignments: &[crate::interface::view::JobAssignmentView]) -> String {
+    if assignments.is_empty() {
+        return "✗ none".to_string();
+    }
+    let local = assignments
+        .iter()
+        .filter(|assignment| !assignment.is_remote)
+        .count();
+    let remote = assignments.len() - local;
+    if remote == 0 {
+        return format!("✓ {local} local");
+    }
+    format!("✓ {local} local · {remote} ◀ neighbor")
+}
+
+fn tui_flag_chip(flag: &InspectFlag) -> &'static str {
+    match flag {
+        InspectFlag::GrowthBlockedNoJobs => "✗ no jobs",
+        InspectFlag::GoodsSupplyNeighbor => "◀ neighbor goods",
+        InspectFlag::GoodsSupplyMissing => "✗ no goods route",
+    }
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &TuiState) {
@@ -1702,7 +1995,7 @@ mod tests {
     use super::*;
     use crate::core::regional_game::RegionalGame;
     use crate::core::regions::RegionId;
-    use crate::interface::view::RoadLinks;
+    use crate::interface::view::{InspectFlag, LocalEffectsView, RoadLinks};
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
 
@@ -2607,7 +2900,9 @@ mod tests {
 
         for expected in [
             "City Map",
-            "Selected Cell",
+            "(0,0) EMPTY LAND",
+            "Buildable ✓",
+            "Land",
             "Status",
             "Build / Actions",
             "Messages / Tick Summary",
@@ -2652,6 +2947,52 @@ mod tests {
         assert_eq!(time_spinner(2), '-');
         assert_eq!(time_spinner(3), '\\');
         assert_eq!(time_spinner(4), '|');
+    }
+
+    #[test]
+    fn tui_inspect_card_uses_unicode_mockup_glyphs() {
+        let inspect = InspectView {
+            x: 12,
+            y: 4,
+            in_bounds: true,
+            cell: None,
+            details: Some(InspectDetailsView::Commercial {
+                powered: true,
+                power_demand: 2,
+                road_connected: true,
+                upgrade_level: 2,
+                maintenance_cost: 3,
+                sales_tax_per_shopper: 1,
+                goods_stored: 4,
+                goods_capacity: 12,
+                business_cash: 30,
+                upgrade_threshold: Some(50),
+                recent_profit: 7,
+                upgrade_ready: false,
+                jobs: 2,
+            }),
+            local_effects: Some(LocalEffectsView {
+                land_value: 6,
+                pollution_pressure: 1,
+                accessibility: 5,
+                desirability: 4,
+            }),
+            flags: vec![InspectFlag::GoodsSupplyNeighbor],
+            explanations: Vec::new(),
+        };
+
+        let (title, body) = tui_inspect_card(&inspect);
+        let lines = body.join("\n");
+
+        assert!(title.contains("(12,4) COMMERCIAL"));
+        assert!(title.contains("Lvl ██░ 2/3"));
+        assert!(body[1].starts_with("Land ▅"));
+        assert_eq!(body[2], "───────────────────────────────────────");
+        assert!(lines.contains("⚡ on  d2"));
+        assert!(lines.contains("🛣 ✓"));
+        assert!(lines.contains("👷 2 jobs"));
+        assert!(lines.contains("Goods   ▕████░░░░░░░░▏ 4/12"));
+        assert!(lines.contains("⚠ ◀ neighbor goods"));
     }
 
     #[test]
