@@ -1,6 +1,6 @@
 # Readable inspect view: fixed slots + visual encodings
 
-Status: P1 implemented; P2 pending.
+Status: P1 and P2 implemented.
 
 The inspect panel is hard to scan. This plan redesigns it as a fixed-slot card
 that **graphs** values (bars, gauges, glyphs) instead of spelling them in a
@@ -104,7 +104,9 @@ notes collapse to a single `⚠`-chip line at the bottom instead of full prose.
   only in `explanations: Vec<String>` (goods-route reachability, "growth blocked:
   no jobs"). To render those as glyphs without fragile string-matching, promote
   them from `String` to a small `enum InspectFlag` on the view model (adapter +
-  view change). Defer until P1 proves the layout.
+  view change). Implemented for no-jobs growth blockers and commercial
+  goods-route reachability; chip-covered diagnostics are omitted from prose, and
+  prose explanations remain for detailed notes that do not have typed flags.
 
 ---
 

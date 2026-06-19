@@ -8,8 +8,8 @@ use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
     BuildOptionView, CellView, CityDemand, CityStatusView, DemandLevel, GameTimeView, GameView,
-    InspectDetailsView, InspectView, JobAssignmentView, LocalEffectsView, MapView, PowerStatusView,
-    RoadLinks,
+    InspectDetailsView, InspectFlag, InspectView, JobAssignmentView, LocalEffectsView, MapView,
+    PowerStatusView, RoadLinks,
 };
 
 /// Converts the private ECS World into the only render model the UI may consume.
@@ -135,10 +135,41 @@ pub(crate) fn inspect_world(world: &World, x: usize, y: usize) -> InspectView {
         cell: in_bounds.then(|| cell_view(world, x, y)),
         details: in_bounds.then(|| inspect_details(world, x, y)),
         local_effects: in_bounds.then(|| local_effects_view(world, x, y)),
+        flags: in_bounds
+            .then(|| inspect_flags(world, x, y))
+            .unwrap_or_default(),
         explanations: in_bounds
             .then(|| inspect_explanations(world, x, y))
             .unwrap_or_default(),
     }
+}
+
+fn inspect_flags(world: &World, x: usize, y: usize) -> Vec<InspectFlag> {
+    let Some(entity) = world.grid.get(x, y) else {
+        return Vec::new();
+    };
+    let Some(building) = world.buildings.get(&entity) else {
+        return Vec::new();
+    };
+
+    let mut flags = Vec::new();
+    match building.kind {
+        BuildingKind::Residential => {
+            if population::available_jobs_for_growth(world) == 0 {
+                flags.push(InspectFlag::GrowthBlockedNoJobs);
+            }
+        }
+        BuildingKind::Commercial => {
+            let access = road_network_analysis::access_for(world, entity);
+            match goods_supply_route(world, access) {
+                GoodsSupplyRoute::Local(_) => {}
+                GoodsSupplyRoute::Neighbor => flags.push(InspectFlag::GoodsSupplyNeighbor),
+                GoodsSupplyRoute::Missing => flags.push(InspectFlag::GoodsSupplyMissing),
+            }
+        }
+        _ => {}
+    }
+    flags
 }
 
 /// Builds type-specific inspect data while keeping ECS details inside the adapter.
@@ -271,12 +302,6 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
             // access already affects simulation through regional job exports; teaching
             // this display helper about neighbor regions is a separate UI mission.
             explain_road_access(world, entity, building.kind, &mut explanations);
-            let available_jobs = population::available_jobs_for_growth(world);
-            if available_jobs == 0 {
-                explanations.push(
-                    "Population growth is blocked because no jobs are available.".to_string(),
-                );
-            }
             if let Some(population) = world.populations.get(&entity) {
                 if population.current >= population.max {
                     explanations
@@ -407,10 +432,12 @@ fn explain_road_access(
             ));
         }
         BuildingKind::Commercial => {
-            explanations.push(format!(
-                "Goods: nearest industrial route is {}.",
-                goods_supply_note(world, access)
-            ));
+            if let GoodsSupplyRoute::Local(distance) = goods_supply_route(world, access) {
+                explanations.push(format!(
+                    "Goods: nearest industrial route is {}.",
+                    distance_note(Some(distance))
+                ));
+            }
             explanations.push(format!(
                 "Trade: edge access is {}.",
                 distance_note(access.import_export_distance)
@@ -430,17 +457,27 @@ fn explain_road_access(
     }
 }
 
-fn goods_supply_note(world: &World, access: road_network_analysis::RoadAccess) -> String {
-    if access.goods_route_distance.is_some() {
-        return distance_note(access.goods_route_distance);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoodsSupplyRoute {
+    Local(u32),
+    Neighbor,
+    Missing,
+}
+
+fn goods_supply_route(
+    world: &World,
+    access: road_network_analysis::RoadAccess,
+) -> GoodsSupplyRoute {
+    if let Some(distance) = access.goods_route_distance {
+        return GoodsSupplyRoute::Local(distance);
     }
     if world
         .cross_region_goods_routes
         .has_supplier_on(access.network_id)
     {
-        return "reachable via neighbor region".to_string();
+        return GoodsSupplyRoute::Neighbor;
     }
-    distance_note(None)
+    GoodsSupplyRoute::Missing
 }
 
 fn explain_business_reinvestment(

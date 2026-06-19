@@ -5,7 +5,7 @@ use std::process::Command;
 
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
-    BuildPreviewView, DemandLevel, GameView, InspectDetailsView, InspectView,
+    BuildPreviewView, DemandLevel, GameView, InspectDetailsView, InspectFlag, InspectView,
 };
 use crate::ui::city_driver::{CityDriver, CityLaunchMode};
 
@@ -190,6 +190,7 @@ pub fn render(view: &GameView) {
         cell: None,
         details: None,
         local_effects: None,
+        flags: Vec::new(),
         explanations: Vec::new(),
     };
     let preview = BuildPreviewView {
@@ -508,19 +509,23 @@ pub fn inspect_card_lines(inspect: &InspectView) -> Vec<String> {
     };
 
     match details {
-        InspectDetailsView::Empty { buildable } => {
+        InspectDetailsView::Empty { buildable } => with_flag_line(
+            inspect,
             vec![
                 header_line(inspect, "EMPTY LAND", None),
                 status_line(None, None, None),
                 format!("Buildable {}", yes_no(*buildable)),
                 local_effects_line(inspect),
-            ]
-        }
-        InspectDetailsView::Road => vec![
-            header_line(inspect, "ROAD", None),
-            status_line(None, None, None),
-            local_effects_line(inspect),
-        ],
+            ],
+        ),
+        InspectDetailsView::Road => with_flag_line(
+            inspect,
+            vec![
+                header_line(inspect, "ROAD", None),
+                status_line(None, None, None),
+                local_effects_line(inspect),
+            ],
+        ),
         InspectDetailsView::Residential {
             powered,
             power_demand,
@@ -535,33 +540,36 @@ pub fn inspect_card_lines(inspect: &InspectView) -> Vec<String> {
             average_happiness_target,
             average_money,
             job_assignments,
-        } => vec![
-            header_line(inspect, "RESIDENTIAL", Some(*upgrade_level)),
-            status_line(
-                Some((*powered, *power_demand)),
-                Some(*road_connected),
-                Some(*maintenance_cost),
-            ),
-            format!(
-                "People  {} {}/{}  citizens {}",
-                ascii_bar(*population, *max_population, 10),
-                population,
-                max_population,
-                citizens
-            ),
-            format!(
-                "Happy   {} target {}",
-                optional_number(*average_happiness),
-                optional_number(*average_happiness_target)
-            ),
-            format!(
-                "Money   {} per citizen  Rent {}",
-                optional_number(*average_money),
-                rent_per_citizen
-            ),
-            format!("Work    {}", format_job_assignments(job_assignments)),
-            local_effects_line(inspect),
-        ],
+        } => with_flag_line(
+            inspect,
+            vec![
+                header_line(inspect, "RESIDENTIAL", Some(*upgrade_level)),
+                status_line(
+                    Some((*powered, *power_demand)),
+                    Some(*road_connected),
+                    Some(*maintenance_cost),
+                ),
+                format!(
+                    "People  {} {}/{}  citizens {}",
+                    ascii_bar(*population, *max_population, 10),
+                    population,
+                    max_population,
+                    citizens
+                ),
+                format!(
+                    "Happy   {} target {}",
+                    optional_number(*average_happiness),
+                    optional_number(*average_happiness_target)
+                ),
+                format!(
+                    "Money   {} per citizen  Rent {}",
+                    optional_number(*average_money),
+                    rent_per_citizen
+                ),
+                format!("Work    {}", format_job_assignments(job_assignments)),
+                local_effects_line(inspect),
+            ],
+        ),
         InspectDetailsView::Commercial {
             powered,
             power_demand,
@@ -576,32 +584,35 @@ pub fn inspect_card_lines(inspect: &InspectView) -> Vec<String> {
             recent_profit,
             upgrade_ready,
             jobs,
-        } => vec![
-            header_line(inspect, "COMMERCIAL", Some(*upgrade_level)),
-            status_line(
-                Some((*powered, *power_demand)),
-                Some(*road_connected),
-                Some(*maintenance_cost),
-            ),
-            format!(
-                "Goods   {} {}/{}",
-                ascii_bar(*goods_stored, *goods_capacity, 10),
-                goods_stored,
-                goods_capacity
-            ),
-            format!(
-                "Cash    {} {}/{}  ready {}",
-                ascii_bar(*business_cash, upgrade_threshold.unwrap_or(0), 10),
-                business_cash,
-                optional_threshold(*upgrade_threshold),
-                yes_no(*upgrade_ready)
-            ),
-            format!(
-                "Sales   {} per shopper  Jobs {}  Recent {}",
-                sales_tax_per_shopper, jobs, recent_profit
-            ),
-            local_effects_line(inspect),
-        ],
+        } => with_flag_line(
+            inspect,
+            vec![
+                header_line(inspect, "COMMERCIAL", Some(*upgrade_level)),
+                status_line(
+                    Some((*powered, *power_demand)),
+                    Some(*road_connected),
+                    Some(*maintenance_cost),
+                ),
+                format!(
+                    "Goods   {} {}/{}",
+                    ascii_bar(*goods_stored, *goods_capacity, 10),
+                    goods_stored,
+                    goods_capacity
+                ),
+                format!(
+                    "Cash    {} {}/{}  ready {}",
+                    ascii_bar(*business_cash, upgrade_threshold.unwrap_or(0), 10),
+                    business_cash,
+                    optional_threshold(*upgrade_threshold),
+                    yes_no(*upgrade_ready)
+                ),
+                format!(
+                    "Sales   {} per shopper  Jobs {}  Recent {}",
+                    sales_tax_per_shopper, jobs, recent_profit
+                ),
+                local_effects_line(inspect),
+            ],
+        ),
         InspectDetailsView::Industrial {
             powered,
             power_demand,
@@ -614,49 +625,83 @@ pub fn inspect_card_lines(inspect: &InspectView) -> Vec<String> {
             recent_profit,
             upgrade_ready,
             jobs,
-        } => vec![
-            header_line(inspect, "INDUSTRIAL", Some(*upgrade_level)),
-            status_line(
-                Some((*powered, *power_demand)),
-                Some(*road_connected),
-                Some(*maintenance_cost),
-            ),
-            format!("Output  {} goods/turn", goods_production),
-            format!(
-                "Cash    {} {}/{}  ready {}",
-                ascii_bar(*business_cash, upgrade_threshold.unwrap_or(0), 10),
-                business_cash,
-                optional_threshold(*upgrade_threshold),
-                yes_no(*upgrade_ready)
-            ),
-            format!("Jobs    {}  Recent {}", jobs, recent_profit),
-            local_effects_line(inspect),
-        ],
+        } => with_flag_line(
+            inspect,
+            vec![
+                header_line(inspect, "INDUSTRIAL", Some(*upgrade_level)),
+                status_line(
+                    Some((*powered, *power_demand)),
+                    Some(*road_connected),
+                    Some(*maintenance_cost),
+                ),
+                format!("Output  {} goods/turn", goods_production),
+                format!(
+                    "Cash    {} {}/{}  ready {}",
+                    ascii_bar(*business_cash, upgrade_threshold.unwrap_or(0), 10),
+                    business_cash,
+                    optional_threshold(*upgrade_threshold),
+                    yes_no(*upgrade_ready)
+                ),
+                format!("Jobs    {}  Recent {}", jobs, recent_profit),
+                local_effects_line(inspect),
+            ],
+        ),
         InspectDetailsView::PowerPlant {
             road_connected,
             connected_to_road_network,
             upgrade_level,
             maintenance_cost,
             power_capacity,
-        } => vec![
-            header_line(inspect, "POWER PLANT", Some(*upgrade_level)),
-            status_line(None, Some(*road_connected), Some(*maintenance_cost)),
-            format!("Output  {} capacity", power_capacity),
-            format!("Network {}", yes_no(*connected_to_road_network)),
-            local_effects_line(inspect),
-        ],
+        } => with_flag_line(
+            inspect,
+            vec![
+                header_line(inspect, "POWER PLANT", Some(*upgrade_level)),
+                status_line(None, Some(*road_connected), Some(*maintenance_cost)),
+                format!("Output  {} capacity", power_capacity),
+                format!("Network {}", yes_no(*connected_to_road_network)),
+                local_effects_line(inspect),
+            ],
+        ),
         InspectDetailsView::Park {
             road_connected,
             upgrade_level,
             maintenance_cost,
             happiness_effect,
-        } => vec![
-            header_line(inspect, "PARK", Some(*upgrade_level)),
-            status_line(None, Some(*road_connected), Some(*maintenance_cost)),
-            format!("Happy   +{}", happiness_effect),
-            local_effects_line(inspect),
-        ],
-        InspectDetailsView::Unknown => vec![header_line(inspect, "UNKNOWN", None)],
+        } => with_flag_line(
+            inspect,
+            vec![
+                header_line(inspect, "PARK", Some(*upgrade_level)),
+                status_line(None, Some(*road_connected), Some(*maintenance_cost)),
+                format!("Happy   +{}", happiness_effect),
+                local_effects_line(inspect),
+            ],
+        ),
+        InspectDetailsView::Unknown => {
+            with_flag_line(inspect, vec![header_line(inspect, "UNKNOWN", None)])
+        }
+    }
+}
+
+fn with_flag_line(inspect: &InspectView, mut lines: Vec<String>) -> Vec<String> {
+    if !inspect.flags.is_empty() {
+        lines.push(format!(
+            "Flags   {}",
+            inspect
+                .flags
+                .iter()
+                .map(flag_chip)
+                .collect::<Vec<_>>()
+                .join("  ")
+        ));
+    }
+    lines
+}
+
+fn flag_chip(flag: &InspectFlag) -> &'static str {
+    match flag {
+        InspectFlag::GrowthBlockedNoJobs => "! no jobs",
+        InspectFlag::GoodsSupplyNeighbor => "< neighbor goods",
+        InspectFlag::GoodsSupplyMissing => "x no goods route",
     }
 }
 
@@ -838,7 +883,9 @@ mod tests {
     use crate::core::regional_game::RegionalGame;
     use crate::core::regions::RegionId;
     use crate::interface::input::{BuildingKind, MapOverlayInput};
-    use crate::interface::view::{DemandLevel, InspectDetailsView, InspectView, LocalEffectsView};
+    use crate::interface::view::{
+        DemandLevel, InspectDetailsView, InspectFlag, InspectView, LocalEffectsView,
+    };
 
     #[test]
     fn parses_single_key_build_selection_and_actions() {
@@ -914,6 +961,7 @@ mod tests {
                 accessibility: 5,
                 desirability: 4,
             }),
+            flags: vec![InspectFlag::GoodsSupplyNeighbor],
             explanations: Vec::new(),
         };
 
@@ -926,7 +974,8 @@ Pwr on d2    Road Y   Maint 3\n\
 Goods   [###.......] 4/12\n\
 Cash    [######....] 30/50  ready No\n\
 Sales   1 per shopper  Jobs 2  Recent 7\n\
-Local   Land 2  Poll .  Access 3  Desir 3"
+Local   Land 2  Poll .  Access 3  Desir 3\n\
+Flags   < neighbor goods"
         );
     }
 

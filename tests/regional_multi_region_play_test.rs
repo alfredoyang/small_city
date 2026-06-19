@@ -3,7 +3,7 @@
 use small_city::core::regional_game::RegionalGame;
 use small_city::core::regions::RegionId;
 use small_city::interface::input::BuildingKind;
-use small_city::interface::view::InspectDetailsView;
+use small_city::interface::view::{InspectDetailsView, InspectFlag};
 use small_city::ui::city_driver::{CityDriver, CityLaunchMode};
 
 fn has_generic_imported_resource_note(game: &RegionalGame, region_id: RegionId) -> bool {
@@ -114,14 +114,14 @@ fn commercial_inspect_reports_neighbor_goods_route_when_border_connected() {
     }
 
     let inspect = game.inspect_region(RegionId(2), 1, 0).unwrap();
-    let goods_note = inspect
-        .explanations
-        .iter()
-        .find(|note| note.starts_with("Goods: nearest industrial route"))
-        .expect("goods route note");
 
-    assert!(goods_note.contains("reachable via neighbor region"));
-    assert!(!goods_note.contains("unreachable by road"));
+    assert!(inspect.flags.contains(&InspectFlag::GoodsSupplyNeighbor));
+    assert!(
+        !inspect
+            .explanations
+            .iter()
+            .any(|note| note.starts_with("Goods: nearest industrial route"))
+    );
 }
 
 #[test]
@@ -135,13 +135,14 @@ fn commercial_inspect_keeps_unreachable_goods_route_without_border_link() {
     }
 
     let inspect = game.inspect_region(RegionId(2), 1, 0).unwrap();
-    let goods_note = inspect
-        .explanations
-        .iter()
-        .find(|note| note.starts_with("Goods: nearest industrial route"))
-        .expect("goods route note");
 
-    assert!(goods_note.contains("unreachable by road"));
+    assert!(inspect.flags.contains(&InspectFlag::GoodsSupplyMissing));
+    assert!(
+        !inspect
+            .explanations
+            .iter()
+            .any(|note| note.starts_with("Goods: nearest industrial route"))
+    );
 }
 
 #[test]
@@ -198,12 +199,7 @@ fn remote_spare_jobs_without_road_link_do_not_unlock_population_growth() {
     };
 
     assert_eq!(population, 0);
-    assert!(
-        inspect
-            .explanations
-            .iter()
-            .any(|note| note.contains("no jobs are available"))
-    );
+    assert!(inspect.flags.contains(&InspectFlag::GrowthBlockedNoJobs));
 }
 
 #[test]

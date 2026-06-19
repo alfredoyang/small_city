@@ -159,7 +159,16 @@ pub struct InspectView {
     pub cell: Option<CellView>,
     pub details: Option<InspectDetailsView>,
     pub local_effects: Option<LocalEffectsView>,
+    pub flags: Vec<InspectFlag>,
     pub explanations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Typed inspect diagnostics rendered as compact chips by UI frontends.
+pub enum InspectFlag {
+    GrowthBlockedNoJobs,
+    GoodsSupplyNeighbor,
+    GoodsSupplyMissing,
 }
 
 /// Type-specific details for the inspected coordinate.

@@ -4,7 +4,7 @@ mod common;
 
 use common::SingleRegionTestGame;
 use small_city::interface::input::BuildingKind;
-use small_city::interface::view::InspectDetailsView;
+use small_city::interface::view::{InspectDetailsView, InspectFlag, InspectView, LocalEffectsView};
 use small_city::ui::ascii::format_inspect;
 
 #[test]
@@ -292,10 +292,12 @@ fn inspect_explains_no_available_jobs_for_residential_growth() {
     game.tick();
     let inspect = game.inspect(1, 0);
 
+    assert!(inspect.flags.contains(&InspectFlag::GrowthBlockedNoJobs));
     assert!(
-        inspect
+        !inspect
             .explanations
-            .contains(&"Population growth is blocked because no jobs are available.".to_string())
+            .iter()
+            .any(|note| note.contains("no jobs are available"))
     );
 }
 
@@ -339,5 +341,50 @@ fn inspect_explains_local_pollution_and_happiness_effects() {
     assert!(
         park.explanations
             .contains(&"Local effect: adds +3 happiness.".to_string())
+    );
+}
+
+#[test]
+fn inspect_card_layout_is_fixed_slot_aligned() {
+    // Sim-independent golden: locks the header + status column layout and the
+    // per-row bar/label positions so the fixed-slot card cannot silently drift.
+    let inspect = InspectView {
+        x: 12,
+        y: 4,
+        in_bounds: true,
+        cell: None,
+        details: Some(InspectDetailsView::Commercial {
+            powered: true,
+            power_demand: 2,
+            road_connected: true,
+            upgrade_level: 2,
+            maintenance_cost: 3,
+            sales_tax_per_shopper: 1,
+            goods_stored: 4,
+            goods_capacity: 8,
+            business_cash: 30,
+            upgrade_threshold: Some(50),
+            recent_profit: 5,
+            upgrade_ready: false,
+            jobs: 2,
+        }),
+        local_effects: Some(LocalEffectsView {
+            land_value: 6,
+            pollution_pressure: 1,
+            accessibility: 5,
+            desirability: 5,
+        }),
+        flags: Vec::new(),
+        explanations: Vec::new(),
+    };
+
+    assert_eq!(
+        format_inspect(&inspect),
+        "(12,  4) COMMERCIAL   Lvl [##.] 2/3\n\
+         Pwr on d2    Road Y   Maint 3\n\
+         Goods   [#####.....] 4/8\n\
+         Cash    [######....] 30/50  ready No\n\
+         Sales   1 per shopper  Jobs 2  Recent 5\n\
+         Local   Land 4  Poll .  Access 3  Desir 3"
     );
 }

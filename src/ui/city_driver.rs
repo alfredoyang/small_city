@@ -346,6 +346,7 @@ impl CityDriver {
             cell: None,
             details: None,
             local_effects: None,
+            flags: Vec::new(),
             explanations: vec![message],
         }
     }
