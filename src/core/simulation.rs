@@ -36,6 +36,7 @@
 //!   morale is frozen while paused.
 //! - `Citizen::age` is durable state, but no aging system exists yet.
 
+use crate::core::entity::Entity;
 use crate::core::regions::RegionId;
 use crate::core::resources::{GameTime, is_new_day, is_new_week};
 use crate::core::systems::{
@@ -156,10 +157,20 @@ pub(crate) fn continue_to_job_phase(
 pub(crate) fn finish_tick_after_job_phase(
     world: &mut World,
     phase: TickJobPhase,
-    exported_job_slots: &[crate::core::entity::Entity],
+    exported_job_slots: &[Entity],
+) -> CommandResult {
+    finish_tick_after_goods_phase(world, phase, exported_job_slots, 0)
+}
+
+/// Finishes the tick after producer-owned job and goods exports resolve.
+pub(crate) fn finish_tick_after_goods_phase(
+    world: &mut World,
+    phase: TickJobPhase,
+    exported_job_slots: &[Entity],
+    exported_goods_units: u32,
 ) -> CommandResult {
     let economy = if phase.is_daily {
-        economy::run(world, exported_job_slots)
+        economy::run_with_goods_exports(world, exported_job_slots, exported_goods_units)
     } else {
         economy::EconomyBreakdown::default()
     };

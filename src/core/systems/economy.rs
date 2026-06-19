@@ -89,7 +89,16 @@ pub(crate) fn assign_local_jobs_for_daily_tick(world: &mut World, local_region: 
 /// `exported_job_slots` lists this region's workplace entities reserved for
 /// remote workers in other regions. The exporting region owns those slots, so it
 /// accrues their workplace tax here; the home region only pays salary and rent.
+#[cfg(test)]
 pub(crate) fn run(world: &mut World, exported_job_slots: &[Entity]) -> EconomyBreakdown {
+    run_with_goods_exports(world, exported_job_slots, 0)
+}
+
+pub(crate) fn run_with_goods_exports(
+    world: &mut World,
+    exported_job_slots: &[Entity],
+    exported_goods_units: u32,
+) -> EconomyBreakdown {
     // Workplaces and shops are recalculated every tick from powered,
     // road-connected buildings. This keeps employment and shopping deterministic
     // after build, bulldoze, replace, upgrade, save, or load.
@@ -112,6 +121,7 @@ pub(crate) fn run(world: &mut World, exported_job_slots: &[Entity]) -> EconomyBr
         world,
         &index.productive_industrials,
         &index.productive_commercials,
+        exported_goods_units,
     );
 
     let mut shopping_slots = index.shopping_slots.clone();
@@ -377,12 +387,14 @@ fn distribute_local_goods(
     world: &mut World,
     productive_industrials: &[Entity],
     productive_commercials: &[Entity],
+    exported_goods_units: u32,
 ) -> GoodsFlow {
     let mut local_goods_produced = 0;
     let mut local_goods_stored = 0;
     let mut exported_goods = 0;
     let mut manufacturing_tax = 0;
     let mut export_tax = 0;
+    let mut regional_export_units_remaining = exported_goods_units as i32;
     for industrial in productive_industrials {
         let mut industrial_profit = 0;
         let produced = industrial_goods_production(world, *industrial);
@@ -411,6 +423,22 @@ fn distribute_local_goods(
             }
         }
 
+        if remaining_goods > 0 && regional_export_units_remaining > 0 {
+            let regional_exported = remaining_goods.min(regional_export_units_remaining);
+            // ponytail: proxy distance. The grant does not carry the exact
+            // producer-to-consumer route yet, so regional goods use the existing
+            // producer-to-edge distance for manufacturing margin. Add route
+            // distance to GoodsExportGrant if balance needs that precision.
+            let distance =
+                road_network_analysis::access_for(world, *industrial).import_export_distance;
+            let manufacturing_margin =
+                regional_exported * margin_per_good(MANUFACTURING_TAX_PER_GOOD, distance);
+            manufacturing_tax += manufacturing_margin;
+            industrial_profit += manufacturing_margin;
+            remaining_goods -= regional_exported;
+            regional_export_units_remaining -= regional_exported;
+        }
+
         if remaining_goods > 0 {
             exported_goods += remaining_goods;
             let distance =
@@ -434,11 +462,13 @@ fn distribute_local_goods(
     }
 }
 
-pub(crate) fn exportable_goods_units_on_network(world: &World, network_id: u32) -> u32 {
-    // ponytail: G1 visibility estimate only. G2 must derive consumable export
-    // capacity from the real GoodsFlow surplus or a shared distribution helper,
-    // otherwise post-local-storage reads can over-report goods already absorbed
-    // by local shops.
+#[derive(Debug, Default)]
+struct GoodsDistributionPlan {
+    commercial_free_capacity: HashMap<Entity, i32>,
+    industrial_surplus: Vec<(Entity, i32)>,
+}
+
+fn goods_distribution_after_local_storage(world: &World) -> GoodsDistributionPlan {
     let mut productive_industrials = Vec::new();
     let mut productive_commercials = Vec::new();
 
@@ -458,9 +488,6 @@ pub(crate) fn exportable_goods_units_on_network(world: &World, network_id: u32) 
     });
 
     for (entity, kind) in workplaces {
-        if road_network_analysis::access_for(world, entity).network_id != Some(network_id) {
-            continue;
-        }
         match kind {
             BuildingKind::Industrial => productive_industrials.push(entity),
             BuildingKind::Commercial => productive_commercials.push(entity),
@@ -477,7 +504,7 @@ pub(crate) fn exportable_goods_units_on_network(world: &World, network_id: u32) 
         })
         .collect::<HashMap<_, _>>();
 
-    let mut exportable = 0;
+    let mut industrial_surplus = Vec::new();
     for industrial in productive_industrials {
         let mut remaining_goods = industrial_goods_production(world, industrial);
         for commercial in nearest_commercials_for_goods(world, industrial, &productive_commercials)
@@ -492,10 +519,45 @@ pub(crate) fn exportable_goods_units_on_network(world: &World, network_id: u32) 
                 break;
             }
         }
-        exportable += remaining_goods.max(0);
+        industrial_surplus.push((industrial, remaining_goods.max(0)));
     }
 
-    exportable as u32
+    GoodsDistributionPlan {
+        commercial_free_capacity,
+        industrial_surplus,
+    }
+}
+
+pub(crate) fn commercial_goods_demands_after_local_distribution(
+    world: &World,
+) -> Vec<(Entity, u32, u32)> {
+    let mut demands = goods_distribution_after_local_storage(world)
+        .commercial_free_capacity
+        .into_iter()
+        .filter_map(|(commercial, free_capacity)| {
+            let network_id = road_network_analysis::access_for(world, commercial).network_id?;
+            (free_capacity > 0).then_some((commercial, free_capacity as u32, network_id))
+        })
+        .collect::<Vec<_>>();
+    demands.sort_by_key(|(commercial, _units, network_id)| {
+        world
+            .positions
+            .get(commercial)
+            .map(|position| (*network_id, position.y, position.x, commercial.0))
+            .unwrap_or((*network_id, usize::MAX, usize::MAX, commercial.0))
+    });
+    demands
+}
+
+pub(crate) fn exportable_goods_units_on_network(world: &World, network_id: u32) -> u32 {
+    goods_distribution_after_local_storage(world)
+        .industrial_surplus
+        .into_iter()
+        .filter(|(industrial, _units)| {
+            road_network_analysis::access_for(world, *industrial).network_id == Some(network_id)
+        })
+        .map(|(_industrial, units)| units.max(0) as u32)
+        .sum()
 }
 
 fn sort_entities_by_position(world: &World, entities: &mut [Entity]) {
@@ -711,7 +773,7 @@ fn recover_happiness_from_shopping(citizen: &mut Citizen, amount: i32) {
     citizen.morale.actual += recovered;
 }
 
-fn add_commercial_goods(world: &mut World, commercial: Entity, amount: i32) {
+pub(crate) fn add_commercial_goods(world: &mut World, commercial: Entity, amount: i32) {
     if amount <= 0 {
         return;
     }

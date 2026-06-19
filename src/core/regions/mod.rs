@@ -30,7 +30,8 @@ use crate::core::entity::Entity;
 use crate::core::resources::CityStats;
 use crate::core::simulation::{
     TickJobPhase, TickPowerPhase, begin_tick_power_phase, continue_to_job_phase,
-    ensure_derived_state, finish_tick_after_job_phase, refresh_derived_state_for_world,
+    ensure_derived_state, finish_tick_after_goods_phase, finish_tick_after_job_phase,
+    refresh_derived_state_for_world,
 };
 use crate::core::systems::{build, bulldoze, economy, replace, road_connectivity, upgrade};
 use crate::core::world::World;
@@ -183,6 +184,7 @@ pub(crate) struct PendingJobDemand {
 /// Caller-local commercial goods demand that may need producer-exported units.
 pub(crate) struct PendingGoodsDemand {
     pub token: u32,
+    pub commercial: Entity,
     pub units: u32,
     pub caller_network: RegionRoadNetworkId,
 }
@@ -559,12 +561,14 @@ impl RegionState {
         &mut self,
         job_phase: RegionalTickJobPhase,
     ) -> RegionalTickGoodsPhase {
-        // G1 only wires the goods export phase. G2 will replace this empty demand
-        // set with commercial storage needs that would otherwise hit the edge
-        // market.
+        let goods_demands = if job_phase.is_daily() {
+            self.pending_goods_demands()
+        } else {
+            Vec::new()
+        };
         RegionalTickGoodsPhase {
             phase: job_phase,
-            goods_demands: Vec::new(),
+            goods_demands,
         }
     }
 
@@ -572,8 +576,14 @@ impl RegionState {
         &mut self,
         phase: RegionalTickGoodsPhase,
         exported_job_slots: &[Entity],
+        exported_goods_units: u32,
     ) -> CommandResult {
-        self.finish_tick_job_demand_phase(phase.phase, exported_job_slots)
+        finish_tick_after_goods_phase(
+            &mut self.world,
+            phase.phase.phase,
+            exported_job_slots,
+            exported_goods_units,
+        )
     }
 
     pub(crate) fn apply_power_export_grant(
@@ -647,6 +657,10 @@ impl RegionState {
             source: WorkplaceSource::Remote { slot_id },
         });
         self.world.invalidate_jobs_registry();
+    }
+
+    pub(crate) fn add_commercial_goods(&mut self, commercial: Entity, units: u32) {
+        economy::add_commercial_goods(&mut self.world, commercial, units as i32);
     }
 
     /// Returns spare local workplace slot entities reachable from one road network.
@@ -826,6 +840,42 @@ impl RegionState {
                 citizen,
                 caller_network,
             });
+        }
+        demands
+    }
+
+    fn pending_goods_demands(&self) -> Vec<PendingGoodsDemand> {
+        let border_networks = self
+            .network_border_links()
+            .into_iter()
+            .map(|link| link.network)
+            .collect::<Vec<_>>();
+        if border_networks.is_empty() {
+            return Vec::new();
+        }
+
+        let mut demands = Vec::new();
+        for (commercial, units, network_id) in
+            economy::commercial_goods_demands_after_local_distribution(&self.world)
+        {
+            let caller_network = RegionRoadNetworkId {
+                region: self.id,
+                road_network: network_id,
+            };
+            if !border_networks.contains(&caller_network) {
+                continue;
+            }
+            // ponytail: one message per unit because ExportResource grants are
+            // all-or-deny today. If goods capacity gets large, replace this with
+            // a batched request and producer partial-grant support.
+            for _ in 0..units {
+                demands.push(PendingGoodsDemand {
+                    token: demands.len() as u32,
+                    commercial,
+                    units: 1,
+                    caller_network,
+                });
+            }
         }
         demands
     }

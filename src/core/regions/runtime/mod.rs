@@ -289,6 +289,7 @@ pub struct RegionRuntime {
     power_export_producers: Vec<RegionId>,
     job_export_producers: Vec<RegionId>,
     goods_export_producers: Vec<RegionId>,
+    pending_goods_stock: Vec<(Entity, u32)>,
     handle: RegionHandle,
     receiver: RegionEventReceiver,
 }
@@ -532,6 +533,7 @@ impl RegionRuntime {
             power_export_producers: Vec::new(),
             job_export_producers: Vec::new(),
             goods_export_producers: Vec::new(),
+            pending_goods_stock: Vec::new(),
             handle,
             receiver,
         }
@@ -851,8 +853,18 @@ impl RegionRuntime {
         request_id: UiRequestId,
         job_phase: RegionalTickJobPhase,
     ) -> Vec<OutboundMessage> {
+        self.apply_pending_goods_stock();
         let phase = self.state.continue_tick_to_goods_demand_phase(job_phase);
         self.reconcile_goods_export_allocations(request_id, phase)
+    }
+
+    fn apply_pending_goods_stock(&mut self) {
+        // Cross-region goods are stale by one economy settlement and runtime-only.
+        // Save/restart drops this in-flight stock rather than persisting a
+        // consumer-side good without the producer's matching transient allocation.
+        for (commercial, units) in std::mem::take(&mut self.pending_goods_stock) {
+            self.state.add_commercial_goods(commercial, units);
+        }
     }
 
     fn reconcile_goods_export_allocations(
@@ -931,12 +943,15 @@ impl RegionRuntime {
         phase: RegionalTickGoodsPhase,
     ) -> RegionTickResponse {
         let exported_job_slots = self.job_export_allocations.units().collect::<Vec<_>>();
+        let exported_goods_units = self.goods_export_allocations.units().sum();
         RegionTickResponse {
             request_id,
             region_id: self.region_id(),
-            result: self
-                .state
-                .finish_tick_goods_demand_phase(phase, &exported_job_slots),
+            result: self.state.finish_tick_goods_demand_phase(
+                phase,
+                &exported_job_slots,
+                exported_goods_units,
+            ),
         }
     }
 
@@ -1165,7 +1180,11 @@ impl RegionRuntime {
             return Vec::new();
         };
 
-        continuation.pending_demands.remove(position);
+        let demand = continuation.pending_demands.remove(position);
+        if grant.granted && grant.units > 0 {
+            self.pending_goods_stock
+                .push((demand.commercial, grant.units));
+        }
         if !continuation.pending_demands.is_empty() {
             self.tick_state = TickState::WaitingForGoodsExports(continuation);
             return Vec::new();

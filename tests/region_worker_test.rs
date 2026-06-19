@@ -1,6 +1,6 @@
 //! Integration tests for the shared single-threaded region worker.
 
-use small_city::core::regional_types::{RegionCommand, UiRequestId};
+use small_city::core::regional_types::{RegionCommand, RegionTickResponse, UiRequestId};
 use small_city::core::regions::directory::RegionDirectory;
 use small_city::core::regions::runtime::{
     ExportAllocationRequest, JobExportRequest, PowerExportRequest, RegionEvent, RegionRuntime,
@@ -13,6 +13,7 @@ use small_city::core::regions::{
     BorderEdge, BorderLinkId, JobExportGrant, NetworkBorderLink, PowerExportGrant, RegionId,
     RegionNeighborLink, RegionRoadNetworkId, RegionState, RegionalAvailabilityHint,
 };
+use small_city::interface::events::{EconomyBreakdownView, GameEventView};
 use small_city::interface::input::BuildingKind;
 use small_city::interface::view::InspectDetailsView;
 use std::sync::Arc;
@@ -1022,6 +1023,72 @@ fn tick_short_on_power_and_jobs_resolves_both_phases() {
 }
 
 #[test]
+fn road_connected_region_uses_neighbor_goods_before_edge_imports() {
+    let consumer = RegionId(70);
+    let producer = RegionId(71);
+    let mut worker = goods_trade_worker(true, consumer, producer);
+
+    let (first_day_consumer, first_day_producer) =
+        run_goods_trade_days(&mut worker, consumer, producer, 1);
+    assert_eq!(
+        first_day_consumer.local_goods_sold, 0,
+        "{first_day_consumer:?}"
+    );
+    assert_eq!(
+        first_day_producer.exported_goods, 4,
+        "{first_day_producer:?}"
+    );
+
+    let (consumer_economy, producer_economy) =
+        run_goods_trade_days(&mut worker, consumer, producer, 1);
+
+    assert!(
+        consumer_economy.local_goods_sold > 0,
+        "{consumer_economy:?}"
+    );
+    assert_eq!(
+        consumer_economy.imported_goods_sold, 0,
+        "{consumer_economy:?}"
+    );
+    assert_eq!(producer_economy.exported_goods, 0, "{producer_economy:?}");
+    assert_eq!(producer_economy.export_tax, 0, "{producer_economy:?}");
+    assert!(producer_economy.manufacturing_tax > 0);
+}
+
+#[test]
+fn disconnected_region_still_uses_edge_goods_market() {
+    let consumer = RegionId(72);
+    let producer = RegionId(73);
+    let mut worker = goods_trade_worker(false, consumer, producer);
+
+    let (consumer_economy, producer_economy) =
+        run_goods_trade_days(&mut worker, consumer, producer, 2);
+
+    assert_eq!(consumer_economy.local_goods_sold, 0);
+    assert_eq!(consumer_economy.imported_goods_sold, 1);
+    assert_eq!(producer_economy.exported_goods, 4);
+    assert!(producer_economy.export_tax > 0);
+}
+
+#[test]
+fn save_restart_drops_in_flight_goods_stock_without_double_counting() {
+    let consumer = RegionId(74);
+    let producer = RegionId(75);
+    let mut worker = goods_trade_worker(true, consumer, producer);
+
+    let _ = run_goods_trade_days(&mut worker, consumer, producer, 1);
+    worker.restart_region_from_save_record(consumer).unwrap();
+    worker.restart_region_from_save_record(producer).unwrap();
+
+    let (consumer_economy, producer_economy) =
+        run_goods_trade_days(&mut worker, consumer, producer, 1);
+
+    assert_eq!(consumer_economy.local_goods_sold, 0, "{consumer_economy:?}");
+    assert_eq!(producer_economy.exported_goods, 4, "{producer_economy:?}");
+    assert!(producer_economy.export_tax > 0, "{producer_economy:?}");
+}
+
+#[test]
 fn two_worker_barrier_matches_single_worker_for_power_and_jobs_script() {
     let consumer = RegionId(90);
     let producer = RegionId(91);
@@ -1280,6 +1347,96 @@ fn run_job_growth_days(
     }
 }
 
+fn goods_trade_worker(link_regions: bool, consumer: RegionId, producer: RegionId) -> RegionWorker {
+    let mut worker = worker_with_region_states(
+        WorkerId(70),
+        vec![
+            goods_consumer_region(consumer),
+            goods_producer_region(producer),
+        ],
+    );
+    if link_regions {
+        worker.set_region_topology(vec![
+            RegionNeighborLink::new(consumer, BorderEdge::West, producer),
+            RegionNeighborLink::new(producer, BorderEdge::East, consumer),
+        ]);
+    }
+    worker
+}
+
+fn goods_consumer_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 3, 3);
+    assert!(region.build(0, 0, BuildingKind::Road).success);
+    assert!(region.build(0, 1, BuildingKind::Road).success);
+    assert!(region.build(1, 1, BuildingKind::Road).success);
+    assert!(region.build(2, 1, BuildingKind::Road).success);
+    assert!(region.build(1, 0, BuildingKind::Commercial).success);
+    assert!(region.build(0, 2, BuildingKind::Residential).success);
+    assert!(region.build(2, 2, BuildingKind::PowerPlant).success);
+    region
+}
+
+fn goods_producer_region(region_id: RegionId) -> RegionState {
+    let mut region = RegionState::new(region_id, 3, 2);
+    assert!(region.build(2, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 0, BuildingKind::Road).success);
+    assert!(region.build(1, 1, BuildingKind::Road).success);
+    assert!(region.build(0, 0, BuildingKind::Industrial).success);
+    assert!(region.build(0, 1, BuildingKind::PowerPlant).success);
+    region
+}
+
+fn run_goods_trade_days(
+    worker: &mut RegionWorker,
+    consumer: RegionId,
+    producer: RegionId,
+    days: u64,
+) -> (EconomyBreakdownView, EconomyBreakdownView) {
+    let mut consumer_economy = empty_economy();
+    let mut producer_economy = empty_economy();
+    for request_id in 1..=(days * 24) {
+        worker.push_event(consumer, tick(request_id)).unwrap();
+        worker
+            .push_event(producer, tick(request_id + 100_000))
+            .unwrap();
+        for reply in drain_worker_tick_replies(worker) {
+            if reply.region_id == consumer {
+                consumer_economy = tick_economy(&reply.result.events[0]);
+            } else if reply.region_id == producer {
+                producer_economy = tick_economy(&reply.result.events[0]);
+            }
+        }
+    }
+    (consumer_economy, producer_economy)
+}
+
+fn tick_economy(event: &GameEventView) -> EconomyBreakdownView {
+    match event {
+        GameEventView::TickSummary { economy, .. } => *economy,
+        _ => panic!("expected tick summary"),
+    }
+}
+
+fn empty_economy() -> EconomyBreakdownView {
+    EconomyBreakdownView {
+        salaries_paid: 0,
+        workplace_tax: 0,
+        rent_income: 0,
+        commercial_sales_tax: 0,
+        shoppers_served: 0,
+        local_goods_produced: 0,
+        local_goods_stored: 0,
+        local_goods_sold: 0,
+        imported_goods_sold: 0,
+        exported_goods: 0,
+        manufacturing_tax: 0,
+        export_tax: 0,
+        rent_failures: 0,
+        maintenance_cost: 0,
+        net: 0,
+    }
+}
+
 fn imported_job_count(worker: &RegionWorker, region_id: RegionId) -> usize {
     worker
         .region(region_id)
@@ -1379,6 +1536,19 @@ fn drain_worker(worker: &mut RegionWorker) {
     for _ in 0..16 {
         if worker.process_region_events(1).processed_regions == 0 {
             return;
+        }
+    }
+
+    panic!("worker did not drain");
+}
+
+fn drain_worker_tick_replies(worker: &mut RegionWorker) -> Vec<RegionTickResponse> {
+    let mut replies = Vec::new();
+    for _ in 0..16 {
+        let summary = worker.process_region_events(1);
+        replies.extend(summary.tick_replies);
+        if summary.processed_regions == 0 {
+            return replies;
         }
     }
 

@@ -1,6 +1,7 @@
 # Cross-region goods transfer plan
 
-Status: proposal (not yet implemented).
+Status: implemented — G1 + G2. Follow-ups: exact route distance on
+`GoodsExportGrant`; goods-specific multi-worker parity test.
 
 This mission lets a road-connected industrial in one region supply goods to a
 shop in a neighboring region, instead of both falling back to the abstract edge
@@ -112,11 +113,14 @@ a third impl alongside `PowerExport` / `JobExport`.
 
    The taxes that *do* apply to an inter-region transfer are the ordinary
    **domestic** ones, split by who did the activity:
-   - manufacturing tax → **producer** region (it made the goods); distance still
-     scales the margin, so longer cross-region road runs earn less, same as today.
+   - manufacturing tax → **producer** region (it made the goods). Current G2 uses
+     the producer's existing map-edge `import_export_distance` as the margin
+     proxy because `GoodsExportGrant` does not yet carry the exact
+     producer-to-consumer route distance. Add that route distance to the grant
+     before claiming longer cross-region road runs are priced exactly.
    - sales tax → **consumer** region (it sold to its citizens).
 
-   So an inter-region good is economically a *local good with a longer road* —
+   So an inter-region good is economically a *local good moved inside the city* —
    not a re-import. This is the goods analog of the jobs "economic ownership flows
    to producer" twist (§4b point 2), minus any border tax.
 
@@ -157,7 +161,9 @@ act on would mint tax out of nothing.
 - **Contention:** two consumer regions competing for one producer's surplus →
   total grants never exceed the reserved surplus (the determinism guard).
 - **Save/load + parity guard** unchanged (the surplus hint is transient like
-  `importable_remote_jobs`).
+  `importable_remote_jobs`). Goods currently rides the same generic worker
+  routing path as power/jobs; a goods-specific multi-worker parity test remains
+  useful follow-up coverage rather than a separate G2 behavior rule.
 
 ---
 
