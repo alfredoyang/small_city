@@ -1,6 +1,6 @@
 # City-aware goods in the commercial inspect view
 
-Status: Part A implemented; Part B pending.
+Status: Part A implemented; Part B implemented for commercial goods-supply inspect notes.
 
 Follow-up to [cross-region-goods-transfer-plan.md](cross-region-goods-transfer-plan.md).
 Now that goods cross regions inside one city (G1+G2), the commercial/industrial
@@ -70,6 +70,14 @@ into storage and only `imported_goods_sold` comes from the edge.
 
 Make `goods_route_distance` (commercial→industrial) cross-region aware so the
 "unreachable" note is correct when the supplier is across a border.
+
+Implemented scope: commercial inspect now layers a display-only worker hint on
+top of local `road_network_analysis`. If the shop has no local industrial route
+but its local road network is in a cross-region component with published spare
+city-goods supply, the note reads "reachable via neighbor region." Residential
+commute/shop and industrial goods-demand notes still need their own published
+summary data before they can be made cross-region aware without reading neighbor
+worlds live.
 
 - This needs the **cross-region road-component reachability** (the worker's
   discovery graph). The inspect path does not have it today:

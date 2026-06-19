@@ -18,6 +18,7 @@ use crate::core::regions::{
     GoodsExportGrant, JobExportGrant, NetworkBorderLink, PowerExportGrant, RegionId,
     RegionNeighborLink, RegionRoadNetworkId, RegionState, RegionalAvailabilityHint,
 };
+use crate::core::world::CrossRegionGoodsRoutes;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -348,6 +349,25 @@ impl RegionWorker {
             )
         };
         self.regions[index].set_importable_remote_jobs(importable_remote_jobs);
+    }
+
+    pub(crate) fn refresh_cross_region_goods_routes(&mut self, region_id: RegionId) {
+        let Some(index) = self
+            .regions
+            .iter()
+            .position(|runtime| runtime.region_id() == region_id)
+        else {
+            return;
+        };
+        let routes = {
+            let runtime = &self.regions[index];
+            cross_region_goods_routes_for_region(
+                &self.directory.discovery_snapshot(),
+                runtime.region_id(),
+                &runtime.state().network_border_links(),
+            )
+        };
+        self.regions[index].set_cross_region_goods_routes(routes);
     }
 
     pub fn handle_for(&self, region_id: RegionId) -> Option<RegionHandle> {
@@ -768,6 +788,37 @@ fn importable_remote_jobs_for_region(
     }
 
     remote_slots.len() as i32
+}
+
+fn cross_region_goods_routes_for_region(
+    discovery: &CrossRegionDiscovery,
+    region_id: RegionId,
+    border_links: &[NetworkBorderLink],
+) -> CrossRegionGoodsRoutes {
+    let mut supplier_networks = BTreeSet::new();
+    for link in border_links {
+        if link.network.region != region_id {
+            continue;
+        }
+        let has_remote_supplier = discovery
+            .component_of(link.network)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|network| network.region != region_id)
+            .any(|network| {
+                discovery
+                    .availability_hints
+                    .iter()
+                    .any(|hint| hint.network == *network && hint.spare_goods_units > 0)
+            });
+        if has_remote_supplier {
+            supplier_networks.insert(link.network.road_network);
+        }
+    }
+
+    CrossRegionGoodsRoutes {
+        supplier_networks: supplier_networks.into_iter().collect(),
+    }
 }
 
 /// The variable bits of one cross-region export resource for the shared routing.

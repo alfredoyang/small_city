@@ -104,6 +104,47 @@ fn regional_view_reports_city_goods_and_city_aware_inspect_notes() {
 }
 
 #[test]
+fn commercial_inspect_reports_neighbor_goods_route_when_border_connected() {
+    let game = RegionalGame::two_region_default(3, 3).unwrap();
+    build_goods_producer(&game, RegionId(1));
+    build_goods_consumer(&game, RegionId(2));
+
+    for _ in 0..24 {
+        game.tick_all_regions().unwrap();
+    }
+
+    let inspect = game.inspect_region(RegionId(2), 1, 0).unwrap();
+    let goods_note = inspect
+        .explanations
+        .iter()
+        .find(|note| note.starts_with("Goods: nearest industrial route"))
+        .expect("goods route note");
+
+    assert!(goods_note.contains("reachable via neighbor region"));
+    assert!(!goods_note.contains("unreachable by road"));
+}
+
+#[test]
+fn commercial_inspect_keeps_unreachable_goods_route_without_border_link() {
+    let game = RegionalGame::two_region_default(3, 3).unwrap();
+    build_goods_producer(&game, RegionId(1));
+    build_goods_consumer_without_border_link(&game, RegionId(2));
+
+    for _ in 0..24 {
+        game.tick_all_regions().unwrap();
+    }
+
+    let inspect = game.inspect_region(RegionId(2), 1, 0).unwrap();
+    let goods_note = inspect
+        .explanations
+        .iter()
+        .find(|note| note.starts_with("Goods: nearest industrial route"))
+        .expect("goods route note");
+
+    assert!(goods_note.contains("unreachable by road"));
+}
+
+#[test]
 fn remote_spare_jobs_allow_connected_residential_population_growth() {
     let game = RegionalGame::two_region_default(4, 3).unwrap();
     build_connected_remote_job_fixture(&game);
@@ -301,6 +342,14 @@ fn build_goods_producer(game: &RegionalGame, region: RegionId) {
 fn build_goods_consumer(game: &RegionalGame, region: RegionId) {
     build(game, region, 0, 0, BuildingKind::Road);
     build(game, region, 0, 1, BuildingKind::Road);
+    build(game, region, 1, 1, BuildingKind::Road);
+    build(game, region, 2, 1, BuildingKind::Road);
+    build(game, region, 1, 0, BuildingKind::Commercial);
+    build(game, region, 0, 2, BuildingKind::Residential);
+    build(game, region, 2, 2, BuildingKind::PowerPlant);
+}
+
+fn build_goods_consumer_without_border_link(game: &RegionalGame, region: RegionId) {
     build(game, region, 1, 1, BuildingKind::Road);
     build(game, region, 2, 1, BuildingKind::Road);
     build(game, region, 1, 0, BuildingKind::Commercial);

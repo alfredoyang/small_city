@@ -409,7 +409,7 @@ fn explain_road_access(
         BuildingKind::Commercial => {
             explanations.push(format!(
                 "Goods: nearest industrial route is {}.",
-                distance_note(access.goods_route_distance)
+                goods_supply_note(world, access)
             ));
             explanations.push(format!(
                 "Trade: edge access is {}.",
@@ -428,6 +428,19 @@ fn explain_road_access(
         }
         _ => {}
     }
+}
+
+fn goods_supply_note(world: &World, access: road_network_analysis::RoadAccess) -> String {
+    if access.goods_route_distance.is_some() {
+        return distance_note(access.goods_route_distance);
+    }
+    if world
+        .cross_region_goods_routes
+        .has_supplier_on(access.network_id)
+    {
+        return "reachable via neighbor region".to_string();
+    }
+    distance_note(None)
 }
 
 fn explain_business_reinvestment(

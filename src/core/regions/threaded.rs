@@ -312,6 +312,7 @@ fn inspect_from_worker(
     y: usize,
 ) -> Option<InspectView> {
     worker.refresh_importable_remote_jobs(region_id);
+    worker.refresh_cross_region_goods_routes(region_id);
     worker
         .region_mut(region_id)
         .map(|runtime| runtime.inspect(x, y))

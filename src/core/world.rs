@@ -46,6 +46,8 @@ pub(crate) struct World {
     registry_cache: RefCell<ResourceRegistryCache>,
     #[serde(skip, default)]
     pub(crate) importable_remote_jobs: i32,
+    #[serde(skip, default)]
+    pub(crate) cross_region_goods_routes: CrossRegionGoodsRoutes,
     // DT1: marks the applied derived state (powered flags, stats, pollution,
     // local effects, happiness) out of date after a config change. Unlike the
     // registry cache above (which stores derived *resolution data* recomputed
@@ -90,6 +92,7 @@ impl World {
             road_analysis: RoadNetworkAnalysis::default(),
             registry_cache: RefCell::default(),
             importable_remote_jobs: 0,
+            cross_region_goods_routes: CrossRegionGoodsRoutes::default(),
             derived_dirty: Cell::new(false),
             positions: HashMap::new(),
             buildings: HashMap::new(),
@@ -254,6 +257,24 @@ impl World {
 
     fn record_mut(&mut self, entity: Entity) -> &mut EntityRecord {
         self.entities.entry(entity).or_default()
+    }
+}
+
+/// Display-only cross-region road reachability published by the regional worker.
+///
+/// The local road analysis stays local-only. These network ids only let inspect
+/// avoid saying "unreachable" when a connected neighbor has already published
+/// spare city-goods supply for the same cross-region road component.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct CrossRegionGoodsRoutes {
+    pub supplier_networks: Vec<u32>,
+}
+
+impl CrossRegionGoodsRoutes {
+    pub(crate) fn has_supplier_on(&self, network_id: Option<u32>) -> bool {
+        network_id
+            .map(|network_id| self.supplier_networks.binary_search(&network_id).is_ok())
+            .unwrap_or(false)
     }
 }
 

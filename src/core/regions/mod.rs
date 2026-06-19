@@ -34,7 +34,7 @@ use crate::core::simulation::{
     refresh_derived_state_for_world,
 };
 use crate::core::systems::{build, bulldoze, economy, replace, road_connectivity, upgrade};
-use crate::core::world::World;
+use crate::core::world::{CrossRegionGoodsRoutes, World};
 use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
 use crate::interface::events::CommandResult;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
@@ -491,6 +491,10 @@ impl RegionState {
 
     pub(crate) fn set_importable_remote_jobs(&mut self, jobs: i32) {
         self.world.importable_remote_jobs = jobs.max(0);
+    }
+
+    pub(crate) fn set_cross_region_goods_routes(&mut self, routes: CrossRegionGoodsRoutes) {
+        self.world.cross_region_goods_routes = routes;
     }
 
     pub(crate) fn power_network_remaining_capacity(&self, network: RegionRoadNetworkId) -> i32 {

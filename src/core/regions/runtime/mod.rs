@@ -91,6 +91,7 @@ use crate::core::regions::{
     PowerExportGrant, RegionId, RegionRoadNetworkId, RegionState, RegionalTickGoodsPhase,
     RegionalTickJobPhase, RegionalTickPowerPhase,
 };
+use crate::core::world::CrossRegionGoodsRoutes;
 use crate::interface::input::MapOverlayInput;
 
 #[derive(Debug)]
@@ -549,6 +550,10 @@ impl RegionRuntime {
 
     pub(crate) fn set_importable_remote_jobs(&mut self, jobs: i32) {
         self.state.set_importable_remote_jobs(jobs);
+    }
+
+    pub(crate) fn set_cross_region_goods_routes(&mut self, routes: CrossRegionGoodsRoutes) {
+        self.state.set_cross_region_goods_routes(routes);
     }
 
     /// Inspects one cell, recomputing the derived pass first if a paused command
