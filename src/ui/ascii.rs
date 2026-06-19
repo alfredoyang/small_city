@@ -305,6 +305,13 @@ fn render_status(stdout: &mut impl Write, view: &GameView) -> io::Result<()> {
         status.power.total_capacity,
         status.power.total_demand,
         status.power.total_shortage
+    )?;
+    writeln!(
+        stdout,
+        "Goods: city produced {} | outside imports {} | outside exports {}",
+        status.goods.city_goods_produced,
+        status.goods.goods_imported_from_outside,
+        status.goods.goods_exported_outside
     )
 }
 

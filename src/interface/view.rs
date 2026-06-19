@@ -85,6 +85,14 @@ pub struct CityStatusView {
     pub average_citizen_money: Option<i32>,
     pub demand: CityDemand,
     pub power: PowerStatusView,
+    pub goods: CityGoodsView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CityGoodsView {
+    pub city_goods_produced: i32,
+    pub goods_imported_from_outside: i32,
+    pub goods_exported_outside: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -58,6 +58,7 @@ pub(crate) fn view_world_with_overlay(world: &World, overlay: MapOverlayInput) -
                 total_supplied: world.stats.power.total_power_supplied,
                 total_shortage: world.stats.power.total_power_shortage,
             },
+            goods: Default::default(),
         },
         build_options: [
             BuildingKind::Road,
@@ -314,7 +315,7 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
                     economy::commercial_sales_tax_for_purchase(world, entity)
                 ));
                 explanations.push(format!(
-                    "Goods: {}/{} local goods stored; imports are used when storage is empty.",
+                    "Goods: {}/{} city goods stored; goods from outside the city are bought only when storage is empty.",
                     economy::commercial_goods_stored(world, entity),
                     economy::commercial_goods_capacity_for_entity(world, entity)
                 ));
@@ -332,7 +333,7 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
             if road_connected && is_consumer_powered(world, entity) {
                 explanations.push("Provides 3 effective jobs and income.".to_string());
                 explanations.push(format!(
-                    "Goods: produces {} local goods per turn for commercial storage or export.",
+                    "Goods: produces {} city goods per turn for commercial storage or outside-city export.",
                     economy::industrial_goods_production(world, entity)
                 ));
                 explain_business_reinvestment(world, entity, building.kind, &mut explanations);

@@ -961,6 +961,12 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &Tui
             status.power.total_shortage
         )),
         Line::from(format!(
+            "Goods: city produced {} | outside imports {} | outside exports {}",
+            status.goods.city_goods_produced,
+            status.goods.goods_imported_from_outside,
+            status.goods.goods_exported_outside
+        )),
+        Line::from(format!(
             "Demand: R {} | C {} | I {}",
             demand_label(status.demand.residential),
             demand_label(status.demand.commercial),

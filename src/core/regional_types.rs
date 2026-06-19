@@ -8,6 +8,7 @@ use crate::core::regions::RegionId;
 use crate::interface::events::CommandResult;
 use crate::interface::input::BuildingKind;
 use crate::interface::view::BuildPreviewView;
+use crate::interface::view::CityGoodsView;
 use crate::interface::view::GameView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -58,6 +59,7 @@ pub struct RegionTickResponse {
 pub struct RegionalGameView {
     pub regions: Vec<RegionViewSnapshot>,
     pub selected_region: Option<RegionId>,
+    pub goods: CityGoodsView,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

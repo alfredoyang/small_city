@@ -9,9 +9,11 @@
 //! can see rebuildable imported-resource summaries from neighbors, but economy,
 //! jobs, happiness, and other local systems do not consume those imports yet.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -26,9 +28,9 @@ pub use crate::core::regional_types::{
 use crate::core::regions::{
     BorderEdge, RegionId, RegionNeighborLink, RegionState, RegionStateSaveRecord,
 };
-use crate::interface::events::CommandResult;
+use crate::interface::events::{CommandResult, EconomyBreakdownView, GameEventView};
 use crate::interface::input::{BuildingKind, MapOverlayInput};
-use crate::interface::view::{BuildPreviewView, GameView, InspectView};
+use crate::interface::view::{BuildPreviewView, CityGoodsView, GameView, InspectView};
 
 const DEFAULT_SINGLE_REGION_ID: RegionId = RegionId(1);
 
@@ -198,6 +200,7 @@ pub struct RegionalGame {
     region_worker_indexes: Option<Vec<usize>>,
     selected_region: Option<RegionId>,
     next_request_id: AtomicU64,
+    latest_goods_by_region: Mutex<BTreeMap<RegionId, CityGoodsView>>,
 }
 
 impl RegionalGame {
@@ -280,6 +283,7 @@ impl RegionalGame {
             region_worker_indexes,
             selected_region,
             next_request_id: AtomicU64::new(1),
+            latest_goods_by_region: Mutex::new(BTreeMap::new()),
         };
 
         Ok(game)
@@ -385,9 +389,15 @@ impl RegionalGame {
             regions.push(snapshot);
         }
 
+        let goods = self.city_goods();
+        for snapshot in &mut regions {
+            snapshot.view.status.goods = goods;
+        }
+
         Ok(RegionalGameView {
             regions,
             selected_region: self.selected_region,
+            goods,
         })
     }
 
@@ -425,9 +435,12 @@ impl RegionalGame {
 
     pub fn tick_region(&self, region_id: RegionId) -> Result<CommandResult, RegionalGameError> {
         let request_id = self.next_request_id();
-        self.runner
+        let result = self
+            .runner
             .tick_region(request_id, region_id)
-            .map_err(RegionalGameError::from)
+            .map_err(RegionalGameError::from)?;
+        self.record_tick_goods(region_id, &result);
+        Ok(result)
     }
 
     pub fn tick_all_regions(&self) -> Result<(), RegionalGameError> {
@@ -437,7 +450,10 @@ impl RegionalGame {
             .copied()
             .map(|region_id| (self.next_request_id(), region_id))
             .collect::<Vec<_>>();
-        self.runner.tick_regions(&requests)?;
+        let results = self.runner.tick_regions(&requests)?;
+        for ((_, region_id), result) in requests.iter().zip(results.iter()) {
+            self.record_tick_goods(*region_id, result);
+        }
         Ok(())
     }
 
@@ -599,6 +615,29 @@ impl RegionalGame {
 
     fn next_request_id(&self) -> UiRequestId {
         UiRequestId(self.next_request_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn record_tick_goods(&self, region_id: RegionId, result: &CommandResult) {
+        let Some(goods) = result.events.iter().find_map(tick_goods_summary) else {
+            return;
+        };
+        self.latest_goods_by_region
+            .lock()
+            .expect("regional goods summary lock poisoned")
+            .insert(region_id, goods);
+    }
+
+    fn city_goods(&self) -> CityGoodsView {
+        self.latest_goods_by_region
+            .lock()
+            .expect("regional goods summary lock poisoned")
+            .values()
+            .fold(CityGoodsView::default(), |mut total, goods| {
+                total.city_goods_produced += goods.city_goods_produced;
+                total.goods_imported_from_outside += goods.goods_imported_from_outside;
+                total.goods_exported_outside += goods.goods_exported_outside;
+                total
+            })
     }
 
     fn selected_region_or_first(&self) -> Result<RegionId, RegionalGameError> {
@@ -787,6 +826,25 @@ fn validate_layout(
             columns: layout.columns,
             region_count,
         })
+    }
+}
+
+fn tick_goods_summary(event: &GameEventView) -> Option<CityGoodsView> {
+    let GameEventView::TickSummary { economy, .. } = event else {
+        return None;
+    };
+    let goods = goods_summary_from_economy(*economy);
+    (goods.city_goods_produced > 0
+        || goods.goods_imported_from_outside > 0
+        || goods.goods_exported_outside > 0)
+        .then_some(goods)
+}
+
+fn goods_summary_from_economy(economy: EconomyBreakdownView) -> CityGoodsView {
+    CityGoodsView {
+        city_goods_produced: economy.local_goods_produced,
+        goods_imported_from_outside: economy.imported_goods_sold,
+        goods_exported_outside: economy.exported_goods,
     }
 }
 

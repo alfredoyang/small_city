@@ -114,7 +114,7 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
 
     assert_eq!(
         commercial.details,
-        // Commercial inspect now includes local goods inventory through the
+        // Commercial inspect includes city goods inventory through the
         // view model, because storage lives on the commercial building and must
         // be visible without exposing ECS internals.
         Some(InspectDetailsView::Commercial {
@@ -135,8 +135,8 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
     );
     assert_eq!(
         industrial.details,
-        // Industrial inspect now includes goods production so players can see
-        // how much local supply the factory contributes to nearby commercial.
+        // Industrial inspect includes goods production so players can see
+        // how much city supply the factory contributes to nearby commercial.
         Some(InspectDetailsView::Industrial {
             powered: true,
             power_demand: 3,
@@ -160,6 +160,18 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
     assert_eq!(
         format_inspect(&industrial),
         "(2, 0) Industrial | Powered: Yes | Demand: 3 | Road: Yes | Level: 1 | Maintenance: 1 | Goods: 4 | Business: 3/14 recent 3 ready No | Jobs: 3"
+    );
+    assert!(
+        commercial
+            .explanations
+            .iter()
+            .any(|note| note.contains("city goods stored"))
+    );
+    assert!(
+        !commercial
+            .explanations
+            .iter()
+            .any(|note| note.contains("local goods stored"))
     );
 }
 

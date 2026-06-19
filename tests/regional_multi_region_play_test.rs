@@ -68,6 +68,42 @@ fn selected_region_switching_changes_composed_view_deterministically() {
 }
 
 #[test]
+fn regional_view_reports_city_goods_and_city_aware_inspect_notes() {
+    let game = RegionalGame::two_region_default(3, 3).unwrap();
+    build_goods_producer(&game, RegionId(1));
+    build_goods_consumer(&game, RegionId(2));
+
+    for _ in 0..(2 * 24) {
+        game.tick_all_regions().unwrap();
+    }
+
+    let view = game.view().unwrap();
+    assert!(view.goods.city_goods_produced > 0, "{:?}", view.goods);
+    assert_eq!(
+        view.goods.goods_imported_from_outside, 0,
+        "{:?}",
+        view.goods
+    );
+
+    game.tick_all_regions().unwrap();
+    assert_eq!(game.view().unwrap().goods, view.goods);
+
+    let inspect = game.inspect_region(RegionId(2), 1, 0).unwrap();
+    assert!(
+        inspect
+            .explanations
+            .iter()
+            .any(|note| note.contains("city goods"))
+    );
+    assert!(
+        !inspect
+            .explanations
+            .iter()
+            .any(|note| note.contains("local goods"))
+    );
+}
+
+#[test]
 fn remote_spare_jobs_allow_connected_residential_population_growth() {
     let game = RegionalGame::two_region_default(4, 3).unwrap();
     build_connected_remote_job_fixture(&game);
@@ -252,6 +288,24 @@ fn build_bridge_workplace_double_count_fixture(game: &RegionalGame) {
 
 fn build(game: &RegionalGame, region: RegionId, x: usize, y: usize, kind: BuildingKind) {
     assert!(game.build(region, x, y, kind).unwrap().success);
+}
+
+fn build_goods_producer(game: &RegionalGame, region: RegionId) {
+    build(game, region, 2, 0, BuildingKind::Road);
+    build(game, region, 1, 0, BuildingKind::Road);
+    build(game, region, 1, 1, BuildingKind::Road);
+    build(game, region, 0, 0, BuildingKind::Industrial);
+    build(game, region, 0, 1, BuildingKind::PowerPlant);
+}
+
+fn build_goods_consumer(game: &RegionalGame, region: RegionId) {
+    build(game, region, 0, 0, BuildingKind::Road);
+    build(game, region, 0, 1, BuildingKind::Road);
+    build(game, region, 1, 1, BuildingKind::Road);
+    build(game, region, 2, 1, BuildingKind::Road);
+    build(game, region, 1, 0, BuildingKind::Commercial);
+    build(game, region, 0, 2, BuildingKind::Residential);
+    build(game, region, 2, 2, BuildingKind::PowerPlant);
 }
 
 fn tick_region_for_one_day(game: &RegionalGame, region: RegionId) {
