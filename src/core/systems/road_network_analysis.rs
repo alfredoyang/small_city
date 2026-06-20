@@ -243,7 +243,7 @@ fn nearest_distance(roads: &[Entity], distances: &HashMap<Entity, u32>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::{access_for, run};
-    use crate::core::components::{Building, BuildingData, Position};
+    use crate::core::components::{Building, BuildingData, Footprint, Position};
     use crate::core::world::World;
     use crate::interface::input::BuildingKind;
 
@@ -310,6 +310,7 @@ mod tests {
                 kind,
                 level: 1,
                 data: BuildingData::None,
+                footprint: Footprint::single(),
             },
         );
         assert!(world.grid.set(x, y, entity));

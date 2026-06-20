@@ -1,8 +1,8 @@
 //! Shared building placement logic used by build and replace command systems.
 
 use crate::core::components::{
-    Building, BuildingData, BusinessFinance, HappinessEffect, PollutionSource, Population,
-    Position, PowerConsumer, PowerProvider,
+    Building, BuildingData, BusinessFinance, Footprint, HappinessEffect, PollutionSource,
+    Population, Position, PowerConsumer, PowerProvider,
 };
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;
@@ -18,6 +18,7 @@ pub(crate) fn place_building(world: &mut World, x: usize, y: usize, kind: Buildi
             kind,
             level: 1,
             data: building_data_for_kind(kind),
+            footprint: Footprint::single(),
         },
     );
 

@@ -18,6 +18,33 @@ pub struct Position {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// A building's rectangular footprint, anchored at its `Position` (top-left corner).
+///
+/// Buildings start 1x1 and (from the multi-cell upgrade work) grow to a larger rectangle on
+/// upgrade. The footprint cells are `anchor.x .. anchor.x + width` by `anchor.y .. anchor.y +
+/// height`; every one of those grid cells maps back to the same building entity.
+pub struct Footprint {
+    pub width: u8,
+    pub height: u8,
+}
+
+impl Footprint {
+    /// The default single-cell footprint.
+    pub const fn single() -> Self {
+        Self {
+            width: 1,
+            height: 1,
+        }
+    }
+}
+
+impl Default for Footprint {
+    fn default() -> Self {
+        Self::single()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Building identity and upgrade level for entities placed on the grid.
 ///
 /// `kind` determines which companion components are attached by placement: residential buildings
@@ -33,6 +60,10 @@ pub struct Building {
     /// keep durable local goods inventory here so it stays attached to the building itself.
     #[serde(default)]
     pub data: BuildingData,
+    /// Rectangular footprint anchored at this building's `Position`. Defaults to 1x1 so saves
+    /// written before multi-cell buildings load unchanged.
+    #[serde(default)]
+    pub footprint: Footprint,
 }
 
 fn default_building_level() -> u8 {
@@ -240,4 +271,18 @@ pub struct PollutionSource {
 /// happiness amount.
 pub struct HappinessEffect {
     pub amount: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn building_without_footprint_field_defaults_to_single_cell() {
+        // Saves written before multi-cell buildings have no footprint; they must load as 1x1.
+        let building: Building = serde_json::from_str(r#"{"kind":"Residential"}"#)
+            .expect("legacy building json deserializes");
+        assert_eq!(building.footprint, Footprint::single());
+        assert_eq!(building.level, 1);
+    }
 }

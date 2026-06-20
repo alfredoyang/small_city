@@ -281,7 +281,9 @@ impl CrossRegionGoodsRoutes {
 #[cfg(test)]
 mod tests {
     use super::World;
-    use crate::core::components::{Building, BuildingData, Citizen, Morale, Population, Position};
+    use crate::core::components::{
+        Building, BuildingData, Citizen, Footprint, Morale, Population, Position,
+    };
     use crate::interface::input::BuildingKind;
 
     #[test]
@@ -296,6 +298,7 @@ mod tests {
                 kind: BuildingKind::Residential,
                 level: 1,
                 data: BuildingData::None,
+                footprint: Footprint::single(),
             },
         );
         world.attach_population(entity, Population { current: 0, max: 5 });
@@ -342,6 +345,7 @@ mod tests {
                 kind: BuildingKind::Park,
                 level: 1,
                 data: BuildingData::None,
+                footprint: Footprint::single(),
             },
         );
         world.entities.clear();

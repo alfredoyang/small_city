@@ -120,7 +120,7 @@ fn manhattan_distance(ax: usize, ay: usize, bx: usize, by: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{DesirabilityLevel, desirability_level, run};
-    use crate::core::components::{Building, BuildingData, Position};
+    use crate::core::components::{Building, BuildingData, Footprint, Position};
     use crate::core::world::World;
     use crate::interface::input::BuildingKind;
 
@@ -135,6 +135,7 @@ mod tests {
                 kind: BuildingKind::Park,
                 level: 1,
                 data: BuildingData::None,
+                footprint: Footprint::single(),
             },
         );
 
@@ -156,6 +157,7 @@ mod tests {
                 kind: BuildingKind::Industrial,
                 level: 1,
                 data: BuildingData::None,
+                footprint: Footprint::single(),
             },
         );
 

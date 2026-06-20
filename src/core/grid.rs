@@ -49,7 +49,41 @@ impl Grid {
         self.index(x, y).and_then(|index| self.cells[index].take())
     }
 
+    /// Clears every cell of a `width` x `height` rectangle anchored at `(x, y)`. Used to remove a
+    /// multi-cell building from all the cells it occupies. Out-of-bounds cells are skipped.
+    pub fn clear_footprint(&mut self, x: usize, y: usize, width: usize, height: usize) {
+        for cy in y..y.saturating_add(height) {
+            for cx in x..x.saturating_add(width) {
+                if let Some(index) = self.index(cx, cy) {
+                    self.cells[index] = None;
+                }
+            }
+        }
+    }
+
     fn index(&self, x: usize, y: usize) -> Option<usize> {
         self.contains(x, y).then_some(y * self.width + x)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_footprint_clears_the_whole_rectangle_and_nothing_else() {
+        let mut grid = Grid::new(4, 4);
+        let building = Entity(1);
+        for &(x, y) in &[(1, 1), (2, 1), (1, 2), (2, 2)] {
+            grid.set(x, y, building);
+        }
+        grid.set(0, 0, Entity(2)); // outside the footprint
+
+        grid.clear_footprint(1, 1, 2, 2);
+
+        for &(x, y) in &[(1, 1), (2, 1), (1, 2), (2, 2)] {
+            assert_eq!(grid.get(x, y), None);
+        }
+        assert_eq!(grid.get(0, 0), Some(Entity(2)), "neighbours are untouched");
     }
 }
