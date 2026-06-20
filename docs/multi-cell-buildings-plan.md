@@ -40,11 +40,12 @@ Upgrading a building costs **space**, not just money:
 
 ## Data model
 
-- **`Building.footprint`** (already reserved): store the building's occupied cells
-  as a **connected set** anchored at its top-left cell (min y, then min x). The
-  nominal 2×1/2×2 are the *minimum compact* shapes; merges can yield larger or
-  L-shaped connected footprints — that is expected and fine. `#[serde(default)]`
-  to 1×1 so old saves load unchanged.
+- **`Building.footprint`** (already reserved): store the footprint as a **strict
+  rectangle** — the anchor (top-left, min y then min x) plus `width × height`.
+  **Every level is a rectangle** (1×1, then 2×1 or 1×2, then 2×2); growth extends
+  one full side, and a merge is only allowed when it keeps the footprint
+  rectangular (see the algorithm). `#[serde(default)]` to 1×1 so old saves load
+  unchanged.
 - **`Grid` stays `Vec<Option<Entity>>`** — write the same owner `Entity` into every
   footprint cell. Add `set_footprint` / `clear_footprint` / `footprint_cells`
   helpers; storage type unchanged.
@@ -109,31 +110,52 @@ the saved rules**, not the current external JSON:
 - The rules are stored once at the `RegionalGameSave` level and injected into each
   region's `World` on construction (single source of truth, no per-region drift).
 
-## The upgrade algorithm (deterministic)
+## The upgrade algorithm (deterministic, strict rectangle)
+
+The footprint is always a rectangle, so an upgrade **extends the rectangle by one
+full row or column** to a rectangle of the next level's target area.
 
 ```
 fn upgrade(entity):
     next = level + 1; if next > MAX: fail "already max level"
-    need = rules.footprint_area(kind, next) - footprint.len()   # 0 if merges already grew it
-    claimed = []
-    while need > 0:
-        cell = first_claimable_perimeter_cell(entity)   # see order below
-        match cell:
-            SameType(neighbor) -> merge neighbor; need -= neighbor.cells; claimed += neighbor.cells
-            Empty(c)           -> claim c; need -= 1; claimed += c
-            None               -> ROLLBACK claims; fail "no space to level up"
-    apply: footprint += claimed; level = next; capacity = capacity_for(next)
-    transfer absorbed contents into self, capped at capacity (excess lost)
+    target = rules.footprint_area(kind, next)
+    if current_rect.area >= target:                 # earlier merges already grew it
+        level = next; capacity = capacity_for(next); return ok
+
+    # Try extending one full side; only sides that yield a rectangle of `target` area count.
+    candidates = []
+    for side in [N, E, S, W]:                        # fixed order → deterministic
+        new_rect = current_rect.extend(side)         # adds one row/column on that side
+        if new_rect.area != target: continue
+        added = new_rect.cells - current_rect.cells  # the new row/column
+        if added all satisfy claimable_in_rect(new_rect):   # see below
+            candidates.push(side)
+
+    # Prefer a side that MERGES a same-type neighbor, else a side that is all-empty.
+    side = candidates.find(|s| added_cells(s) contain a same-type building)
+                 .or(candidates.first())
+    if side is None: fail "no space to level up"     # nothing changed (atomic)
+
+    # Commit:
+    merge same-type buildings fully inside the added cells (absorb + transfer)
+    claim the empty added cells
+    footprint = new_rect; level = next; capacity = capacity_for(next)
 ```
 
-- **Scan order (determinism, CLAUDE.md §3):** iterate footprint cells in row-major
-  order; for each, test neighbours N, E, S, W. **Pass 1** takes the first adjacent
-  *same-type building*; only if none exists does **Pass 2** take the first *empty*
-  cell. First match wins; identical inputs → identical result.
-- **Merging a multi-cell neighbor absorbs all its cells at once** (may overshoot
-  `need` — accepted; the extra space is a bonus).
-- **Atomic:** if the target can't be met, roll back any cells claimed this attempt
-  so a failed upgrade changes nothing (no half-grown building, no spent money).
+- **`claimable_in_rect(new_rect)`** for each added cell: it is **empty**, or it
+  belongs to a **same-type building whose entire footprint lies inside `new_rect`**
+  (no overhang). A road, a different-type building, a same-type building that would
+  overhang the rectangle, or an out-of-bounds cell (incl. region border) makes that
+  side fail — this is what keeps the footprint a rectangle.
+- **Side preference (determinism, CLAUDE.md §3):** sides are tested N, E, S, W;
+  **pass 1** picks the first side whose added cells include a mergeable same-type
+  building; only if none, **pass 2** picks the first all-empty side. First match
+  wins; identical inputs → identical result.
+- **Merge absorbs whole neighbors** that sit fully inside the new rectangle (their
+  contents transfer, capped at capacity); because they must be fully contained,
+  the result stays a clean rectangle.
+- **Atomic:** if no side qualifies, nothing is claimed/merged and no money is
+  spent — the failed upgrade changes nothing.
 
 ## Contents transfer on merge
 
@@ -218,11 +240,32 @@ Run `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test -q` after each.
 - **Architecture**: all simulation logic in `core`; UI renders view models only
   and resolves cell→owner in the adapter, never the ECS.
 
+## Levels & capacity (today vs this plan)
+
+The current code only supports **one** upgrade step (`MAX_UPGRADE_LEVEL = 2`).
+Capacity-on-upgrade today is a mix:
+
+- **Formula** — commercial/industrial jobs: `BuildingKind::jobs_at_level =
+  base + (level − 1)` (C: 2→3, I: 3→4). Extends to any level for free.
+- **Hardcoded L2 values** in `apply_upgrade_effect` — residential `population.max`
+  5→8, power capacity 10→15, park happiness 3→5, industrial pollution 2→3.
+
+To reach this plan's **L3 (2×2)** you must:
+
+1. raise `MAX_UPGRADE_LEVEL` to **3**, and
+2. define **L3 capacity** — jobs extend via the formula automatically, but
+   residential pop / power / park have no L3 number and need one.
+
+That capacity-per-level table is the natural next extension of the M0 JSON
+ruleset (the schema was designed for it). **Footprint-size-only config ships
+first** (your choice), but flag whether L3 capacity should be hardcoded for now or
+folded into the ruleset at the same time as multi-cell.
+
 ## Open design notes
 
-- **Connected-set vs strict rectangle.** This plan allows irregular connected
-  footprints (a natural consequence of merging). If you prefer footprints to stay
-  strictly rectangular, M2 would instead only claim cells that keep a rectangle
-  (and refuse merges that would not) — simpler shapes, but more upgrades blocked.
-  Flag which you want before M2.
+- **Footprint shape: strict rectangle** (chosen). Every footprint is a `w × h`
+  rectangle; growth extends one full side and merges only same-type neighbors that
+  sit fully inside the new rectangle. Cleaner sprites and inspect, at the cost of
+  more "no space to level up" blocks than a free-form connected set would hit —
+  accepted.
 - **Down-level / un-merge** is out of scope: bulldoze removes the whole building.
