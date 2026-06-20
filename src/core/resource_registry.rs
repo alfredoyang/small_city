@@ -430,8 +430,14 @@ fn workplace_slots_from_world(world: &World) -> Vec<Entity> {
     let mut workplace_slots = Vec::new();
     let mut workplace_entities = effective_workplace_entities(world);
 
-    for (entity, kind, level) in workplace_entities.drain(..) {
-        for _ in 0..kind.jobs_at_level(level).max(0) {
+    for (entity, kind, _level) in workplace_entities.drain(..) {
+        // Job capacity scales with footprint area through the shared capacity_for source.
+        let area = world
+            .buildings
+            .get(&entity)
+            .map(|building| building.footprint.area())
+            .unwrap_or(1);
+        for _ in 0..crate::core::building_stats::capacity_for(kind, area).max(0) {
             workplace_slots.push(entity);
         }
     }
@@ -835,7 +841,9 @@ mod tests {
         let summary = business_growth::run(&mut world);
 
         assert_eq!(summary.commercial_upgrades, 1);
-        assert_eq!(world.cached_job_resolution().total_jobs, 3);
+        // Upgrading grows the commercial footprint to 2 cells, so job capacity is area-based
+        // capacity_for(Commercial, 2) = 6 (was a flat +1 under the old level-only model).
+        assert_eq!(world.cached_job_resolution().total_jobs, 6);
         assert_cached_matches_forced(&world);
     }
 

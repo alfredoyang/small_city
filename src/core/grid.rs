@@ -61,6 +61,26 @@ impl Grid {
         }
     }
 
+    /// Writes `entity` into every cell of a `width` x `height` rectangle anchored at `(x, y)`. Used
+    /// when a building grows so all the cells it now occupies map back to it. Out-of-bounds cells
+    /// are skipped.
+    pub fn set_footprint(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        entity: Entity,
+    ) {
+        for cy in y..y.saturating_add(height) {
+            for cx in x..x.saturating_add(width) {
+                if let Some(index) = self.index(cx, cy) {
+                    self.cells[index] = Some(entity);
+                }
+            }
+        }
+    }
+
     fn index(&self, x: usize, y: usize) -> Option<usize> {
         self.contains(x, y).then_some(y * self.width + x)
     }

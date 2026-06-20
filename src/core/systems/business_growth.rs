@@ -1,7 +1,7 @@
 //! Weekly business reinvestment system for automatic commercial and industrial upgrades.
 
 use crate::core::entity::Entity;
-use crate::core::systems::{citizens, economy, road_connectivity};
+use crate::core::systems::{citizens, economy, road_connectivity, upgrade};
 use crate::core::world::World;
 use crate::interface::input::BuildingKind;
 
@@ -35,16 +35,14 @@ pub(crate) fn run(world: &mut World) -> BusinessGrowthSummary {
             continue;
         };
 
-        if let Some(building) = world.buildings.get_mut(&candidate.entity) {
-            building.level = candidate.next_level;
+        // Reinvestment grows the footprint like a manual upgrade, so capacity (area-based) actually
+        // increases. A boxed-in business that cannot grow keeps its cash and tries again later.
+        // grow_to_level already applies the level/capacity/pollution effects (shared with manual
+        // upgrades), so there is nothing extra to apply here.
+        if !upgrade::grow_to_level(world, candidate.entity, candidate.next_level) {
+            continue;
         }
         economy::spend_business_cash(world, candidate.entity, candidate.cost);
-        apply_business_upgrade_effect(
-            world,
-            candidate.entity,
-            candidate.kind,
-            candidate.next_level,
-        );
         match candidate.kind {
             BuildingKind::Commercial => summary.commercial_upgrades += 1,
             BuildingKind::Industrial => summary.industrial_upgrades += 1,
@@ -87,14 +85,12 @@ pub(crate) fn demand_allows_reinvestment(world: &World, kind: BuildingKind) -> b
 #[derive(Debug, Clone, Copy)]
 struct BusinessGrowthContext {
     citizen_count: i32,
-    pollution: i32,
 }
 
 impl BusinessGrowthContext {
     fn from_world(world: &World) -> Self {
         Self {
             citizen_count: citizens::citizen_count(world),
-            pollution: world.stats.pollution,
         }
     }
 }
@@ -176,20 +172,10 @@ fn demand_allows_reinvestment_with_context(
     kind: BuildingKind,
 ) -> bool {
     match kind {
-        BuildingKind::Commercial => context.citizen_count > 0,
-        BuildingKind::Industrial => context.citizen_count > 0 && context.pollution <= 8,
+        // Reinvestment only needs paying customers/residents; pollution no longer gates industrial
+        // growth, so a heavy-industry district can keep leveling up.
+        BuildingKind::Commercial | BuildingKind::Industrial => context.citizen_count > 0,
         _ => false,
-    }
-}
-
-fn apply_business_upgrade_effect(world: &mut World, entity: Entity, kind: BuildingKind, level: u8) {
-    if kind == BuildingKind::Industrial {
-        if let Some(source) = world.pollution_sources.get_mut(&entity) {
-            // Industrial production scales by level through the economy system.
-            // Pollution follows the same simple level curve so level 3 factories
-            // carry a stronger local and city-wide environmental tradeoff.
-            source.amount = i32::from(level.max(1)) + 1;
-        }
     }
 }
 
@@ -203,17 +189,19 @@ mod tests {
 
     #[test]
     fn run_upgrades_eligible_businesses_from_single_candidate_pass() {
+        // Spacing matters now that upgrading grows the footprint: each business needs an empty
+        // cell to expand into, so commercial and industrial are placed with a gap.
         let mut world = World::new(5, 3);
         placement::place_building(&mut world, 0, 0, BuildingKind::Residential);
         placement::place_building(&mut world, 1, 0, BuildingKind::Commercial);
-        placement::place_building(&mut world, 2, 0, BuildingKind::Industrial);
-        for x in 0..=2 {
+        placement::place_building(&mut world, 3, 0, BuildingKind::Industrial);
+        for x in 0..=3 {
             placement::place_building(&mut world, x, 1, BuildingKind::Road);
         }
 
         let residential = world.grid.get(0, 0).expect("residential entity");
         let commercial = world.grid.get(1, 0).expect("commercial entity");
-        let industrial = world.grid.get(2, 0).expect("industrial entity");
+        let industrial = world.grid.get(3, 0).expect("industrial entity");
         citizens::spawn_for_home(&mut world, residential, 1);
         world.power_consumers.get_mut(&commercial).unwrap().powered = true;
         world.power_consumers.get_mut(&industrial).unwrap().powered = true;
@@ -232,7 +220,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (1, 0, BuildingKind::Commercial, 2),
-                (2, 0, BuildingKind::Industrial, 2)
+                (3, 0, BuildingKind::Industrial, 2)
             ]
         );
         assert_eq!(world.buildings.get(&commercial).unwrap().level, 2);

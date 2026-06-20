@@ -74,7 +74,9 @@ fn upgrade_residential_increases_capacity() {
     assert!(result.success);
     assert_eq!(game.view().status.money, before_money - 10);
     let cell = game.inspect(1, 1).cell.expect("residential cell");
-    assert_eq!(cell.max_population, Some(8));
+    // Upgrading grows the footprint to 2 cells, so capacity is area-based:
+    // capacity_for(Residential, 2) = 5 * 2 * 3/2 = 15.
+    assert_eq!(cell.max_population, Some(15));
     assert_eq!(cell.upgrade_level, Some(2));
 }
 

@@ -74,20 +74,47 @@ pub(crate) fn adjacent_road_entities(
     })
 }
 
+/// Cells orthogonally adjacent to a building's whole footprint (multi-cell aware), excluding the
+/// footprint's own cells and out-of-bounds cells. A building is road-connected / road-adjacent when
+/// *any* footprint cell touches a road, so growth never silently severs road or export access.
 pub(crate) fn adjacent_cells(
     world: &World,
     entity: Entity,
-) -> impl Iterator<Item = (usize, usize)> + '_ {
-    let position = world.positions.get(&entity).copied();
-    [
-        position.and_then(|position| position.x.checked_sub(1).map(|x| (x, position.y))),
-        position.map(|position| (position.x.saturating_add(1), position.y)),
-        position.and_then(|position| position.y.checked_sub(1).map(|y| (position.x, y))),
-        position.map(|position| (position.x, position.y.saturating_add(1))),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|(x, y)| world.grid.contains(*x, *y))
+) -> impl Iterator<Item = (usize, usize)> {
+    let mut neighbours = Vec::new();
+    let Some(position) = world.positions.get(&entity).copied() else {
+        return neighbours.into_iter();
+    };
+    let footprint = world
+        .buildings
+        .get(&entity)
+        .map(|building| building.footprint)
+        .unwrap_or_default();
+    let width = usize::from(footprint.width.max(1));
+    let height = usize::from(footprint.height.max(1));
+    let in_footprint = |x: usize, y: usize| {
+        x >= position.x && x < position.x + width && y >= position.y && y < position.y + height
+    };
+
+    for cy in position.y..position.y + height {
+        for cx in position.x..position.x + width {
+            let candidates = [
+                cx.checked_sub(1).map(|x| (x, cy)),
+                Some((cx.saturating_add(1), cy)),
+                cy.checked_sub(1).map(|y| (cx, y)),
+                Some((cx, cy.saturating_add(1))),
+            ];
+            for (nx, ny) in candidates.into_iter().flatten() {
+                if world.grid.contains(nx, ny)
+                    && !in_footprint(nx, ny)
+                    && !neighbours.contains(&(nx, ny))
+                {
+                    neighbours.push((nx, ny));
+                }
+            }
+        }
+    }
+    neighbours.into_iter()
 }
 
 pub(crate) fn is_road_entity(world: &World, entity: Entity) -> bool {

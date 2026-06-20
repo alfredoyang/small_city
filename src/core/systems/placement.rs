@@ -32,7 +32,13 @@ fn attach_building_components(
 ) {
     match kind {
         BuildingKind::Residential => {
-            world.attach_population(entity, Population { current: 0, max: 5 });
+            world.attach_population(
+                entity,
+                Population {
+                    current: 0,
+                    max: crate::core::building_stats::capacity_for(BuildingKind::Residential, 1),
+                },
+            );
             world.attach_power_consumer(
                 entity,
                 PowerConsumer {

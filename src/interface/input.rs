@@ -51,10 +51,16 @@ impl BuildingKind {
         self.upgrade_cost_for_level(2)
     }
 
-    /// Cost to upgrade this building type into a specific target level.
+    /// Cost to upgrade this building type into a specific target level. The zoned buildings
+    /// (Residential/Commercial/Industrial) grow with their footprint up to level 3; Power and Park
+    /// stay 1x1 and only have the single level-2 step.
     pub fn upgrade_cost_for_level(self, target_level: u8) -> Option<i32> {
         match self {
-            Self::Residential if target_level == 2 => Some(10),
+            Self::Residential | Self::Commercial | Self::Industrial => match target_level {
+                2 => Some(10),
+                3 => Some(20),
+                _ => None,
+            },
             Self::PowerPlant if target_level == 2 => Some(15),
             Self::Park if target_level == 2 => Some(8),
             _ => None,

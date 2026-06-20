@@ -709,11 +709,13 @@ fn effective_jobs(world: &World, entity: crate::core::entity::Entity, kind: Buil
         .get(&entity)
         .is_some_and(|consumer| consumer.powered);
     if powered && road_connectivity::is_road_connected(world, entity) {
-        world
+        // Mirror the jobs registry: job capacity scales with footprint area.
+        let area = world
             .buildings
             .get(&entity)
-            .map(|building| kind.jobs_at_level(building.level))
-            .unwrap_or_else(|| kind.jobs())
+            .map(|building| building.footprint.area())
+            .unwrap_or(1);
+        crate::core::building_stats::capacity_for(kind, area)
     } else {
         0
     }

@@ -194,10 +194,11 @@ fn profitable_industrial_auto_upgrades_from_business_cash() {
     let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Industrial).success);
-    for x in 2..=5 {
+    // Leave (2,0) empty so the industrial has room to grow its footprint when it upgrades.
+    for x in 3..=6 {
         assert!(game.build(x, 0, BuildingKind::Residential).success);
     }
-    for x in 0..=5 {
+    for x in 0..=6 {
         assert!(game.build(x, 1, BuildingKind::Road).success);
     }
 
@@ -221,7 +222,8 @@ fn profitable_industrial_auto_upgrades_from_business_cash() {
             assert!(business_cash >= 14);
             assert!(recent_profit > 0);
             assert!(upgrade_ready);
-            assert_eq!(jobs, 4);
+            // Grew to a 2-cell footprint: jobs are area-based capacity_for(Industrial, 2) = 12.
+            assert_eq!(jobs, 12);
         }
         other => panic!("expected industrial details, got {other:?}"),
     }
@@ -247,8 +249,9 @@ fn profitable_commercial_auto_upgrades_from_shopping_profit() {
         assert!(game.build(x, 0, BuildingKind::Residential).success);
     }
     assert!(game.build(6, 0, BuildingKind::Commercial).success);
-    assert!(game.build(7, 0, BuildingKind::Industrial).success);
-    for x in 0..=7 {
+    // Leave (7,0) empty so the commercial has room to grow when it upgrades.
+    assert!(game.build(8, 0, BuildingKind::Industrial).success);
+    for x in 0..=8 {
         assert!(game.build(x, 1, BuildingKind::Road).success);
     }
 
@@ -273,7 +276,8 @@ fn profitable_commercial_auto_upgrades_from_shopping_profit() {
             assert_eq!(upgrade_threshold, Some(8));
             assert!(recent_profit > 0);
             assert!(upgrade_ready);
-            assert_eq!(jobs, 3);
+            // Grew to a 2-cell footprint: jobs are area-based capacity_for(Commercial, 2) = 6.
+            assert_eq!(jobs, 6);
         }
         other => panic!("expected commercial details, got {other:?}"),
     }

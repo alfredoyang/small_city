@@ -36,6 +36,11 @@ impl Footprint {
             height: 1,
         }
     }
+
+    /// Number of grid cells this footprint occupies.
+    pub fn area(&self) -> u32 {
+        u32::from(self.width) * u32::from(self.height)
+    }
 }
 
 impl Default for Footprint {

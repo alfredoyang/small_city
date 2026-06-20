@@ -69,12 +69,12 @@ fn tick_returns_structured_summary_events() {
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
-    assert!(game.build(3, 0, BuildingKind::Industrial).success);
-    assert!(game.build(4, 0, BuildingKind::Park).success);
-    assert!(game.build(0, 1, BuildingKind::Road).success);
-    assert!(game.build(1, 1, BuildingKind::Road).success);
-    assert!(game.build(2, 1, BuildingKind::Road).success);
-    assert!(game.build(3, 1, BuildingKind::Road).success);
+    // Gaps at (3,0) and (5,0) give the commercial and industrial room to grow when they upgrade.
+    assert!(game.build(4, 0, BuildingKind::Industrial).success);
+    assert!(game.build(6, 0, BuildingKind::Park).success);
+    for x in 0..=6 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
 
     let result = advance_one_week(&mut game);
 
@@ -91,12 +91,12 @@ fn tick_returns_structured_summary_events() {
                 after: 5
             },
             money: MetricChange {
-                before: 219,
-                after: 252
+                before: 216,
+                after: 249
             },
             happiness: MetricChange {
-                before: 84,
-                after: 85
+                before: 90,
+                after: 91
             },
             // The profitable industrial can auto-upgrade at the weekly boundary,
             // increasing its pollution source after the economy event is applied.
@@ -146,7 +146,7 @@ fn tick_returns_structured_summary_events() {
     assert_eq!(
         result.events[2],
         GameEventView::BusinessAutoUpgraded {
-            x: 3,
+            x: 4,
             y: 0,
             kind: BuildingKind::Industrial,
             level: 2
@@ -160,17 +160,17 @@ fn tick_summary_message_includes_metric_changes() {
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(1, 0, BuildingKind::Residential).success);
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
-    assert!(game.build(3, 0, BuildingKind::Industrial).success);
-    assert!(game.build(0, 1, BuildingKind::Road).success);
-    assert!(game.build(1, 1, BuildingKind::Road).success);
-    assert!(game.build(2, 1, BuildingKind::Road).success);
-    assert!(game.build(3, 1, BuildingKind::Road).success);
+    // Gap at (3,0) gives the commercial room to grow; industrial sits past it.
+    assert!(game.build(4, 0, BuildingKind::Industrial).success);
+    for x in 0..=4 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
 
     let message = advance_one_week(&mut game).message();
 
     assert!(message.contains("population 5 (+0)"));
     assert!(message.contains("Year 1, Month 1, Week 2, Day 1, 00:00"));
-    assert!(message.contains("money 244 (+34)"));
+    assert!(message.contains("money 260 (+34)"));
     assert!(message.contains("powered buildings 3 (+0)"));
     // The message expectation changed because tick feedback now explains goods
     // production, local/imported sales, export flow, and related taxes.
@@ -180,41 +180,67 @@ fn tick_summary_message_includes_metric_changes() {
         )
     );
     assert!(message.contains("Commercial at (2, 0) upgraded to level 2 from reinvestment"));
-    assert!(message.contains("Industrial at (3, 0) upgraded to level 2 from reinvestment"));
+    assert!(message.contains("Industrial at (4, 0) upgraded to level 2 from reinvestment"));
 }
 
 #[test]
 fn business_reinvestment_can_raise_industrial_to_level_three_and_emit_event() {
+    // The industrial sits at (1,1) with an empty 2x2 zone above/right, and the road runs along
+    // y=2 so it never blocks the square. Reinvestment grows it N then E to a 2x2 anchored at (1,0)
+    // (level 2 after week one, level 3 after week two).
     let mut game = SingleRegionTestGame::new(10, 10);
-    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
-    assert!(game.build(1, 0, BuildingKind::Industrial).success);
-    for x in 2..=5 {
-        assert!(game.build(x, 0, BuildingKind::Residential).success);
+    assert!(game.build(0, 1, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 1, BuildingKind::Industrial).success);
+    for x in 3..=6 {
+        assert!(game.build(x, 1, BuildingKind::Residential).success);
     }
-    for x in 0..=5 {
-        assert!(game.build(x, 1, BuildingKind::Road).success);
+    for x in 0..=6 {
+        assert!(game.build(x, 2, BuildingKind::Road).success);
     }
 
-    let first_week = advance_one_week(&mut game);
-    let second_week = advance_one_week(&mut game);
+    // Advance week by week, collecting the level-2 and level-3 reinvestment events. Each
+    // reinvestment costs flat business cash, so reaching the cap can take a few profitable weeks.
+    let mut level_two_event = None;
+    let mut level_three_event = None;
+    for _ in 0..8 {
+        let week = advance_one_week(&mut game);
+        for event in &week.events {
+            if let GameEventView::BusinessAutoUpgraded {
+                kind: BuildingKind::Industrial,
+                level,
+                ..
+            } = event
+            {
+                match level {
+                    2 => level_two_event = Some(event.clone()),
+                    3 => level_three_event = Some(event.clone()),
+                    _ => {}
+                }
+            }
+        }
+        if level_three_event.is_some() {
+            break;
+        }
+    }
 
+    // The growth anchors the 2x2 footprint at (1,0), so both events report that corner.
     assert_eq!(
-        first_week.events[1],
-        GameEventView::BusinessAutoUpgraded {
+        level_two_event,
+        Some(GameEventView::BusinessAutoUpgraded {
             x: 1,
             y: 0,
             kind: BuildingKind::Industrial,
             level: 2
-        }
+        })
     );
     assert_eq!(
-        second_week.events[1],
-        GameEventView::BusinessAutoUpgraded {
+        level_three_event,
+        Some(GameEventView::BusinessAutoUpgraded {
             x: 1,
             y: 0,
             kind: BuildingKind::Industrial,
             level: 3
-        }
+        })
     );
     match game.inspect(1, 0).details.expect("industrial details") {
         InspectDetailsView::Industrial {
@@ -227,7 +253,8 @@ fn business_reinvestment_can_raise_industrial_to_level_three_and_emit_event() {
             assert_eq!(upgrade_level, 3);
             assert_eq!(maintenance_cost, 3);
             assert_eq!(goods_production, 8);
-            assert_eq!(jobs, 5);
+            // 2x2 footprint: jobs are area-based capacity_for(Industrial, 4) = 24.
+            assert_eq!(jobs, 24);
         }
         other => panic!("expected industrial details, got {other:?}"),
     }

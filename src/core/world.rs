@@ -56,6 +56,11 @@ pub(crate) struct World {
     // recompute it. A `Cell` so the `&self` invalidation chokepoints can set it.
     #[serde(skip, default)]
     derived_dirty: Cell<bool>,
+    // Tunable footprint/building rules. `#[serde(skip)]` so they are not duplicated per region in
+    // the save; the regional layer injects the save-stamped rules into each world (until then every
+    // world deterministically gets the embedded default).
+    #[serde(skip, default)]
+    building_rules: crate::core::building_rules::BuildingRules,
     pub positions: HashMap<Entity, Position>,
     pub buildings: HashMap<Entity, Building>,
     pub populations: HashMap<Entity, Population>,
@@ -94,6 +99,7 @@ impl World {
             importable_remote_jobs: 0,
             cross_region_goods_routes: CrossRegionGoodsRoutes::default(),
             derived_dirty: Cell::new(false),
+            building_rules: crate::core::building_rules::BuildingRules::default(),
             positions: HashMap::new(),
             buildings: HashMap::new(),
             populations: HashMap::new(),
@@ -103,6 +109,11 @@ impl World {
             pollution_sources: HashMap::new(),
             happiness_effects: HashMap::new(),
         }
+    }
+
+    /// Tunable footprint/building rules in effect for this world.
+    pub(crate) fn building_rules(&self) -> &crate::core::building_rules::BuildingRules {
+        &self.building_rules
     }
 
     pub fn spawn(&mut self) -> Entity {

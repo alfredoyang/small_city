@@ -1,6 +1,7 @@
 //! Core simulation layer containing the custom ECS data model and deterministic systems.
 
 pub mod building_rules;
+pub mod building_stats;
 pub mod components;
 pub mod entity;
 pub mod grid;

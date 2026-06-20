@@ -132,9 +132,36 @@ impl BuildingRules {
             if table.windows(2).any(|pair| pair[1] < pair[0]) {
                 return Err(format!("{key} footprint area must be non-decreasing"));
             }
+            // Level 1 is the single placed cell, and the growth algorithm extends one full side per
+            // level, so each area must be reachable from the previous one in a single step
+            // (e.g. 1 -> 2 -> 4 works; 1 -> 3 does not). Reject tables the algorithm cannot realize.
+            if table[0] != 1 {
+                return Err(format!("{key} level-1 footprint area must be 1"));
+            }
+            if let Some(pair) = table
+                .windows(2)
+                .find(|pair| pair[0] != pair[1] && !area_reachable_in_one_step(pair[0], pair[1]))
+            {
+                return Err(format!(
+                    "{key} footprint area {} is not reachable from {} by extending one side",
+                    pair[1], pair[0]
+                ));
+            }
         }
         Ok(())
     }
+}
+
+/// Whether a rectangle of area `from` can become a rectangle of area `to` by extending one full
+/// side. From a factor pair `(w, h)` of `from`, a single side-extension reaches `from + w` (a new
+/// column) or `from + h` (a new row).
+fn area_reachable_in_one_step(from: u32, to: u32) -> bool {
+    if to <= from {
+        return false;
+    }
+    (1..=from)
+        .filter(|w| from % w == 0)
+        .any(|w| to == from + w || to == from + from / w)
 }
 
 #[cfg(test)]
@@ -165,16 +192,17 @@ mod tests {
     #[test]
     fn good_override_loads_from_disk() {
         let path = std::env::temp_dir().join("small_city_rules_ok.json");
+        // A reachable override that differs from the default (1 -> 2 -> 3 instead of 1 -> 2 -> 4).
         std::fs::write(
             &path,
-            r#"{"buildings":{"Residential":{"footprint_area_per_level":[1,4,9]},
+            r#"{"buildings":{"Residential":{"footprint_area_per_level":[1,2,3]},
                 "Commercial":{"footprint_area_per_level":[1,2,4]},
                 "Industrial":{"footprint_area_per_level":[1,2,4]}}}"#,
         )
         .unwrap();
 
         let rules = BuildingRules::load(&path).expect("good override loads");
-        assert_eq!(rules.footprint_area(BuildingKind::Residential, 3), 9);
+        assert_eq!(rules.footprint_area(BuildingKind::Residential, 3), 3);
 
         let _ = std::fs::remove_file(path);
     }
@@ -214,6 +242,22 @@ mod tests {
             "Commercial":{"footprint_area_per_level":[1,2,4]},
             "Industrial":{"footprint_area_per_level":[1,2,4]}}}"#;
         assert!(BuildingRules::from_json(short).is_err());
+    }
+
+    #[test]
+    fn unreachable_area_step_is_rejected() {
+        // 1 -> 3 cannot be reached by one side-extension (1x1 only grows to area 2 in one step).
+        let unreachable = r#"{"buildings":{"Residential":{"footprint_area_per_level":[1,3,4]},
+            "Commercial":{"footprint_area_per_level":[1,2,4]},
+            "Industrial":{"footprint_area_per_level":[1,2,4]}}}"#;
+        assert!(BuildingRules::from_json(unreachable).is_err());
+
+        // From a 1x1 (area 1) one step reaches area 2; from area 2 (a 2x1) it reaches 3 or 4.
+        assert!(area_reachable_in_one_step(1, 2));
+        assert!(area_reachable_in_one_step(2, 3));
+        assert!(area_reachable_in_one_step(2, 4));
+        assert!(!area_reachable_in_one_step(1, 3));
+        assert!(!area_reachable_in_one_step(2, 6));
     }
 
     #[test]
