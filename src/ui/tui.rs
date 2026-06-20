@@ -51,6 +51,9 @@ struct TuiState {
     /// When set, a modal asks the player to confirm quitting (with a save option) instead of
     /// exiting immediately. Cleared on cancel or once the quit is carried out.
     quit_confirm: bool,
+    /// Whether the chrome panels (header bar, tool strip, City HUD, legend) may use emoji icons.
+    /// The map grid is always emoji-free; only these panels fall back to ASCII on bare terminals.
+    use_emoji: bool,
 }
 
 impl Default for TuiState {
@@ -70,6 +73,7 @@ impl Default for TuiState {
             show_help: false,
             prompt: None,
             quit_confirm: false,
+            use_emoji: true,
         }
     }
 }
@@ -709,6 +713,8 @@ fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
     let mut runtime = TuiRuntime::with_mode(Instant::now(), mode)
         .map_err(|error| io::Error::other(error.to_string()))?;
     runtime.state.tile_theme = default_tile_theme();
+    // Chrome panels use emoji only when the locale advertises UTF-8 (matching the tile theme).
+    runtime.state.use_emoji = locale_supports_unicode(current_terminal_locale().as_deref());
 
     loop {
         runtime.apply_due_auto_tick(Instant::now());
@@ -797,34 +803,46 @@ fn render(
         return;
     }
 
-    // The screen is split into three horizontal bands. Each band is then split into panels.
-    // `Constraint::Min` gives the map the flexible space; fixed-height lower panels stay readable.
+    // The screen is a SimCity-style stack: a one-line header bar, then three horizontal bands.
+    // `Constraint::Min` gives the map the flexible space; fixed-height panels stay readable.
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Min(12),
             Constraint::Length(8),
             Constraint::Length(5),
         ])
         .split(root);
+    let header = vertical[0];
+    // The top band carries the left tool strip, the map, and the inspect panel.
     let top = Layout::default()
         .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(10), Constraint::Min(1)])
+        .split(vertical[1]);
+    let tool_strip = top[0];
+    let map_inspect = Layout::default()
+        .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(vertical[0]);
+        .split(top[1]);
+    let map_area = map_inspect[0];
+    let inspect_area = map_inspect[1];
     let middle = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(vertical[1]);
+        .split(vertical[2]);
 
     // The map viewport depends on the panel `Rect`, which is only known during draw. Keep that
     // layout-derived scroll state in `TuiState` so cursor movement can follow the visible window.
-    state.follow_cursor_in_map_viewport(view, top[0]);
+    state.follow_cursor_in_map_viewport(view, map_area);
 
-    render_map(frame, top[0], view, preview, state);
-    render_selected_cell(frame, top[1], inspect);
-    render_status(frame, middle[0], view, state);
+    render_header_bar(frame, header, view, state);
+    render_tool_strip(frame, tool_strip, state);
+    render_map(frame, map_area, view, preview, state);
+    render_selected_cell(frame, inspect_area, inspect);
+    render_city_hud(frame, middle[0], view, state);
     render_build_preview(frame, middle[1], view, preview, state);
-    render_messages(frame, vertical[2], state);
+    render_messages(frame, vertical[3], state);
 
     // Modal panels are rendered after the base layout so they appear on top. `Clear` inside the
     // modal renderers blanks the covered area before drawing the popup border and text.
@@ -1446,43 +1464,65 @@ fn tui_flag_chip(flag: &InspectFlag) -> &'static str {
     }
 }
 
-fn render_status(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &TuiState) {
-    let status = &view.status;
+/// Picks an emoji icon or its ASCII fallback for the chrome panels.
+fn hud_icon(use_emoji: bool, emoji: &'static str, ascii: &'static str) -> &'static str {
+    if use_emoji { emoji } else { ascii }
+}
+
+/// A compact 3-cell demand meter (Low/Medium/High) for the HUD.
+fn demand_bar(level: DemandLevel) -> &'static str {
+    match level {
+        DemandLevel::Low => "▰▱▱",
+        DemandLevel::Medium => "▰▰▱",
+        DemandLevel::High => "▰▰▰",
+    }
+}
+
+/// SimCity-style status HUD: an icon row per city metric (money, people, jobs, power, happiness,
+/// pollution, goods) plus RCI demand meters. Reads only `view.status`, so it stays a pure view of
+/// the simulation. Emoji degrade to ASCII on bare terminals via `state.use_emoji`.
+fn render_city_hud(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &TuiState) {
+    let s = &view.status;
+    let e = state.use_emoji;
+
     let lines = vec![
-        simulation_status_line(state),
-        Line::from(state.region_label.clone()),
-        Line::from(format!(
-            "Turn: {} | Money: ${} | Pop: {} | Citizens: {}",
-            status.turn, status.money, status.population, status.citizens
+        Line::from(Span::styled(
+            state.region_label.clone(),
+            Style::default().add_modifier(Modifier::DIM),
         )),
         Line::from(format!(
-            "Jobs: {} | Unemployed: {} | Happiness: {} | Pollution: {}",
-            status.jobs, status.unemployment, status.happiness, status.pollution
+            "{} ${}   {} {} pop   {} {} jobs ({} idle)",
+            hud_icon(e, "💰", "$"),
+            s.money,
+            hud_icon(e, "👥", "pop"),
+            s.population,
+            hud_icon(e, "💼", "job"),
+            s.jobs,
+            s.unemployment,
         )),
         Line::from(format!(
-            "Power: {}/{} supplied | Demand: {} | Shortage: {}",
-            status.power.total_supplied,
-            status.power.total_capacity,
-            status.power.total_demand,
-            status.power.total_shortage
+            "{} {}/{}   {} {} happy   {} {} pollution",
+            hud_icon(e, "⚡", "pwr"),
+            s.power.total_supplied,
+            s.power.total_capacity,
+            hud_icon(e, "🙂", "joy"),
+            s.happiness,
+            hud_icon(e, "🏭", "pol"),
+            s.pollution,
         )),
         Line::from(format!(
-            "Goods: city produced {} | outside imports {} | outside exports {}",
-            status.goods.city_goods_produced,
-            status.goods.goods_imported_from_outside,
-            status.goods.goods_exported_outside
+            "{} +{} made · {} imported · {} exported",
+            hud_icon(e, "📦", "goods"),
+            s.goods.city_goods_produced,
+            s.goods.goods_imported_from_outside,
+            s.goods.goods_exported_outside,
         )),
         Line::from(format!(
-            "Demand: R {} | C {} | I {}",
-            demand_label(status.demand.residential),
-            demand_label(status.demand.commercial),
-            demand_label(status.demand.industrial)
-        )),
-        Line::from(format!(
-            "Demand Notes: R {} | C {} | I {}",
-            demand_note(BuildingKind::Residential, status.demand.residential),
-            demand_note(BuildingKind::Commercial, status.demand.commercial),
-            demand_note(BuildingKind::Industrial, status.demand.industrial)
+            "{} R {} · C {} · I {}",
+            hud_icon(e, "📈", "dmd"),
+            demand_bar(s.demand.residential),
+            demand_bar(s.demand.commercial),
+            demand_bar(s.demand.industrial),
         )),
     ];
 
@@ -1490,11 +1530,99 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &Tui
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title("Status")
+                    .title("City HUD")
                     .title(status_time_title(view))
-                    .borders(Borders::ALL),
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
             )
             .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+/// Top SimCity-style info bar: Funds on the left, the city name centred, the clock on the right,
+/// all on a blue band.
+fn render_header_bar(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &TuiState) {
+    let s = &view.status;
+    let bar = Style::default()
+        .bg(Color::Blue)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(format!(
+            " {} Funds: ${}",
+            hud_icon(state.use_emoji, "💰", "$"),
+            s.money
+        )))
+        .style(bar),
+        cols[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from("S M A L L   C I T Y"))
+            .style(bar)
+            .alignment(Alignment::Center),
+        cols[1],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(format!(
+            "{} {} {} ",
+            hud_icon(state.use_emoji, "🕑", "Time:"),
+            time_spinner(s.turn),
+            s.time.label
+        )))
+        .style(bar)
+        .alignment(Alignment::Right),
+        cols[2],
+    );
+}
+
+/// Left build-tool strip: a static icon + hotkey legend that also doubles as the zone colour key.
+/// Selection still happens via the number keys; the strip just highlights the active tool.
+fn render_tool_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let e = state.use_emoji;
+    let build_tools = [
+        (BuildingKind::Road, hud_icon(e, "🛣", "Rd"), '1'),
+        (BuildingKind::Residential, hud_icon(e, "🏠", "Rs"), '2'),
+        (BuildingKind::Commercial, hud_icon(e, "🏪", "Cm"), '3'),
+        (BuildingKind::Industrial, hud_icon(e, "🏭", "In"), '4'),
+        (BuildingKind::PowerPlant, hud_icon(e, "⚡", "Pw"), '5'),
+        (BuildingKind::Park, hud_icon(e, "🌳", "Pk"), '6'),
+    ];
+
+    let mut lines: Vec<Line> = build_tools
+        .iter()
+        .map(|(kind, icon, key)| {
+            let selected = state.selected_build == *kind;
+            let mut style = building_style(*kind);
+            if selected {
+                style = style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
+            }
+            let marker = if selected { "◀" } else { " " };
+            Line::from(Span::styled(format!("{icon} {key}{marker}"), style))
+        })
+        .collect();
+    // Bulldoze is an action, not a selectable tool, so it sits apart with its own key.
+    lines.push(Line::from(Span::styled(
+        format!("{} X", hud_icon(e, "🚜", "Bz")),
+        Style::default().fg(Color::Red),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title("Tools")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
         area,
     );
 }
@@ -2183,29 +2311,6 @@ fn overlay_label(overlay: MapOverlayInput) -> &'static str {
         MapOverlayInput::Population => "Population",
         MapOverlayInput::LandValue => "Land Value",
         MapOverlayInput::Desirability => "Desirability",
-    }
-}
-
-fn demand_label(level: DemandLevel) -> &'static str {
-    match level {
-        DemandLevel::Low => "Low",
-        DemandLevel::Medium => "Medium",
-        DemandLevel::High => "High",
-    }
-}
-
-fn demand_note(kind: BuildingKind, level: DemandLevel) -> &'static str {
-    match (kind, level) {
-        (BuildingKind::Residential, DemandLevel::High) => "High: jobs and happiness support growth",
-        (BuildingKind::Residential, DemandLevel::Medium) => "Medium: some room for growth",
-        (BuildingKind::Residential, DemandLevel::Low) => "Low: add jobs or improve happiness",
-        (BuildingKind::Commercial, DemandLevel::High) => "High: residents can support more shops",
-        (BuildingKind::Commercial, DemandLevel::Medium) => "Medium: shops are near balance",
-        (BuildingKind::Commercial, DemandLevel::Low) => "Low: grow population first",
-        (BuildingKind::Industrial, DemandLevel::High) => "High: unemployed residents need jobs",
-        (BuildingKind::Industrial, DemandLevel::Medium) => "Medium: industry is near balance",
-        (BuildingKind::Industrial, DemandLevel::Low) => "Low: jobs or pollution are limiting",
-        _ => "",
     }
 }
 
@@ -3290,7 +3395,7 @@ mod tests {
             "(0,0) EMPTY LAND",
             "Buildable ✓",
             "Land",
-            "Status",
+            "City HUD",
             "Build / Actions",
             "Messages / Tick Summary",
             "Overlay: Normal",
@@ -3312,8 +3417,8 @@ mod tests {
         let output = render_test_screen(&game, TuiState::default());
         let header = output
             .lines()
-            .find(|line| line.contains("Status"))
-            .expect("status panel header");
+            .find(|line| line.contains("City HUD"))
+            .expect("city hud panel header");
 
         assert!(header.contains("Time: | Year 1, Month 1, Week 1, Day 1, 00:00"));
     }
@@ -3325,6 +3430,45 @@ mod tests {
         let output = render_test_screen(&game, TuiState::default());
 
         assert!(output.contains("Time: / Year 1, Month 1, Week 1, Day 1, 01:00"));
+    }
+
+    #[test]
+    fn header_bar_and_tool_strip_render() {
+        let game = RegionalGame::single_region(10, 10).expect("regional test game");
+        let output = render_test_screen(&game, TuiState::default());
+
+        // SimCity-style header bar with Funds and the centred city name.
+        assert!(output.contains("Funds: $"));
+        assert!(output.contains("S M A L L"));
+        // Left tool strip panel.
+        assert!(output.contains("Tools"));
+    }
+
+    #[test]
+    fn city_hud_uses_emoji_or_ascii_per_capability() {
+        let game = RegionalGame::single_region(10, 10).expect("regional test game");
+
+        let with_emoji = render_test_screen(
+            &game,
+            TuiState {
+                use_emoji: true,
+                ..TuiState::default()
+            },
+        );
+        assert!(
+            with_emoji.contains("👥"),
+            "emoji HUD shows the people glyph"
+        );
+
+        let ascii = render_test_screen(
+            &game,
+            TuiState {
+                use_emoji: false,
+                ..TuiState::default()
+            },
+        );
+        assert!(!ascii.contains("👥"), "ascii fallback omits emoji");
+        assert!(ascii.contains("pop"), "ascii fallback labels people as pop");
     }
 
     #[test]
