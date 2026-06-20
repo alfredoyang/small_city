@@ -250,16 +250,18 @@ Capacity-on-upgrade today is a mix:
 - **Hardcoded L2 values** in `apply_upgrade_effect` — residential `population.max`
   5→8, power capacity 10→15, park happiness 3→5, industrial pollution 2→3.
 
-To reach this plan's **L3 (2×2)** you must:
+To reach this plan's **L3 (2×2)** you must raise `MAX_UPGRADE_LEVEL` to **3**, and:
 
-1. raise `MAX_UPGRADE_LEVEL` to **3**, and
-2. define **L3 capacity** — jobs extend via the formula automatically, but
-   residential pop / power / park have no L3 number and need one.
-
-That capacity-per-level table is the natural next extension of the M0 JSON
-ruleset (the schema was designed for it). **Footprint-size-only config ships
-first** (your choice), but flag whether L3 capacity should be hardcoded for now or
-folded into the ruleset at the same time as multi-cell.
+- **Residential — area formula (chosen):** `max_population = base × area × 3/2`
+  (integer; core is float-free), with `area == 1` → `base`. E.g. base 8 →
+  1×1: 8, 1×2: 24, 2×2: 48. Capacity falls out of the footprint, so residential
+  needs **no per-level table** and L3 is automatic. `base` is the 1×1 value
+  (today 5 — set to 8 to match the example).
+- **Commercial / Industrial:** keep the `jobs_at_level` formula (extends to L3
+  for free).
+- **Power / Park:** still hardcoded single-step; need an explicit L3 value (or
+  give them the same area treatment later). ponytail: hardcode L3 now, table only
+  if you actually tune them.
 
 ## Open design notes
 
