@@ -32,6 +32,8 @@ pub(crate) enum TuiAction {
     DecreaseSpeed,
     /// Toggle paint mode: while on, moving the cursor lays the selected tool along the path.
     TogglePaint,
+    /// Toggle live map animation (power pulse, industrial smoke, cursor pulse).
+    ToggleAnimation,
     /// Ask to quit: opens the confirm-and-save dialog instead of exiting immediately.
     RequestQuit,
     /// Quit immediately without confirmation. Reserved for the Ctrl-C emergency hatch.
@@ -81,6 +83,7 @@ pub(crate) fn map_key_event(event: KeyEvent) -> TuiAction {
         KeyCode::Char('+') | KeyCode::Char('=') => TuiAction::IncreaseSpeed,
         KeyCode::Char('-') => TuiAction::DecreaseSpeed,
         KeyCode::Char('p') | KeyCode::Char('P') => TuiAction::TogglePaint,
+        KeyCode::Char(';') => TuiAction::ToggleAnimation,
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => TuiAction::RequestQuit,
         _ => TuiAction::None,
     }
@@ -203,6 +206,14 @@ mod tests {
         assert_eq!(
             map_key_event(key(KeyCode::Char('P'))),
             TuiAction::TogglePaint
+        );
+    }
+
+    #[test]
+    fn semicolon_toggles_animation() {
+        assert_eq!(
+            map_key_event(key(KeyCode::Char(';'))),
+            TuiAction::ToggleAnimation
         );
     }
 

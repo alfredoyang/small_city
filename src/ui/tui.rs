@@ -65,7 +65,16 @@ struct TuiState {
     /// Paint mode: while on, moving the cursor lays the selected build tool along the path so roads
     /// and zones can be "drawn" instead of placed one cell at a time.
     paint_mode: bool,
+    /// Whether live map animation (power pulse, industrial smoke, cursor pulse) is enabled. Only
+    /// runs while the simulation is also running, so a paused city is perfectly still.
+    animate: bool,
+    /// UI-only animation frame counter (advanced off a wall-clock timer, never the simulation), so
+    /// animation never affects determinism. Drives which phase of a pulse a tile shows.
+    anim_frame: u64,
 }
+
+/// How often the animation frame advances. The map repaints on this cadence only while animating.
+const ANIM_INTERVAL: Duration = Duration::from_millis(300);
 
 /// How long a build/bulldoze flash stays on screen before it fades.
 const FLASH_DURATION: Duration = Duration::from_millis(900);
@@ -136,6 +145,8 @@ impl Default for TuiState {
             hud_trend: HudTrend::default(),
             build_flash: None,
             paint_mode: false,
+            animate: true,
+            anim_frame: 0,
         }
     }
 }
@@ -513,6 +524,8 @@ struct TuiRuntime {
     /// Set when the player has confirmed a quit (directly, or after a save-and-quit). The event
     /// loop checks it after each modal key so it can exit cleanly without an extra action enum.
     pending_quit: bool,
+    /// Wall-clock origin for the animation frame counter.
+    anim_start: Instant,
 }
 
 impl TuiRuntime {
@@ -531,7 +544,26 @@ impl TuiRuntime {
             next_auto_tick: now + RunSpeed::One.interval(),
             dirty: true,
             pending_quit: false,
+            anim_start: now,
         })
+    }
+
+    /// Whether live animation should currently advance: enabled and the simulation is running.
+    fn animation_active(&self) -> bool {
+        self.state.animate && self.state.is_running
+    }
+
+    /// Advances the animation frame off the wall clock and requests a repaint when it changes.
+    fn tick_animation(&mut self, now: Instant) {
+        if !self.animation_active() {
+            return;
+        }
+        let frame = (now.saturating_duration_since(self.anim_start).as_millis()
+            / ANIM_INTERVAL.as_millis()) as u64;
+        if frame != self.state.anim_frame {
+            self.state.anim_frame = frame;
+            self.dirty = true;
+        }
     }
 
     fn apply_due_auto_tick(&mut self, now: Instant) {
@@ -543,14 +575,18 @@ impl TuiRuntime {
     }
 
     fn poll_timeout(&self, now: Instant) -> Duration {
-        let base = poll_timeout(self.state.is_running, self.next_auto_tick, now);
+        let mut timeout = poll_timeout(self.state.is_running, self.next_auto_tick, now);
         // While a build flash is showing, wake at its expiry so the redraw can clear it.
-        match &self.state.build_flash {
-            Some(flash) if flash.is_active(now) => {
-                base.min(flash.expires_at.saturating_duration_since(now))
+        if let Some(flash) = &self.state.build_flash {
+            if flash.is_active(now) {
+                timeout = timeout.min(flash.expires_at.saturating_duration_since(now));
             }
-            _ => base,
         }
+        // While animating, wake on the animation cadence so the next frame can paint.
+        if self.animation_active() {
+            timeout = timeout.min(ANIM_INTERVAL);
+        }
+        timeout
     }
 
     /// Drops an expired build flash and asks for a repaint so it disappears on time.
@@ -773,6 +809,14 @@ impl TuiRuntime {
                     "Paint mode OFF".to_string()
                 };
             }
+            TuiAction::ToggleAnimation => {
+                self.state.animate = !self.state.animate;
+                self.state.message = if self.state.animate {
+                    "Animation ON (runs while the city is running)".to_string()
+                } else {
+                    "Animation OFF".to_string()
+                };
+            }
             TuiAction::RequestQuit => {
                 // Esc / q / Q never exit straight away: open the confirm-and-save modal instead.
                 self.state.quit_confirm = true;
@@ -888,6 +932,7 @@ fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
     loop {
         runtime.apply_due_auto_tick(Instant::now());
         runtime.expire_build_flash(Instant::now());
+        runtime.tick_animation(Instant::now());
 
         if runtime.dirty {
             // Pull all render data through the public API only when the screen needs repainting.
@@ -1132,6 +1177,13 @@ fn render_map(
         .as_ref()
         .filter(|f| f.is_active(Instant::now()));
 
+    // Live animation only applies to the City theme's Normal overlay. Day/night tint follows the
+    // clock; the frame-driven pulses run only while `animation_active` (animate && running).
+    let city_normal =
+        state.tile_theme == TileTheme::Unicode && state.current_overlay == MapOverlayInput::Normal;
+    let hour = (view.status.turn % 24) as u8;
+    let animating = state.animate && state.is_running;
+
     let gap = map_cell_gap(area, view);
     let visible_columns = visible_map_columns(area, gap, view);
     let visible_rows = visible_map_rows(area, view, state.tile_theme, state.current_overlay);
@@ -1163,6 +1215,19 @@ fn render_map(
                 is_cursor,
                 preview_state,
             );
+            // Day/night tint + frame-driven pulses (City theme, Normal overlay). Always keeps the
+            // tile exactly two columns: only char-2 and colours change.
+            if city_normal {
+                animate_city_tile(
+                    &mut glyph,
+                    cell,
+                    is_cursor,
+                    preview_state,
+                    hour,
+                    state.anim_frame,
+                    animating,
+                );
+            }
             // A freshly edited cell flashes in its delta colour (build green / refund yellow),
             // without changing the tile width.
             if flash.is_some_and(|f| f.x == x && f.y == y) {
@@ -1948,7 +2013,7 @@ fn render_messages(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         simulation_status_line(state),
         Line::from(format_message(&state.message)),
         Line::from(
-            "Space pause/resume | +/- speed | WASD/Arrows move | 1-6 tools | P paint | N next | O overlay | T theme | [ ] region | H help | Q quit",
+            "Space pause/resume | +/- speed | WASD/Arrows move | 1-6 tools | P paint | ; anim | N next | O overlay | T theme | [ ] region | H help | Q quit",
         ),
     ];
 
@@ -2439,6 +2504,89 @@ fn city_cell_style(cell: &CellView) -> Style {
         _ => GROUND_BG,
     };
     cell_base_style(cell).bg(bg).add_modifier(Modifier::BOLD)
+}
+
+/// Power-plant pulse phases (char-2): the plant visibly "hums".
+const POWER_PULSE: [char; 6] = ['░', '▒', '▓', '█', '▓', '▒'];
+/// Industrial smoke phases (char-2): a smokestack churning.
+const INDUSTRIAL_SMOKE: [char; 4] = ['░', '▒', '▓', '▒'];
+
+/// Applies the City-theme animations to one already-rendered tile **without changing its width**:
+/// only char-2 (a single-width block glyph) and colours change.
+///
+/// - day/night: dims the muted-earth/zone background by the hour (clock-driven, always on)
+/// - power pulse / industrial smoke: cycles char-2 by frame (only while animating)
+/// - cursor pulse: blinks the cursor highlight (only while animating)
+fn animate_city_tile(
+    glyph: &mut TileGlyph,
+    cell: &CellView,
+    is_cursor: bool,
+    preview: PreviewState,
+    hour: u8,
+    frame: u64,
+    animating: bool,
+) {
+    // Day/night only tints plain cells (leave the bright cursor/preview highlight at full strength).
+    if !is_cursor && preview == PreviewState::None {
+        if let Some(Color::Rgb(r, g, b)) = glyph.style.bg {
+            let f = day_night_factor(hour);
+            glyph.style = glyph.style.bg(Color::Rgb(
+                dim_channel(r, f),
+                dim_channel(g, f),
+                dim_channel(b, f),
+            ));
+        }
+    }
+
+    if !animating {
+        return;
+    }
+
+    // Pulses never touch a problem tile (it keeps its warning marker).
+    if building_problem_marker(cell).is_none() {
+        match cell.building {
+            Some(BuildingKind::PowerPlant) => set_tile_char2(
+                glyph,
+                POWER_PULSE[(frame % POWER_PULSE.len() as u64) as usize],
+            ),
+            Some(BuildingKind::Industrial) => set_tile_char2(
+                glyph,
+                INDUSTRIAL_SMOKE[(frame % INDUSTRIAL_SMOKE.len() as u64) as usize],
+            ),
+            _ => {}
+        }
+    }
+
+    // Cursor pulse: alternate the bright highlight so the selected lot blinks.
+    if is_cursor && frame % 2 == 1 {
+        glyph.style = glyph.style.bg(Color::Gray);
+    }
+}
+
+/// Replaces a tile's second display column, preserving char-1 so the tile stays two columns wide.
+fn set_tile_char2(glyph: &mut TileGlyph, char2: char) {
+    let mut chars = glyph.tile.chars();
+    if let Some(char1) = chars.next() {
+        glyph.tile = format!("{char1}{char2}");
+    }
+}
+
+/// Brightness percentage (0..=100) of the ground by hour of day: full at midday, dim at night.
+fn day_night_factor(hour: u8) -> u16 {
+    match hour {
+        0..=5 => 60,
+        6 => 75,
+        7 => 88,
+        8..=17 => 100,
+        18 => 90,
+        19 => 78,
+        _ => 65,
+    }
+}
+
+/// Scales one colour channel by a 0..=100 percentage using integer math (determinism-friendly).
+fn dim_channel(channel: u8, percent: u16) -> u8 {
+    (u16::from(channel) * percent / 100) as u8
 }
 
 fn zone_activity_modifier(cell: &CellView, kind: BuildingKind) -> Option<Modifier> {
@@ -3782,6 +3930,88 @@ mod tests {
         // Toggling off stops drawing.
         runtime.apply_action(TuiAction::TogglePaint, now);
         assert!(!runtime.state.paint_mode);
+    }
+
+    #[test]
+    fn toggle_animation_flips_the_flag() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        assert!(runtime.state.animate, "animation defaults on");
+
+        runtime.apply_action(TuiAction::ToggleAnimation, now);
+        assert!(!runtime.state.animate);
+
+        // Animation only advances while running, even when enabled.
+        runtime.state.animate = true;
+        runtime.state.is_running = false;
+        assert!(!runtime.animation_active());
+        runtime.state.is_running = true;
+        assert!(runtime.animation_active());
+    }
+
+    #[test]
+    fn day_night_factor_dims_at_night() {
+        assert_eq!(day_night_factor(12), 100, "full brightness at midday");
+        assert!(
+            day_night_factor(2) < day_night_factor(12),
+            "dimmer at night"
+        );
+        assert!(day_night_factor(23) < day_night_factor(12));
+    }
+
+    #[test]
+    fn animation_keeps_tiles_two_columns_wide() {
+        // Every animated City tile must stay exactly two display columns (the alignment invariant).
+        let cells = [
+            themed_cell(Some(BuildingKind::PowerPlant), 'P', Some(2), None, None, 0),
+            themed_cell(Some(BuildingKind::Industrial), 'I', Some(2), None, None, 0),
+            themed_cell(Some(BuildingKind::Residential), 'R', Some(1), None, None, 0),
+            themed_cell(None, '.', None, None, None, 0),
+        ];
+
+        for frame in 0..6 {
+            for cell in &cells {
+                let mut glyph = TileTheme::Unicode.tile_for_cell(
+                    cell,
+                    MapOverlayInput::Normal,
+                    false,
+                    PreviewState::None,
+                );
+                animate_city_tile(&mut glyph, cell, false, PreviewState::None, 2, frame, true);
+                assert_eq!(
+                    glyph.tile.chars().count(),
+                    2,
+                    "animated tile must stay two columns (frame {frame})"
+                );
+                assert!(glyph.tile.chars().all(is_allowed_unicode_tile_char));
+            }
+        }
+    }
+
+    #[test]
+    fn power_plant_pulse_changes_char_two_across_frames() {
+        let cell = themed_cell(Some(BuildingKind::PowerPlant), 'P', Some(2), None, None, 0);
+        let render = |frame: u64| {
+            let mut glyph = TileTheme::Unicode.tile_for_cell(
+                &cell,
+                MapOverlayInput::Normal,
+                false,
+                PreviewState::None,
+            );
+            animate_city_tile(
+                &mut glyph,
+                &cell,
+                false,
+                PreviewState::None,
+                12,
+                frame,
+                true,
+            );
+            glyph.tile
+        };
+        // The plant glyph stays ϟ but its second cell cycles, so the tile differs across the pulse.
+        assert!(render(0).starts_with('ϟ'));
+        assert_ne!(render(0), render(3));
     }
 
     #[test]
