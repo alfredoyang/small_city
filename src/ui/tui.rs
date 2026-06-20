@@ -176,6 +176,16 @@ impl RunSpeed {
         }
     }
 
+    /// How much faster than 1x this speed runs. Animation cadence scales by the same factor so the
+    /// city visibly speeds up at 2x / 4x.
+    fn multiplier(self) -> u32 {
+        match self {
+            Self::One => 1,
+            Self::Two => 2,
+            Self::Four => 4,
+        }
+    }
+
     fn faster(self) -> Self {
         match self {
             Self::One => Self::Two,
@@ -524,8 +534,8 @@ struct TuiRuntime {
     /// Set when the player has confirmed a quit (directly, or after a save-and-quit). The event
     /// loop checks it after each modal key so it can exit cleanly without an extra action enum.
     pending_quit: bool,
-    /// Wall-clock origin for the animation frame counter.
-    anim_start: Instant,
+    /// Wall-clock instant of the last animation frame advance (the accumulator cursor).
+    last_anim_at: Instant,
 }
 
 impl TuiRuntime {
@@ -544,7 +554,7 @@ impl TuiRuntime {
             next_auto_tick: now + RunSpeed::One.interval(),
             dirty: true,
             pending_quit: false,
-            anim_start: now,
+            last_anim_at: now,
         })
     }
 
@@ -553,17 +563,27 @@ impl TuiRuntime {
         self.state.animate && self.state.is_running
     }
 
-    /// Advances the animation frame off the wall clock and requests a repaint when it changes.
+    /// Time between animation frames at the current run speed: faster at 2x / 4x.
+    fn anim_interval(&self) -> Duration {
+        ANIM_INTERVAL / self.state.run_speed.multiplier()
+    }
+
+    /// Advances the animation frame, accumulating elapsed time so the cadence tracks the run speed.
+    /// When inactive it just keeps the cursor at `now`, so re-enabling never bursts a backlog.
     fn tick_animation(&mut self, now: Instant) {
         if !self.animation_active() {
+            self.last_anim_at = now;
             return;
         }
-        let frame = (now.saturating_duration_since(self.anim_start).as_millis()
-            / ANIM_INTERVAL.as_millis()) as u64;
-        if frame != self.state.anim_frame {
-            self.state.anim_frame = frame;
-            self.dirty = true;
+        let interval = self.anim_interval();
+        let elapsed = now.saturating_duration_since(self.last_anim_at);
+        if elapsed < interval {
+            return;
         }
+        let steps = (elapsed.as_millis() / interval.as_millis()) as u64;
+        self.state.anim_frame = self.state.anim_frame.wrapping_add(steps);
+        self.last_anim_at += interval * steps as u32;
+        self.dirty = true;
     }
 
     fn apply_due_auto_tick(&mut self, now: Instant) {
@@ -582,9 +602,9 @@ impl TuiRuntime {
                 timeout = timeout.min(flash.expires_at.saturating_duration_since(now));
             }
         }
-        // While animating, wake on the animation cadence so the next frame can paint.
+        // While animating, wake on the (speed-scaled) animation cadence so the next frame can paint.
         if self.animation_active() {
-            timeout = timeout.min(ANIM_INTERVAL);
+            timeout = timeout.min(self.anim_interval());
         }
         timeout
     }
@@ -3947,6 +3967,29 @@ mod tests {
         assert!(!runtime.animation_active());
         runtime.state.is_running = true;
         assert!(runtime.animation_active());
+    }
+
+    #[test]
+    fn animation_cadence_scales_with_run_speed() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.state.is_running = true;
+        runtime.state.animate = true;
+
+        // At 1x (300ms/frame) 100ms is not enough for a new frame.
+        runtime.state.run_speed = RunSpeed::One;
+        runtime.last_anim_at = now;
+        runtime.state.anim_frame = 0;
+        runtime.tick_animation(now + Duration::from_millis(100));
+        assert_eq!(runtime.state.anim_frame, 0);
+
+        // At 4x (75ms/frame) the same 100ms advances at least one frame.
+        runtime.state.run_speed = RunSpeed::Four;
+        runtime.last_anim_at = now;
+        runtime.state.anim_frame = 0;
+        runtime.tick_animation(now + Duration::from_millis(100));
+        assert!(runtime.state.anim_frame >= 1);
+        assert!(runtime.dirty);
     }
 
     #[test]
