@@ -1603,8 +1603,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  S             Save city"),
         Line::from("  L             Load city"),
         Line::from("  H             Close Help"),
-        Line::from("  Esc / Q       Quit (confirm dialog, with save option)"),
-        Line::from("  Ctrl-C        Quit immediately"),
+        Line::from("  Esc / Q       Quit (confirm + save option) · Ctrl-C immediate"),
         Line::from("  Enter at save/load prompt uses city1"),
         Line::from(format!(
             "  T             Cycle tile theme: {}",
