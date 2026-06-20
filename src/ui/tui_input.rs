@@ -30,6 +30,8 @@ pub(crate) enum TuiAction {
     ToggleRun,
     IncreaseSpeed,
     DecreaseSpeed,
+    /// Toggle paint mode: while on, moving the cursor lays the selected tool along the path.
+    TogglePaint,
     /// Ask to quit: opens the confirm-and-save dialog instead of exiting immediately.
     RequestQuit,
     /// Quit immediately without confirmation. Reserved for the Ctrl-C emergency hatch.
@@ -78,6 +80,7 @@ pub(crate) fn map_key_event(event: KeyEvent) -> TuiAction {
         KeyCode::Char(' ') => TuiAction::ToggleRun,
         KeyCode::Char('+') | KeyCode::Char('=') => TuiAction::IncreaseSpeed,
         KeyCode::Char('-') => TuiAction::DecreaseSpeed,
+        KeyCode::Char('p') | KeyCode::Char('P') => TuiAction::TogglePaint,
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => TuiAction::RequestQuit,
         _ => TuiAction::None,
     }
@@ -189,6 +192,18 @@ mod tests {
         // Ctrl-C remains an immediate, unconfirmed quit (emergency hatch).
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(map_key_event(ctrl_c), TuiAction::Quit);
+    }
+
+    #[test]
+    fn p_toggles_paint_mode() {
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('p'))),
+            TuiAction::TogglePaint
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('P'))),
+            TuiAction::TogglePaint
+        );
     }
 
     #[test]

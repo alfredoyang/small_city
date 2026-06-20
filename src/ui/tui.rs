@@ -62,6 +62,9 @@ struct TuiState {
     hud_trend: HudTrend,
     /// Transient "build juice": a short-lived flash on the last edited cell plus its money delta.
     build_flash: Option<BuildFlash>,
+    /// Paint mode: while on, moving the cursor lays the selected build tool along the path so roads
+    /// and zones can be "drawn" instead of placed one cell at a time.
+    paint_mode: bool,
 }
 
 /// How long a build/bulldoze flash stays on screen before it fades.
@@ -132,6 +135,7 @@ impl Default for TuiState {
             hud_prev: None,
             hud_trend: HudTrend::default(),
             build_flash: None,
+            paint_mode: false,
         }
     }
 }
@@ -674,10 +678,22 @@ impl TuiRuntime {
 
     fn apply_action(&mut self, action: TuiAction, now: Instant) -> TuiFlow {
         match action {
-            TuiAction::MoveUp => self.move_cursor(0, -1),
-            TuiAction::MoveDown => self.move_cursor(0, 1),
-            TuiAction::MoveLeft => self.move_cursor(-1, 0),
-            TuiAction::MoveRight => self.move_cursor(1, 0),
+            TuiAction::MoveUp => {
+                self.move_cursor(0, -1);
+                self.paint_if_active(now);
+            }
+            TuiAction::MoveDown => {
+                self.move_cursor(0, 1);
+                self.paint_if_active(now);
+            }
+            TuiAction::MoveLeft => {
+                self.move_cursor(-1, 0);
+                self.paint_if_active(now);
+            }
+            TuiAction::MoveRight => {
+                self.move_cursor(1, 0);
+                self.paint_if_active(now);
+            }
             TuiAction::SelectBuild(kind) => {
                 self.state.selected_build = kind;
                 self.state.message = format!("Selected {}", kind.label());
@@ -746,6 +762,17 @@ impl TuiRuntime {
                 self.state.decrease_speed();
                 self.next_auto_tick = now + self.state.run_speed.interval();
             }
+            TuiAction::TogglePaint => {
+                self.state.paint_mode = !self.state.paint_mode;
+                self.state.message = if self.state.paint_mode {
+                    format!(
+                        "Paint mode ON: move to lay {}",
+                        self.state.selected_build.label()
+                    )
+                } else {
+                    "Paint mode OFF".to_string()
+                };
+            }
             TuiAction::RequestQuit => {
                 // Esc / q / Q never exit straight away: open the confirm-and-save modal instead.
                 self.state.quit_confirm = true;
@@ -795,6 +822,19 @@ impl TuiRuntime {
             color,
             expires_at: now + FLASH_DURATION,
         });
+    }
+
+    /// In paint mode, lays the selected tool on the cell the cursor just entered. Re-uses the
+    /// normal build path (so it flashes and reports cost); placing on an occupied/identical cell
+    /// just fails quietly and the player keeps drawing.
+    fn paint_if_active(&mut self, now: Instant) {
+        if !self.state.paint_mode {
+            return;
+        }
+        let (x, y) = (self.state.cursor_x, self.state.cursor_y);
+        let before = self.current_money();
+        let result = self.game.build(x, y, self.state.selected_build);
+        self.finish_map_command(x, y, before, result, now);
     }
 
     fn move_cursor(&mut self, dx: isize, dy: isize) {
@@ -1804,12 +1844,18 @@ fn render_tool_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Style::default().fg(Color::Red),
     )));
 
+    // Paint mode is shown in the strip title and a brighter border so "draw" mode is obvious.
+    let (title, border) = if state.paint_mode {
+        ("Tools ✎", Color::Yellow)
+    } else {
+        ("Tools", Color::DarkGray)
+    };
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
-                .title("Tools")
+                .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(border)),
         ),
         area,
     );
@@ -1902,7 +1948,7 @@ fn render_messages(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         simulation_status_line(state),
         Line::from(format_message(&state.message)),
         Line::from(
-            "Space pause/resume | +/- speed | WASD/Arrows move | 1-6 tools | N next | O overlay | T theme | [ ] region | H help | Q quit",
+            "Space pause/resume | +/- speed | WASD/Arrows move | 1-6 tools | P paint | N next | O overlay | T theme | [ ] region | H help | Q quit",
         ),
     ];
 
@@ -1930,7 +1976,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from(""),
         help_section("Actions"),
         Line::from("  Space         Pause / resume automatic ticks | +/- speed"),
-        Line::from("  B / Enter     Build selected tool"),
+        Line::from("  B / Enter     Build selected tool      P Paint (draw on move)"),
         Line::from("  R             Replace selected cell with selected tool"),
         Line::from("  U             Upgrade selected cell"),
         Line::from("  X             Bulldoze selected cell"),
@@ -3708,6 +3754,34 @@ mod tests {
         runtime.apply_action(TuiAction::Bulldoze, now);
 
         assert!(runtime.state.build_flash.is_none());
+    }
+
+    #[test]
+    fn paint_mode_draws_along_cursor_movement() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+
+        // Off by default: moving does not build.
+        runtime.apply_action(TuiAction::MoveRight, now);
+        assert!(runtime.state.build_flash.is_none());
+
+        // Turn paint mode on, then a move lays the selected tool on the entered cell.
+        runtime.apply_action(TuiAction::TogglePaint, now);
+        assert!(runtime.state.paint_mode);
+        runtime.apply_action(TuiAction::MoveRight, now);
+        let flash = runtime
+            .state
+            .build_flash
+            .as_ref()
+            .expect("painting builds on the entered cell");
+        assert_eq!(
+            (flash.x, flash.y),
+            (runtime.state.cursor_x, runtime.state.cursor_y)
+        );
+
+        // Toggling off stops drawing.
+        runtime.apply_action(TuiAction::TogglePaint, now);
+        assert!(!runtime.state.paint_mode);
     }
 
     #[test]
