@@ -9,9 +9,9 @@
 //! ```
 
 use crate::core::building_stats::capacity_for;
-use crate::core::components::{Footprint, Position};
+use crate::core::components::{BuildingData, Footprint, Position};
 use crate::core::entity::Entity;
-use crate::core::systems::entity_cleanup;
+use crate::core::systems::{citizens, economy, entity_cleanup};
 use crate::core::world::World;
 use crate::interface::events::{CommandResult, GameEventView};
 use crate::interface::input::BuildingKind;
@@ -101,9 +101,17 @@ pub(crate) fn grow_to_level(world: &mut World, entity: Entity, next_level: u8) -
         }
     };
 
-    // Merge: absorb every same-type neighbour fully inside the new rectangle. M2 reclaims their
-    // cells only; transferring their population/goods is M3, so their residents are lost for now.
-    for neighbour in same_type_entities_in(world, entity, new_rect) {
+    // Merge: absorb every same-type neighbour fully inside the new rectangle, transferring its
+    // contents into this building (M3). Citizens are re-homed *before* removal so they are not
+    // despawned with the neighbour; goods/cash are accumulated and applied once the new capacity is
+    // known.
+    let neighbours = same_type_entities_in(world, entity, new_rect);
+    let mut absorbed_goods = 0;
+    let mut absorbed_cash = 0;
+    for &neighbour in &neighbours {
+        reassign_citizen_homes(world, neighbour, entity);
+        absorbed_goods += economy::commercial_goods_stored(world, neighbour);
+        absorbed_cash += business_cash_of(world, neighbour);
         let (nx, ny) = world
             .positions
             .get(&neighbour)
@@ -131,6 +139,17 @@ pub(crate) fn grow_to_level(world: &mut World, entity: Entity, next_level: u8) -
         };
     }
     apply_upgrade_effect(world, entity, building.kind);
+
+    // Apply absorbed contents now that the merged building's new capacity is set: cash sums, goods
+    // are capped at the new storage, and excess residents (beyond the new max) are dropped.
+    if absorbed_cash != 0 {
+        add_business_cash(world, entity, absorbed_cash);
+    }
+    if absorbed_goods != 0 {
+        add_commercial_goods_capped(world, entity, absorbed_goods);
+    }
+    cap_residents_to_capacity(world, entity);
+
     // Growing the footprint changes grid occupancy (power/road adjacency, jobs), so refresh derived
     // state broadly rather than relying on per-kind invalidation alone.
     world.invalidate_resource_registry();
@@ -141,6 +160,73 @@ fn fail(reason: &str) -> CommandResult {
     CommandResult::failure(GameEventView::UpgradeFailed {
         reason: reason.to_string(),
     })
+}
+
+/// Re-homes every citizen living in `from` to `to`. Called before a merged neighbour is removed so
+/// its residents move into the merged building instead of being despawned with it.
+fn reassign_citizen_homes(world: &mut World, from: Entity, to: Entity) {
+    for citizen in world.citizens.values_mut() {
+        if citizen.home == from {
+            citizen.home = to;
+        }
+    }
+}
+
+/// Private business cash a building holds (0 for kinds without business data).
+fn business_cash_of(world: &World, entity: Entity) -> i32 {
+    match world.buildings.get(&entity).map(|building| &building.data) {
+        Some(BuildingData::Commercial { business, .. } | BuildingData::Industrial { business }) => {
+            business.business_cash
+        }
+        _ => 0,
+    }
+}
+
+/// Adds `amount` to a building's business cash (commercial or industrial).
+fn add_business_cash(world: &mut World, entity: Entity, amount: i32) {
+    if let Some(building) = world.buildings.get_mut(&entity) {
+        match &mut building.data {
+            BuildingData::Commercial { business, .. } | BuildingData::Industrial { business } => {
+                business.business_cash += amount;
+            }
+            BuildingData::None => {}
+        }
+    }
+}
+
+/// Adds `amount` goods to a commercial building's local stock, capped at its (level-based) storage.
+fn add_commercial_goods_capped(world: &mut World, entity: Entity, amount: i32) {
+    let capacity = economy::commercial_goods_capacity_for_entity(world, entity);
+    if let Some(building) = world.buildings.get_mut(&entity) {
+        if let BuildingData::Commercial {
+            local_goods_stored, ..
+        } = &mut building.data
+        {
+            *local_goods_stored = (*local_goods_stored + amount).min(capacity);
+        }
+    }
+}
+
+/// Drops citizens beyond a residential building's max population after a merge (deterministic by
+/// entity id), then refreshes the population cache. A no-op for buildings without residents.
+fn cap_residents_to_capacity(world: &mut World, entity: Entity) {
+    let max = world
+        .populations
+        .get(&entity)
+        .map(|population| population.max.max(0))
+        .unwrap_or(0);
+    let mut homed: Vec<Entity> = world
+        .citizens
+        .iter()
+        .filter(|(_, citizen)| citizen.home == entity)
+        .map(|(citizen_entity, _)| *citizen_entity)
+        .collect();
+    homed.sort_by_key(|citizen_entity| citizen_entity.0);
+    for &citizen in homed.iter().skip(max as usize) {
+        world.citizens.remove(&citizen);
+        world.entities.remove(&citizen);
+    }
+    citizens::sync_population_from_citizens(world);
 }
 
 pub(crate) fn apply_upgrade_effect(world: &mut World, entity: Entity, kind: BuildingKind) {
@@ -387,7 +473,154 @@ fn same_type_entities_in(world: &World, self_entity: Entity, rect: Rect) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::components::{Building, BuildingData, PollutionSource};
+    use crate::core::components::{
+        Building, BuildingData, BusinessFinance, PollutionSource, Population,
+    };
+
+    fn place_zone(
+        world: &mut World,
+        x: usize,
+        y: usize,
+        kind: BuildingKind,
+        data: BuildingData,
+    ) -> Entity {
+        let entity = world.spawn();
+        world.attach_position(entity, Position { x, y });
+        world.attach_building(
+            entity,
+            Building {
+                kind,
+                level: 1,
+                data,
+                footprint: Footprint::single(),
+            },
+        );
+        world.grid.set(x, y, entity);
+        entity
+    }
+
+    #[test]
+    fn merging_a_residential_transfers_its_residents() {
+        let mut world = World::new(4, 4);
+        world.resources.money = 1000;
+        let a = place_zone(
+            &mut world,
+            1,
+            1,
+            BuildingKind::Residential,
+            BuildingData::None,
+        );
+        world.attach_population(a, Population { current: 0, max: 5 });
+        let b = place_zone(
+            &mut world,
+            2,
+            1,
+            BuildingKind::Residential,
+            BuildingData::None,
+        );
+        world.attach_population(b, Population { current: 0, max: 5 });
+        citizens::spawn_for_home(&mut world, b, 3);
+
+        // Upgrading A grows it east, merging the same-type B; B's residents move into A.
+        assert!(upgrade(&mut world, 1, 1).success);
+
+        assert!(!world.buildings.contains_key(&b), "B is absorbed");
+        let a_residents = world
+            .citizens
+            .values()
+            .filter(|citizen| citizen.home == a)
+            .count();
+        assert_eq!(a_residents, 3, "B's residents were re-homed to A, not lost");
+    }
+
+    #[test]
+    fn merging_residents_over_capacity_drops_the_excess() {
+        let mut world = World::new(4, 4);
+        world.resources.money = 1000;
+        let a = place_zone(
+            &mut world,
+            1,
+            1,
+            BuildingKind::Residential,
+            BuildingData::None,
+        );
+        world.attach_population(a, Population { current: 0, max: 5 });
+        let b = place_zone(
+            &mut world,
+            2,
+            1,
+            BuildingKind::Residential,
+            BuildingData::None,
+        );
+        world.attach_population(b, Population { current: 0, max: 5 });
+        // 10 + 10 = 20 residents; the merged 2-cell building caps at capacity_for(Residential, 2) = 15.
+        citizens::spawn_for_home(&mut world, a, 10);
+        citizens::spawn_for_home(&mut world, b, 10);
+
+        assert!(upgrade(&mut world, 1, 1).success);
+
+        let a_residents = world
+            .citizens
+            .values()
+            .filter(|citizen| citizen.home == a)
+            .count();
+        assert_eq!(a_residents, 15, "capped at the new max population");
+        assert_eq!(
+            world.citizens.len(),
+            15,
+            "excess citizens were despawned, not left orphaned"
+        );
+        assert_eq!(
+            world.populations.get(&a).unwrap().current,
+            15,
+            "population cache resynced to the capped count"
+        );
+    }
+
+    #[test]
+    fn merging_a_commercial_transfers_goods_and_cash() {
+        let mut world = World::new(4, 4);
+        world.resources.money = 1000;
+        let a = place_zone(
+            &mut world,
+            1,
+            1,
+            BuildingKind::Commercial,
+            BuildingData::Commercial {
+                local_goods_stored: 2,
+                business: BusinessFinance {
+                    business_cash: 10,
+                    ..BusinessFinance::default()
+                },
+            },
+        );
+        place_zone(
+            &mut world,
+            2,
+            1,
+            BuildingKind::Commercial,
+            BuildingData::Commercial {
+                local_goods_stored: 3,
+                business: BusinessFinance {
+                    business_cash: 7,
+                    ..BusinessFinance::default()
+                },
+            },
+        );
+
+        assert!(upgrade(&mut world, 1, 1).success);
+
+        match world.buildings.get(&a).unwrap().data {
+            BuildingData::Commercial {
+                local_goods_stored,
+                business,
+            } => {
+                assert_eq!(local_goods_stored, 5, "goods summed (2 + 3)");
+                assert_eq!(business.business_cash, 17, "cash summed (10 + 7)");
+            }
+            other => panic!("expected commercial data, got {other:?}"),
+        }
+    }
 
     #[test]
     fn manual_industrial_upgrade_to_level_three_sets_level_based_pollution() {
