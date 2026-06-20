@@ -259,6 +259,10 @@ To reach this plan's **L3 (2×2)** you must raise `MAX_UPGRADE_LEVEL` to **3**, 
   - Commercial = jobs, base 2 → 1×1: 2, 1×2: 6, 2×2: 12
   - Industrial = jobs, base 3 → 1×1: 3, 1×2: 12, 2×2: 24
   Falls out of the footprint, so **no per-level table** and L3 is automatic.
+  - **Single source:** put all of this in one `capacity_for(kind, area) -> i32`
+    backed by a tiny `(base, mult_num, mult_den)` per-kind table — adjusting a
+    formula means editing one table row. Build/upgrade/merge all call it; no
+    capacity numbers scattered across systems.
 - **Power / Park:** still hardcoded single-step; need an explicit L3 value.
   ponytail: hardcode L3 now, formula/table only when you actually tune them.
 
