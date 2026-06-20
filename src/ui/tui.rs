@@ -175,33 +175,47 @@ impl TileTheme {
             }
         };
 
+        // Build preview tints the targeted cell with a bright background so it reads as a
+        // highlighted lot on the zoning map (basic named colors stay legible on 16-color terminals).
         if preview_state != PreviewState::None {
             glyph.style = match preview_state {
-                PreviewState::Valid => glyph.style.fg(Color::Green),
-                PreviewState::Invalid => glyph.style.fg(Color::Red),
+                PreviewState::Valid => glyph.style.bg(Color::Green).fg(Color::Black),
+                PreviewState::Invalid => glyph.style.bg(Color::Red).fg(Color::White),
                 PreviewState::None => glyph.style,
             }
             .add_modifier(Modifier::BOLD);
         }
 
+        // The cursor wins over any preview tint: a bright white lot marker that never changes the
+        // tile width.
         if is_cursor {
             glyph.style = glyph
                 .style
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD);
+                .bg(Color::White)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD);
         }
 
         glyph
     }
 
     fn normal_tile(self, cell: &CellView) -> TileGlyph {
-        let tile = match self {
-            TileTheme::AsciiCompact => format!("{}.", cell.symbol),
-            TileTheme::AsciiDetailed => ascii_detailed_normal_tile(cell),
-            TileTheme::Unicode => unicode_normal_tile(cell),
-        };
-        TileGlyph {
-            tile,
-            style: cell_base_style(cell),
+        // The City (Unicode) theme paints a muted-earth ground plus per-zone background tints so
+        // the map reads like a SimCity zoning plan. The ASCII fallbacks stay foreground-only for
+        // bare terminals.
+        match self {
+            TileTheme::AsciiCompact => TileGlyph {
+                tile: format!("{}.", cell.symbol),
+                style: cell_base_style(cell),
+            },
+            TileTheme::AsciiDetailed => TileGlyph {
+                tile: ascii_detailed_normal_tile(cell),
+                style: cell_base_style(cell),
+            },
+            TileTheme::Unicode => TileGlyph {
+                tile: unicode_normal_tile(cell),
+                style: city_cell_style(cell),
+            },
         }
     }
 
@@ -256,9 +270,16 @@ impl TileTheme {
 
     fn legend(self, overlay: MapOverlayInput) -> &'static str {
         match overlay {
-            MapOverlayInput::Normal => {
-                ".. Empty | == Road | R1/R2 Residential | C1 Commercial | I1 Industrial | T1 Power | P1 Park"
-            }
+            // The City theme draws SimCity-style letters (ϟ power, ♣ park); the ASCII fallbacks
+            // keep the older T/P markers, so the legend follows the theme.
+            MapOverlayInput::Normal => match self {
+                TileTheme::Unicode => {
+                    ".. Empty | ══ Road | R Residential | C Commercial | I Industrial | ϟ Power | ♣ Park"
+                }
+                TileTheme::AsciiCompact | TileTheme::AsciiDetailed => {
+                    ".. Empty | == Road | R1/R2 Residential | C1 Commercial | I1 Industrial | T1 Power | P1 Park"
+                }
+            },
             MapOverlayInput::Power => {
                 "T* Plant | =* Powered road | R+ Powered | R- Unpowered | C+/C- Commercial | I+/I- Industrial"
             }
@@ -273,7 +294,7 @@ impl TileTheme {
         match self {
             TileTheme::AsciiCompact => "ASCII Compact",
             TileTheme::AsciiDetailed => "ASCII-2",
-            TileTheme::Unicode => "Unicode",
+            TileTheme::Unicode => "City",
         }
     }
 }
@@ -1842,7 +1863,25 @@ fn unicode_normal_tile(cell: &CellView) -> String {
         return ascii_detailed_normal_tile(cell);
     }
 
-    format!("{}{}", tile_type(cell), unicode_building_shade(cell, kind))
+    // char1 = zone marker (SimCity-style letter / glyph), char2 = occupancy or level shade.
+    format!(
+        "{}{}",
+        city_zone_glyph(kind),
+        unicode_building_shade(cell, kind)
+    )
+}
+
+/// SimCity-style zone glyph for the City theme. Single display column so the two-column tile rule
+/// holds. Power uses the lightning glyph already shipped in the power overlay; park uses a clover.
+fn city_zone_glyph(kind: BuildingKind) -> char {
+    match kind {
+        BuildingKind::Residential => 'R',
+        BuildingKind::Commercial => 'C',
+        BuildingKind::Industrial => 'I',
+        BuildingKind::PowerPlant => 'ϟ',
+        BuildingKind::Park => '♣',
+        BuildingKind::Road => '=',
+    }
 }
 
 fn unicode_road_tile(cell: &CellView) -> String {
@@ -1995,9 +2034,7 @@ fn cell_base_style(cell: &CellView) -> Style {
         return empty_style();
     };
 
-    if matches!(cell.road_connected, Some(false))
-        || (matches!(cell.powered, Some(false)) && cell.power_demand.unwrap_or_default() > 0)
-    {
+    if cell_is_problem(cell) {
         return problem_style();
     }
 
@@ -2007,6 +2044,39 @@ fn cell_base_style(cell: &CellView) -> Style {
     }
 
     style
+}
+
+/// A building cell in trouble: not connected to a road, or a powered consumer left unpowered.
+fn cell_is_problem(cell: &CellView) -> bool {
+    matches!(cell.road_connected, Some(false))
+        || (matches!(cell.powered, Some(false)) && cell.power_demand.unwrap_or_default() > 0)
+}
+
+/// Muted-earth ground colour. Dark-but-not-black so the map is never a void, while bright zone
+/// glyphs stay high-contrast on top (see docs/tui-city-redesign-plan.md §4a).
+const GROUND_BG: Color = Color::Rgb(60, 48, 34);
+
+/// Per-zone background tint, a notch brighter than the ground so districts read as raised lots.
+fn zone_bg(kind: BuildingKind) -> Color {
+    match kind {
+        BuildingKind::Residential => Color::Rgb(30, 60, 30), // green district
+        BuildingKind::Commercial => Color::Rgb(28, 40, 70),  // blue district
+        BuildingKind::Industrial => Color::Rgb(70, 60, 25),  // olive/yellow district
+        BuildingKind::Park => Color::Rgb(28, 72, 36),        // forest green
+        BuildingKind::PowerPlant => Color::Rgb(25, 60, 65),  // dark cyan
+        BuildingKind::Road => GROUND_BG,                     // roads sit on the ground
+    }
+}
+
+/// City-theme cell style: the foreground/activity from [`cell_base_style`] plus a zoning background.
+/// Empty land, roads and problem cells sit on the ground; healthy zones get their district tint.
+/// Glyphs are bold for contrast against the coloured ground.
+fn city_cell_style(cell: &CellView) -> Style {
+    let bg = match cell.building {
+        Some(kind) if !cell_is_problem(cell) && kind != BuildingKind::Road => zone_bg(kind),
+        _ => GROUND_BG,
+    };
+    cell_base_style(cell).bg(bg).add_modifier(Modifier::BOLD)
 }
 
 fn zone_activity_modifier(cell: &CellView, kind: BuildingKind) -> Option<Modifier> {
@@ -2230,7 +2300,7 @@ mod tests {
 
         state.cycle_tile_theme();
         assert_eq!(state.tile_theme, TileTheme::Unicode);
-        assert_eq!(state.message, "Tile theme: Unicode");
+        assert_eq!(state.message, "Tile theme: City");
 
         state.cycle_tile_theme();
         assert_eq!(state.tile_theme, TileTheme::AsciiDetailed);
@@ -2522,11 +2592,11 @@ mod tests {
             ),
             (
                 themed_cell(Some(BuildingKind::PowerPlant), 'P', Some(2), None, None, 0),
-                "T▒",
+                "ϟ▒",
             ),
             (
                 themed_cell(Some(BuildingKind::Park), 'P', Some(2), None, None, 0),
-                "P▒",
+                "♣▒",
             ),
         ];
 
@@ -2921,9 +2991,47 @@ mod tests {
             PreviewState::Invalid,
         );
 
-        assert!(valid.style.add_modifier.contains(Modifier::REVERSED));
-        assert_eq!(invalid.style.fg, Some(Color::Red));
+        // Cursor highlight is now a bright background (it wins over the preview tint).
+        assert_eq!(valid.style.bg, Some(Color::White));
+        assert!(valid.style.add_modifier.contains(Modifier::BOLD));
+        // Invalid build preview tints the cell red.
+        assert_eq!(invalid.style.bg, Some(Color::Red));
         assert!(invalid.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn city_theme_paints_zoning_backgrounds() {
+        // Empty land sits on the muted-earth ground instead of the terminal default (the void).
+        let empty = themed_cell(None, '.', None, None, None, 0);
+        let empty_glyph = TileTheme::Unicode.tile_for_cell(
+            &empty,
+            MapOverlayInput::Normal,
+            false,
+            PreviewState::None,
+        );
+        assert_eq!(empty_glyph.style.bg, Some(GROUND_BG));
+
+        // A healthy commercial lot gets its district tint, not the ground.
+        let commercial = themed_cell(Some(BuildingKind::Commercial), 'C', Some(1), None, None, 0);
+        let commercial_glyph = TileTheme::Unicode.tile_for_cell(
+            &commercial,
+            MapOverlayInput::Normal,
+            false,
+            PreviewState::None,
+        );
+        assert_eq!(
+            commercial_glyph.style.bg,
+            Some(zone_bg(BuildingKind::Commercial))
+        );
+
+        // The ASCII fallbacks stay background-free for bare terminals.
+        let ascii = TileTheme::AsciiDetailed.tile_for_cell(
+            &commercial,
+            MapOverlayInput::Normal,
+            false,
+            PreviewState::None,
+        );
+        assert_eq!(ascii.style.bg, None);
     }
 
     #[test]
@@ -3477,6 +3585,8 @@ mod tests {
                     | '▒'
                     | '▓'
                     | '█'
+                    | 'ϟ'
+                    | '♣'
             )
     }
 
