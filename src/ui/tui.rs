@@ -17,6 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
+use crate::interface::events::CommandResult;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
     BuildPreviewView, CellView, DemandLevel, GameView, InspectDetailsView, InspectFlag, InspectView,
@@ -59,6 +60,28 @@ struct TuiState {
     hud_prev: Option<HudStats>,
     /// Direction each headline stat moved over the last turn (▲/▼/→). Stable within a turn.
     hud_trend: HudTrend,
+    /// Transient "build juice": a short-lived flash on the last edited cell plus its money delta.
+    build_flash: Option<BuildFlash>,
+}
+
+/// How long a build/bulldoze flash stays on screen before it fades.
+const FLASH_DURATION: Duration = Duration::from_millis(900);
+
+/// A transient confirmation flash for the most recent successful map edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BuildFlash {
+    x: usize,
+    y: usize,
+    /// Money delta readout, e.g. "+$100" / "-$50".
+    text: String,
+    color: Color,
+    expires_at: Instant,
+}
+
+impl BuildFlash {
+    fn is_active(&self, now: Instant) -> bool {
+        now < self.expires_at
+    }
 }
 
 /// Headline city stats captured once per turn so the HUD can show whether they are rising/falling.
@@ -108,6 +131,7 @@ impl Default for TuiState {
             use_emoji: true,
             hud_prev: None,
             hud_trend: HudTrend::default(),
+            build_flash: None,
         }
     }
 }
@@ -515,7 +539,24 @@ impl TuiRuntime {
     }
 
     fn poll_timeout(&self, now: Instant) -> Duration {
-        poll_timeout(self.state.is_running, self.next_auto_tick, now)
+        let base = poll_timeout(self.state.is_running, self.next_auto_tick, now);
+        // While a build flash is showing, wake at its expiry so the redraw can clear it.
+        match &self.state.build_flash {
+            Some(flash) if flash.is_active(now) => {
+                base.min(flash.expires_at.saturating_duration_since(now))
+            }
+            _ => base,
+        }
+    }
+
+    /// Drops an expired build flash and asks for a repaint so it disappears on time.
+    fn expire_build_flash(&mut self, now: Instant) {
+        if let Some(flash) = &self.state.build_flash {
+            if !flash.is_active(now) {
+                self.state.build_flash = None;
+                self.dirty = true;
+            }
+        }
     }
 
     fn mark_clean(&mut self) {
@@ -642,36 +683,28 @@ impl TuiRuntime {
                 self.state.message = format!("Selected {}", kind.label());
             }
             TuiAction::Build => {
-                self.state.message = self
-                    .game
-                    .build(
-                        self.state.cursor_x,
-                        self.state.cursor_y,
-                        self.state.selected_build,
-                    )
-                    .message();
+                let (x, y) = (self.state.cursor_x, self.state.cursor_y);
+                let before = self.current_money();
+                let result = self.game.build(x, y, self.state.selected_build);
+                self.finish_map_command(x, y, before, result, now);
             }
             TuiAction::Replace => {
-                self.state.message = self
-                    .game
-                    .replace(
-                        self.state.cursor_x,
-                        self.state.cursor_y,
-                        self.state.selected_build,
-                    )
-                    .message();
+                let (x, y) = (self.state.cursor_x, self.state.cursor_y);
+                let before = self.current_money();
+                let result = self.game.replace(x, y, self.state.selected_build);
+                self.finish_map_command(x, y, before, result, now);
             }
             TuiAction::Upgrade => {
-                self.state.message = self
-                    .game
-                    .upgrade(self.state.cursor_x, self.state.cursor_y)
-                    .message();
+                let (x, y) = (self.state.cursor_x, self.state.cursor_y);
+                let before = self.current_money();
+                let result = self.game.upgrade(x, y);
+                self.finish_map_command(x, y, before, result, now);
             }
             TuiAction::Bulldoze => {
-                self.state.message = self
-                    .game
-                    .bulldoze(self.state.cursor_x, self.state.cursor_y)
-                    .message();
+                let (x, y) = (self.state.cursor_x, self.state.cursor_y);
+                let before = self.current_money();
+                let result = self.game.bulldoze(x, y);
+                self.finish_map_command(x, y, before, result, now);
             }
             TuiAction::Tick => self.manual_tick(),
             TuiAction::Save => {
@@ -726,6 +759,44 @@ impl TuiRuntime {
         TuiFlow::Continue
     }
 
+    /// Current city money, read through the public view (no ECS access).
+    fn current_money(&mut self) -> i32 {
+        self.game
+            .view_with_overlay(self.state.current_overlay)
+            .status
+            .money
+    }
+
+    /// Records a map command's message and, on success, raises a transient "build juice" flash on
+    /// the edited cell showing the money delta. The flash is pure UI state driven by a timer; it
+    /// never feeds back into the simulation.
+    fn finish_map_command(
+        &mut self,
+        x: usize,
+        y: usize,
+        before_money: i32,
+        result: CommandResult,
+        now: Instant,
+    ) {
+        self.state.message = result.message();
+        if !result.success {
+            return;
+        }
+        let delta = self.current_money() - before_money;
+        let (text, color) = match delta.cmp(&0) {
+            Ordering::Greater => (format!("+${delta}"), Color::Green),
+            Ordering::Less => (format!("-${}", -delta), Color::Yellow),
+            Ordering::Equal => ("✔".to_string(), Color::Green),
+        };
+        self.state.build_flash = Some(BuildFlash {
+            x,
+            y,
+            text,
+            color,
+            expires_at: now + FLASH_DURATION,
+        });
+    }
+
     fn move_cursor(&mut self, dx: isize, dy: isize) {
         let view = self.game.view_with_overlay(self.state.current_overlay);
         let (cursor_x, cursor_y) = self.game.move_cursor_across_region(
@@ -776,6 +847,7 @@ fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
 
     loop {
         runtime.apply_due_auto_tick(Instant::now());
+        runtime.expire_build_flash(Instant::now());
 
         if runtime.dirty {
             // Pull all render data through the public API only when the screen needs repainting.
@@ -1014,6 +1086,12 @@ fn render_map(
         state.current_overlay,
     )));
 
+    // "Build juice": a short-lived flash on the last edited cell. Only honoured while it is active.
+    let flash = state
+        .build_flash
+        .as_ref()
+        .filter(|f| f.is_active(Instant::now()));
+
     let gap = map_cell_gap(area, view);
     let visible_columns = visible_map_columns(area, gap, view);
     let visible_rows = visible_map_rows(area, view, state.tile_theme, state.current_overlay);
@@ -1039,12 +1117,21 @@ fn render_map(
             let cell = &view.map.cells[index];
             let is_cursor = x == state.cursor_x && y == state.cursor_y;
             let preview_state = preview_state_for_cell(x, y, preview, state);
-            let glyph = state.tile_theme.tile_for_cell(
+            let mut glyph = state.tile_theme.tile_for_cell(
                 cell,
                 state.current_overlay,
                 is_cursor,
                 preview_state,
             );
+            // A freshly edited cell flashes in its delta colour (build green / refund yellow),
+            // without changing the tile width.
+            if flash.is_some_and(|f| f.x == x && f.y == y) {
+                let color = flash.expect("flash present").color;
+                glyph.style = Style::default()
+                    .bg(color)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD);
+            }
             // Each tile is exactly two display columns. The optional gap is outside the styled
             // tile so cursor highlighting never changes map width.
             row.push(Span::styled(glyph.tile, glyph.style));
@@ -1062,11 +1149,25 @@ fn render_map(
         lines.push(Line::from(row));
     }
 
+    let mut block = Block::default().title("City Map").borders(Borders::ALL);
+    // The money delta rides the map title as a transient floating readout (e.g. "+$100").
+    if let Some(flash) = flash {
+        block = block.title(
+            Line::from(Span::styled(
+                flash.text.clone(),
+                Style::default()
+                    .fg(flash.color)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .right_aligned(),
+        );
+    }
+
     frame.render_widget(
         // A Paragraph is enough here because the map is already formatted into line spans. Ratatui
         // handles clipping if the terminal is smaller than the full map.
         Paragraph::new(lines)
-            .block(Block::default().title("City Map").borders(Borders::ALL))
+            .block(block)
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -3582,6 +3683,50 @@ mod tests {
         assert_eq!(trend_span(Ordering::Greater).style.fg, Some(Color::Green));
         assert_eq!(trend_span(Ordering::Less).style.fg, Some(Color::Red));
         assert_eq!(trend_span(Ordering::Equal).style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn successful_build_raises_a_money_flash() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+
+        // Default cursor (0,0) is empty land; the default tool is Residential.
+        runtime.apply_action(TuiAction::Build, now);
+
+        let flash = runtime.state.build_flash.expect("build raises a flash");
+        assert_eq!((flash.x, flash.y), (0, 0));
+        assert!(flash.text.contains('$'), "flash shows a money delta");
+        assert!(flash.is_active(now));
+    }
+
+    #[test]
+    fn failed_command_raises_no_flash() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+
+        // Bulldozing empty land fails, so there is nothing to celebrate.
+        runtime.apply_action(TuiAction::Bulldoze, now);
+
+        assert!(runtime.state.build_flash.is_none());
+    }
+
+    #[test]
+    fn expired_build_flash_is_cleared_and_repaints() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.state.build_flash = Some(BuildFlash {
+            x: 1,
+            y: 1,
+            text: "+$10".to_string(),
+            color: Color::Green,
+            expires_at: now,
+        });
+        runtime.mark_clean();
+
+        runtime.expire_build_flash(now + Duration::from_millis(1));
+
+        assert!(runtime.state.build_flash.is_none());
+        assert!(runtime.dirty, "clearing the flash asks for a repaint");
     }
 
     #[test]
