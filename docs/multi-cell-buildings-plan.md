@@ -252,13 +252,13 @@ Capacity-on-upgrade today is a mix:
 
 To reach this plan's **L3 (2×2)** you must raise `MAX_UPGRADE_LEVEL` to **3**, and:
 
-- **Residential & Commercial — area formula (chosen):** capacity =
-  `base × area × 3/2` (integer; core is float-free), with `area == 1` → `base`.
-  Residential capacity = `max_population` (base 5/8); commercial capacity = jobs
-  (base 2 → 1×1: 2, 1×2: 6, 2×2: 12). Falls out of the footprint, so **no
-  per-level table** and L3 is automatic.
-- **Industrial:** keep the `jobs_at_level` formula for now (extends to L3 free);
-  align to the area formula in a later finetune patch if wanted.
+- **Area formula (chosen) — R, C, I:** capacity = `base × area × mult` (integer;
+  core is float-free), with `area == 1` → `base`. `mult` = **3/2** for
+  Residential & Commercial, **2** for Industrial.
+  - Residential = `max_population`, base 5/8 → 1×1: base, 1×2: base·3, 2×2: base·6
+  - Commercial = jobs, base 2 → 1×1: 2, 1×2: 6, 2×2: 12
+  - Industrial = jobs, base 3 → 1×1: 3, 1×2: 12, 2×2: 24
+  Falls out of the footprint, so **no per-level table** and L3 is automatic.
 - **Power / Park:** still hardcoded single-step; need an explicit L3 value.
   ponytail: hardcode L3 now, formula/table only when you actually tune them.
 
