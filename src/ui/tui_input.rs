@@ -30,6 +30,9 @@ pub(crate) enum TuiAction {
     ToggleRun,
     IncreaseSpeed,
     DecreaseSpeed,
+    /// Ask to quit: opens the confirm-and-save dialog instead of exiting immediately.
+    RequestQuit,
+    /// Quit immediately without confirmation. Reserved for the Ctrl-C emergency hatch.
     Quit,
     None,
 }
@@ -75,7 +78,7 @@ pub(crate) fn map_key_event(event: KeyEvent) -> TuiAction {
         KeyCode::Char(' ') => TuiAction::ToggleRun,
         KeyCode::Char('+') | KeyCode::Char('=') => TuiAction::IncreaseSpeed,
         KeyCode::Char('-') => TuiAction::DecreaseSpeed,
-        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => TuiAction::Quit,
+        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => TuiAction::RequestQuit,
         _ => TuiAction::None,
     }
 }
@@ -164,7 +167,28 @@ mod tests {
             TuiAction::NextRegion
         );
         assert_eq!(map_key_event(key(KeyCode::Char(' '))), TuiAction::ToggleRun);
-        assert_eq!(map_key_event(key(KeyCode::Char('Q'))), TuiAction::Quit);
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('Q'))),
+            TuiAction::RequestQuit
+        );
+    }
+
+    #[test]
+    fn quit_keys_request_confirmation_but_ctrl_c_quits_immediately() {
+        // Esc / q / Q open the confirm-and-save dialog rather than exiting outright.
+        assert_eq!(map_key_event(key(KeyCode::Esc)), TuiAction::RequestQuit);
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('q'))),
+            TuiAction::RequestQuit
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('Q'))),
+            TuiAction::RequestQuit
+        );
+
+        // Ctrl-C remains an immediate, unconfirmed quit (emergency hatch).
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(map_key_event(ctrl_c), TuiAction::Quit);
     }
 
     #[test]

@@ -48,6 +48,9 @@ struct TuiState {
     run_speed: RunSpeed,
     show_help: bool,
     prompt: Option<PromptState>,
+    /// When set, a modal asks the player to confirm quitting (with a save option) instead of
+    /// exiting immediately. Cleared on cancel or once the quit is carried out.
+    quit_confirm: bool,
 }
 
 impl Default for TuiState {
@@ -66,6 +69,7 @@ impl Default for TuiState {
             run_speed: RunSpeed::One,
             show_help: false,
             prompt: None,
+            quit_confirm: false,
         }
     }
 }
@@ -380,6 +384,8 @@ impl TuiState {
 struct PromptState {
     kind: PromptKind,
     input: String,
+    /// When `true` (only for a Save raised from the quit dialog), a successful save quits the app.
+    then_quit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,6 +399,9 @@ struct TuiRuntime {
     state: TuiState,
     next_auto_tick: Instant,
     dirty: bool,
+    /// Set when the player has confirmed a quit (directly, or after a save-and-quit). The event
+    /// loop checks it after each modal key so it can exit cleanly without an extra action enum.
+    pending_quit: bool,
 }
 
 impl TuiRuntime {
@@ -410,6 +419,7 @@ impl TuiRuntime {
             state: TuiState::default(),
             next_auto_tick: now + RunSpeed::One.interval(),
             dirty: true,
+            pending_quit: false,
         })
     }
 
@@ -459,7 +469,16 @@ impl TuiRuntime {
                 match prompt.kind {
                     PromptKind::Save => {
                         self.state.message = match self.game.save_to_file(&filename) {
-                            Ok(()) => format!("Saved {filename}"),
+                            Ok(()) => {
+                                // A save raised from the quit dialog exits once it succeeds; a
+                                // failed save keeps the app open so progress is never lost silently.
+                                if prompt.then_quit {
+                                    self.pending_quit = true;
+                                    format!("Saved {filename}; quitting")
+                                } else {
+                                    format!("Saved {filename}")
+                                }
+                            }
                             Err(error) => error.to_string(),
                         };
                     }
@@ -485,6 +504,48 @@ impl TuiRuntime {
 
         self.dirty = true;
         Ok(true)
+    }
+
+    /// Handles a key while the quit-confirmation modal is open. Returns `true` when the modal
+    /// consumed the key (so it should not fall through to a gameplay action). The actual exit is
+    /// signalled via `pending_quit` and carried out by the event loop.
+    ///
+    /// ```text
+    ///   [S] save & quit ─► open Save prompt (then_quit) ─► save ok ─► pending_quit
+    ///   [Q]/[Enter] quit ─────────────────────────────────────────► pending_quit
+    ///   [Esc]/[N]/[C] cancel ─► close modal, stay in game
+    /// ```
+    fn handle_quit_confirm_key(&mut self, key: KeyEvent) -> bool {
+        if !self.state.quit_confirm {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                // Route through the normal Save filename prompt, flagged to quit once it succeeds.
+                self.state.quit_confirm = false;
+                self.state.prompt = Some(PromptState {
+                    kind: PromptKind::Save,
+                    input: String::new(),
+                    then_quit: true,
+                });
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Enter => {
+                self.pending_quit = true;
+            }
+            KeyCode::Esc
+            | KeyCode::Char('n')
+            | KeyCode::Char('N')
+            | KeyCode::Char('c')
+            | KeyCode::Char('C') => {
+                self.state.quit_confirm = false;
+                self.state.message = "Quit cancelled".to_string();
+            }
+            _ => {}
+        }
+
+        self.dirty = true;
+        true
     }
 
     fn apply_action(&mut self, action: TuiAction, now: Instant) -> TuiFlow {
@@ -534,12 +595,14 @@ impl TuiRuntime {
                 self.state.prompt = Some(PromptState {
                     kind: PromptKind::Save,
                     input: String::new(),
+                    then_quit: false,
                 });
             }
             TuiAction::Load => {
                 self.state.prompt = Some(PromptState {
                     kind: PromptKind::Load,
                     input: String::new(),
+                    then_quit: false,
                 });
             }
             TuiAction::ToggleHelp => self.state.show_help = !self.state.show_help,
@@ -566,6 +629,11 @@ impl TuiRuntime {
             TuiAction::DecreaseSpeed => {
                 self.state.decrease_speed();
                 self.next_auto_tick = now + self.state.run_speed.interval();
+            }
+            TuiAction::RequestQuit => {
+                // Esc / q / Q never exit straight away: open the confirm-and-save modal instead.
+                self.state.quit_confirm = true;
+                self.state.message = "Quit? S save & quit · Q quit · Esc cancel".to_string();
             }
             TuiAction::Quit => return TuiFlow::Quit,
             TuiAction::None => return TuiFlow::Continue,
@@ -664,6 +732,18 @@ fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
 
         // Prompts are modal: while entering a filename, normal gameplay hotkeys are ignored.
         if runtime.handle_prompt_key(key)? {
+            // A save raised by "save & quit" sets this once the write succeeds.
+            if runtime.pending_quit {
+                return Ok(());
+            }
+            continue;
+        }
+
+        // The quit-confirmation modal is also fully modal while open.
+        if runtime.handle_quit_confirm_key(key) {
+            if runtime.pending_quit {
+                return Ok(());
+            }
             continue;
         }
 
@@ -733,6 +813,56 @@ fn render(
     if let Some(prompt) = &state.prompt {
         render_prompt(frame, root, prompt);
     }
+    if state.quit_confirm {
+        render_quit_confirm(frame, root);
+    }
+}
+
+/// Modal shown when the player presses Esc/Q to quit. Double-confirms and offers to save first so
+/// progress is never lost by an accidental keypress.
+fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect) {
+    let popup = centered_rect(50, 30, area);
+    let lines = vec![
+        Line::from(Span::styled(
+            "Quit Small City?",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("Unsaved progress will be lost."),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "S",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Save & Quit    "),
+            Span::styled(
+                "Q",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Quit    "),
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Cancel"),
+        ]),
+    ];
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().title("Confirm Quit").borders(Borders::ALL))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
 }
 
 fn terminal_is_too_small(area: Rect) -> bool {
@@ -1473,7 +1603,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  S             Save city"),
         Line::from("  L             Load city"),
         Line::from("  H             Close Help"),
-        Line::from("  Q             Quit"),
+        Line::from("  Esc / Q       Quit (confirm dialog, with save option)"),
+        Line::from("  Ctrl-C        Quit immediately"),
         Line::from("  Enter at save/load prompt uses city1"),
         Line::from(format!(
             "  T             Cycle tile theme: {}",
@@ -2928,6 +3059,87 @@ mod tests {
             .expect("prompt escape handled");
         assert!(runtime.state.prompt.is_none());
         assert_eq!(runtime.state.message, "Cancelled prompt");
+    }
+
+    #[test]
+    fn request_quit_opens_confirm_dialog_without_exiting() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+
+        let flow = runtime.apply_action(TuiAction::RequestQuit, now);
+
+        assert_eq!(flow, TuiFlow::Continue);
+        assert!(runtime.state.quit_confirm, "Esc/Q opens the confirm modal");
+        assert!(!runtime.pending_quit, "it must not exit yet");
+    }
+
+    #[test]
+    fn quit_confirm_cancel_returns_to_game() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.state.quit_confirm = true;
+
+        let consumed =
+            runtime.handle_quit_confirm_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(consumed, "the modal swallows the key");
+        assert!(!runtime.state.quit_confirm);
+        assert!(!runtime.pending_quit);
+    }
+
+    #[test]
+    fn quit_confirm_quit_sets_pending_quit() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.state.quit_confirm = true;
+
+        runtime.handle_quit_confirm_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+
+        assert!(runtime.pending_quit, "Q in the modal confirms the quit");
+    }
+
+    #[test]
+    fn quit_confirm_save_opens_save_prompt_flagged_to_quit() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.state.quit_confirm = true;
+
+        runtime.handle_quit_confirm_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+
+        assert!(
+            !runtime.state.quit_confirm,
+            "the modal hands off to the prompt"
+        );
+        let prompt = runtime.state.prompt.as_ref().expect("save prompt opened");
+        assert_eq!(prompt.kind, PromptKind::Save);
+        assert!(prompt.then_quit, "save is flagged to quit on success");
+        assert!(
+            !runtime.pending_quit,
+            "not until the save actually succeeds"
+        );
+    }
+
+    #[test]
+    fn save_and_quit_prompt_quits_after_successful_save() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        let path = std::env::temp_dir().join("small_city_save_and_quit_test.json");
+        runtime.state.prompt = Some(PromptState {
+            kind: PromptKind::Save,
+            input: path.to_string_lossy().into_owned(),
+            then_quit: true,
+        });
+
+        runtime
+            .handle_prompt_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("save handled");
+
+        assert!(
+            runtime.pending_quit,
+            "a save-and-quit exits once the write lands"
+        );
+        assert!(runtime.state.prompt.is_none());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
