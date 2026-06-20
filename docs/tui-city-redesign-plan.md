@@ -1,6 +1,10 @@
 # TUI city-look redesign (SimCity skin), built for multi-cell buildings & traffic
 
-Status: planned (not implemented).
+Status: **implemented** — T1 (map skin), T2 (chrome: header bar, tool strip,
+City HUD, emoji fallback), F1 (HUD trend arrows), F2 (build juice), F3 (paint
+mode) are committed on branch `new_tui`. Still reserved/not built: §5 multi-cell
+and §6 traffic (need core work) and F4 undo (needs core snapshot plumbing — see
+§7c F4).
 
 Target aesthetic: the original **SimCity (1989, DOS/Maxis)** — tan ground, green
 forest blobs, gray roads, colored `R`/`C`/`I` zones, a `Funds · City · Date`
@@ -291,31 +295,37 @@ Every action should *react*. On a successful build/bulldoze/upgrade:
   zero. **Off a UI frame counter, never sim state, never fed back into `core/`**
   (keeps determinism/saves intact, CLAUDE.md §3).
 
-### F3. Drag / paint to build — input mission (separate)
+### F3. Paint to build — IMPLEMENTED
 
-The biggest *tactile* win: hold-drag to lay a **road line** or repeat-place a zone
-along the cursor path, instead of one cell per keypress.
+The biggest *tactile* win: lay a **road line** or repeat-place a zone along the
+cursor path, instead of one cell per keypress. Shipped as a keyboard **paint
+mode** (the deterministic, mouse-free form of drag-build):
 
-- A UI-side **paint mode**: on drag-start record the anchor; as the cursor moves,
-  apply the selected tool to each newly-entered cell by calling the existing
-  facade `build()` per cell (no `core/` change — just multiple normal builds).
-- Needs event-loop work (track press/drag/release or a toggled paint mode) and a
-  preview of the pending line. Deterministic: each cell is an ordinary build.
-- **Its own mission**, after the skin — not part of T1/T2.
+- `P` toggles `TuiState.paint_mode`; while on, each cursor move applies the
+  selected tool to the entered cell via the existing facade `build()` (no `core/`
+  change — just normal builds; occupied cells fail quietly so drawing continues).
+- The tool strip shows `Tools ✎` with a bright border while painting.
+- Deterministic: each painted cell is an ordinary build. Tested.
 
-### F4. Undo last action — driver mission (separate, touches `core/`)
+### F4. Undo last action — RESERVED (needs a core snapshot mission)
 
-Forgiveness lowers anxiety and invites experimentation.
+Forgiveness lowers anxiety and invites experimentation, but **a safe undo is not
+UI-only and is deferred**:
 
-- Snapshot the region state before each mutating command (build/replace/upgrade/
-  bulldoze), keep a small bounded undo stack in the driver/facade, and add an
-  `undo()` that restores the last snapshot. Bind to a key (e.g. `Z`).
-- **Not UI-only** — it adds a command/snapshot surface to the driver (and must
-  respect the regional threading model). Scope it as its own mission; weigh cost
-  vs. a simpler "snapshot only the last command" first cut.
+- The intended design — snapshot region state before each mutating command, keep
+  a bounded undo stack, restore on `Z` — needs a **lightweight in-memory snapshot
+  of the live game**. None exists today: `RegionalGame::save_to_file` *consumes
+  the game and shuts down the worker thread*, so snapshotting per build would be
+  far too heavy and would churn the threading model.
+- A command-inverse undo (undo build → bulldoze, etc.) was rejected: it cannot
+  restore spent money / economy side-effects exactly, so it would desync state.
+- **Proper fix = a small core mission**: add `RegionalGame::snapshot_bytes()` /
+  `restore_from_bytes()` that serialize/deserialize region state *without* tearing
+  down the worker, then build the bounded undo stack in the driver on top. Scoped
+  separately; not attempted here to avoid a fragile or heavy implementation.
 
-> F1 + F2 ride along with the chrome work; F3 and F4 are deliberately *not*
-> bundled — they each deserve their own small, tested patch.
+> F1, F2 and F3 are implemented as their own small, tested patches; F4 is
+> reserved pending the core snapshot mission above.
 
 ---
 
