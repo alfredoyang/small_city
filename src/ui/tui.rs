@@ -1,5 +1,6 @@
 //! Panel-based ratatui terminal frontend built only from facade view models.
 
+use std::cmp::Ordering;
 use std::env;
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
@@ -54,6 +55,37 @@ struct TuiState {
     /// Whether the chrome panels (header bar, tool strip, City HUD, legend) may use emoji icons.
     /// The map grid is always emoji-free; only these panels fall back to ASCII on bare terminals.
     use_emoji: bool,
+    /// Snapshot of headline stats at the last turn boundary, used to draw HUD trend arrows.
+    hud_prev: Option<HudStats>,
+    /// Direction each headline stat moved over the last turn (▲/▼/→). Stable within a turn.
+    hud_trend: HudTrend,
+}
+
+/// Headline city stats captured once per turn so the HUD can show whether they are rising/falling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HudStats {
+    turn: u32,
+    money: i32,
+    population: i32,
+    happiness: i32,
+}
+
+/// The direction each headline stat moved across the last turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HudTrend {
+    money: Ordering,
+    population: Ordering,
+    happiness: Ordering,
+}
+
+impl Default for HudTrend {
+    fn default() -> Self {
+        Self {
+            money: Ordering::Equal,
+            population: Ordering::Equal,
+            happiness: Ordering::Equal,
+        }
+    }
 }
 
 impl Default for TuiState {
@@ -74,6 +106,8 @@ impl Default for TuiState {
             prompt: None,
             quit_confirm: false,
             use_emoji: true,
+            hud_prev: None,
+            hud_trend: HudTrend::default(),
         }
     }
 }
@@ -325,6 +359,30 @@ enum IntensityKind {
 }
 
 impl TuiState {
+    /// Refreshes the HUD trend arrows once per turn. Comparing against the previous turn's snapshot
+    /// (not the previous frame) keeps the arrows stable while the turn is paused. The first observed
+    /// turn just seeds the baseline so nothing spikes from zero.
+    fn update_hud_trend(&mut self, turn: u32, money: i32, population: i32, happiness: i32) {
+        let current = HudStats {
+            turn,
+            money,
+            population,
+            happiness,
+        };
+        match self.hud_prev {
+            Some(prev) if prev.turn != current.turn => {
+                self.hud_trend = HudTrend {
+                    money: current.money.cmp(&prev.money),
+                    population: current.population.cmp(&prev.population),
+                    happiness: current.happiness.cmp(&prev.happiness),
+                };
+                self.hud_prev = Some(current);
+            }
+            None => self.hud_prev = Some(current),
+            _ => {}
+        }
+    }
+
     /// Keeps the cursor valid after operations that may change the loaded map size.
     fn clamp_cursor(&mut self, view: &GameView) {
         self.cursor_x = self.cursor_x.min(view.map.width.saturating_sub(1));
@@ -727,6 +785,12 @@ fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
                 .game
                 .view_with_overlay(runtime.state.current_overlay);
             runtime.state.region_label = runtime.game.region_label();
+            runtime.state.update_hud_trend(
+                view.status.turn,
+                view.status.money,
+                view.status.population,
+                view.status.happiness,
+            );
             runtime.state.clamp_cursor(&view);
             let inspect = runtime
                 .game
@@ -1469,6 +1533,16 @@ fn hud_icon(use_emoji: bool, emoji: &'static str, ascii: &'static str) -> &'stat
     if use_emoji { emoji } else { ascii }
 }
 
+/// A coloured trend arrow for a headline stat: ▲ rising (green), ▼ falling (red), → steady (dim).
+fn trend_span(direction: Ordering) -> Span<'static> {
+    let (arrow, color) = match direction {
+        Ordering::Greater => ("▲", Color::Green),
+        Ordering::Less => ("▼", Color::Red),
+        Ordering::Equal => ("→", Color::DarkGray),
+    };
+    Span::styled(arrow.to_string(), Style::default().fg(color))
+}
+
 /// A compact 3-cell demand meter (Low/Medium/High) for the HUD.
 fn demand_bar(level: DemandLevel) -> &'static str {
     match level {
@@ -1485,31 +1559,44 @@ fn render_city_hud(frame: &mut Frame<'_>, area: Rect, view: &GameView, state: &T
     let s = &view.status;
     let e = state.use_emoji;
 
+    let t = &state.hud_trend;
     let lines = vec![
         Line::from(Span::styled(
             state.region_label.clone(),
             Style::default().add_modifier(Modifier::DIM),
         )),
-        Line::from(format!(
-            "{} ${}   {} {} pop   {} {} jobs ({} idle)",
-            hud_icon(e, "💰", "$"),
-            s.money,
-            hud_icon(e, "👥", "pop"),
-            s.population,
-            hud_icon(e, "💼", "job"),
-            s.jobs,
-            s.unemployment,
-        )),
-        Line::from(format!(
-            "{} {}/{}   {} {} happy   {} {} pollution",
-            hud_icon(e, "⚡", "pwr"),
-            s.power.total_supplied,
-            s.power.total_capacity,
-            hud_icon(e, "🙂", "joy"),
-            s.happiness,
-            hud_icon(e, "🏭", "pol"),
-            s.pollution,
-        )),
+        Line::from(vec![
+            Span::raw(format!("{} ${}", hud_icon(e, "💰", "$"), s.money)),
+            trend_span(t.money),
+            Span::raw(format!(
+                "  {} {} pop",
+                hud_icon(e, "👥", "pop"),
+                s.population
+            )),
+            trend_span(t.population),
+            Span::raw(format!(
+                "  {} {} jobs ({} idle)",
+                hud_icon(e, "💼", "job"),
+                s.jobs,
+                s.unemployment
+            )),
+        ]),
+        Line::from(vec![
+            Span::raw(format!(
+                "{} {}/{}   {} {} happy",
+                hud_icon(e, "⚡", "pwr"),
+                s.power.total_supplied,
+                s.power.total_capacity,
+                hud_icon(e, "🙂", "joy"),
+                s.happiness
+            )),
+            trend_span(t.happiness),
+            Span::raw(format!(
+                "   {} {} pollution",
+                hud_icon(e, "🏭", "pol"),
+                s.pollution
+            )),
+        ]),
         Line::from(format!(
             "{} +{} made · {} imported · {} exported",
             hud_icon(e, "📦", "goods"),
@@ -3469,6 +3556,32 @@ mod tests {
         );
         assert!(!ascii.contains("👥"), "ascii fallback omits emoji");
         assert!(ascii.contains("pop"), "ascii fallback labels people as pop");
+    }
+
+    #[test]
+    fn hud_trend_tracks_changes_across_a_turn() {
+        let mut state = TuiState::default();
+
+        // First observation just seeds the baseline — no spurious arrows from zero.
+        state.update_hud_trend(0, 100, 10, 50);
+        assert_eq!(state.hud_trend.money, Ordering::Equal);
+
+        // Same turn: trend stays put even if values are re-read.
+        state.update_hud_trend(0, 999, 999, 999);
+        assert_eq!(state.hud_trend.money, Ordering::Equal);
+
+        // New turn with money up, population down, happiness flat.
+        state.update_hud_trend(1, 140, 8, 50);
+        assert_eq!(state.hud_trend.money, Ordering::Greater);
+        assert_eq!(state.hud_trend.population, Ordering::Less);
+        assert_eq!(state.hud_trend.happiness, Ordering::Equal);
+    }
+
+    #[test]
+    fn trend_span_colors_by_direction() {
+        assert_eq!(trend_span(Ordering::Greater).style.fg, Some(Color::Green));
+        assert_eq!(trend_span(Ordering::Less).style.fg, Some(Color::Red));
+        assert_eq!(trend_span(Ordering::Equal).style.fg, Some(Color::DarkGray));
     }
 
     #[test]
