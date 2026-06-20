@@ -10,8 +10,10 @@ patch). Implements the §5 multi-cell feature reserved in
 Upgrading a building costs **space**, not just money:
 
 1. **Grow on upgrade (gradual).** Footprint area per level: **L1 = 1, L2 = 2,
-   L3 = 4** cells (nominal shapes 1×1 → 2×1 → 2×2). Capacity still scales with
-   level as today; the footprint is the new *spatial* requirement.
+   L3 = 4** cells (nominal shapes 1×1 → 2×1 → 2×2). These per-level areas are
+   **configurable** (see [Configurable footprint ruleset](#configurable-footprint-ruleset)).
+   Capacity still scales with level as today; the footprint is the new *spatial*
+   requirement.
 2. **Claim cells — same-type first, then empty.** To reach the next level's area,
    the building claims adjacent cells. Scanning its perimeter in a fixed order
    (N, E, S, W), it prefers an adjacent **same-type building → merge it**, else an
@@ -57,12 +59,62 @@ grid cells:       (3,4)=Some(E7) (4,4)=Some(E7)
 get(4,4) → E7 → inspect/bulldoze/upgrade all resolve to the one building
 ```
 
+## Configurable footprint ruleset
+
+The per-level footprint areas are **data, not constants** — tunable without
+recompiling.
+
+- **Format: JSON via `serde_json`** (already a project dependency — no new crate;
+  TOML/RON are avoided since they would add one).
+- **Delivery: embedded default + optional external override.** A baseline ruleset
+  is baked into the binary with `include_str!` so the game always runs; an
+  external `config/buildings.json` overrides it when present. Malformed overrides
+  fail loudly with a clear error; the embedded default is guarded by a parse test.
+- **Lives in `core`** as a `BuildingRules` resource; the UI never reads it.
+
+```json
+{
+  "buildings": {
+    "Residential": { "footprint_area_per_level": [1, 2, 4] },
+    "Commercial":  { "footprint_area_per_level": [1, 2, 4] },
+    "Industrial":  { "footprint_area_per_level": [1, 2, 4] }
+  }
+}
+```
+
+```rust
+struct BuildingRules { footprint_area_per_level: BTreeMap<BuildingKind, Vec<u32>> }
+impl BuildingRules {
+    fn footprint_area(&self, kind, level) -> u32  // clamped to the table length
+}
+```
+
+- **Validation on load:** each list is non-empty, strictly positive, and
+  non-decreasing (an upgrade must never *shrink* a footprint); length covers all
+  levels. R/C/I are required; Road/Power/Park are fixed 1×1 and not configurable.
+
+### Determinism: the ruleset is stamped into saves
+
+Footprint areas are **game rules**, and replays assume fixed rules (CLAUDE.md §3).
+So the active `BuildingRules` is **written into the save file** and **loading uses
+the saved rules**, not the current external JSON:
+
+- `RegionalGameSave` gains `building_rules: BuildingRules`, `#[serde(default)]` to
+  the embedded baseline so **legacy saves load unchanged** (they get the [1,2,4]
+  default).
+- A **new** game reads the embedded default / external override; that ruleset then
+  travels with the city. Editing `config/buildings.json` afterwards affects only
+  *new* games — an existing save replays identically regardless. Replay parity is
+  guaranteed.
+- The rules are stored once at the `RegionalGameSave` level and injected into each
+  region's `World` on construction (single source of truth, no per-region drift).
+
 ## The upgrade algorithm (deterministic)
 
 ```
 fn upgrade(entity):
     next = level + 1; if next > MAX: fail "already max level"
-    need = AREA[next] - footprint.len()        # 0 if merges already grew it
+    need = rules.footprint_area(kind, next) - footprint.len()   # 0 if merges already grew it
     claimed = []
     while need > 0:
         cell = first_claimable_perimeter_cell(entity)   # see order below
@@ -120,6 +172,14 @@ fn upgrade(entity):
 
 ## Suggested split (each its own tested patch)
 
+- **M0 — configurable footprint ruleset.** `core/building_rules.rs`:
+  `BuildingRules` (per-kind `footprint_area_per_level`), embedded default via
+  `include_str!` + optional `config/buildings.json` override, validation, and
+  `footprint_area(kind, level)`. Stamp it into `RegionalGameSave`
+  (`#[serde(default)]`) and inject into each region's `World`. No gameplay change
+  yet — nothing reads the area until M2. Tests: default parses and validates; a
+  good override loads; a bad/shrinking override is rejected; save round-trips the
+  rules; a legacy save (no field) gets the default.
 - **M1 — footprint plumbing, 1×1 parity.** `Building.footprint` (default 1×1),
   grid helpers, write/clear on build/bulldoze, cell→owner inspect resolution.
   **No behaviour change** — everything is still 1×1. Tests: 1×1 round-trips;
@@ -148,7 +208,11 @@ Run `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test -q` after each.
 - **Balance**: merging transfers population/goods — capacity caps prevent spikes,
   but watch for pop loss surprising the player; surface "excess lost" in the
   upgrade message. Keep economy formulas otherwise untouched.
-- **Save migration**: `footprint` defaults to 1×1 so existing saves are valid.
+- **Save migration**: `footprint` defaults to 1×1 and `building_rules` defaults to
+  the embedded baseline, so existing saves load unchanged.
+- **Config vs. determinism**: the ruleset is stamped into saves and load uses the
+  saved rules, so editing `config/buildings.json` never breaks an existing city's
+  replay parity — it only affects new games.
 - **Region borders**: footprints never cross a region edge (out-of-grid cells are
   not claimable → may block an upgrade at the border, which is correct).
 - **Architecture**: all simulation logic in `core`; UI renders view models only
