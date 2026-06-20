@@ -220,6 +220,41 @@ fn upgrade(entity):
 
 Run `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test -q` after each.
 
+## M2 implementation notes (worked out during M0/M1)
+
+How the ruleset and capacity thread through, decided while building M0/M1:
+
+- **`World` holds the rules:** add `#[serde(skip, default)] building_rules:
+  BuildingRules` to `World` (defaults to the embedded baseline, like the other
+  skip fields). Serde-skip means it is *not* duplicated per region in the save and
+  every `World` deterministically gets the same rules. `upgrade` reads
+  `world.building_rules().footprint_area(kind, next_level)`.
+- **`capacity_for(kind, area) -> i32` is the single source** (the `(base, mult)`
+  table). It feeds **two** readers, which must both change together:
+  - residential `population.max` in `apply_upgrade_effect`, and
+  - the **jobs registry** — `resource_registry` currently calls
+    `BuildingKind::jobs_at_level(level)`; commercial/industrial capacity is now
+    area-based, so the registry must read the building's `footprint.area()` and
+    call `capacity_for` instead. This is the one cross-system ripple in M2.
+- **Level cap:** raise `MAX_UPGRADE_LEVEL` from 2 to **3**. L3 capacity then falls
+  out of `capacity_for` (no hardcoded L3 numbers) for R/C/I; power/park keep their
+  hardcoded value and need an explicit L3 (or stay level-2-only).
+- **M2 merges absorb cells only** (the neighbor entity is removed); transferring
+  the neighbor's population/goods is **M3** — so M2 alone loses a merged
+  neighbor's residents until M3 lands (accepted by the split).
+- **File override + save-stamping is its own follow-up** (call it M5). It is the
+  threaded-save plumbing: add `building_rules` to `RegionalGameSave`
+  (`#[serde(default)]`), load `config/buildings.json` at new-game time, and inject
+  the rules into each `RegionState`'s `World` before the runner takes ownership
+  (in `from_regions_with_layout_and_worker_setup` / `from_save`). Until M5,
+  every `World` uses the embedded default — a *single* source, so determinism and
+  replay parity already hold; M5 only adds external-file configurability.
+
+Files M2 touches (~5–6): `world.rs`, `components.rs` (Footprint area/cells/rect
+helpers), `grid.rs` (`set_footprint`), `systems/upgrade.rs` (algorithm +
+`capacity_for` + MAX level), `resource_registry.rs` (area-based jobs). Right at
+the size guideline — keep M2's scope to growth+capacity and leave transfer to M3.
+
 ## Risks / guardrails
 
 - **Determinism** is the top risk: the fixed N,E,S,W scan, pass-1-same-type /
