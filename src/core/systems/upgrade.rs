@@ -162,6 +162,35 @@ fn fail(reason: &str) -> CommandResult {
     })
 }
 
+/// Whether the building at `entity` could level up but has no room to grow its footprint (so an
+/// upgrade would be blocked for space). Pure: reuses the growth search without mutating. Used by the
+/// inspect view to warn the player. Returns false for buildings that cannot upgrade or grow in place.
+pub(crate) fn upgrade_blocked_for_space(world: &World, entity: Entity) -> bool {
+    let Some(building) = world.buildings.get(&entity) else {
+        return false;
+    };
+    let next_level = building.level + 1;
+    if building.kind.upgrade_cost_for_level(next_level).is_none() {
+        return false; // already capped / not upgradeable: not a space problem
+    }
+    let Some(anchor) = world.positions.get(&entity) else {
+        return false;
+    };
+    let current = Rect::new(
+        anchor.x,
+        anchor.y,
+        building.footprint.width as usize,
+        building.footprint.height as usize,
+    );
+    let target_area = world
+        .building_rules()
+        .footprint_area(building.kind, next_level) as usize;
+    if current.area() >= target_area {
+        return false; // grows in place, no extra space needed
+    }
+    choose_extension(world, entity, building.kind, current, target_area).is_none()
+}
+
 /// Re-homes every citizen living in `from` to `to`. Called before a merged neighbour is removed so
 /// its residents move into the merged building instead of being despawned with it.
 fn reassign_citizen_homes(world: &mut World, from: Entity, to: Entity) {

@@ -2,7 +2,8 @@
 
 use crate::core::components::WorkplaceSource;
 use crate::core::systems::{
-    business_growth, citizens, economy, population, power, road_connectivity, road_network_analysis,
+    business_growth, citizens, economy, population, power, road_connectivity,
+    road_network_analysis, upgrade,
 };
 use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
@@ -289,6 +290,22 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
     };
 
     let mut explanations = Vec::new();
+
+    // Multi-cell footprint readout, plus a warning when the building wants to grow but is boxed in.
+    let footprint = building.footprint;
+    if footprint.area() > 1 {
+        explanations.push(format!(
+            "Footprint: {}x{} ({} cells).",
+            footprint.width,
+            footprint.height,
+            footprint.area()
+        ));
+    }
+    if upgrade::upgrade_blocked_for_space(world, entity) {
+        explanations
+            .push("No room to grow: clear an adjacent cell to level this building up.".to_string());
+    }
+
     let road_connected =
         building.kind == BuildingKind::Road || road_connectivity::is_road_connected(world, entity);
 

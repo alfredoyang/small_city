@@ -137,3 +137,28 @@ fn unsupported_or_max_upgrade_fails() {
     assert!(!result.success);
     assert!(result.message().contains("fully upgraded"));
 }
+
+#[test]
+fn inspect_shows_footprint_and_blocked_growth_notes() {
+    // After upgrading, a multi-cell building reports its footprint in the inspect notes.
+    let mut game = SingleRegionTestGame::new(4, 4);
+    assert!(game.build(1, 1, BuildingKind::Residential).success);
+    assert!(game.upgrade(1, 1).success);
+    let notes = game.inspect(1, 1).explanations;
+    assert!(
+        notes.iter().any(|note| note.contains("Footprint:")),
+        "expected a footprint note, got {notes:?}"
+    );
+
+    // A residential boxed in on all four sides cannot grow, so inspect warns about it.
+    let mut boxed = SingleRegionTestGame::new(3, 3);
+    assert!(boxed.build(1, 1, BuildingKind::Residential).success);
+    for (x, y) in [(0, 1), (2, 1), (1, 0), (1, 2)] {
+        assert!(boxed.build(x, y, BuildingKind::Road).success);
+    }
+    let notes = boxed.inspect(1, 1).explanations;
+    assert!(
+        notes.iter().any(|note| note.contains("No room to grow")),
+        "expected a blocked-growth note, got {notes:?}"
+    );
+}
