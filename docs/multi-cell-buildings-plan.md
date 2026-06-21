@@ -651,6 +651,7 @@ CityDriver::upgrade(x, y)
 RegionalGame::upgrade_selected_region(x, y)
   |
   | selected RegionId + RegionCommand::Upgrade { x, y }
+  | RegionalGame also owns the save-stamped BuildingRules copy (M5)
   v
 RegionalGameRunner::run_region_command(request_id, region_id, command)
   |
@@ -667,8 +668,39 @@ RegionRuntime::run_command()
   v
 RegionState::upgrade(x, y)
   |
+  | owns one World; World.building_rules was injected from RegionalGameSave/new-game config (M0/M5)
   v
 core::systems::upgrade::upgrade(world, x, y)
+  |
+  +-- grid.get(x, y) resolves any footprint cell to the owner entity (M1)
+  |
+  +-- world.building_rules().footprint_area(kind, next_level) picks target area (M0)
+  |
+  +-- grow_to_level() tries deterministic N/E/S/W side extension (M2)
+  |
+  +-- same-type neighbours fully inside the new rectangle are merged (M2)
+  |
+  +-- transferred citizens/goods/cash are kept, then capped deterministically (M3)
+  |
+  +-- building_stats::capacity_for(kind, footprint.area()) updates capacity (M2)
+  |
+  +-- road_connectivity sees the whole footprint boundary after growth (M2)
+  |
+  v
+CommandResult::success/failure
+```
+
+Inspect after the command uses the same structures:
+
+```text
+TUI requests fresh view/inspect
+  |
+  v
+adapter::inspect_world()
+  |
+  +-- grid cell -> owner entity, even for non-anchor footprint cells (M1)
+  +-- shows "Footprint: WxH (N cells)" through explanations (M4)
+  +-- upgrade_blocked_for_space() reuses the same pure extension search (M4)
 ```
 
 Reply path:
