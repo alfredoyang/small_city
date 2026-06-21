@@ -1,6 +1,7 @@
 //! Adapter that converts private ECS world data into UI-safe view and inspect models.
 
-use crate::core::components::WorkplaceSource;
+use crate::core::components::{Citizen, WorkplaceSource};
+use crate::core::entity::Entity;
 use crate::core::systems::{
     business_growth, citizens, economy, population, power, road_connectivity,
     road_network_analysis, upgrade,
@@ -8,9 +9,9 @@ use crate::core::systems::{
 use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
-    BuildOptionView, CellView, CityDemand, CityStatusView, DemandLevel, GameTimeView, GameView,
-    InspectDetailsView, InspectFlag, InspectView, JobAssignmentView, LocalEffectsView, MapView,
-    PowerStatusView, RoadLinks,
+    BuildOptionView, CellView, CitizenDetailView, CitizenRelation, CityDemand, CityStatusView,
+    DemandLevel, GameTimeView, GameView, InspectDetailsView, InspectFlag, InspectView,
+    JobAssignmentView, LocalEffectsView, MapView, PowerStatusView, RoadLinks,
 };
 
 /// Converts the private ECS World into the only render model the UI may consume.
@@ -142,6 +143,81 @@ pub(crate) fn inspect_world(world: &World, x: usize, y: usize) -> InspectView {
         explanations: in_bounds
             .then(|| inspect_explanations(world, x, y))
             .unwrap_or_default(),
+        roster: in_bounds
+            .then(|| citizen_roster(world, x, y))
+            .unwrap_or_default(),
+    }
+}
+
+/// Per-citizen roster for the building at `(x, y)`, kept UI-safe inside the adapter.
+///
+/// ```text
+///   Residential          -> residents (home == building), each: WorksAt | Unemployed
+///   Commercial/Industrial -> LOCAL workers (workplace == building), each: LivesAt
+///   anything else / empty -> []
+/// ```
+///
+/// Remote workers (imported from another region) are not in this region's world,
+/// so a workplace lists local workers only. Order is deterministic: by `Entity` id.
+fn citizen_roster(world: &World, x: usize, y: usize) -> Vec<CitizenDetailView> {
+    let Some(entity) = world.grid.get(x, y) else {
+        return Vec::new();
+    };
+    let Some(building) = world.buildings.get(&entity) else {
+        return Vec::new();
+    };
+
+    let mut citizens: Vec<(&Entity, &Citizen)> = match building.kind {
+        BuildingKind::Residential => world
+            .citizens
+            .iter()
+            .filter(|(_, citizen)| citizen.home == entity)
+            .collect(),
+        BuildingKind::Commercial | BuildingKind::Industrial => world
+            .citizens
+            .iter()
+            .filter(|(_, citizen)| {
+                matches!(
+                    citizen.workplace_assignment.map(|assignment| assignment.source),
+                    Some(WorkplaceSource::Local { entity: workplace }) if workplace == entity
+                )
+            })
+            .collect(),
+        _ => return Vec::new(),
+    };
+    citizens.sort_by_key(|(entity, _)| entity.0);
+
+    citizens
+        .into_iter()
+        .map(|(_, citizen)| CitizenDetailView {
+            age: citizen.age,
+            happiness: citizen.morale.actual,
+            money: citizen.money,
+            relation: citizen_relation(world, building.kind, citizen),
+        })
+        .collect()
+}
+
+fn citizen_relation(world: &World, kind: BuildingKind, citizen: &Citizen) -> CitizenRelation {
+    match kind {
+        BuildingKind::Residential => match citizen.workplace_assignment {
+            Some(assignment) => CitizenRelation::WorksAt {
+                region: assignment.region,
+                x: assignment.position.x,
+                y: assignment.position.y,
+                salary: assignment.salary,
+                is_remote: matches!(assignment.source, WorkplaceSource::Remote { .. }),
+            },
+            None => CitizenRelation::Unemployed,
+        },
+        // Workplace roster: locate where this local worker lives.
+        _ => {
+            let home = world.positions.get(&citizen.home);
+            CitizenRelation::LivesAt {
+                x: home.map(|position| position.x).unwrap_or(0),
+                y: home.map(|position| position.y).unwrap_or(0),
+            }
+        }
     }
 }
 

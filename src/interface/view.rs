@@ -51,6 +51,42 @@ pub struct JobAssignmentView {
     pub is_remote: bool,
 }
 
+/// One citizen's UI-safe detail for the roster popup.
+///
+/// Carries only display data; the ECS `Entity` id is intentionally omitted, like
+/// every other view model. `happiness` is the citizen's current morale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CitizenDetailView {
+    pub age: u32,
+    pub happiness: i32,
+    pub money: i32,
+    pub relation: CitizenRelation,
+}
+
+/// How a rostered citizen relates to the inspected building.
+///
+/// ```text
+///  inspected building   roster entry shows
+///  ------------------   ------------------------------------
+///  Residential          WorksAt{..} | Unemployed   (where the resident works)
+///  Commercial/Industrial LivesAt{..}               (where the worker lives)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CitizenRelation {
+    /// Residential roster: where this resident works (local or remote region).
+    WorksAt {
+        region: RegionId,
+        x: usize,
+        y: usize,
+        salary: i32,
+        is_remote: bool,
+    },
+    /// Residential roster: a resident with no workplace.
+    Unemployed,
+    /// Workplace roster: where this local worker lives.
+    LivesAt { x: usize, y: usize },
+}
+
 /// Orthogonal road neighbors for a road cell, exposed as derived UI-safe data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RoadLinks {
@@ -161,6 +197,11 @@ pub struct InspectView {
     pub local_effects: Option<LocalEffectsView>,
     pub flags: Vec<InspectFlag>,
     pub explanations: Vec<String>,
+    /// Per-citizen roster for the inspected building: residents (Residential) or
+    /// local workers (Commercial/Industrial). Empty for every other cell. Remote
+    /// workers imported from another region are not listed (they live in their
+    /// home region's world); residents holding a remote job are still listed.
+    pub roster: Vec<CitizenDetailView>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

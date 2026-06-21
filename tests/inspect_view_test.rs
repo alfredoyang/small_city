@@ -4,7 +4,9 @@ mod common;
 
 use common::SingleRegionTestGame;
 use small_city::interface::input::BuildingKind;
-use small_city::interface::view::{InspectDetailsView, InspectFlag, InspectView, LocalEffectsView};
+use small_city::interface::view::{
+    CitizenRelation, InspectDetailsView, InspectFlag, InspectView, LocalEffectsView,
+};
 use small_city::ui::ascii::format_inspect;
 
 #[test]
@@ -93,6 +95,56 @@ fn inspect_and_cell_view_show_local_citizen_workplace_tile() {
     assert!(!assignment.is_remote);
     assert_eq!(cell_assignment, assignment);
     assert!(format_inspect(&inspect).contains("local R1 (2, 0) salary 3"));
+}
+
+#[test]
+fn roster_lists_residents_with_their_workplace_and_workers_with_their_home() {
+    // Same fixture as the local-workplace test: the resident at (1,0) takes the
+    // local commercial job at (2,0) after a day of ticks.
+    let mut game = SingleRegionTestGame::new(4, 3);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(2, 0, BuildingKind::Commercial).success);
+    for x in 0..=2 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+    for _ in 0..24 {
+        assert!(game.tick().success);
+    }
+
+    // Residential roster: one entry per resident, each tagged with where they work.
+    let residential = game.inspect(1, 0);
+    let citizens = match residential.details {
+        Some(InspectDetailsView::Residential { citizens, .. }) => citizens,
+        details => panic!("expected residential inspect, got {details:?}"),
+    };
+    assert_eq!(residential.roster.len() as i32, citizens);
+    assert!(!residential.roster.is_empty());
+    assert!(matches!(
+        residential.roster[0].relation,
+        CitizenRelation::WorksAt {
+            x: 2,
+            y: 0,
+            salary: 3,
+            is_remote: false,
+            ..
+        }
+    ));
+
+    // Workplace roster: the local worker, tagged with where they live.
+    let commercial = game.inspect(2, 0);
+    assert_eq!(commercial.roster.len(), residential.roster.len());
+    assert!(matches!(
+        commercial.roster[0].relation,
+        CitizenRelation::LivesAt { x: 1, y: 0 }
+    ));
+
+    // Road and empty cells carry no roster.
+    assert!(game.inspect(0, 1).roster.is_empty());
+    assert!(game.inspect(3, 2).roster.is_empty());
+
+    // Deterministic: the same state inspected twice yields the identical roster.
+    assert_eq!(game.inspect(1, 0).roster, residential.roster);
 }
 
 #[test]
@@ -390,6 +442,7 @@ fn inspect_card_layout_is_fixed_slot_aligned() {
         }),
         flags: Vec::new(),
         explanations: Vec::new(),
+        roster: Vec::new(),
     };
 
     assert_eq!(

@@ -4037,6 +4037,7 @@ mod tests {
             }),
             flags: vec![InspectFlag::GoodsSupplyNeighbor],
             explanations: Vec::new(),
+            roster: Vec::new(),
         };
 
         let (title, body) = tui_inspect_card(&inspect);
@@ -4081,6 +4082,7 @@ mod tests {
             local_effects: None,
             flags: Vec::new(),
             explanations: Vec::new(),
+            roster: Vec::new(),
         };
         let (_, body) = tui_inspect_card(&inspect);
         let source = body

@@ -348,6 +348,7 @@ impl CityDriver {
             local_effects: None,
             flags: Vec::new(),
             explanations: vec![message],
+            roster: Vec::new(),
         }
     }
 

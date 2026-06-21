@@ -82,7 +82,7 @@ untouched.
 │  view.rs                                                                   │
 │    (+) CitizenDetailView { age, happiness, money, relation }               │
 │    (+) CitizenRelation   { WorksAt | Unemployed | LivesAt }                │
-│    (+) InspectView.roster : Vec<CitizenDetailView>  (+ remote_worker_count)│
+│    (+) InspectView.roster : Vec<CitizenDetailView>  (local citizens only)  │
 │  adapter.rs::inspect_world(world, x, y)                                     │
 │    (+) fills roster: residential→residents, C/I→local workers, else empty  │
 │        sorted by Entity.0 (deterministic); resolves worker home→Position   │
@@ -124,11 +124,15 @@ side of the boundary.
 A workplace can employ **remote** workers imported from another region. Those
 citizens live in their home region's `World`; this region only holds an opaque
 slot reservation, not the worker's identity. So a workplace roster can fully
-enumerate **local** workers only. Remote workers are shown as an aggregate
-count ("+2 remote workers") — not per-citizen detail. Symmetric note for
-residents who hold a `Remote` job: we show "works in region N" without that
-region's building detail. This matches the existing one-way cross-region data
-model and keeps the feature single-region-local.
+enumerate **local** workers only. A remote-worker *count* is **not derivable at
+the adapter boundary either**: the producer's export reservations live in the
+runtime ledger, not in the `World` the adapter reads — so M1 exposes local
+workers only and does not add a `remote_worker_count` field. (M2 may show a
+static "local workers only" footnote on workplace rosters.) Residents who hold
+a `Remote` job are still fully listed (`WorksAt { is_remote: true }`), since the
+resident lives in this region and carries the assignment. This matches the
+existing one-way cross-region data model and keeps the feature
+single-region-local.
 
 ## Missions (one patch each, per the dev loop)
 
@@ -158,8 +162,8 @@ model and keeps the feature single-region-local.
   - Everything else → empty.
   - **Deterministic order**: sort by citizen `Entity.0` (the adapter already
     uses this ordering for `job_assignment_views_for_home`).
-- For workplaces, also surface a `remote_worker_count` (aggregate) — either a
-  field on the relevant `InspectDetailsView` variants or alongside `roster`.
+- No `remote_worker_count`: not derivable from the `World` (see the cross-region
+  note above). Workplace rosters are local-workers-only.
 - Tests (`tests/inspect_view_test.rs` + adapter unit tests):
   - Residential roster lists each resident once, in entity order, with correct
     job/unemployed mapping.
@@ -182,8 +186,8 @@ Size: ~2 files (`view.rs`, `adapter.rs`) + tests. Well under the 5-file/400-line
   `handle_citizen_panel_key` mirroring `handle_quit_confirm_key`.
 - `render_citizen_panel(frame, area, inspect)`: `centered_rect` + `Clear` +
   bordered `Paragraph`/rows from `inspect.roster`, a title naming the building
-  and `shown/total`, and the remote-worker count line when > 0. Render after the
-  base layout so it overlays (like `render_quit_confirm`).
+  and citizen count, and (on workplaces) a static "local workers only" footnote.
+  Render after the base layout so it overlays (like `render_quit_confirm`).
 - Empty roster (e.g. a building with no citizens yet) → show "No citizens yet".
 - Tests (`tui.rs` unit tests, no real terminal):
   - Toggling `citizen_panel` open/closed via the key handler.

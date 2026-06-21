@@ -192,6 +192,7 @@ pub fn render(view: &GameView) {
         local_effects: None,
         flags: Vec::new(),
         explanations: Vec::new(),
+        roster: Vec::new(),
     };
     let preview = BuildPreviewView {
         kind: state.selected_build,
@@ -987,6 +988,7 @@ mod tests {
             }),
             flags: vec![InspectFlag::GoodsSupplyNeighbor],
             explanations: Vec::new(),
+            roster: Vec::new(),
         };
 
         let output = format_inspect(&inspect);
