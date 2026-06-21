@@ -1,11 +1,12 @@
 # Multi-cell buildings: grow-on-upgrade, merge same-type, block when boxed in
 
-Status: **M0–M4 implemented** on branch `multi-cell` (each codex-reviewed, all
-tests green). Remaining: **M5** (external `config/buildings.json` override +
-save-stamping the ruleset) — the configurability-via-file enhancement, deferred
-as its own follow-up (until then every world uses the embedded default, which is
-deterministic). The cosmetic unified-sprite / footprint-spanning-cursor polish
-from M4 is also deferred (buildings render cell-by-cell correctly today).
+Status: **M0–M5 implemented and complete** on branch `multi-cell` (each
+codex-reviewed, all tests green). The whole plan is done: configurable footprint
+ruleset (M0), footprint plumbing (M1), grow/merge/block + area capacity (M2),
+contents transfer on merge (M3), inspect visibility (M4), and external
+`config/buildings.json` override + save-stamping for replay parity (M5). The only
+deferred item is cosmetic: a unified multi-cell sprite + footprint-spanning
+cursor (buildings already render cell-by-cell correctly today).
 
 Implements the §5 multi-cell feature reserved in
 [tui-city-redesign-plan.md](tui-city-redesign-plan.md), using its reserved
