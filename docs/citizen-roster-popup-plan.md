@@ -1,0 +1,233 @@
+# Citizen Roster Popup — Plan
+
+## Goal
+
+Let the player see the individual citizens tied to a building. With the cursor
+on a building, opening the roster shows a scrollable popup:
+
+- **Residential** → the citizens who **live** there (residents), each with their
+  job, happiness, money, age.
+- **Commercial / Industrial** → the citizens who **work** there (workers), each
+  with where they live, salary, happiness, money, age.
+
+Anything else (road / power plant / park / empty) → no roster (a short "no
+citizens" note, or the key is a no-op there).
+
+```text
+            cursor on a building
+                   │  open roster
+                   ▼
+   ┌─ Residents of R(3,2) ─ 3/3 ───────────┐
+   │ #  age  happy  $    works at          │
+   │ 1   27   72   14    C (5,0) local      │
+   │ 2   34   41   3     I (7,1) local      │
+   │ 3   19   88   21    — unemployed       │
+   └ ↑/↓ scroll · Esc close ───────────────┘
+```
+
+## What already exists (reuse, don't rebuild)
+
+- `Citizen` (`src/core/components.rs`) already carries everything we display:
+  `age`, `home: Entity`, `workplace_assignment: Option<WorkplaceAssignment>`
+  (`region`, `position`, `salary`, `source: Local{entity} | Remote{slot_id}`),
+  `morale.actual` (happiness), `money`.
+- Residents of a building = `world.citizens.filter(|c| c.home == entity)`.
+  The adapter already does exactly this in `job_assignment_views_for_home`
+  (`src/interface/adapter.rs:650`).
+- Local workers of a workplace = `world.citizens.filter(|c|
+  c.workplace_assignment.source == WorkplaceSource::Local { entity == W })`.
+  Same identity the economy uses (`economy.rs:160,375`).
+- The TUI already fetches an `InspectView` for the selected cell every frame and
+  passes it to `render_selected_cell` (`tui.rs:1083`). The roster can ride that
+  existing inspect read — **no new cross-layer request/reply plumbing**.
+- A modal template already exists: `render_quit_confirm` + `centered_rect` +
+  `Clear` (`tui.rs:1103`). The popup copies this pattern.
+
+## Do we modify core? No.
+
+The citizen data already exists in core — this feature adds **no simulation
+change**. Every field the roster shows is already on the `Citizen` component
+(`age`, `money`, `morale.actual`, `home`, `workplace_assignment`). The reverse
+lookups (residents of a home, workers of a workplace) are plain filters over
+`world.citizens`, the same ones the adapter/economy already use. No new
+components, no new systems, no new fields in core.
+
+What is missing is purely the **projection**: the current API exposes only
+*aggregates and anonymized slices* (`average_happiness`, `average_money`,
+`population`, `citizens` count, and `job_assignments` — residents' jobs only,
+no per-citizen attributes, nothing for workers-of-a-workplace). There is no
+view model carrying one citizen's full detail. That gap is closed entirely in
+the interface layer.
+
+## Layered architecture & mission boundary
+
+UI never touches ECS. Citizen data becomes a **UI-safe view model** in the
+adapter (the sole ECS→view boundary), then renders in the TUI. No `Entity` ids,
+no remote slot ids leak out — same rule the existing views follow.
+
+`(+)` = added by this feature. **M1** owns the core→view projection; **M2** owns
+the TUI popup. The simulation core and the regional facade/threading are
+untouched.
+
+```text
+┌─ src/core  (SIMULATION — UNCHANGED) ───────────────────────────────────────┐
+│  World.citizens : HashMap<Entity, Citizen>                                 │
+│    Citizen { age, money, morale.actual, home: Entity,                      │
+│              workplace_assignment: Option<{region,position,salary,src}> }  │
+│  residents(building) = citizens.filter(home == building)                   │
+│  workers(workplace)  = citizens.filter(workplace.src == Local{workplace})  │
+└───────────────────────────────────────────────┬───────────────────────────┘
+                                                  │  ECS read (adapter only)
+┌─ src/interface  (ECS→VIEW BOUNDARY) ── M1 ──────▼───────────────────────────┐
+│  view.rs                                                                   │
+│    (+) CitizenDetailView { age, happiness, money, relation }               │
+│    (+) CitizenRelation   { WorksAt | Unemployed | LivesAt }                │
+│    (+) InspectView.roster : Vec<CitizenDetailView>  (+ remote_worker_count)│
+│  adapter.rs::inspect_world(world, x, y)                                     │
+│    (+) fills roster: residential→residents, C/I→local workers, else empty  │
+│        sorted by Entity.0 (deterministic); resolves worker home→Position   │
+└───────────────────────────────────────────────┬───────────────────────────┘
+                                                  │  existing inspect path —
+                                                  │  NO new request/reply enum
+┌─ src/core/regional_game.rs  (UI FACADE — UNCHANGED) ─▼───────────────────────┐
+│  RegionalGame::inspect_region(region, x, y) -> InspectView                  │
+│    already plumbed runner→worker→runtime→RegionState; roster rides along    │
+└───────────────────────────────────────────────┬───────────────────────────┘
+                                                  │
+┌─ src/ui/tui.rs  (FRONTEND) ── M2 ───────────────▼───────────────────────────┐
+│  render loop ALREADY holds an InspectView for the cursor cell               │
+│  (+) TuiState { citizen_panel: bool, citizen_scroll: usize }                │
+│  (+) Enter on occupied R/C/I → open panel (empty land still builds)         │
+│  (+) handle_citizen_panel_key (modal: ↑/↓ scroll, Esc close)                │
+│  (+) render_citizen_panel(inspect) — reuses centered_rect + Clear           │
+│        renders rows straight from inspect.roster                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+One-line flow:
+
+```text
+Citizen (core, exists) → inspect_world projects → InspectView.roster (view model)
+   → RegionalGame.inspect_region (existing path) → TUI modal renders rows
+```
+
+Why no new transport: the roster is a field **inside the InspectView the TUI
+already requests**, so nothing new crosses the region-threading boundary — no
+new `UiRequest`/`UiReply` variant, no worker/runtime change. The data already
+makes the trip; we put more in the existing envelope. The only read that
+reaches past a normal inspect is resolving a worker's `home: Entity` → its
+`Position` for `LivesAt`, still a pure read inside `inspect_world` on the core
+side of the boundary.
+
+## Cross-region limitation (call out, don't solve now)
+
+A workplace can employ **remote** workers imported from another region. Those
+citizens live in their home region's `World`; this region only holds an opaque
+slot reservation, not the worker's identity. So a workplace roster can fully
+enumerate **local** workers only. Remote workers are shown as an aggregate
+count ("+2 remote workers") — not per-citizen detail. Symmetric note for
+residents who hold a `Remote` job: we show "works in region N" without that
+region's building detail. This matches the existing one-way cross-region data
+model and keeps the feature single-region-local.
+
+## Missions (one patch each, per the dev loop)
+
+### M1 — view model + adapter roster (core/interface)
+
+- Add to `src/interface/view.rs`:
+  ```rust
+  pub struct CitizenDetailView {
+      pub age: u32,
+      pub happiness: i32,          // morale.actual
+      pub money: i32,
+      pub relation: CitizenRelation,
+  }
+  pub enum CitizenRelation {
+      // For a residential roster: where this resident works.
+      WorksAt { region: RegionId, x: usize, y: usize, salary: i32, is_remote: bool },
+      Unemployed,
+      // For a workplace roster: where this worker lives.
+      LivesAt { x: usize, y: usize },
+  }
+  ```
+- Add `pub roster: Vec<CitizenDetailView>` to `InspectView` (default empty).
+- In `adapter.rs::inspect_world`, populate `roster`:
+  - Residential → residents (`home == entity`), each mapped to `WorksAt`/`Unemployed`.
+  - Commercial/Industrial → local workers (`source == Local { entity }`), each
+    mapped to `LivesAt` (resolve the worker's `home` Entity → its `Position`).
+  - Everything else → empty.
+  - **Deterministic order**: sort by citizen `Entity.0` (the adapter already
+    uses this ordering for `job_assignment_views_for_home`).
+- For workplaces, also surface a `remote_worker_count` (aggregate) — either a
+  field on the relevant `InspectDetailsView` variants or alongside `roster`.
+- Tests (`tests/inspect_view_test.rs` + adapter unit tests):
+  - Residential roster lists each resident once, in entity order, with correct
+    job/unemployed mapping.
+  - Commercial/Industrial roster lists each local worker with the right
+    `LivesAt` position.
+  - Road/power/park/empty roster is empty.
+  - Determinism: two inspects of the same state produce identical rosters.
+
+Size: ~2 files (`view.rs`, `adapter.rs`) + tests. Well under the 5-file/400-line cap.
+
+### M2 — TUI roster popup (ui)
+
+- `TuiState`: add `citizen_panel: bool` (open/closed) and `citizen_scroll: usize`.
+- Key binding decision (**see "Open key" below**). Default plan: make **Enter
+  context-sensitive** — on an occupied R/C/I cell Enter opens the roster; on
+  empty land Enter still builds. Keep `b`/`B` as the unambiguous build key
+  (already mapped). Add a fallback explicit key too if preferred.
+- While the panel is open it is modal (like the quit/prompt modals): `↑/↓`
+  scroll, `Esc`/`Enter`/`q` close, other gameplay keys ignored. Add a
+  `handle_citizen_panel_key` mirroring `handle_quit_confirm_key`.
+- `render_citizen_panel(frame, area, inspect)`: `centered_rect` + `Clear` +
+  bordered `Paragraph`/rows from `inspect.roster`, a title naming the building
+  and `shown/total`, and the remote-worker count line when > 0. Render after the
+  base layout so it overlays (like `render_quit_confirm`).
+- Empty roster (e.g. a building with no citizens yet) → show "No citizens yet".
+- Tests (`tui.rs` unit tests, no real terminal):
+  - Toggling `citizen_panel` open/closed via the key handler.
+  - Panel only opens on R/C/I, not on road/empty.
+  - Rendered rows match `inspect.roster` length; scroll clamps at bounds.
+  - 2-column tile alignment invariant is untouched (popup is separate widget).
+
+Size: 1–2 files (`tui.rs`, maybe `tui_input.rs`) + tests.
+
+## Open key (decision needed before M2)
+
+Enter is currently `TuiAction::Build` (`tui_input.rs:70`). Options:
+
+1. **Context-sensitive Enter** (recommended, matches the user's ask): occupied
+   R/C/I → open roster; empty land → build. `b`/`B` remains a pure build key.
+2. **Dedicated key** (e.g. `i`/`Enter`-free): unambiguous, but the user asked
+   for Enter specifically.
+
+Recommend option 1. Confirm before implementing M2.
+
+## Risks / notes
+
+- Roster is recomputed on every inspect (each cursor move) even when the popup
+  is closed. Citizen counts are tiny (≈ base×area, single digits), so the cost
+  is negligible; revisit only if profiling ever says otherwise. *(ponytail:
+  reuse the existing inspect read instead of adding a request channel; add
+  dedicated plumbing only if roster size grows.)*
+- No new dependencies. No balance/sim changes — this is read-only presentation.
+- Determinism holds: rosters are a pure function of world state in a fixed
+  (entity-id) order.
+
+## Architecture diagram (post-implementation, to append per dev-flow step 8)
+
+```text
+ press Enter on a building
+        │
+        ▼
+ TuiState.citizen_panel = true ──► modal loop (↑/↓ scroll, Esc close)
+        │
+        └─ render_citizen_panel(inspect)
+                 ▲
+                 │ reads
+        InspectView.roster: Vec<CitizenDetailView>   ◄─ filled by adapter::inspect_world
+                                                          residents:  home == entity
+                                                          workers:    workplace == entity (Local)
+                                                          remote:     aggregate count only
+```
