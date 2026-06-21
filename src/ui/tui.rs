@@ -1434,21 +1434,34 @@ fn tui_inspect_card(inspect: &InspectView) -> (String, Vec<String>) {
     let title = match details {
         InspectDetailsView::Empty { .. } => tui_header_line(inspect, "EMPTY LAND", None),
         InspectDetailsView::Road => tui_header_line(inspect, "ROAD", None),
-        InspectDetailsView::Residential { upgrade_level, .. } => {
-            tui_header_line(inspect, "RESIDENTIAL", Some(*upgrade_level))
-        }
-        InspectDetailsView::Commercial { upgrade_level, .. } => {
-            tui_header_line(inspect, "COMMERCIAL", Some(*upgrade_level))
-        }
-        InspectDetailsView::Industrial { upgrade_level, .. } => {
-            tui_header_line(inspect, "INDUSTRIAL", Some(*upgrade_level))
-        }
-        InspectDetailsView::PowerPlant { upgrade_level, .. } => {
-            tui_header_line(inspect, "POWER PLANT", Some(*upgrade_level))
-        }
-        InspectDetailsView::Park { upgrade_level, .. } => {
-            tui_header_line(inspect, "PARK", Some(*upgrade_level))
-        }
+        InspectDetailsView::Residential { upgrade_level, .. } => tui_header_line(
+            inspect,
+            "RESIDENTIAL",
+            Some((
+                *upgrade_level,
+                BuildingKind::Residential.max_upgrade_level(),
+            )),
+        ),
+        InspectDetailsView::Commercial { upgrade_level, .. } => tui_header_line(
+            inspect,
+            "COMMERCIAL",
+            Some((*upgrade_level, BuildingKind::Commercial.max_upgrade_level())),
+        ),
+        InspectDetailsView::Industrial { upgrade_level, .. } => tui_header_line(
+            inspect,
+            "INDUSTRIAL",
+            Some((*upgrade_level, BuildingKind::Industrial.max_upgrade_level())),
+        ),
+        InspectDetailsView::PowerPlant { upgrade_level, .. } => tui_header_line(
+            inspect,
+            "POWER PLANT",
+            Some((*upgrade_level, BuildingKind::PowerPlant.max_upgrade_level())),
+        ),
+        InspectDetailsView::Park { upgrade_level, .. } => tui_header_line(
+            inspect,
+            "PARK",
+            Some((*upgrade_level, BuildingKind::Park.max_upgrade_level())),
+        ),
         InspectDetailsView::Unknown => tui_header_line(inspect, "UNKNOWN", None),
     };
 
@@ -1644,9 +1657,9 @@ fn with_inspect_footer(inspect: &InspectView, mut lines: Vec<String>) -> Vec<Str
     lines
 }
 
-fn tui_header_line(inspect: &InspectView, label: &str, level: Option<u8>) -> String {
+fn tui_header_line(inspect: &InspectView, label: &str, level: Option<(u8, u8)>) -> String {
     let level = level
-        .map(|level| format!("Lvl {} {level}/3", level_gauge(level)))
+        .map(|(level, max)| format!("Lvl {} {level}/{max}", level_gauge(level, max)))
         .unwrap_or_else(|| "Lvl —".to_string());
     format!("({},{}) {:<12} {}", inspect.x, inspect.y, label, level)
 }
@@ -1705,9 +1718,10 @@ fn split_bar(city: i32, outside: i32, width: usize) -> String {
     format!("▕{}{}▏", "█".repeat(city_width), "▓".repeat(outside_width))
 }
 
-fn level_gauge(level: u8) -> String {
-    let filled = level.clamp(0, 3) as usize;
-    format!("{}{}", "█".repeat(filled), "░".repeat(3 - filled))
+fn level_gauge(level: u8, max: u8) -> String {
+    let max = max.max(1) as usize;
+    let filled = (level as usize).min(max);
+    format!("{}{}", "█".repeat(filled), "░".repeat(max - filled))
 }
 
 fn block_meter(value: i32) -> char {
@@ -2721,6 +2735,18 @@ mod tests {
                 "{kind:?} icon must be two display columns"
             );
         }
+    }
+
+    #[test]
+    fn level_gauge_uses_each_buildings_own_max() {
+        // Power/Park cap at level 2, zoned buildings at 3. The gauge denominator and bar must follow
+        // the building's own max, so a maxed power plant reads as full (not a phantom "2/3").
+        assert_eq!(BuildingKind::PowerPlant.max_upgrade_level(), 2);
+        assert_eq!(BuildingKind::Park.max_upgrade_level(), 2);
+        assert_eq!(BuildingKind::Residential.max_upgrade_level(), 3);
+        assert_eq!(level_gauge(2, 2), "██");
+        assert_eq!(level_gauge(2, 3), "██░");
+        assert_eq!(level_gauge(3, 3), "███");
     }
 
     #[test]

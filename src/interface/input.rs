@@ -51,6 +51,15 @@ impl BuildingKind {
         self.upgrade_cost_for_level(2)
     }
 
+    /// Highest level this building can reach. Buildings start at level 1; the cap is the highest
+    /// level that still has an upgrade cost (zoned buildings 3, Power/Park 2, Road none).
+    pub fn max_upgrade_level(self) -> u8 {
+        (2..=3)
+            .rev()
+            .find(|&level| self.upgrade_cost_for_level(level).is_some())
+            .unwrap_or(1)
+    }
+
     /// Cost to upgrade this building type into a specific target level. The zoned buildings
     /// (Residential/Commercial/Industrial) grow with their footprint up to level 3; Power and Park
     /// stay 1x1 and only have the single level-2 step.

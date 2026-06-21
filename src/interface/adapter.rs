@@ -467,10 +467,9 @@ fn explain_road_access(
             ));
         }
         BuildingKind::Industrial => {
-            explanations.push(format!(
-                "Goods: nearest commercial route is {}.",
-                distance_note(access.goods_route_distance)
-            ));
+            // An industrial does not need a nearby commercial: it sells to commercial storage *or*
+            // exports off the map edge, so a missing commercial route is not a problem to flag here.
+            // Its goods output is already explained in the per-kind notes above.
             explanations.push(format!(
                 "Trade: edge access is {}.",
                 distance_note(access.import_export_distance)

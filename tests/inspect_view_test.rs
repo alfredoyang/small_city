@@ -173,6 +173,16 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
             .iter()
             .any(|note| note.contains("local goods stored"))
     );
+    // An industrial sells to commercial storage or exports off the edge, so it must not warn about a
+    // "nearest commercial route" (it read "unreachable by road" even when the factory was fine).
+    assert!(
+        !industrial
+            .explanations
+            .iter()
+            .any(|note| note.contains("nearest commercial route")),
+        "industrial should not show a commercial-route note: {:?}",
+        industrial.explanations
+    );
 }
 
 #[test]
