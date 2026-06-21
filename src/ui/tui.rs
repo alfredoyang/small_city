@@ -1235,12 +1235,11 @@ fn render_map(
                 is_cursor,
                 preview_state,
             );
-            // Day/night tint + frame-driven pulses (City theme, Normal overlay). Always keeps the
-            // tile exactly two columns: only char-2 and colours change.
+            // Day/night tint + cursor pulse (City theme, Normal overlay). Only colours change, so
+            // the tile stays exactly two columns.
             if city_normal {
                 animate_city_tile(
                     &mut glyph,
-                    cell,
                     is_cursor,
                     preview_state,
                     hour,
@@ -2310,24 +2309,23 @@ fn unicode_normal_tile(cell: &CellView) -> String {
         return ascii_detailed_normal_tile(cell);
     }
 
-    // char1 = zone marker (SimCity-style letter / glyph), char2 = occupancy or level shade.
-    format!(
-        "{}{}",
-        city_zone_glyph(kind),
-        unicode_building_shade(cell, kind)
-    )
+    // Each building is one two-column emoji icon that fills the whole tile (SimCity-style). Roads
+    // keep box-drawing above; problem tiles fell back to ASCII markers just above.
+    building_emoji(kind).to_string()
 }
 
-/// SimCity-style zone glyph for the City theme. Single display column so the two-column tile rule
-/// holds. Power uses the lightning glyph already shipped in the power overlay; park uses a clover.
-fn city_zone_glyph(kind: BuildingKind) -> char {
+/// SimCity-style building icon for the City (Unicode) theme. Every emoji is two display columns, so
+/// it fills one tile exactly and the two-column grid stays aligned (guarded by a test). ASCII themes
+/// are the fallback for terminals without emoji — auto-selected by locale, and reachable via the
+/// theme-cycle key.
+fn building_emoji(kind: BuildingKind) -> &'static str {
     match kind {
-        BuildingKind::Residential => 'R',
-        BuildingKind::Commercial => 'C',
-        BuildingKind::Industrial => 'I',
-        BuildingKind::PowerPlant => 'ϟ',
-        BuildingKind::Park => '♣',
-        BuildingKind::Road => '=',
+        BuildingKind::Residential => "🏠",
+        BuildingKind::Commercial => "🏪",
+        BuildingKind::Industrial => "🏭",
+        BuildingKind::PowerPlant => "⚡",
+        BuildingKind::Park => "🌳",
+        BuildingKind::Road => "==", // roads render via unicode_road_tile; never reached here
     }
 }
 
@@ -2373,40 +2371,6 @@ fn building_problem_marker(cell: &CellView) -> Option<char> {
         Some('-')
     } else {
         None
-    }
-}
-
-fn unicode_building_shade(cell: &CellView, kind: BuildingKind) -> char {
-    match kind {
-        BuildingKind::Residential => unicode_residential_occupancy_shade(cell),
-        BuildingKind::Commercial
-        | BuildingKind::Industrial
-        | BuildingKind::PowerPlant
-        | BuildingKind::Park => unicode_level_shade(cell.upgrade_level.unwrap_or(1)),
-        BuildingKind::Road => '░',
-    }
-}
-
-fn unicode_residential_occupancy_shade(cell: &CellView) -> char {
-    let population = cell.population.unwrap_or_default().max(0) as i64;
-    let max_population = cell.max_population.unwrap_or_default().max(0) as i64;
-
-    if population == 0 || max_population == 0 {
-        '░'
-    } else if population >= max_population {
-        '█'
-    } else if population * 2 < max_population {
-        '▒'
-    } else {
-        '▓'
-    }
-}
-
-fn unicode_level_shade(level: u8) -> char {
-    match level {
-        0 | 1 => '░',
-        2 => '▒',
-        _ => '▓',
     }
 }
 
@@ -2526,20 +2490,14 @@ fn city_cell_style(cell: &CellView) -> Style {
     cell_base_style(cell).bg(bg).add_modifier(Modifier::BOLD)
 }
 
-/// Power-plant pulse phases (char-2): the plant visibly "hums".
-const POWER_PULSE: [char; 6] = ['░', '▒', '▓', '█', '▓', '▒'];
-/// Industrial smoke phases (char-2): a smokestack churning.
-const INDUSTRIAL_SMOKE: [char; 4] = ['░', '▒', '▓', '▒'];
-
 /// Applies the City-theme animations to one already-rendered tile **without changing its width**:
-/// only char-2 (a single-width block glyph) and colours change.
+/// only colours change (the building emoji icon is a single two-column glyph, so there is no
+/// char-2 to pulse — the old power-hum / industrial-smoke animation went away with the shade char).
 ///
 /// - day/night: dims the muted-earth/zone background by the hour (clock-driven, always on)
-/// - power pulse / industrial smoke: cycles char-2 by frame (only while animating)
 /// - cursor pulse: blinks the cursor highlight (only while animating)
 fn animate_city_tile(
     glyph: &mut TileGlyph,
-    cell: &CellView,
     is_cursor: bool,
     preview: PreviewState,
     hour: u8,
@@ -2558,36 +2516,9 @@ fn animate_city_tile(
         }
     }
 
-    if !animating {
-        return;
-    }
-
-    // Pulses never touch a problem tile (it keeps its warning marker).
-    if building_problem_marker(cell).is_none() {
-        match cell.building {
-            Some(BuildingKind::PowerPlant) => set_tile_char2(
-                glyph,
-                POWER_PULSE[(frame % POWER_PULSE.len() as u64) as usize],
-            ),
-            Some(BuildingKind::Industrial) => set_tile_char2(
-                glyph,
-                INDUSTRIAL_SMOKE[(frame % INDUSTRIAL_SMOKE.len() as u64) as usize],
-            ),
-            _ => {}
-        }
-    }
-
     // Cursor pulse: alternate the bright highlight so the selected lot blinks.
-    if is_cursor && frame % 2 == 1 {
+    if animating && is_cursor && frame % 2 == 1 {
         glyph.style = glyph.style.bg(Color::Gray);
-    }
-}
-
-/// Replaces a tile's second display column, preserving char-1 so the tile stays two columns wide.
-fn set_tile_char2(glyph: &mut TileGlyph, char2: char) {
-    let mut chars = glyph.tile.chars();
-    if let Some(char1) = chars.next() {
-        glyph.tile = format!("{char1}{char2}");
     }
 }
 
@@ -2773,6 +2704,24 @@ mod tests {
     use crate::interface::view::{InspectFlag, LocalEffectsView, RoadLinks};
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn building_emoji_icons_are_exactly_two_columns_wide() {
+        // The two-column grid alignment depends on every building emoji occupying one full tile.
+        for kind in [
+            BuildingKind::Residential,
+            BuildingKind::Commercial,
+            BuildingKind::Industrial,
+            BuildingKind::PowerPlant,
+            BuildingKind::Park,
+        ] {
+            assert_eq!(
+                Span::raw(building_emoji(kind)).width(),
+                2,
+                "{kind:?} icon must be two display columns"
+            );
+        }
+    }
 
     #[test]
     fn overlay_cycles_in_display_order() {
@@ -3058,52 +3007,27 @@ mod tests {
     }
 
     #[test]
-    fn unicode_residential_tiles_show_occupancy_buckets() {
-        let cases = [
-            (residential_cell_with_population(0, 10), "R░"),
-            (residential_cell_with_population(1, 10), "R▒"),
-            (residential_cell_with_population(5, 10), "R▓"),
-            (residential_cell_with_population(10, 10), "R█"),
-        ];
-
-        for (cell, expected) in cases {
-            let glyph = TileTheme::Unicode.tile_for_cell(
-                &cell,
-                MapOverlayInput::Normal,
-                false,
-                PreviewState::None,
-            );
-
-            assert_eq!(glyph.tile, expected);
-        }
-    }
-
-    #[test]
-    fn unicode_non_residential_buildings_show_level_buckets() {
+    fn unicode_building_tiles_render_their_emoji_icon() {
         let cases = [
             (
-                themed_cell(Some(BuildingKind::Commercial), 'C', Some(1), None, None, 0),
-                "C░",
+                themed_cell(Some(BuildingKind::Residential), 'R', Some(1), None, None, 0),
+                "🏠",
             ),
             (
                 themed_cell(Some(BuildingKind::Commercial), 'C', Some(2), None, None, 0),
-                "C▒",
-            ),
-            (
-                themed_cell(Some(BuildingKind::Commercial), 'C', Some(3), None, None, 0),
-                "C▓",
+                "🏪",
             ),
             (
                 themed_cell(Some(BuildingKind::Industrial), 'I', Some(3), None, None, 0),
-                "I▓",
+                "🏭",
             ),
             (
                 themed_cell(Some(BuildingKind::PowerPlant), 'P', Some(2), None, None, 0),
-                "ϟ▒",
+                "⚡",
             ),
             (
                 themed_cell(Some(BuildingKind::Park), 'P', Some(2), None, None, 0),
-                "♣▒",
+                "🌳",
             ),
         ];
 
@@ -3163,13 +3087,10 @@ mod tests {
     }
 
     #[test]
-    fn unicode_building_tiles_are_two_allowed_width_safe_characters() {
+    fn unicode_building_tiles_are_two_display_columns_wide() {
         let cells = [
             residential_cell_with_population(0, 10),
-            residential_cell_with_population(1, 10),
-            residential_cell_with_population(5, 10),
             residential_cell_with_population(10, 10),
-            themed_cell(Some(BuildingKind::Commercial), 'C', Some(1), None, None, 0),
             themed_cell(Some(BuildingKind::Commercial), 'C', Some(2), None, None, 0),
             themed_cell(Some(BuildingKind::Industrial), 'I', Some(3), None, None, 0),
             themed_cell(Some(BuildingKind::PowerPlant), 'P', Some(2), None, None, 0),
@@ -3184,8 +3105,8 @@ mod tests {
                 PreviewState::None,
             );
 
-            assert_eq!(glyph.tile.chars().count(), 2);
-            assert!(glyph.tile.chars().all(is_allowed_unicode_tile_char));
+            // Emoji tiles are a single char but two display columns; what matters is the width.
+            assert_eq!(Span::raw(&glyph.tile).width(), 2);
         }
     }
 
@@ -4020,41 +3941,14 @@ mod tests {
                     false,
                     PreviewState::None,
                 );
-                animate_city_tile(&mut glyph, cell, false, PreviewState::None, 2, frame, true);
+                animate_city_tile(&mut glyph, false, PreviewState::None, 2, frame, true);
                 assert_eq!(
-                    glyph.tile.chars().count(),
+                    Span::raw(&glyph.tile).width(),
                     2,
                     "animated tile must stay two columns (frame {frame})"
                 );
-                assert!(glyph.tile.chars().all(is_allowed_unicode_tile_char));
             }
         }
-    }
-
-    #[test]
-    fn power_plant_pulse_changes_char_two_across_frames() {
-        let cell = themed_cell(Some(BuildingKind::PowerPlant), 'P', Some(2), None, None, 0);
-        let render = |frame: u64| {
-            let mut glyph = TileTheme::Unicode.tile_for_cell(
-                &cell,
-                MapOverlayInput::Normal,
-                false,
-                PreviewState::None,
-            );
-            animate_city_tile(
-                &mut glyph,
-                &cell,
-                false,
-                PreviewState::None,
-                12,
-                frame,
-                true,
-            );
-            glyph.tile
-        };
-        // The plant glyph stays ϟ but its second cell cycles, so the tile differs across the pulse.
-        assert!(render(0).starts_with('ϟ'));
-        assert_ne!(render(0), render(3));
     }
 
     #[test]
@@ -4314,29 +4208,6 @@ mod tests {
         let mut cell = themed_cell(Some(kind), symbol, Some(1), None, None, 0);
         cell.local_effects.land_value = land_value;
         cell
-    }
-
-    fn is_allowed_unicode_tile_char(value: char) -> bool {
-        value.is_ascii()
-            || matches!(
-                value,
-                '─' | '│'
-                    | '┌'
-                    | '┐'
-                    | '└'
-                    | '┘'
-                    | '├'
-                    | '┤'
-                    | '┬'
-                    | '┴'
-                    | '┼'
-                    | '░'
-                    | '▒'
-                    | '▓'
-                    | '█'
-                    | 'ϟ'
-                    | '♣'
-            )
     }
 
     fn is_allowed_unicode_road_char(value: char) -> bool {
