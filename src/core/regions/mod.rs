@@ -280,6 +280,16 @@ impl RegionState {
         self.id
     }
 
+    /// Sets this region's tunable building rules (the regional game injects the save-stamped ruleset).
+    pub(crate) fn set_building_rules(&mut self, rules: crate::core::building_rules::BuildingRules) {
+        self.world.set_building_rules(rules);
+    }
+
+    /// This region's tunable building rules.
+    pub(crate) fn building_rules(&self) -> crate::core::building_rules::BuildingRules {
+        self.world.building_rules().clone()
+    }
+
     /// Advances only this region's local simulation using the shared tick order.
     pub fn tick_local(&mut self) -> CommandResult {
         let phase = begin_tick_power_phase(&mut self.world, self.id);

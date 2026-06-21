@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::building_rules::BuildingRules;
 use crate::core::regional_game_runner::{
     RecoveredRegionalGame, RegionalGameRunner, RegionalGameRunnerError,
 };
@@ -33,6 +34,8 @@ use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{BuildPreviewView, CityGoodsView, GameView, InspectView};
 
 const DEFAULT_SINGLE_REGION_ID: RegionId = RegionId(1);
+/// External building-rules override path read when a new game starts (absent in tests → embedded).
+const BUILDING_RULES_OVERRIDE_PATH: &str = "config/buildings.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Deterministic errors returned by regional facade operations.
@@ -154,6 +157,11 @@ struct RegionalGameSave {
     selected_region: Option<RegionId>,
     regions: Vec<RegionStateSaveRecord>,
     layout: RegionalLayoutSave,
+    // Tunable building rules travel with the save so a city replays under the rules it was created
+    // with, regardless of the current config/buildings.json. Defaults to the embedded baseline for
+    // saves written before this field existed.
+    #[serde(default)]
+    building_rules: BuildingRules,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +171,8 @@ struct RegionalGameSaveWire {
     regions: Vec<RegionStateSaveRecord>,
     #[serde(default)]
     layout: Option<RegionalLayoutSave>,
+    #[serde(default)]
+    building_rules: BuildingRules,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +211,8 @@ pub struct RegionalGame {
     selected_region: Option<RegionId>,
     next_request_id: AtomicU64,
     latest_goods_by_region: Mutex<BTreeMap<RegionId, CityGoodsView>>,
+    /// Tunable building rules in effect for this city; written into saves and restored on load.
+    building_rules: BuildingRules,
 }
 
 impl RegionalGame {
@@ -252,12 +264,21 @@ impl RegionalGame {
     }
 
     fn from_regions_with_layout_and_worker_setup(
-        regions: Vec<RegionState>,
+        mut regions: Vec<RegionState>,
         layout: RegionalLayoutSave,
         worker_count: usize,
         region_worker_indexes: Option<Vec<usize>>,
     ) -> Result<Self, RegionalGameError> {
         let region_ids = regions.iter().map(RegionState::id).collect::<Vec<_>>();
+        // A city shares one ruleset. Capture it from the first region and enforce it on all the
+        // others, so save (which stamps a single ruleset) and load stay consistent for every region.
+        let building_rules = regions
+            .first()
+            .map(RegionState::building_rules)
+            .unwrap_or_default();
+        for region in &mut regions {
+            region.set_building_rules(building_rules.clone());
+        }
         validate_layout(region_ids.len(), layout)?;
         let topology = derive_topology(&region_ids, layout);
         let selected_region = region_ids.first().copied();
@@ -284,6 +305,7 @@ impl RegionalGame {
             selected_region,
             next_request_id: AtomicU64::new(1),
             latest_goods_by_region: Mutex::new(BTreeMap::new()),
+            building_rules,
         };
 
         Ok(game)
@@ -305,8 +327,15 @@ impl RegionalGame {
     }
 
     pub fn three_by_three_default(width: usize, height: usize) -> Result<Self, RegionalGameError> {
+        // New games read the external building-rules override if present (else the embedded
+        // default). A malformed override falls back to the default rather than bricking the game.
+        let rules = BuildingRules::load(BUILDING_RULES_OVERRIDE_PATH).unwrap_or_default();
         let regions = (1..=9)
-            .map(|id| RegionState::new(RegionId(id), width, height))
+            .map(|id| {
+                let mut region = RegionState::new(RegionId(id), width, height);
+                region.set_building_rules(rules.clone());
+                region
+            })
             .collect();
         Self::from_regions_with_layout_and_worker_setup(
             regions,
@@ -341,6 +370,12 @@ impl RegionalGame {
 
     pub fn selected_region(&self) -> Result<RegionId, RegionalGameError> {
         self.selected_region_or_first()
+    }
+
+    /// Tunable building rules in effect for this city (stamped into saves, restored on load).
+    #[cfg(test)]
+    pub(crate) fn building_rules(&self) -> &BuildingRules {
+        &self.building_rules
     }
 
     pub fn selected_region_position(&self) -> Result<(usize, usize), RegionalGameError> {
@@ -676,6 +711,7 @@ impl RegionalGame {
         let layout = self.layout;
         let worker_count = self.worker_count;
         let region_worker_indexes = self.region_worker_indexes.clone();
+        let building_rules = self.building_rules.clone();
         let recovered = self
             .shutdown()
             .map_err(|error| RegionalGameSaveFailure::Unrecoverable(error.into()))?;
@@ -687,6 +723,7 @@ impl RegionalGame {
                 .map(RegionState::into_save_record)
                 .collect(),
             layout,
+            building_rules,
         };
 
         let file = match File::create(path) {
@@ -729,11 +766,17 @@ impl RegionalGame {
         worker_count: usize,
         region_worker_indexes: Option<Vec<usize>>,
     ) -> Result<Self, RegionalGameError> {
-        let regions = save
+        // Inject the save-stamped ruleset into every region's world (worlds skip it in serialization),
+        // so the loaded city replays under the rules it was saved with.
+        let building_rules = save.building_rules.clone();
+        let mut regions = save
             .regions
             .into_iter()
             .map(RegionState::from_save_record)
             .collect::<Vec<_>>();
+        for region in &mut regions {
+            region.set_building_rules(building_rules.clone());
+        }
         let mut game = Self::from_regions_with_layout_and_worker_setup(
             regions,
             save.layout,
@@ -789,6 +832,7 @@ impl RegionalGameSaveWire {
             selected_region: self.selected_region,
             regions: self.regions,
             layout,
+            building_rules: self.building_rules,
         }
     }
 }
@@ -920,6 +964,40 @@ impl From<RegionalGameRunnerError> for RegionalGameError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_stamps_building_rules_and_restores_them_on_load() {
+        // A game built with a custom ruleset keeps it through save and load (replay parity),
+        // independent of the embedded default.
+        let custom = BuildingRules::from_json(
+            r#"{"buildings":{"Residential":{"footprint_area_per_level":[1,2,3]},
+                "Commercial":{"footprint_area_per_level":[1,2,4]},
+                "Industrial":{"footprint_area_per_level":[1,2,4]}}}"#,
+        )
+        .unwrap();
+        assert_ne!(custom, BuildingRules::default());
+
+        let mut region = RegionState::new(DEFAULT_SINGLE_REGION_ID, 4, 4);
+        region.set_building_rules(custom.clone());
+        let game = RegionalGame::from_regions(vec![region]).expect("game from custom-rules region");
+        assert_eq!(
+            game.building_rules(),
+            &custom,
+            "rules captured on construction"
+        );
+
+        let path = std::env::temp_dir().join("small_city_m5_rules_roundtrip.json");
+        let restarted = game.save_to_file(&path).expect("save");
+        drop(restarted);
+        let loaded = RegionalGame::load_from_file(&path).expect("load");
+        assert_eq!(
+            loaded.building_rules(),
+            &custom,
+            "rules restored from the save"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn derives_row_major_topology_from_layout() {

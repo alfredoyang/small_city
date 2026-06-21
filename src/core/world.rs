@@ -116,6 +116,12 @@ impl World {
         &self.building_rules
     }
 
+    /// Injects the tunable building rules (the regional layer sets the save-stamped ruleset here so
+    /// every world in a city shares it). `#[serde(skip)]` means rules are never serialized per world.
+    pub(crate) fn set_building_rules(&mut self, rules: crate::core::building_rules::BuildingRules) {
+        self.building_rules = rules;
+    }
+
     pub fn spawn(&mut self) -> Entity {
         let entity = Entity(self.next_entity);
         self.next_entity += 1;
