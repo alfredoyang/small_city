@@ -316,3 +316,379 @@ To reach this plan's **L3 (2×2)** you must raise `MAX_UPGRADE_LEVEL` to **3**, 
   more "no space to level up" blocks than a free-form connected set would hit —
   accepted.
 - **Down-level / un-merge** is out of scope: bulldoze removes the whole building.
+
+## Implemented architecture (M0-M5)
+
+This is the final shape after M0-M5. The important rule: `World` owns the local
+simulation state, `RegionalGame` owns the city-wide ruleset for save/load, and UI
+only sees view models.
+
+```text
+config/buildings.json (optional, new game only)
+        |
+        v
+BuildingRules
+        |
+        +----------------------+
+        |                      |
+        v                      v
+RegionalGame.building_rules    World.building_rules
+(save-stamped once)            (serde skip; injected per region)
+        |                      |
+        v                      v
+RegionalGameSave          upgrade::grow_to_level()
+```
+
+### Important structs and fields
+
+```rust
+// core/building_rules.rs
+BuildingRules {
+    buildings: BTreeMap<String, ZoneRules>,
+}
+
+ZoneRules {
+    footprint_area_per_level: Vec<u32>,
+}
+```
+
+`BuildingRules` validates:
+
+- every zone has at least 3 levels,
+- areas are positive and non-decreasing,
+- level 1 is area 1,
+- each next area is reachable by one side extension.
+
+```rust
+// core/components.rs
+Building {
+    kind: BuildingKind,
+    level: u8,
+    data: BuildingData,
+    footprint: Footprint, // serde default = 1x1
+}
+
+Footprint {
+    width: u8,
+    height: u8,
+}
+```
+
+`footprint` is the durable per-building shape. The grid maps every occupied cell
+back to the same building entity.
+
+```rust
+// core/world.rs
+World {
+    grid: Grid,
+    buildings: HashMap<Entity, Building>,
+    positions: HashMap<Entity, Position>,
+    building_rules: BuildingRules, // serde skip
+}
+```
+
+`building_rules` is skipped inside `World` saves so it is not duplicated once per
+region. The regional layer injects the save-stamped rules into every region.
+
+```rust
+// core/regional_game.rs
+RegionalGame {
+    runner: RegionalGameRunner,
+    building_rules: BuildingRules,
+}
+
+RegionalGameSave {
+    regions: Vec<RegionStateSaveRecord>,
+    layout: RegionalLayoutSave,
+    building_rules: BuildingRules, // serde default for legacy saves
+}
+```
+
+`RegionalGame` captures one city-wide ruleset, stamps it into saves, and restores
+it into every region on load.
+
+### M0: ruleset
+
+```text
+embedded src/core/buildings_default.json
+        |
+        v
+BuildingRules::default()
+
+optional config/buildings.json
+        |
+        v
+BuildingRules::load(path)
+        |
+        +-- NotFound or invalid -> embedded default for new games
+        +-- valid override      -> active ruleset for new games
+```
+
+M0 makes footprint areas configurable without changing gameplay yet.
+
+### M1: footprint plumbing
+
+```text
+Building(Position {x,y}, Footprint {w,h})
+        |
+        v
+Grid cells:
+
+anchor (x,y)
+   |
+   v
++---+---+
+| E | E |   every footprint cell stores the same Entity E
++---+---+
+| E | E |
++---+---+
+```
+
+Important helpers:
+
+- `Grid::set_footprint(x, y, w, h, entity)`
+- `Grid::clear_footprint(x, y, w, h)`
+- `entity_cleanup::remove_entity()` clears the whole footprint before removing
+  components.
+
+Legacy saves work because missing `Building.footprint` defaults to `1x1`.
+
+### M2: grow, claim, merge, capacity
+
+Upgrade growth is deterministic: try `N`, then `E`, then `S`, then `W`.
+
+```text
+upgrade(entity)
+   |
+   v
+target_area = world.building_rules().footprint_area(kind, next_level)
+   |
+   v
+current area >= target?
+   | yes
+   v
+level up in place
+
+   | no
+   v
+choose_extension(N, E, S, W)
+   |
+   +-- no claimable rectangle -> fail, no money spent, no mutation
+   |
+   +-- claimable rectangle -> merge same-type neighbours fully inside
+                              stamp new footprint
+                              apply level effects
+```
+
+Claim rules:
+
+```text
+new cell is empty                         -> claim
+new cell belongs to same type fully inside -> merge
+new cell is different type / overhang / OOB -> block
+```
+
+Capacity is single-sourced:
+
+```text
+capacity_for(kind, footprint.area())
+        |
+        +-- Residential -> Population.max
+        +-- Commercial  -> job slots
+        +-- Industrial  -> job slots
+```
+
+Road connectivity is footprint-aware:
+
+```text
+before M2: anchor-only
+
+R R
+. =
+^
+only this cell checked
+
+after M2: whole boundary
+
+R R
+. =
+
+any footprint edge touching road counts
+```
+
+### M3: contents transfer on merge
+
+M3 keeps contents when same-type buildings merge.
+
+```text
+grow A into rectangle containing B
+
+before removing B:
+    citizens with home B -> home A
+    absorb B.goods
+    absorb B.business_cash
+
+remove B
+set A level + footprint
+apply new capacity
+cap transferred contents
+```
+
+Residential cap is deterministic:
+
+```text
+citizens at home A sorted by Entity id
+keep first max_population
+remove the rest from citizens + entities
+sync Population.current from citizens
+```
+
+Commercial transfer:
+
+```text
+A.local_goods + B.local_goods -> capped at commercial_goods_capacity_for_entity(A)
+A.business_cash + B.business_cash -> summed
+```
+
+### M4: inspect visibility
+
+M4 does not add new view structs. It uses the existing `InspectView.explanations`
+field.
+
+```text
+inspect(any footprint cell)
+        |
+        v
+grid cell -> owner entity
+        |
+        v
+adapter::inspect_explanations()
+        |
+        +-- Footprint: WxH (N cells)
+        +-- No room to grow: clear an adjacent cell...
+```
+
+The space warning uses a pure helper:
+
+```text
+upgrade::upgrade_blocked_for_space(world, entity)
+        |
+        v
+same choose_extension() search as real upgrade
+        |
+        +-- Some(_) -> not blocked
+        +-- None    -> blocked for space
+```
+
+### M5: save-stamped rules
+
+New game:
+
+```text
+RegionalGame::three_by_three_default()
+        |
+        v
+BuildingRules::load("config/buildings.json").unwrap_or_default()
+        |
+        v
+inject same rules into all 9 RegionState.world values
+        |
+        v
+RegionalGame captures the same ruleset
+```
+
+Save:
+
+```text
+RegionalGame.building_rules
+        |
+        v
+RegionalGameSave.building_rules
+        |
+        v
+JSON save file
+```
+
+Load:
+
+```text
+JSON save file
+        |
+        v
+RegionalGameSave.building_rules
+        |
+        v
+RegionState::from_save_record(...) for each region
+        |
+        v
+region.set_building_rules(saved_rules.clone())
+        |
+        v
+RegionalGame runner starts
+```
+
+This keeps replay parity: editing `config/buildings.json` affects new games only,
+not existing saves.
+
+## UI command path: upgrade to region worker
+
+The UI never calls `World` or ECS systems directly. An upgrade key press is just
+another UI-safe command that crosses the same facade/worker boundary as build,
+replace, and bulldoze.
+
+```text
+TUI thread
+  |
+  | U key / TuiAction::Upgrade
+  v
+TuiRuntime::handle_action()
+  |
+  | current cursor (x, y)
+  v
+CityDriver::upgrade(x, y)
+  |
+  v
+RegionalGame::upgrade_selected_region(x, y)
+  |
+  | selected RegionId + RegionCommand::Upgrade { x, y }
+  v
+RegionalGameRunner::run_region_command(request_id, region_id, command)
+  |
+  | RegionEvent::RunCommand { request_id, command }
+  v
+ThreadedRegionWorker channel
+  |
+  v
+RegionWorker -> RegionRuntime
+  |
+  v
+RegionRuntime::run_command()
+  |
+  v
+RegionState::upgrade(x, y)
+  |
+  v
+core::systems::upgrade::upgrade(world, x, y)
+```
+
+Reply path:
+
+```text
+CommandResult
+  ^
+  |
+RegionCommandCompleted(request_id, result)
+  ^
+  |
+RegionalGameRunner waits for the matching UiRequestId
+  ^
+  |
+CityDriver returns result to TUI
+  ^
+  |
+TUI updates message / flash / dirty view state
+```
+
+`UiRequestId` exists because the UI thread sends work through a worker channel
+and then pumps worker replies; the id ties the returned `CommandResult` to the
+specific UI command that requested it.
