@@ -265,6 +265,64 @@ fn bridged_remote_workplace_is_not_double_counted_for_population_growth() {
     );
 }
 
+fn region_cell_powered(game: &RegionalGame, region: RegionId, x: usize, y: usize) -> bool {
+    game.view()
+        .unwrap()
+        .regions
+        .into_iter()
+        .find(|snapshot| snapshot.region_id == region)
+        .expect("region snapshot")
+        .view
+        .map
+        .cells
+        .iter()
+        .find(|cell| cell.x == x && cell.y == y)
+        .and_then(|cell| cell.powered)
+        .unwrap_or(false)
+}
+
+#[test]
+fn paused_build_keeps_imported_power_until_next_tick() {
+    // Region 2 imports power from region 1's plant across the border.
+    let game = RegionalGame::two_region_default(3, 2).unwrap();
+    assert!(
+        game.build(RegionId(1), 2, 0, BuildingKind::Road)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(1), 2, 1, BuildingKind::PowerPlant)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(2), 0, 0, BuildingKind::Road)
+            .unwrap()
+            .success
+    );
+    assert!(
+        game.build(RegionId(2), 1, 0, BuildingKind::Residential)
+            .unwrap()
+            .success
+    );
+    assert!(game.tick_region(RegionId(2)).unwrap().success);
+    assert!(
+        region_cell_powered(&game, RegionId(2), 1, 0),
+        "residential should be imported-powered after the tick"
+    );
+
+    // Paused build (no tick): the derived refresh must not drop the import.
+    assert!(
+        game.build(RegionId(2), 1, 1, BuildingKind::Park)
+            .unwrap()
+            .success
+    );
+    assert!(
+        region_cell_powered(&game, RegionId(2), 1, 0),
+        "imported power must survive a paused build until the next tick"
+    );
+}
+
 #[test]
 fn two_region_default_wires_topology_for_cross_region_power_export() {
     let game = RegionalGame::two_region_default(3, 2).unwrap();

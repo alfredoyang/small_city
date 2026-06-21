@@ -36,6 +36,7 @@
 //!   morale is frozen while paused.
 //! - `Citizen::age` is durable state, but no aging system exists yet.
 
+use crate::core::components::PowerSource;
 use crate::core::entity::Entity;
 use crate::core::regions::RegionId;
 use crate::core::resources::{GameTime, is_new_day, is_new_week};
@@ -255,7 +256,16 @@ pub(crate) fn ensure_derived_state(world: &mut World, local_region: RegionId) {
 /// and local effects. DT2 keeps actual citizen happiness in the time pass while
 /// exposing the conditions-only `happiness_target` from this derived pass.
 pub(crate) fn refresh_derived_state_for_world(world: &mut World, local_region: RegionId) {
+    // Cross-region imported power is reserved in the runtime ledger and only
+    // (re)applied during a tick's export phase. `power::run` clears every consumer
+    // and re-applies only *local* grants, so running this derived pass for a paused
+    // config change (build/bulldoze) would drop still-valid imports and make
+    // imported-powered buildings flash unpowered until the next tick. Capture the
+    // imports first, then restore the ones local power did not cover. The next real
+    // tick re-derives imports authoritatively through the cross-region flow.
+    let imported = imported_power_grants(world);
     power::run(world);
+    reapply_imported_power(world, &imported);
     road_network_analysis::run(world);
     stats::refresh_population_and_jobs(world);
     pollution::run(world);
@@ -263,6 +273,41 @@ pub(crate) fn refresh_derived_state_for_world(world: &mut World, local_region: R
     economy::assign_local_jobs(world, local_region);
     citizens::update_happiness_targets(world);
     happiness::run(world);
+}
+
+/// Imported-power grants currently held by consumers, captured before a local
+/// power recompute so a paused derived pass can restore them (see
+/// `refresh_derived_state_for_world`).
+fn imported_power_grants(world: &World) -> Vec<(Entity, i32, RegionId)> {
+    world
+        .power_consumers
+        .iter()
+        .filter_map(|(entity, consumer)| match consumer.source {
+            Some(PowerSource::Imported { source_region }) if consumer.powered => {
+                Some((*entity, consumer.demand, source_region))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Re-applies previously-held imported power to consumers that local resolution
+/// left unpowered (mirrors `RegionState::apply_power_export_grant`). Keeps the
+/// reservation reflected in the consumer flag and the supplied/shortage stats.
+fn reapply_imported_power(world: &mut World, imported: &[(Entity, i32, RegionId)]) {
+    for &(entity, demand, source_region) in imported {
+        let Some(consumer) = world.power_consumers.get_mut(&entity) else {
+            continue;
+        };
+        if consumer.powered || consumer.demand != demand {
+            continue;
+        }
+        consumer.powered = true;
+        consumer.source = Some(PowerSource::Imported { source_region });
+        world.stats.power.total_power_supplied += demand;
+    }
+    world.stats.power.total_power_shortage =
+        (world.stats.power.total_power_demand - world.stats.power.total_power_supplied).max(0);
 }
 
 #[derive(Debug, Clone, Copy)]
