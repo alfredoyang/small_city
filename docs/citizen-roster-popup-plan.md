@@ -233,5 +233,84 @@ Recommend option 1. Confirm before implementing M2.
         InspectView.roster: Vec<CitizenDetailView>   ◄─ filled by adapter::inspect_world
                                                           residents:  home == entity
                                                           workers:    workplace == entity (Local)
-                                                          remote:     aggregate count only
+                                                          remote:     not listed (other region)
 ```
+
+---
+
+## Implemented architecture (M1 + M2)
+
+Status: **done**. M1 `efc3a4a`, M2 `8bf2a74`. No simulation/core change — the
+feature is a read-only projection (M1) plus a TUI modal (M2).
+
+### Data flow as built
+
+```text
+ ECS (unchanged)                interface (M1)                 ui/tui (M2)
+ ───────────────                ──────────────                 ───────────
+ World.citizens                 adapter::inspect_world         render loop fetches
+   Citizen{age,money,    ─────►   └ citizen_roster(x,y)  ─────►  inspect each frame
+     morale, home,                   residents | local workers     │
+     workplace_assignment}           → Vec<CitizenDetailView>      ▼
+                                    (sorted by Entity.0)        render_citizen_panel(inspect)
+                                  InspectView.roster ───────────┘  (Clear + centered popup)
+```
+
+### M1 — projection (src/interface)
+
+- `view.rs`: `CitizenDetailView { age, happiness, money, relation }` +
+  `CitizenRelation { WorksAt{region,x,y,salary,is_remote} | Unemployed |
+  LivesAt{x,y} }`; `InspectView.roster: Vec<CitizenDetailView>`.
+- `adapter.rs`: `citizen_roster(world, x, y)` + `citizen_relation(...)`.
+  Residential → residents (`home == entity`), each `WorksAt`/`Unemployed`;
+  Commercial/Industrial → local workers (`workplace_assignment.source ==
+  Local{entity}`), each `LivesAt` (worker `home` Entity → `world.positions`);
+  every other cell → empty. Deterministic: `sort_by_key(Entity.0)`.
+- Boundary: a workplace's remote workers live in another region's world and a
+  remote-worker *count* is not in this world either (it's in the runtime export
+  ledger), so workplace rosters are local-only. Residents holding a remote job
+  are still listed (`is_remote: true`).
+
+### M2 — TUI popup (src/ui)
+
+```text
+ key event
+   │
+   ├─ handle_prompt_key ───────────► (save/load filename) ─ consumed
+   ├─ handle_quit_confirm_key ─────► (quit dialog)        ─ consumed
+   ├─ handle_citizen_panel_key ────► OPEN: ↑/↓ scroll (clamp to live roster),
+   │                                       Esc/Enter/q close              ─ consumed
+   └─ map_key_event → apply_action
+         Enter → EnterCell:  cell_has_roster(inspect)? open panel : Build
+         b/B   → Build       (always builds)
+```
+
+- `tui_input.rs`: `Enter → TuiAction::EnterCell`; `b/B → Build`.
+- `tui.rs`: `TuiState{ citizen_panel, citizen_scroll }`;
+  `apply_action(EnterCell)` opens on R/C/I else builds;
+  `handle_citizen_panel_key` is fully modal (dispatched after the quit modal,
+  before `map_key_event`); `render_citizen_panel` draws the popup from the
+  `InspectView` the render loop already holds — title `Residents of`/`Workers
+  at`, `No citizens yet` when empty, `(local workers only)` footnote on
+  workplaces; `citizen_row` formats one line per citizen.
+- Scroll is clamped twice: in the key handler (against the live roster length)
+  and again at render (so a roster that shrank while open never blanks).
+
+### Invariants preserved
+
+- UI reads only view models (`InspectView.roster` / `CitizenDetailView`); no ECS
+  access from `src/ui`.
+- Determinism unaffected — roster is a pure function of world state in a fixed
+  (entity-id) order; the panel and scroll are UI-only state.
+- No new cross-region transport: the roster rides inside the existing
+  per-frame `InspectView`.
+
+### Tests
+
+- M1 (`tests/inspect_view_test.rs`):
+  `roster_lists_residents_with_their_workplace_and_workers_with_their_home`
+  (WorksAt/LivesAt, empty road/empty cells, count match, determinism).
+- M2 (`src/ui/tui.rs`, `src/ui/tui_input.rs`): Enter→EnterCell mapping;
+  Enter opens on a zone / builds on empty land; Enter no-ops the panel on a road;
+  modal scroll-clamp + close; `citizen_row` formatting for all four relations;
+  popup render headers (`Residents of` / `Workers at` + footnote).
