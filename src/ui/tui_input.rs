@@ -16,6 +16,9 @@ pub(crate) enum TuiAction {
     MoveRight,
     SelectBuild(BuildingKind),
     Build,
+    /// Context-sensitive Enter: open the citizen roster on an occupied
+    /// Residential/Commercial/Industrial cell, otherwise build (empty land).
+    EnterCell,
     Replace,
     Upgrade,
     Bulldoze,
@@ -67,7 +70,8 @@ pub(crate) fn map_key_event(event: KeyEvent) -> TuiAction {
         KeyCode::Char('4') => TuiAction::SelectBuild(BuildingKind::Industrial),
         KeyCode::Char('5') => TuiAction::SelectBuild(BuildingKind::PowerPlant),
         KeyCode::Char('6') => TuiAction::SelectBuild(BuildingKind::Park),
-        KeyCode::Enter | KeyCode::Char('b') | KeyCode::Char('B') => TuiAction::Build,
+        KeyCode::Enter => TuiAction::EnterCell,
+        KeyCode::Char('b') | KeyCode::Char('B') => TuiAction::Build,
         KeyCode::Char('r') | KeyCode::Char('R') => TuiAction::Replace,
         KeyCode::Char('u') | KeyCode::Char('U') => TuiAction::Upgrade,
         KeyCode::Char('x') | KeyCode::Char('X') => TuiAction::Bulldoze,
@@ -140,7 +144,7 @@ mod tests {
 
     #[test]
     fn maps_gameplay_actions() {
-        assert_eq!(map_key_event(key(KeyCode::Enter)), TuiAction::Build);
+        assert_eq!(map_key_event(key(KeyCode::Enter)), TuiAction::EnterCell);
         assert_eq!(map_key_event(key(KeyCode::Char('b'))), TuiAction::Build);
         assert_eq!(map_key_event(key(KeyCode::Char('R'))), TuiAction::Replace);
         assert_eq!(map_key_event(key(KeyCode::Char('U'))), TuiAction::Upgrade);

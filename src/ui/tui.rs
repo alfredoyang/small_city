@@ -20,7 +20,8 @@ use ratatui::{Frame, Terminal};
 use crate::interface::events::CommandResult;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
-    BuildPreviewView, CellView, DemandLevel, GameView, InspectDetailsView, InspectFlag, InspectView,
+    BuildPreviewView, CellView, CitizenDetailView, CitizenRelation, DemandLevel, GameView,
+    InspectDetailsView, InspectFlag, InspectView,
 };
 use crate::ui::city_driver::{CityDriver, CityLaunchMode};
 use crate::ui::tui_input::{TuiAction, map_key_event};
@@ -53,6 +54,11 @@ struct TuiState {
     /// When set, a modal asks the player to confirm quitting (with a save option) instead of
     /// exiting immediately. Cleared on cancel or once the quit is carried out.
     quit_confirm: bool,
+    /// When set, a modal lists the citizens of the selected building (residents for Residential,
+    /// local workers for Commercial/Industrial). Opened by Enter on a populated zone.
+    citizen_panel: bool,
+    /// Scroll offset into the open citizen roster, clamped to the roster length at render time.
+    citizen_scroll: usize,
     /// Whether the chrome panels (header bar, tool strip, City HUD, legend) may use emoji icons.
     /// The map grid is always emoji-free; only these panels fall back to ASCII on bare terminals.
     use_emoji: bool,
@@ -140,6 +146,8 @@ impl Default for TuiState {
             show_help: false,
             prompt: None,
             quit_confirm: false,
+            citizen_panel: false,
+            citizen_scroll: 0,
             use_emoji: true,
             hud_prev: None,
             hud_trend: HudTrend::default(),
@@ -690,6 +698,43 @@ impl TuiRuntime {
         Ok(true)
     }
 
+    /// Handles a key while the citizen roster modal is open. Returns `true` when the modal
+    /// consumed the key (so it should not fall through to a gameplay action).
+    ///
+    /// ```text
+    ///   [↑]/[↓]  scroll the roster (clamped to its length)
+    ///   [Esc]/[Enter]/[q]  close the panel
+    /// ```
+    fn handle_citizen_panel_key(&mut self, key: KeyEvent) -> bool {
+        if !self.state.citizen_panel {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('W') => {
+                self.state.citizen_scroll = self.state.citizen_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('s') => {
+                // Clamp against the live roster so scrolling can never run past the last citizen.
+                let count = self
+                    .game
+                    .inspect(self.state.cursor_x, self.state.cursor_y)
+                    .roster
+                    .len();
+                if self.state.citizen_scroll + 1 < count {
+                    self.state.citizen_scroll += 1;
+                }
+            }
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                self.state.citizen_panel = false;
+            }
+            _ => {}
+        }
+
+        self.dirty = true;
+        true
+    }
+
     /// Handles a key while the quit-confirmation modal is open. Returns `true` when the modal
     /// consumed the key (so it should not fall through to a gameplay action). The actual exit is
     /// signalled via `pending_quit` and carried out by the event loop.
@@ -759,6 +804,21 @@ impl TuiRuntime {
                 let before = self.current_money();
                 let result = self.game.build(x, y, self.state.selected_build);
                 self.finish_map_command(x, y, before, result, now);
+            }
+            TuiAction::EnterCell => {
+                // Context-sensitive: a populated zone opens its citizen roster;
+                // anything else (empty land, road, power, park) behaves as Build.
+                let (x, y) = (self.state.cursor_x, self.state.cursor_y);
+                if cell_has_roster(&self.game.inspect(x, y)) {
+                    self.state.citizen_panel = true;
+                    self.state.citizen_scroll = 0;
+                    self.state.message = "Citizen roster (↑/↓ scroll · Esc close)".to_string();
+                    self.dirty = true;
+                } else {
+                    let before = self.current_money();
+                    let result = self.game.build(x, y, self.state.selected_build);
+                    self.finish_map_command(x, y, before, result, now);
+                }
             }
             TuiAction::Replace => {
                 let (x, y) = (self.state.cursor_x, self.state.cursor_y);
@@ -1015,6 +1075,11 @@ fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
             continue;
         }
 
+        // The citizen roster modal consumes its own keys while open.
+        if runtime.handle_citizen_panel_key(key) {
+            continue;
+        }
+
         // Non-modal keys are normalized into actions before mutating UI state or calling facades.
         let action = map_key_event(key);
         if runtime.apply_action(action, Instant::now()) == TuiFlow::Quit {
@@ -1096,6 +1161,9 @@ fn render(
     if state.quit_confirm {
         render_quit_confirm(frame, root);
     }
+    if state.citizen_panel {
+        render_citizen_panel(frame, root, inspect, state.citizen_scroll);
+    }
 }
 
 /// Modal shown when the player presses Esc/Q to quit. Double-confirms and offers to save first so
@@ -1143,6 +1211,109 @@ fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect) {
             .wrap(Wrap { trim: true }),
         popup,
     );
+}
+
+/// True when the inspected cell is a zone whose citizens we can list (residents
+/// for Residential, local workers for Commercial/Industrial).
+fn cell_has_roster(inspect: &InspectView) -> bool {
+    matches!(
+        inspect.details,
+        Some(InspectDetailsView::Residential { .. })
+            | Some(InspectDetailsView::Commercial { .. })
+            | Some(InspectDetailsView::Industrial { .. })
+    )
+}
+
+/// Modal roster of the selected building's citizens.
+///
+/// ```text
+///  Residential          -> residents,      each row: where they work
+///  Commercial/Industrial -> local workers,  each row: where they live
+/// ```
+///
+/// `scroll` is the index of the first row shown; it is clamped here so a roster
+/// that shrank while the panel was open never leaves a blank window.
+fn render_citizen_panel(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView, scroll: usize) {
+    let popup = centered_rect(60, 60, area);
+    let is_workplace = matches!(
+        inspect.details,
+        Some(InspectDetailsView::Commercial { .. }) | Some(InspectDetailsView::Industrial { .. })
+    );
+    let heading = if is_workplace {
+        "Workers at"
+    } else {
+        "Residents of"
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "{heading} ({},{}) — {} citizen(s)",
+                inspect.x,
+                inspect.y,
+                inspect.roster.len()
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    if inspect.roster.is_empty() {
+        lines.push(Line::from("No citizens yet."));
+    } else {
+        let start = scroll.min(inspect.roster.len() - 1);
+        for (index, citizen) in inspect.roster.iter().enumerate().skip(start) {
+            lines.push(Line::from(citizen_row(index + 1, citizen)));
+        }
+    }
+
+    if is_workplace {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "(local workers only)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title("Citizens · ↑/↓ scroll · Esc close")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+/// Formats one roster row, e.g. `#2  age 34  happy 41  $3  works (2,0) · $3`.
+fn citizen_row(number: usize, citizen: &CitizenDetailView) -> String {
+    let relation = match citizen.relation {
+        CitizenRelation::WorksAt {
+            region,
+            x,
+            y,
+            salary,
+            is_remote,
+        } => {
+            let location = if is_remote {
+                format!("region {} ({},{})", region.0, x, y)
+            } else {
+                format!("({x},{y})")
+            };
+            format!("works {location} · ${salary}")
+        }
+        CitizenRelation::Unemployed => "unemployed".to_string(),
+        CitizenRelation::LivesAt { x, y } => format!("lives ({x},{y})"),
+    };
+    format!(
+        "#{number}  age {}  happy {}  ${}  {}",
+        citizen.age, citizen.happiness, citizen.money, relation
+    )
 }
 
 fn terminal_is_too_small(area: Rect) -> bool {
@@ -2074,7 +2245,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from(""),
         help_section("Actions"),
         Line::from("  Space         Pause / resume automatic ticks | +/- speed"),
-        Line::from("  B / Enter     Build selected tool      P Paint (draw on move)"),
+        Line::from("  B Build · Enter zone citizens (else build) · P Paint (draw on move)"),
         Line::from("  R             Replace selected cell with selected tool"),
         Line::from("  U             Upgrade selected cell"),
         Line::from("  X             Bulldoze selected cell"),
@@ -3545,6 +3716,149 @@ mod tests {
         );
         assert_eq!((runtime.state.cursor_x, runtime.state.cursor_y), (1, 0));
         assert!(runtime.dirty);
+    }
+
+    #[test]
+    fn enter_opens_roster_on_a_zone_and_builds_on_empty_land() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.game = CityDriver::regional_with_size(4, 3).expect("regional UI driver");
+        runtime.state.cursor_x = 0;
+        runtime.state.cursor_y = 0;
+        runtime.state.selected_build = BuildingKind::Residential;
+
+        // Empty land: Enter builds and does not open the roster.
+        runtime.apply_action(TuiAction::EnterCell, now);
+        assert!(!runtime.state.citizen_panel);
+        assert!(cell_has_roster(&runtime.game.inspect(0, 0)));
+
+        // Now on the placed zone: Enter opens the roster instead of building.
+        runtime.apply_action(TuiAction::EnterCell, now);
+        assert!(runtime.state.citizen_panel);
+        assert_eq!(runtime.state.citizen_scroll, 0);
+    }
+
+    #[test]
+    fn enter_does_not_open_roster_on_a_road() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.game = CityDriver::regional_with_size(4, 3).expect("regional UI driver");
+        runtime.state.cursor_x = 0;
+        runtime.state.cursor_y = 0;
+        runtime.state.selected_build = BuildingKind::Road;
+        runtime.apply_action(TuiAction::Build, now);
+
+        runtime.apply_action(TuiAction::EnterCell, now);
+        assert!(!runtime.state.citizen_panel);
+    }
+
+    #[test]
+    fn citizen_panel_key_scrolls_clamped_and_closes() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.game = CityDriver::regional_with_size(4, 3).expect("regional UI driver");
+        runtime.state.citizen_panel = true;
+
+        // Scrolling up is clamped at the top.
+        assert!(runtime.handle_citizen_panel_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(runtime.state.citizen_scroll, 0);
+
+        // Esc closes the panel; once closed the handler stops consuming keys.
+        assert!(runtime.handle_citizen_panel_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!runtime.state.citizen_panel);
+        assert!(!runtime.handle_citizen_panel_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn citizen_row_formats_each_relation() {
+        let local = CitizenDetailView {
+            age: 27,
+            happiness: 72,
+            money: 14,
+            relation: CitizenRelation::WorksAt {
+                region: RegionId(1),
+                x: 2,
+                y: 0,
+                salary: 3,
+                is_remote: false,
+            },
+        };
+        assert_eq!(
+            citizen_row(1, &local),
+            "#1  age 27  happy 72  $14  works (2,0) · $3"
+        );
+
+        let remote = CitizenDetailView {
+            relation: CitizenRelation::WorksAt {
+                region: RegionId(2),
+                x: 1,
+                y: 1,
+                salary: 4,
+                is_remote: true,
+            },
+            ..local
+        };
+        assert_eq!(
+            citizen_row(2, &remote),
+            "#2  age 27  happy 72  $14  works region 2 (1,1) · $4"
+        );
+
+        let lives = CitizenDetailView {
+            relation: CitizenRelation::LivesAt { x: 1, y: 0 },
+            ..local
+        };
+        assert_eq!(
+            citizen_row(3, &lives),
+            "#3  age 27  happy 72  $14  lives (1,0)"
+        );
+
+        let jobless = CitizenDetailView {
+            relation: CitizenRelation::Unemployed,
+            ..local
+        };
+        assert_eq!(
+            citizen_row(4, &jobless),
+            "#4  age 27  happy 72  $14  unemployed"
+        );
+    }
+
+    #[test]
+    fn citizen_panel_renders_resident_and_workplace_headers() {
+        let game = RegionalGame::single_region(4, 3).expect("regional test game");
+        assert!(
+            game.build(RegionId(1), 1, 0, BuildingKind::Residential)
+                .unwrap()
+                .success
+        );
+        assert!(
+            game.build(RegionId(1), 2, 0, BuildingKind::Commercial)
+                .unwrap()
+                .success
+        );
+
+        let resident_screen = render_test_screen(
+            &game,
+            TuiState {
+                cursor_x: 1,
+                cursor_y: 0,
+                citizen_panel: true,
+                ..TuiState::default()
+            },
+        );
+        assert!(resident_screen.contains("Residents of"));
+        assert!(resident_screen.contains("No citizens yet"));
+
+        let workplace_screen = render_test_screen(
+            &game,
+            TuiState {
+                cursor_x: 2,
+                cursor_y: 0,
+                citizen_panel: true,
+                ..TuiState::default()
+            },
+        );
+        assert!(workplace_screen.contains("Workers at"));
+        assert!(workplace_screen.contains("local workers only"));
     }
 
     #[test]
