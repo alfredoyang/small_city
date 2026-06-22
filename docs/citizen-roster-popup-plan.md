@@ -364,3 +364,56 @@ feature is a read-only projection (M1) plus a TUI modal (M2).
   Enter opens on a zone / builds on empty land; Enter no-ops the panel on a road;
   modal scroll-clamp + close; `citizen_row` formatting for all four relations;
   popup render headers (`Residents of` / `Workers at` + footnote).
+
+---
+
+## M3 — Table + in-list cursor (done, `d39d4d3`)
+
+Status: **done**. UI-only; no view-model/adapter/core change, no new deps. M2's
+`Paragraph` of hand-padded strings (`citizen_row`) with a cursor-less scroll
+offset becomes a ratatui `Table` whose **selected row is the cursor**.
+
+### Layout as built
+
+```text
+ popup = centered_rect(60,60)            ← Clear + bordered Block, title carries
+   │                                       "Residents of / Workers at (x,y) — N …"
+   ├─ block.inner ─┬─ body  (Table)        header: # · Age · Happy · $ · Relation
+   │               │         rows: one per inspect.roster entry (relation_text)
+   │               │         selected row: REVERSED + "> " highlight_symbol
+   │               └─ footer (1 line, workplaces only): "(local workers only)"
+   └─ empty roster → "No citizens yet." in body (footer still shown on workplaces)
+```
+
+### Cursor / scroll model (ponytail)
+
+```text
+ TuiState.citizen_selected : usize   (the cursor; renamed from citizen_scroll)
+        │  ↑/↓ in handle_citizen_panel_key: ±1, clamped to 0..roster.len()
+        ▼
+ render: TableState::default().with_selected(Some(selected.min(len-1)))   ← rebuilt
+        │                                                                    per frame,
+        ▼                                                                    offset 0
+ ratatui get_row_bounds scrolls the viewport so the selected row is visible
+```
+
+- No persisted `TableState`: a fresh one each frame (offset 0 + selected) is
+  enough because ratatui recomputes the viewport to reveal the selection. Persist
+  a real `TableState` only if sticky mid-screen scrolling is ever wanted.
+- `selected` is clamped at render against the live roster length — if the roster
+  shrinks while the panel is open, the cursor clamps to the last row instead of
+  vanishing (ratatui scrolls an out-of-range selection into view but won't draw
+  its highlight).
+- `citizen_row(number, &c) -> String` → `relation_text(&c) -> String` (relation
+  column only); the numeric fields are now their own `Table` cells.
+
+### M3 tests (`src/ui/tui.rs`)
+
+- `relation_text_formats_each_relation` — the four relation arms.
+- `citizen_panel_table_renders_header_and_rows` — renders a non-empty roster
+  through `render_citizen_panel` (bypassing the sim, which doesn't spawn citizens
+  deterministically in a unit test): asserts the column header, per-row aligned
+  values, the `> ` cursor on the selected row, and that an out-of-range selection
+  clamps to the last row.
+- `citizen_panel_key_moves_cursor_clamped_and_closes` — ↑/↓ clamp against the
+  live roster, Esc closes and stops consuming keys.
