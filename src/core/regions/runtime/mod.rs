@@ -591,14 +591,14 @@ impl RegionRuntime {
     }
 
     /// Anchor `Position` of the building occupying `(x, y)` (see
-    /// `RegionState::workplace_anchor_at`). Pure config read — building footprints
+    /// `RegionState::building_anchor_at`). Pure config read — building footprints
     /// are not part of the derived pass, so no DT1 recompute is needed.
-    pub fn workplace_anchor_at(
+    pub fn building_anchor_at(
         &self,
         x: usize,
         y: usize,
     ) -> Option<crate::core::components::Position> {
-        self.state.workplace_anchor_at(x, y)
+        self.state.building_anchor_at(x, y)
     }
 
     /// Recomputes the derived pass if a paused command left it dirty (DT1).

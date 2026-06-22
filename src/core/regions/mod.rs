@@ -759,7 +759,7 @@ impl RegionState {
     ///   grid:  (1,2)->E (2,2)->E      positions: E -> (1,2)   (anchor)
     ///   click (2,2) ─► grid.get ─► E ─► positions.get ─► (1,2) == assignment.position
     /// ```
-    pub(crate) fn workplace_anchor_at(&self, x: usize, y: usize) -> Option<Position> {
+    pub(crate) fn building_anchor_at(&self, x: usize, y: usize) -> Option<Position> {
         let entity = self.world.grid.get(x, y)?;
         self.world.positions.get(&entity).copied()
     }

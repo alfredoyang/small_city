@@ -315,9 +315,9 @@ click (2,2) ─► grid.get ─► E ─► positions.get ─► anchor (1,2)
    assignment.position == (1,2) == anchor   ► matches on every footprint cell
 ```
 
-`RegionState::workplace_anchor_at(x,y) = positions.get(grid.get(x,y))` resolves any
+`RegionState::building_anchor_at(x,y) = positions.get(grid.get(x,y))` resolves any
 footprint cell to the current anchor; the runner reads it from the producer
-region's worker (new `WorkplaceAnchorAt` command) before fanning out the scan with
+region's worker (new `BuildingAnchorAt` command) before fanning out the scan with
 the anchor. Producer anchor and consumer `assignment.position` both derive from
 `positions.get(entity)`, so they agree regardless of the direction the building
 grew. An empty cell (no anchor) short-circuits to an empty roster.

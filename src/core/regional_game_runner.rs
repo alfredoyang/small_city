@@ -331,7 +331,7 @@ impl RegionalGameRunner {
         // this only the anchor cell would list remote workers. An empty cell (no
         // anchor) has no remote staff.
         let Some(anchor) = producer_worker
-            .workplace_anchor_at(producer_region, pos.x, pos.y)
+            .building_anchor_at(producer_region, pos.x, pos.y)
             .map_err(RegionalGameRunnerError::from)?
         else {
             return Ok(Vec::new());

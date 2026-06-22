@@ -155,7 +155,7 @@ impl ThreadedRegionWorker {
     /// Anchor `Position` of the building at `(region_id, x, y)`, read on the worker
     /// thread. The runner uses it to normalize a clicked footprint cell to the
     /// workplace anchor before the remote-roster fan-out.
-    pub fn workplace_anchor_at(
+    pub fn building_anchor_at(
         &self,
         region_id: RegionId,
         x: usize,
@@ -163,7 +163,7 @@ impl ThreadedRegionWorker {
     ) -> Result<Option<crate::core::components::Position>, ThreadedWorkerError> {
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.commands
-            .send(ThreadedWorkerCommand::WorkplaceAnchorAt {
+            .send(ThreadedWorkerCommand::BuildingAnchorAt {
                 region_id,
                 x,
                 y,
@@ -315,7 +315,7 @@ enum ThreadedWorkerCommand {
     /// Lets the runner normalize a clicked footprint cell to the workplace anchor
     /// before the remote-roster fan-out, so a multi-cell workplace lists its remote
     /// staff on every footprint cell.
-    WorkplaceAnchorAt {
+    BuildingAnchorAt {
         region_id: RegionId,
         x: usize,
         y: usize,
@@ -366,13 +366,13 @@ fn run_worker(mut worker: RegionWorker, commands: Receiver<ThreadedWorkerCommand
             } => {
                 let _ = reply.send(inspect_from_worker(&mut worker, region_id, x, y));
             }
-            ThreadedWorkerCommand::WorkplaceAnchorAt {
+            ThreadedWorkerCommand::BuildingAnchorAt {
                 region_id,
                 x,
                 y,
                 reply,
             } => {
-                let _ = reply.send(worker.workplace_anchor_at(region_id, x, y));
+                let _ = reply.send(worker.building_anchor_at(region_id, x, y));
             }
             ThreadedWorkerCommand::RemoteWorkersAt {
                 producer_region,
