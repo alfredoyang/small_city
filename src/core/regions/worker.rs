@@ -332,6 +332,20 @@ impl RegionWorker {
             .find(|runtime| runtime.region_id() == region_id)
     }
 
+    /// Anchor `Position` of the building at `(x, y)` in one owned region, used to
+    /// normalize a clicked footprint cell to the workplace anchor before the remote
+    /// roster scan. `None` if this worker does not own `region_id` or the cell is
+    /// empty.
+    pub(crate) fn workplace_anchor_at(
+        &self,
+        region_id: RegionId,
+        x: usize,
+        y: usize,
+    ) -> Option<crate::core::components::Position> {
+        self.region(region_id)
+            .and_then(|runtime| runtime.workplace_anchor_at(x, y))
+    }
+
     /// Remote staff of the workplace at `(producer_region, pos)`: every owned
     /// region's residents who commute there. The producer region is skipped (its
     /// own workers at that cell are Local, already on the local roster). Within a

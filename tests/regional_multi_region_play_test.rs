@@ -239,6 +239,43 @@ fn remote_workers_at_lists_cross_region_commuters_on_the_workplace() {
 }
 
 #[test]
+fn remote_workers_show_on_every_footprint_cell_of_a_multicell_workplace() {
+    // Region-1 resident commutes to region-2's workplace. After the workplace grows
+    // to a multi-cell footprint, the remote commuter must appear on EVERY footprint
+    // cell — not only the anchor cell the assignment records.
+    let game = RegionalGame::two_region_default(4, 3).unwrap();
+    build_connected_remote_job_fixture(&game);
+    // Grow the region-2 commercial at (1,2) into a multi-cell building, then let the
+    // commuter (re)assign to its current anchor.
+    assert!(game.upgrade(RegionId(2), 1, 2).unwrap().success);
+    tick_region_for_one_day(&game, RegionId(1));
+
+    // Footprint cells = region-2 cells whose inspect reports Commercial details.
+    let footprint: Vec<(usize, usize)> = (0..3)
+        .flat_map(|y| (0..4).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            matches!(
+                game.inspect_region(RegionId(2), x, y).unwrap().details,
+                Some(InspectDetailsView::Commercial { .. })
+            )
+        })
+        .collect();
+    assert!(
+        footprint.len() >= 2,
+        "workplace should be multi-cell: {footprint:?}"
+    );
+
+    // The commuter must show on every footprint cell (the bug: only the anchor did).
+    for &(x, y) in &footprint {
+        let workers = game.remote_workers_at(RegionId(2), x, y).unwrap();
+        assert!(
+            !workers.is_empty(),
+            "remote commuter missing on footprint cell ({x},{y})"
+        );
+    }
+}
+
+#[test]
 fn inspect_uses_published_remote_jobs_before_region_ticks() {
     let game = RegionalGame::two_region_default(4, 3).unwrap();
     build_connected_remote_job_fixture(&game);

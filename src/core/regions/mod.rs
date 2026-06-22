@@ -746,6 +746,24 @@ impl RegionState {
         self.world.positions.get(&slot).copied()
     }
 
+    /// The anchor `Position` of whatever building occupies cell `(x, y)`.
+    ///
+    /// A multi-cell building is one entity with a single `Position` (its anchor),
+    /// and the grid maps every footprint cell back to that entity. So any clicked
+    /// footprint cell resolves to the same anchor — exactly the position a remote
+    /// worker's assignment records (`workplace_position`). The remote-roster reverse
+    /// lookup normalizes the clicked cell through this before matching, so a remote
+    /// worker shows on every footprint cell, not only the anchor.
+    ///
+    /// ```text
+    ///   grid:  (1,2)->E (2,2)->E      positions: E -> (1,2)   (anchor)
+    ///   click (2,2) ─► grid.get ─► E ─► positions.get ─► (1,2) == assignment.position
+    /// ```
+    pub(crate) fn workplace_anchor_at(&self, x: usize, y: usize) -> Option<Position> {
+        let entity = self.world.grid.get(x, y)?;
+        self.world.positions.get(&entity).copied()
+    }
+
     pub(crate) fn into_save_record(self) -> RegionStateSaveRecord {
         let mut world = self.world;
         scrub_transient_import_state_for_save(&mut world);

@@ -590,6 +590,17 @@ impl RegionRuntime {
         self.state.remote_workers_for(producer_region, pos)
     }
 
+    /// Anchor `Position` of the building occupying `(x, y)` (see
+    /// `RegionState::workplace_anchor_at`). Pure config read — building footprints
+    /// are not part of the derived pass, so no DT1 recompute is needed.
+    pub fn workplace_anchor_at(
+        &self,
+        x: usize,
+        y: usize,
+    ) -> Option<crate::core::components::Position> {
+        self.state.workplace_anchor_at(x, y)
+    }
+
     /// Recomputes the derived pass if a paused command left it dirty (DT1).
     ///
     /// The worker calls this after a scheduling slice and before reading the

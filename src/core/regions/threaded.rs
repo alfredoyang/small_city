@@ -152,6 +152,34 @@ impl ThreadedRegionWorker {
             })
     }
 
+    /// Anchor `Position` of the building at `(region_id, x, y)`, read on the worker
+    /// thread. The runner uses it to normalize a clicked footprint cell to the
+    /// workplace anchor before the remote-roster fan-out.
+    pub fn workplace_anchor_at(
+        &self,
+        region_id: RegionId,
+        x: usize,
+        y: usize,
+    ) -> Result<Option<crate::core::components::Position>, ThreadedWorkerError> {
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.commands
+            .send(ThreadedWorkerCommand::WorkplaceAnchorAt {
+                region_id,
+                x,
+                y,
+                reply: reply_sender,
+            })
+            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
+                worker_id: self.worker_id,
+            })?;
+
+        reply_receiver
+            .recv()
+            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
+                worker_id: self.worker_id,
+            })
+    }
+
     /// Remote staff (cross-region commuters) of the workplace at `(producer_region,
     /// pos)` that live in THIS worker's owned regions. Like `inspect_region`, it
     /// reads the worker-owned runtimes directly on the worker thread. The runner
@@ -282,6 +310,17 @@ enum ThreadedWorkerCommand {
         y: usize,
         reply: Sender<Option<InspectView>>,
     },
+    /// Resolve the anchor `Position` of the building at `(region_id, x, y)`.
+    ///
+    /// Lets the runner normalize a clicked footprint cell to the workplace anchor
+    /// before the remote-roster fan-out, so a multi-cell workplace lists its remote
+    /// staff on every footprint cell.
+    WorkplaceAnchorAt {
+        region_id: RegionId,
+        x: usize,
+        y: usize,
+        reply: Sender<Option<crate::core::components::Position>>,
+    },
     /// Enumerate the remote staff of a workplace from this worker's owned regions.
     ///
     /// The reverse of `Inspect`'s local-only roster: it scans the consumer regions
@@ -326,6 +365,14 @@ fn run_worker(mut worker: RegionWorker, commands: Receiver<ThreadedWorkerCommand
                 reply,
             } => {
                 let _ = reply.send(inspect_from_worker(&mut worker, region_id, x, y));
+            }
+            ThreadedWorkerCommand::WorkplaceAnchorAt {
+                region_id,
+                x,
+                y,
+                reply,
+            } => {
+                let _ = reply.send(worker.workplace_anchor_at(region_id, x, y));
             }
             ThreadedWorkerCommand::RemoteWorkersAt {
                 producer_region,

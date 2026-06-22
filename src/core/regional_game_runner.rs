@@ -324,13 +324,24 @@ impl RegionalGameRunner {
 
         // Parity with inspect_region: reject an unknown workplace region instead of
         // silently returning an empty roster.
-        self.worker_for_region(producer_region)?;
+        let producer_worker = self.worker_for_region(producer_region)?;
+
+        // Normalize a clicked footprint cell to the workplace anchor: a multi-cell
+        // building records only its anchor on each commuter's assignment, so without
+        // this only the anchor cell would list remote workers. An empty cell (no
+        // anchor) has no remote staff.
+        let Some(anchor) = producer_worker
+            .workplace_anchor_at(producer_region, pos.x, pos.y)
+            .map_err(RegionalGameRunnerError::from)?
+        else {
+            return Ok(Vec::new());
+        };
 
         let mut workers = Vec::new();
         for worker in &self.workers {
             workers.extend(
                 worker
-                    .remote_workers_at(producer_region, pos)
+                    .remote_workers_at(producer_region, anchor)
                     .map_err(RegionalGameRunnerError::from)?,
             );
         }
