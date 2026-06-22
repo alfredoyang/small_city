@@ -13,7 +13,7 @@ use crate::core::regional_game::{
 use crate::core::regions::BorderEdge;
 use crate::interface::events::{CommandResult, GameEventView};
 use crate::interface::input::{BuildingKind, MapOverlayInput};
-use crate::interface::view::{BuildPreviewView, GameView, InspectView};
+use crate::interface::view::{BuildPreviewView, CitizenDetailView, GameView, InspectView};
 
 const DEFAULT_MAP_WIDTH: usize = 20;
 const DEFAULT_MAP_HEIGHT: usize = 15;
@@ -188,6 +188,18 @@ impl CityDriver {
             CityBackend::Unavailable { message, .. } => {
                 self.fallback_inspect(x, y, message.clone())
             }
+        }
+    }
+
+    /// Cross-region commuters staffing the workplace at `(x, y)` in the selected
+    /// region. Empty on any backend error or when the cell has no remote workers,
+    /// so the roster simply shows its local workers.
+    pub fn remote_workers_at(&mut self, x: usize, y: usize) -> Vec<CitizenDetailView> {
+        match &self.backend {
+            CityBackend::RegionalMultiRegion(game) => game
+                .remote_workers_at_selected_region(x, y)
+                .unwrap_or_default(),
+            CityBackend::Unavailable { .. } => Vec::new(),
         }
     }
 

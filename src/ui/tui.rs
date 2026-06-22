@@ -60,6 +60,10 @@ struct TuiState {
     /// Selected (highlighted) row in the open citizen roster — the in-list cursor. Clamped to the
     /// roster length by the key handler; the `Table` auto-scrolls so the selection stays visible.
     citizen_selected: usize,
+    /// Cross-region commuters staffing the open workplace roster, fetched once when the panel opens
+    /// (and refreshed on tick), never per frame. Empty for residential rosters and workplaces with
+    /// no remote staff. Rendered below the local workers, region-tagged via `LivesAt { region }`.
+    citizen_remote: Vec<CitizenDetailView>,
     /// Whether the chrome panels (header bar, tool strip, City HUD, legend) may use emoji icons.
     /// The map grid is always emoji-free; only these panels fall back to ASCII on bare terminals.
     use_emoji: bool,
@@ -149,6 +153,7 @@ impl Default for TuiState {
             quit_confirm: false,
             citizen_panel: false,
             citizen_selected: 0,
+            citizen_remote: Vec::new(),
             use_emoji: true,
             hud_prev: None,
             hud_trend: HudTrend::default(),
@@ -598,6 +603,7 @@ impl TuiRuntime {
     fn apply_due_auto_tick(&mut self, now: Instant) {
         if self.state.is_running && now >= self.next_auto_tick {
             self.state.message = self.game.tick().message();
+            self.refresh_citizen_remote();
             self.next_auto_tick = now + self.state.run_speed.interval();
             self.dirty = true;
         }
@@ -699,6 +705,37 @@ impl TuiRuntime {
         Ok(true)
     }
 
+    /// Remote (cross-region) staff for an open workplace roster. Residential cells
+    /// and non-workplaces have none, so this avoids the cross-worker fan-out there.
+    fn fetch_citizen_remote(
+        &mut self,
+        inspect: &InspectView,
+        x: usize,
+        y: usize,
+    ) -> Vec<CitizenDetailView> {
+        let is_workplace = matches!(
+            inspect.details,
+            Some(InspectDetailsView::Commercial { .. })
+                | Some(InspectDetailsView::Industrial { .. })
+        );
+        if is_workplace {
+            self.game.remote_workers_at(x, y)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Refreshes the cached remote roster after a tick while the panel stays open,
+    /// so commuter changes show without a per-frame cross-region query.
+    fn refresh_citizen_remote(&mut self) {
+        if !self.state.citizen_panel {
+            return;
+        }
+        let (x, y) = (self.state.cursor_x, self.state.cursor_y);
+        let inspect = self.game.inspect(x, y);
+        self.state.citizen_remote = self.fetch_citizen_remote(&inspect, x, y);
+    }
+
     /// Handles a key while the citizen roster modal is open. Returns `true` when the modal
     /// consumed the key (so it should not fall through to a gameplay action).
     ///
@@ -716,12 +753,14 @@ impl TuiRuntime {
                 self.state.citizen_selected = self.state.citizen_selected.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('s') => {
-                // Clamp against the live roster so the cursor can never run past the last citizen.
+                // Clamp against the live roster (local workers + cached remote commuters) so the
+                // cursor can never run past the last citizen.
                 let count = self
                     .game
                     .inspect(self.state.cursor_x, self.state.cursor_y)
                     .roster
-                    .len();
+                    .len()
+                    + self.state.citizen_remote.len();
                 if self.state.citizen_selected + 1 < count {
                     self.state.citizen_selected += 1;
                 }
@@ -810,9 +849,11 @@ impl TuiRuntime {
                 // Context-sensitive: a populated zone opens its citizen roster;
                 // anything else (empty land, road, power, park) behaves as Build.
                 let (x, y) = (self.state.cursor_x, self.state.cursor_y);
-                if cell_has_roster(&self.game.inspect(x, y)) {
+                let inspect = self.game.inspect(x, y);
+                if cell_has_roster(&inspect) {
                     self.state.citizen_panel = true;
                     self.state.citizen_selected = 0;
+                    self.state.citizen_remote = self.fetch_citizen_remote(&inspect, x, y);
                     self.state.message = "Citizen roster (↑/↓ select · Esc close)".to_string();
                     self.dirty = true;
                 } else {
@@ -983,6 +1024,7 @@ impl TuiRuntime {
         }
 
         self.state.message = self.game.tick().message();
+        self.refresh_citizen_remote();
     }
 }
 
@@ -1163,7 +1205,13 @@ fn render(
         render_quit_confirm(frame, root);
     }
     if state.citizen_panel {
-        render_citizen_panel(frame, root, inspect, state.citizen_selected);
+        render_citizen_panel(
+            frame,
+            root,
+            inspect,
+            &state.citizen_remote,
+            state.citizen_selected,
+        );
     }
 }
 
@@ -1240,14 +1288,24 @@ fn cell_has_roster(inspect: &InspectView) -> bool {
 /// visible, so no persistent scroll offset is needed.
 ///
 /// ```text
-/// ┌ Residents of (1,0) — 3 citizen(s) · ↑/↓ · Esc close ┐
-/// │ #   Age  Happy  $    Works at                       │  (header: "Works at" on
-/// │ #1  27   72     $14  (2,0) · $3                      │   residential, "Lives at"
-/// │>#2  34   41     $3   unemployed             (cursor) │   on a workplace)
-/// │ (local workers only)  ← footnote on workplaces only  │
+/// ┌ Workers at (1,2) — 3 worker(s) · ↑/↓ · Esc close ───┐
+/// │ #   Age  Happy  $    Lives at                       │  (header: "Works at" on
+/// │ #1  27   72     $14  (0,1)                           │   residential, "Lives at"
+/// │>#2  34   41     $3   region 1 (4,11)        (cursor) │   on a workplace; remote
+/// │ 1 local · 1 remote  ← footnote on workplaces only    │   commuters tagged by region)
 /// └─────────────────────────────────────────────────────┘
 /// ```
-fn render_citizen_panel(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView, selected: usize) {
+///
+/// On a workplace the body lists local workers first, then the cross-region
+/// commuters in `remote` (already merged/ordered by the facade); the `selected`
+/// cursor and clamp run over the combined list.
+fn render_citizen_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    inspect: &InspectView,
+    remote: &[CitizenDetailView],
+    selected: usize,
+) {
     let popup = centered_rect(60, 60, area);
     let is_workplace = matches!(
         inspect.details,
@@ -1258,11 +1316,12 @@ fn render_citizen_panel(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView
     } else {
         "Residents of"
     };
+    // Remote commuters only staff a workplace; ignore any stray cache on other cells.
+    let remote: &[CitizenDetailView] = if is_workplace { remote } else { &[] };
+    let total = inspect.roster.len() + remote.len();
     let title = format!(
         "{heading} ({},{}) — {} citizen(s) · ↑/↓ · Esc close",
-        inspect.x,
-        inspect.y,
-        inspect.roster.len()
+        inspect.x, inspect.y, total
     );
 
     frame.render_widget(Clear, popup);
@@ -1270,7 +1329,7 @@ fn render_citizen_panel(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    // Workplaces reserve the bottom line for the "local workers only" footnote.
+    // Workplaces reserve the bottom line for the local/remote count footnote.
     let (body, footer) = if is_workplace {
         let parts = Layout::default()
             .direction(Direction::Vertical)
@@ -1281,7 +1340,7 @@ fn render_citizen_panel(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView
         (inner, None)
     };
 
-    if inspect.roster.is_empty() {
+    if total == 0 {
         frame.render_widget(Paragraph::new("No citizens yet."), body);
     } else {
         // Last column is context-sensitive: on a workplace it lists where each worker lives;
@@ -1292,15 +1351,22 @@ fn render_citizen_panel(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         );
-        let rows = inspect.roster.iter().enumerate().map(|(index, citizen)| {
-            Row::new([
-                format!("#{}", index + 1),
-                citizen.age.to_string(),
-                citizen.happiness.to_string(),
-                format!("${}", citizen.money),
-                relation_text(citizen),
-            ])
-        });
+        // Local workers first, then remote commuters; the row index runs across both.
+        let rows =
+            inspect
+                .roster
+                .iter()
+                .chain(remote.iter())
+                .enumerate()
+                .map(|(index, citizen)| {
+                    Row::new([
+                        format!("#{}", index + 1),
+                        citizen.age.to_string(),
+                        citizen.happiness.to_string(),
+                        format!("${}", citizen.money),
+                        relation_text(citizen),
+                    ])
+                });
         let table = Table::new(
             rows,
             [
@@ -1316,8 +1382,8 @@ fn render_citizen_panel(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView
         .highlight_symbol("> ");
         // Clamp in case the roster shrank while the panel was open: ratatui scrolls an
         // out-of-range selection into view but won't draw the highlight, so the cursor
-        // would vanish. Roster is non-empty here, so the subtraction is safe.
-        let selected = selected.min(inspect.roster.len() - 1);
+        // would vanish. `total` is non-zero here, so the subtraction is safe.
+        let selected = selected.min(total - 1);
         let mut state = TableState::default().with_selected(Some(selected));
         frame.render_stateful_widget(table, body, &mut state);
     }
@@ -1325,7 +1391,7 @@ fn render_citizen_panel(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView
     if let Some(footer) = footer {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                "(local workers only)",
+                format!("{} local · {} remote", inspect.roster.len(), remote.len()),
                 Style::default().fg(Color::DarkGray),
             )),
             footer,
@@ -3911,7 +3977,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_citizen_panel(frame, area, &inspect, 1);
+                render_citizen_panel(frame, area, &inspect, &[], 1);
             })
             .expect("render citizen panel");
         let text = buffer_text(terminal.backend().buffer());
@@ -3933,7 +3999,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_citizen_panel(frame, area, &inspect, 99);
+                render_citizen_panel(frame, area, &inspect, &[], 99);
             })
             .expect("render citizen panel");
         assert!(buffer_text(terminal.backend().buffer()).contains("> #2"));
@@ -3959,10 +4025,83 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_citizen_panel(frame, area, &workplace, 0);
+                render_citizen_panel(frame, area, &workplace, &[], 0);
             })
             .expect("render citizen panel");
         assert!(buffer_text(terminal.backend().buffer()).contains("Lives at"));
+    }
+
+    /// A workplace roster mixing a local worker and a remote commuter: both rows
+    /// render, the remote one carries its home-region tag, and the footnote counts
+    /// each group. Renders straight through `render_citizen_panel`.
+    #[test]
+    fn citizen_panel_lists_local_and_remote_workers() {
+        let workplace = InspectView {
+            x: 1,
+            y: 2,
+            in_bounds: true,
+            cell: None,
+            details: Some(InspectDetailsView::Commercial {
+                powered: true,
+                power_demand: 0,
+                road_connected: true,
+                upgrade_level: 0,
+                maintenance_cost: 0,
+                sales_tax_per_shopper: 0,
+                goods_stored: 0,
+                goods_capacity: 0,
+                business_cash: 0,
+                upgrade_threshold: None,
+                recent_profit: 0,
+                upgrade_ready: false,
+                jobs: 0,
+                goods_sold_from_city: 0,
+                goods_sold_from_outside: 0,
+            }),
+            local_effects: None,
+            flags: Vec::new(),
+            explanations: Vec::new(),
+            // One local worker living in this region at (0,1).
+            roster: vec![CitizenDetailView {
+                age: 40,
+                happiness: 55,
+                money: 8,
+                relation: CitizenRelation::LivesAt {
+                    region: None,
+                    x: 0,
+                    y: 1,
+                },
+            }],
+        };
+        // One remote commuter living in region 1 at (4,11).
+        let remote = [CitizenDetailView {
+            age: 31,
+            happiness: 70,
+            money: 9,
+            relation: CitizenRelation::LivesAt {
+                region: Some(RegionId(1)),
+                x: 4,
+                y: 11,
+            },
+        }];
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_citizen_panel(frame, area, &workplace, &remote, 0);
+            })
+            .expect("render citizen panel");
+        let text = buffer_text(terminal.backend().buffer());
+
+        // Both workers appear; the remote one is region-tagged, the local one is not.
+        assert!(text.contains("#1"));
+        assert!(text.contains("#2"));
+        assert!(text.contains("(0,1)"));
+        assert!(text.contains("region 1 (4,11)"));
+        // Title counts both; footnote breaks down local vs remote.
+        assert!(text.contains("2 citizen(s)"));
+        assert!(text.contains("1 local · 1 remote"));
     }
 
     #[test]
@@ -4001,7 +4140,8 @@ mod tests {
             },
         );
         assert!(workplace_screen.contains("Workers at"));
-        assert!(workplace_screen.contains("local workers only"));
+        // Footnote now breaks down local vs remote staff (none here yet).
+        assert!(workplace_screen.contains("0 local · 0 remote"));
     }
 
     #[test]

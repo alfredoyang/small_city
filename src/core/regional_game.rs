@@ -484,6 +484,15 @@ impl RegionalGame {
             .map_err(RegionalGameError::from)
     }
 
+    /// `remote_workers_at` for the currently selected region (the UI's view region).
+    pub fn remote_workers_at_selected_region(
+        &self,
+        x: usize,
+        y: usize,
+    ) -> Result<Vec<CitizenDetailView>, RegionalGameError> {
+        self.remote_workers_at(self.selected_region_or_first()?, x, y)
+    }
+
     pub fn tick_region(&self, region_id: RegionId) -> Result<CommandResult, RegionalGameError> {
         let request_id = self.next_request_id();
         let result = self
