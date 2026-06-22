@@ -152,6 +152,33 @@ impl ThreadedRegionWorker {
             })
     }
 
+    /// Remote staff (cross-region commuters) of the workplace at `(producer_region,
+    /// pos)` that live in THIS worker's owned regions. Like `inspect_region`, it
+    /// reads the worker-owned runtimes directly on the worker thread. The runner
+    /// fans this out to every worker and merges the results.
+    pub fn remote_workers_at(
+        &self,
+        producer_region: RegionId,
+        pos: crate::core::components::Position,
+    ) -> Result<Vec<crate::interface::view::CitizenDetailView>, ThreadedWorkerError> {
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.commands
+            .send(ThreadedWorkerCommand::RemoteWorkersAt {
+                producer_region,
+                pos,
+                reply: reply_sender,
+            })
+            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
+                worker_id: self.worker_id,
+            })?;
+
+        reply_receiver
+            .recv()
+            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
+                worker_id: self.worker_id,
+            })
+    }
+
     pub fn shutdown(
         mut self,
         mode: ThreadedWorkerShutdown,
@@ -255,6 +282,15 @@ enum ThreadedWorkerCommand {
         y: usize,
         reply: Sender<Option<InspectView>>,
     },
+    /// Enumerate the remote staff of a workplace from this worker's owned regions.
+    ///
+    /// The reverse of `Inspect`'s local-only roster: it scans the consumer regions
+    /// where commuters live, keyed on `(producer_region, pos)`.
+    RemoteWorkersAt {
+        producer_region: RegionId,
+        pos: crate::core::components::Position,
+        reply: Sender<Vec<crate::interface::view::CitizenDetailView>>,
+    },
     /// Stop the worker thread and return the owned `RegionWorker`.
     ///
     /// The shutdown mode decides whether pending events are rejected or one final
@@ -290,6 +326,13 @@ fn run_worker(mut worker: RegionWorker, commands: Receiver<ThreadedWorkerCommand
                 reply,
             } => {
                 let _ = reply.send(inspect_from_worker(&mut worker, region_id, x, y));
+            }
+            ThreadedWorkerCommand::RemoteWorkersAt {
+                producer_region,
+                pos,
+                reply,
+            } => {
+                let _ = reply.send(worker.remote_workers_at(producer_region, pos));
             }
             ThreadedWorkerCommand::Shutdown { mode, reply } => {
                 let final_pass = match mode {

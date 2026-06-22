@@ -23,7 +23,7 @@ use crate::core::regions::worker::{
 use crate::core::regions::{RegionId, RegionNeighborLink, RegionState};
 use crate::interface::events::CommandResult;
 use crate::interface::input::MapOverlayInput;
-use crate::interface::view::InspectView;
+use crate::interface::view::{CitizenDetailView, CitizenRelation, InspectView};
 
 const INITIAL_WORKER_ID: WorkerId = WorkerId(1);
 // UI calls are synchronous today, so the runner pumps bounded worker passes
@@ -304,6 +304,40 @@ impl RegionalGameRunner {
             .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })
     }
 
+    /// Remote staff of the workplace at `(producer_region, pos)`: cross-region
+    /// commuters who live in any region, on any worker.
+    ///
+    /// Unlike `inspect_region` (one worker), this fans out to **every** worker
+    /// because the commuters may live in regions owned by different workers. The
+    /// per-region runs come back `Entity.0`-ordered and contiguous (each region is
+    /// owned by exactly one worker), so a **stable** sort by home region yields a
+    /// deterministic `(region, entity)` order regardless of region→worker layout.
+    pub fn remote_workers_at(
+        &self,
+        producer_region: RegionId,
+        pos: crate::core::components::Position,
+    ) -> Result<Vec<CitizenDetailView>, RegionalGameRunnerError> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .expect("regional runner operation lock poisoned");
+
+        // Parity with inspect_region: reject an unknown workplace region instead of
+        // silently returning an empty roster.
+        self.worker_for_region(producer_region)?;
+
+        let mut workers = Vec::new();
+        for worker in &self.workers {
+            workers.extend(
+                worker
+                    .remote_workers_at(producer_region, pos)
+                    .map_err(RegionalGameRunnerError::from)?,
+            );
+        }
+        workers.sort_by_key(home_region_key);
+        Ok(workers)
+    }
+
     pub fn settle_power_imports(
         &self,
         request_id: UiRequestId,
@@ -542,6 +576,19 @@ impl RegionalGameRunner {
             request_id,
             region_id,
         })
+    }
+}
+
+/// Stable-sort key for merging remote workers: their home region id. Every entry
+/// from `remote_workers_at` is a `LivesAt { region: Some(_) }`; the `u32::MAX`
+/// fallback is unreachable and only keeps the key total.
+fn home_region_key(worker: &CitizenDetailView) -> u32 {
+    match worker.relation {
+        CitizenRelation::LivesAt {
+            region: Some(region),
+            ..
+        } => region.0,
+        _ => u32::MAX,
     }
 }
 

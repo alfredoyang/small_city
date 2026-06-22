@@ -574,6 +574,22 @@ impl RegionRuntime {
         self.state.inspect(x, y)
     }
 
+    /// Residents of THIS region who commute to `(producer_region, pos)` in another
+    /// region — the consumer half of a workplace's remote roster.
+    ///
+    /// Recomputes the derived pass first (DT1), mirroring `inspect`, for a uniform
+    /// `&mut` read boundary. Remote assignments are set in the job-export tick, not
+    /// the derived pass, so this is a no-op for the returned data today; it stays
+    /// for consistency and future-proofing and is bounded (called only on panel open).
+    pub fn remote_workers_for(
+        &mut self,
+        producer_region: RegionId,
+        pos: crate::core::components::Position,
+    ) -> Vec<crate::interface::view::CitizenDetailView> {
+        self.ensure_derived_state();
+        self.state.remote_workers_for(producer_region, pos)
+    }
+
     /// Recomputes the derived pass if a paused command left it dirty (DT1).
     ///
     /// The worker calls this after a scheduling slice and before reading the

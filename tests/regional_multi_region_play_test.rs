@@ -3,7 +3,7 @@
 use small_city::core::regional_game::RegionalGame;
 use small_city::core::regions::RegionId;
 use small_city::interface::input::BuildingKind;
-use small_city::interface::view::{InspectDetailsView, InspectFlag};
+use small_city::interface::view::{CitizenRelation, InspectDetailsView, InspectFlag};
 use small_city::ui::city_driver::{CityDriver, CityLaunchMode};
 
 fn has_generic_imported_resource_note(game: &RegionalGame, region_id: RegionId) -> bool {
@@ -206,6 +206,36 @@ fn remote_spare_jobs_allow_connected_residential_population_growth() {
         .expect("remote job assignment");
     assert_eq!(assignment.region, RegionId(2));
     assert!(assignment.is_remote);
+}
+
+#[test]
+fn remote_workers_at_lists_cross_region_commuters_on_the_workplace() {
+    // Region-1 resident at (1,1) commutes to region-2 commercial at (1,2). The
+    // workplace's own region holds no local worker there, so the only staff is the
+    // remote commuter — invisible to the local-only roster but found by the reverse
+    // lookup across regions.
+    let game = RegionalGame::two_region_default(4, 3).unwrap();
+    build_connected_remote_job_fixture(&game);
+    tick_region_for_one_day(&game, RegionId(1));
+
+    let workers = game.remote_workers_at(RegionId(2), 1, 2).unwrap();
+    assert!(!workers.is_empty(), "remote commuter should be listed");
+    assert!(workers.iter().all(|worker| matches!(
+        worker.relation,
+        CitizenRelation::LivesAt {
+            region: Some(RegionId(1)),
+            x: 1,
+            y: 1
+        }
+    )));
+
+    // The producer region is skipped (its own workers there would be Local, not
+    // double-counted), and a non-workplace cell yields nothing.
+    assert!(
+        game.remote_workers_at(RegionId(2), 0, 0)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

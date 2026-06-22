@@ -31,7 +31,9 @@ use crate::core::regions::{
 };
 use crate::interface::events::{CommandResult, EconomyBreakdownView, GameEventView};
 use crate::interface::input::{BuildingKind, MapOverlayInput};
-use crate::interface::view::{BuildPreviewView, CityGoodsView, GameView, InspectView};
+use crate::interface::view::{
+    BuildPreviewView, CitizenDetailView, CityGoodsView, GameView, InspectView,
+};
 
 const DEFAULT_SINGLE_REGION_ID: RegionId = RegionId(1);
 /// External building-rules override path read when a new game starts (absent in tests → embedded).
@@ -466,6 +468,20 @@ impl RegionalGame {
         y: usize,
     ) -> Result<InspectView, RegionalGameError> {
         self.inspect_region(self.selected_region_or_first()?, x, y)
+    }
+
+    /// Remote staff of the workplace at `(region_id, x, y)`: cross-region commuters
+    /// who live in other regions. Empty for a non-workplace cell or one with no
+    /// remote workers. Ordered by home region then `Entity.0`.
+    pub fn remote_workers_at(
+        &self,
+        region_id: RegionId,
+        x: usize,
+        y: usize,
+    ) -> Result<Vec<CitizenDetailView>, RegionalGameError> {
+        self.runner
+            .remote_workers_at(region_id, crate::core::components::Position { x, y })
+            .map_err(RegionalGameError::from)
     }
 
     pub fn tick_region(&self, region_id: RegionId) -> Result<CommandResult, RegionalGameError> {

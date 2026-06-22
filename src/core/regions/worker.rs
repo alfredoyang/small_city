@@ -332,6 +332,26 @@ impl RegionWorker {
             .find(|runtime| runtime.region_id() == region_id)
     }
 
+    /// Remote staff of the workplace at `(producer_region, pos)`: every owned
+    /// region's residents who commute there. The producer region is skipped (its
+    /// own workers at that cell are Local, already on the local roster). Within a
+    /// region the order is `Entity.0`; the runner sorts the cross-worker merge by
+    /// home region for full determinism.
+    pub(crate) fn remote_workers_at(
+        &mut self,
+        producer_region: RegionId,
+        pos: crate::core::components::Position,
+    ) -> Vec<crate::interface::view::CitizenDetailView> {
+        let mut workers = Vec::new();
+        for runtime in &mut self.regions {
+            if runtime.region_id() == producer_region {
+                continue;
+            }
+            workers.extend(runtime.remote_workers_for(producer_region, pos));
+        }
+        workers
+    }
+
     pub(crate) fn refresh_importable_remote_jobs(&mut self, region_id: RegionId) {
         let Some(index) = self
             .regions
