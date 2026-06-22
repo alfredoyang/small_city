@@ -120,3 +120,44 @@ to fix the reported problem and is intentionally left for later.
   per-region tick repeated; the one-tick-stale export model is unchanged.
 - **Balance:** the whole city now grows each tick (every district), not just the
   viewed one — watch economy/pollution/demand pacing after the change.
+
+---
+
+## Implemented architecture (`60f2948`)
+
+Shipped exactly as the minimal fix — the shared-clock hoist stayed deferred.
+
+```text
+BEFORE                                   AFTER
+──────────────────────────────────       ──────────────────────────────────
+CityDriver::tick()                        CityDriver::tick()
+  └ tick_selected_region()                  └ RegionalGame::tick_city()
+      └ tick_region(selected)                   ├ tick_regions(ALL region_ids)
+          → only that region +1h                 │    ├ region A +1h ; run A
+          (others frozen)                         │    ├ region B +1h ; run B
+                                                  │    └ ...
+                                                  ├ record_tick_goods(each)
+                                                  └ return selected region's result
+                                                        (for the status line)
+tick_all_regions()  [tests only]          tick_all_regions() = tick_city().map(|_| ())
+```
+
+- **`RegionalGame::tick_city()`** is the new single entry point: it ticks every
+  region through the existing `runner.tick_regions(&[...])` path (one `Tick` event
+  per region, all advancing one hour), records per-region goods, and returns the
+  **selected** region's `CommandResult` so the UI status line is unchanged.
+- **`tick_all_regions()`** now delegates to `tick_city()` (drops its result), so the
+  test-facing API and the city-step logic share one implementation.
+- **`CityDriver::tick()`** calls `tick_city()` — the only line that decides "what a
+  UI tick advances." Everything below (events, per-region tick, cross-region export
+  settlement) is unchanged.
+
+Why the per-region counters stay equal without a single shared clock: they all
+start at `0` and the *only* UI tick path advances *all* of them by one hour, so they
+never diverge. The invariant to preserve is simply "the UI never ticks one region
+alone" (today only tests do). If that ever changes — or we want to simulate only
+active regions for performance — promote to the deferred single `city_clock` above.
+
+```text
+invariant:  start equal (all 0)  +  always advance together  =>  always equal
+```
