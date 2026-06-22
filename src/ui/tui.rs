@@ -1242,7 +1242,7 @@ fn cell_has_roster(inspect: &InspectView) -> bool {
 /// ```text
 /// ┌ Residents of (1,0) — 3 citizen(s) · ↑/↓ · Esc close ┐
 /// │ #   Age  Happy  $    Works at                       │  (header: "Works at" on
-/// │ #1  27   72     $14  works (2,0) · $3                │   residential, "Lives at"
+/// │ #1  27   72     $14  (2,0) · $3                      │   residential, "Lives at"
 /// │>#2  34   41     $3   unemployed             (cursor) │   on a workplace)
 /// │ (local workers only)  ← footnote on workplaces only  │
 /// └─────────────────────────────────────────────────────┘
@@ -1333,7 +1333,8 @@ fn render_citizen_panel(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView
     }
 }
 
-/// Formats just the relation column of a roster row, e.g. `works (2,0) · $3` or `lives (1,0)`.
+/// Formats just the relation column of a roster row, e.g. `(2,0) · $3` or `(1,0)`. The leading
+/// verb is omitted — the column header ("Works at" / "Lives at") already supplies it.
 fn relation_text(citizen: &CitizenDetailView) -> String {
     match citizen.relation {
         CitizenRelation::WorksAt {
@@ -1348,10 +1349,10 @@ fn relation_text(citizen: &CitizenDetailView) -> String {
             } else {
                 format!("({x},{y})")
             };
-            format!("works {location} · ${salary}")
+            format!("{location} · ${salary}")
         }
         CitizenRelation::Unemployed => "unemployed".to_string(),
-        CitizenRelation::LivesAt { x, y } => format!("lives ({x},{y})"),
+        CitizenRelation::LivesAt { x, y } => format!("({x},{y})"),
     }
 }
 
@@ -3825,7 +3826,7 @@ mod tests {
                 is_remote: false,
             },
         };
-        assert_eq!(relation_text(&local), "works (2,0) · $3");
+        assert_eq!(relation_text(&local), "(2,0) · $3");
 
         let remote = CitizenDetailView {
             relation: CitizenRelation::WorksAt {
@@ -3837,13 +3838,13 @@ mod tests {
             },
             ..local
         };
-        assert_eq!(relation_text(&remote), "works region 2 (1,1) · $4");
+        assert_eq!(relation_text(&remote), "region 2 (1,1) · $4");
 
         let lives = CitizenDetailView {
             relation: CitizenRelation::LivesAt { x: 1, y: 0 },
             ..local
         };
-        assert_eq!(relation_text(&lives), "lives (1,0)");
+        assert_eq!(relation_text(&lives), "(1,0)");
 
         let jobless = CitizenDetailView {
             relation: CitizenRelation::Unemployed,
@@ -3903,8 +3904,8 @@ mod tests {
         assert!(text.contains("Age"));
         assert!(text.contains("Happy"));
         assert!(text.contains("Works at"));
-        // Per-row, column-aligned values.
-        assert!(text.contains("works (2,0) · $3"));
+        // Per-row, column-aligned values (no verb — the header supplies it).
+        assert!(text.contains("(2,0) · $3"));
         assert!(text.contains("unemployed"));
         // The selected row (index 1) carries the cursor symbol.
         assert!(text.contains("> #2"));
