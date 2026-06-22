@@ -14,7 +14,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::interface::events::CommandResult;
@@ -57,8 +57,9 @@ struct TuiState {
     /// When set, a modal lists the citizens of the selected building (residents for Residential,
     /// local workers for Commercial/Industrial). Opened by Enter on a populated zone.
     citizen_panel: bool,
-    /// Scroll offset into the open citizen roster, clamped to the roster length at render time.
-    citizen_scroll: usize,
+    /// Selected (highlighted) row in the open citizen roster — the in-list cursor. Clamped to the
+    /// roster length by the key handler; the `Table` auto-scrolls so the selection stays visible.
+    citizen_selected: usize,
     /// Whether the chrome panels (header bar, tool strip, City HUD, legend) may use emoji icons.
     /// The map grid is always emoji-free; only these panels fall back to ASCII on bare terminals.
     use_emoji: bool,
@@ -147,7 +148,7 @@ impl Default for TuiState {
             prompt: None,
             quit_confirm: false,
             citizen_panel: false,
-            citizen_scroll: 0,
+            citizen_selected: 0,
             use_emoji: true,
             hud_prev: None,
             hud_trend: HudTrend::default(),
@@ -712,17 +713,17 @@ impl TuiRuntime {
 
         match key.code {
             KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('W') => {
-                self.state.citizen_scroll = self.state.citizen_scroll.saturating_sub(1);
+                self.state.citizen_selected = self.state.citizen_selected.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('s') => {
-                // Clamp against the live roster so scrolling can never run past the last citizen.
+                // Clamp against the live roster so the cursor can never run past the last citizen.
                 let count = self
                     .game
                     .inspect(self.state.cursor_x, self.state.cursor_y)
                     .roster
                     .len();
-                if self.state.citizen_scroll + 1 < count {
-                    self.state.citizen_scroll += 1;
+                if self.state.citizen_selected + 1 < count {
+                    self.state.citizen_selected += 1;
                 }
             }
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('Q') => {
@@ -811,8 +812,8 @@ impl TuiRuntime {
                 let (x, y) = (self.state.cursor_x, self.state.cursor_y);
                 if cell_has_roster(&self.game.inspect(x, y)) {
                     self.state.citizen_panel = true;
-                    self.state.citizen_scroll = 0;
-                    self.state.message = "Citizen roster (↑/↓ scroll · Esc close)".to_string();
+                    self.state.citizen_selected = 0;
+                    self.state.message = "Citizen roster (↑/↓ select · Esc close)".to_string();
                     self.dirty = true;
                 } else {
                     let before = self.current_money();
@@ -1162,7 +1163,7 @@ fn render(
         render_quit_confirm(frame, root);
     }
     if state.citizen_panel {
-        render_citizen_panel(frame, root, inspect, state.citizen_scroll);
+        render_citizen_panel(frame, root, inspect, state.citizen_selected);
     }
 }
 
@@ -1233,7 +1234,20 @@ fn cell_has_roster(inspect: &InspectView) -> bool {
 ///
 /// `scroll` is the index of the first row shown; it is clamped here so a roster
 /// that shrank while the panel was open never leaves a blank window.
-fn render_citizen_panel(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView, scroll: usize) {
+/// Renders the citizen roster as a `Table`: a fixed header row on top, one aligned row per citizen,
+/// and the `selected` row highlighted as an in-list cursor. The `TableState` is rebuilt each frame
+/// from `selected` (offset 0) — ratatui's table render scrolls the viewport so the selection stays
+/// visible, so no persistent scroll offset is needed.
+///
+/// ```text
+/// ┌ Residents of (1,0) — 3 citizen(s) · ↑/↓ · Esc close ┐
+/// │ #   Age  Happy  $    Relation                       │
+/// │ #1  27   72     $14  works (2,0) · $3                │
+/// │>#2  34   41     $3   unemployed             (cursor) │
+/// │ (local workers only)  ← footnote on workplaces only  │
+/// └─────────────────────────────────────────────────────┘
+/// ```
+fn render_citizen_panel(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView, selected: usize) {
     let popup = centered_rect(60, 60, area);
     let is_workplace = matches!(
         inspect.details,
@@ -1244,55 +1258,81 @@ fn render_citizen_panel(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView
     } else {
         "Residents of"
     };
+    let title = format!(
+        "{heading} ({},{}) — {} citizen(s) · ↑/↓ · Esc close",
+        inspect.x,
+        inspect.y,
+        inspect.roster.len()
+    );
 
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!(
-                "{heading} ({},{}) — {} citizen(s)",
-                inspect.x,
-                inspect.y,
-                inspect.roster.len()
-            ),
+    frame.render_widget(Clear, popup);
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Workplaces reserve the bottom line for the "local workers only" footnote.
+    let (body, footer) = if is_workplace {
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner);
+        (parts[0], Some(parts[1]))
+    } else {
+        (inner, None)
+    };
+
+    if inspect.roster.is_empty() {
+        frame.render_widget(Paragraph::new("No citizens yet."), body);
+    } else {
+        let header = Row::new(["#", "Age", "Happy", "$", "Relation"]).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-
-    if inspect.roster.is_empty() {
-        lines.push(Line::from("No citizens yet."));
-    } else {
-        let start = scroll.min(inspect.roster.len() - 1);
-        for (index, citizen) in inspect.roster.iter().enumerate().skip(start) {
-            lines.push(Line::from(citizen_row(index + 1, citizen)));
-        }
+        );
+        let rows = inspect.roster.iter().enumerate().map(|(index, citizen)| {
+            Row::new([
+                format!("#{}", index + 1),
+                citizen.age.to_string(),
+                citizen.happiness.to_string(),
+                format!("${}", citizen.money),
+                relation_text(citizen),
+            ])
+        });
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(4),
+                Constraint::Length(5),
+                Constraint::Length(6),
+                Constraint::Length(6),
+                Constraint::Min(12),
+            ],
+        )
+        .header(header)
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+        // Clamp in case the roster shrank while the panel was open: ratatui scrolls an
+        // out-of-range selection into view but won't draw the highlight, so the cursor
+        // would vanish. Roster is non-empty here, so the subtraction is safe.
+        let selected = selected.min(inspect.roster.len() - 1);
+        let mut state = TableState::default().with_selected(Some(selected));
+        frame.render_stateful_widget(table, body, &mut state);
     }
 
-    if is_workplace {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "(local workers only)",
-            Style::default().fg(Color::DarkGray),
-        )));
+    if let Some(footer) = footer {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "(local workers only)",
+                Style::default().fg(Color::DarkGray),
+            )),
+            footer,
+        );
     }
-
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title("Citizens · ↑/↓ scroll · Esc close")
-                    .borders(Borders::ALL),
-            )
-            .wrap(Wrap { trim: true }),
-        popup,
-    );
 }
 
-/// Formats one roster row, e.g. `#2  age 34  happy 41  $3  works (2,0) · $3`.
-fn citizen_row(number: usize, citizen: &CitizenDetailView) -> String {
-    let relation = match citizen.relation {
+/// Formats just the relation column of a roster row, e.g. `works (2,0) · $3` or `lives (1,0)`.
+fn relation_text(citizen: &CitizenDetailView) -> String {
+    match citizen.relation {
         CitizenRelation::WorksAt {
             region,
             x,
@@ -1309,11 +1349,7 @@ fn citizen_row(number: usize, citizen: &CitizenDetailView) -> String {
         }
         CitizenRelation::Unemployed => "unemployed".to_string(),
         CitizenRelation::LivesAt { x, y } => format!("lives ({x},{y})"),
-    };
-    format!(
-        "#{number}  age {}  happy {}  ${}  {}",
-        citizen.age, citizen.happiness, citizen.money, relation
-    )
+    }
 }
 
 fn terminal_is_too_small(area: Rect) -> bool {
@@ -3735,7 +3771,7 @@ mod tests {
         // Now on the placed zone: Enter opens the roster instead of building.
         runtime.apply_action(TuiAction::EnterCell, now);
         assert!(runtime.state.citizen_panel);
-        assert_eq!(runtime.state.citizen_scroll, 0);
+        assert_eq!(runtime.state.citizen_selected, 0);
     }
 
     #[test]
@@ -3753,15 +3789,18 @@ mod tests {
     }
 
     #[test]
-    fn citizen_panel_key_scrolls_clamped_and_closes() {
+    fn citizen_panel_key_moves_cursor_clamped_and_closes() {
         let now = Instant::now();
         let mut runtime = TuiRuntime::new(now);
         runtime.game = CityDriver::regional_with_size(4, 3).expect("regional UI driver");
         runtime.state.citizen_panel = true;
 
-        // Scrolling up is clamped at the top.
+        // Moving the cursor up is clamped at the top (and stays there with an empty roster).
         assert!(runtime.handle_citizen_panel_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
-        assert_eq!(runtime.state.citizen_scroll, 0);
+        assert_eq!(runtime.state.citizen_selected, 0);
+        // Moving down is clamped against the (empty) live roster, so it cannot pass the last row.
+        assert!(runtime.handle_citizen_panel_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(runtime.state.citizen_selected, 0);
 
         // Esc closes the panel; once closed the handler stops consuming keys.
         assert!(runtime.handle_citizen_panel_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
@@ -3770,7 +3809,7 @@ mod tests {
     }
 
     #[test]
-    fn citizen_row_formats_each_relation() {
+    fn relation_text_formats_each_relation() {
         let local = CitizenDetailView {
             age: 27,
             happiness: 72,
@@ -3783,10 +3822,7 @@ mod tests {
                 is_remote: false,
             },
         };
-        assert_eq!(
-            citizen_row(1, &local),
-            "#1  age 27  happy 72  $14  works (2,0) · $3"
-        );
+        assert_eq!(relation_text(&local), "works (2,0) · $3");
 
         let remote = CitizenDetailView {
             relation: CitizenRelation::WorksAt {
@@ -3798,28 +3834,87 @@ mod tests {
             },
             ..local
         };
-        assert_eq!(
-            citizen_row(2, &remote),
-            "#2  age 27  happy 72  $14  works region 2 (1,1) · $4"
-        );
+        assert_eq!(relation_text(&remote), "works region 2 (1,1) · $4");
 
         let lives = CitizenDetailView {
             relation: CitizenRelation::LivesAt { x: 1, y: 0 },
             ..local
         };
-        assert_eq!(
-            citizen_row(3, &lives),
-            "#3  age 27  happy 72  $14  lives (1,0)"
-        );
+        assert_eq!(relation_text(&lives), "lives (1,0)");
 
         let jobless = CitizenDetailView {
             relation: CitizenRelation::Unemployed,
             ..local
         };
-        assert_eq!(
-            citizen_row(4, &jobless),
-            "#4  age 27  happy 72  $14  unemployed"
-        );
+        assert_eq!(relation_text(&jobless), "unemployed");
+    }
+
+    /// Renders a non-empty roster straight through `render_citizen_panel` (bypassing the
+    /// simulation, which doesn't deterministically spawn citizens in a unit test) to confirm the
+    /// `Table` draws its column header and the per-row values.
+    #[test]
+    fn citizen_panel_table_renders_header_and_rows() {
+        let inspect = InspectView {
+            x: 1,
+            y: 0,
+            in_bounds: true,
+            cell: None,
+            details: None,
+            local_effects: None,
+            flags: Vec::new(),
+            explanations: Vec::new(),
+            roster: vec![
+                CitizenDetailView {
+                    age: 27,
+                    happiness: 72,
+                    money: 14,
+                    relation: CitizenRelation::WorksAt {
+                        region: RegionId(1),
+                        x: 2,
+                        y: 0,
+                        salary: 3,
+                        is_remote: false,
+                    },
+                },
+                CitizenDetailView {
+                    age: 34,
+                    happiness: 41,
+                    money: 3,
+                    relation: CitizenRelation::Unemployed,
+                },
+            ],
+        };
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_citizen_panel(frame, area, &inspect, 1);
+            })
+            .expect("render citizen panel");
+        let text = buffer_text(terminal.backend().buffer());
+
+        // Column header on top.
+        assert!(text.contains("Age"));
+        assert!(text.contains("Happy"));
+        assert!(text.contains("Relation"));
+        // Per-row, column-aligned values.
+        assert!(text.contains("works (2,0) · $3"));
+        assert!(text.contains("unemployed"));
+        // The selected row (index 1) carries the cursor symbol.
+        assert!(text.contains("> #2"));
+
+        // An out-of-range selection (roster shrank while open) clamps to the last row so the
+        // cursor stays visible rather than vanishing.
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_citizen_panel(frame, area, &inspect, 99);
+            })
+            .expect("render citizen panel");
+        assert!(buffer_text(terminal.backend().buffer()).contains("> #2"));
     }
 
     #[test]

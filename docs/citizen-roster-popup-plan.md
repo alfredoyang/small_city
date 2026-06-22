@@ -197,6 +197,51 @@ Size: ~2 files (`view.rs`, `adapter.rs`) + tests. Well under the 5-file/400-line
 
 Size: 1–2 files (`tui.rs`, maybe `tui_input.rs`) + tests.
 
+### M3 — aligned columns + in-list cursor via ratatui `Table` + `TableState` (ui)
+
+M2 shipped the popup as a `Paragraph` whose rows are pre-formatted strings
+(`citizen_row`), with a bare scroll offset (`citizen_scroll`) and **no visible
+cursor on the list** — you can't tell which row is "current." Swap to ratatui's
+native **`Table`** (aligned columns) driven by a **`TableState`** (the selected
+row *is* the cursor). Both are already in deps (0.29).
+
+- In `render_citizen_panel`, replace `Paragraph::new(lines)` with
+  `Table::new(rows, constraints).header(header)`:
+  - Header `Row`: `# · Age · Happy · $ · Relation` (bold/yellow).
+  - One `Row` per `inspect.roster` entry (no manual slicing — `TableState`
+    handles the viewport, see below).
+  - Column `Constraint`s, e.g. `Length(4) / Length(5) / Length(6) / Length(6) /
+    Min(12)` — the last column flexes, the rest stay fixed so values line up.
+  - `.row_highlight_style(reverse/bold)` + `.highlight_symbol("> ")` so the
+    selected row reads as a cursor.
+  - Render with `frame.render_stateful_widget(table, popup, &mut state)`.
+- **Rename `citizen_scroll: usize` → `citizen_selected: usize`** in `TuiState`
+  (the selected row *is* the cursor). *(ponytail: keep a plain `usize`, not a
+  persisted `TableState` — `render_citizen_panel` builds a local
+  `TableState::default().with_selected(Some(i))` (offset 0) each frame and
+  ratatui's `get_row_bounds` scrolls the viewport so the selection stays visible.
+  Persist a real `TableState` only if you later need sticky mid-screen scrolling.)*
+  `↑/↓` in `handle_citizen_panel_key` move the selection (clamped to
+  `0..roster.len()`); opening the panel selects row 0. Render also clamps
+  `selected` to the live roster length so a roster that shrank while open keeps a
+  visible cursor.
+- Collapse `citizen_row(number, citizen) -> String` into
+  `relation_text(&CitizenDetailView) -> String` (just the relation `match` arm);
+  the numeric fields become their own cells instead of being baked into a string.
+- Keep the title, the "No citizens yet" empty state, and the workplace
+  "(local workers only)" footnote as lines/caption around the table.
+- `Table` has no `.wrap()`, so the relation column **truncates** instead of
+  wrapping — acceptable (arguably better) in a fixed-width popup.
+- Determinism/layer rules unchanged: `TableState` is UI-only state, like the
+  scroll offset it replaces; the roster view model is untouched.
+- Tests: rename/repoint the `citizen_row` formatting test to `relation_text`;
+  assert the cursor moves and clamps via the key handler
+  (`state.citizen_selected`); render a non-empty roster through
+  `render_citizen_panel` and assert the popup shows the column header, the
+  per-row values, and the `> ` cursor symbol on the selected row.
+
+Size: 1 file (`tui.rs`) + test tweak. UI-only; no view-model or core change.
+
 ## Open key (decision needed before M2)
 
 Enter is currently `TuiAction::Build` (`tui_input.rs:70`). Options:
@@ -286,15 +331,20 @@ feature is a read-only projection (M1) plus a TUI modal (M2).
 ```
 
 - `tui_input.rs`: `Enter → TuiAction::EnterCell`; `b/B → Build`.
-- `tui.rs`: `TuiState{ citizen_panel, citizen_scroll }`;
-  `apply_action(EnterCell)` opens on R/C/I else builds;
+- `tui.rs`: `TuiState{ citizen_panel, citizen_scroll }` (M3 renames
+  `citizen_scroll` → `citizen_selected`); `apply_action(EnterCell)` opens on
+  R/C/I else builds;
   `handle_citizen_panel_key` is fully modal (dispatched after the quit modal,
   before `map_key_event`); `render_citizen_panel` draws the popup from the
   `InspectView` the render loop already holds — title `Residents of`/`Workers
   at`, `No citizens yet` when empty, `(local workers only)` footnote on
-  workplaces; `citizen_row` formats one line per citizen.
-- Scroll is clamped twice: in the key handler (against the live roster length)
-  and again at render (so a roster that shrank while open never blanks).
+  workplaces; `citizen_row` formats one line per citizen. *(Superseded by M3:
+  the `Paragraph`/`citizen_row` rows become a ratatui `Table` + `TableState`
+  with a header row, aligned columns, and a highlighted selected row as the
+  in-list cursor — replacing the cursor-less `citizen_scroll` offset.)*
+- The cursor is clamped twice: in the key handler (against the live roster
+  length) and again at render (so a roster that shrank while open keeps a
+  visible, in-range highlight).
 
 ### Invariants preserved
 
