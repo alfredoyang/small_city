@@ -81,6 +81,33 @@ fn upgrade_residential_increases_capacity() {
 }
 
 #[test]
+fn upgraded_building_marks_one_anchor_and_a_multi_cell_footprint() {
+    let mut game = SingleRegionTestGame::new(4, 4);
+    assert!(game.build(1, 1, BuildingKind::Residential).success);
+    assert!(game.upgrade(1, 1).success); // grows to a 2-cell footprint
+
+    let view = game.view();
+    let residential: Vec<_> = view
+        .map
+        .cells
+        .iter()
+        .filter(|cell| cell.building == Some(BuildingKind::Residential))
+        .collect();
+
+    // Both cells report the same multi-cell footprint size, but exactly one is the
+    // anchor — the renderer draws the icon there and a fill on the other.
+    assert_eq!(residential.len(), 2, "footprint should span two cells");
+    assert!(residential.iter().all(|cell| cell.footprint_area == 2));
+    assert_eq!(
+        residential
+            .iter()
+            .filter(|cell| cell.footprint_anchor)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn manual_upgrade_fails_without_enough_money_and_keeps_state() {
     let mut game = SingleRegionTestGame::new(4, 4);
     assert!(game.build(0, 0, BuildingKind::Residential).success);

@@ -302,6 +302,17 @@ impl TileTheme {
     }
 
     fn normal_tile(self, cell: &CellView) -> TileGlyph {
+        // Non-anchor cells of a healthy multi-cell building render as a dim continuation fill so
+        // the whole footprint reads as one lot (the icon shows only on the anchor cell). A problem
+        // (unpowered/disconnected) is building-wide, so those cells fall through to the normal path
+        // and keep their `R-`/`C!` marker on every footprint cell. Roads are always 1x1 anchors.
+        if cell.building.is_some()
+            && !cell.footprint_anchor
+            && building_problem_marker(cell).is_none()
+        {
+            return self.footprint_fill_tile(cell);
+        }
+
         // The City (Unicode) theme paints a muted-earth ground plus per-zone background tints so
         // the map reads like a SimCity zoning plan. The ASCII fallbacks stay foreground-only for
         // bare terminals.
@@ -317,6 +328,22 @@ impl TileTheme {
             TileTheme::Unicode => TileGlyph {
                 tile: unicode_normal_tile(cell),
                 style: city_cell_style(cell),
+            },
+        }
+    }
+
+    /// Continuation fill for a non-anchor footprint cell: a dim two-column block that
+    /// sits on the building's (size-brightened) zone background, so a 2x1 / 2x2 reads
+    /// as one lot rather than several identical icons. Width stays two columns.
+    fn footprint_fill_tile(self, cell: &CellView) -> TileGlyph {
+        match self {
+            TileTheme::Unicode => TileGlyph {
+                tile: "░░".to_string(),
+                style: city_cell_style(cell),
+            },
+            TileTheme::AsciiCompact | TileTheme::AsciiDetailed => TileGlyph {
+                tile: "::".to_string(),
+                style: cell_base_style(cell),
             },
         }
     }
@@ -2803,11 +2830,45 @@ fn cell_base_style(cell: &CellView) -> Style {
     }
 
     let mut style = building_style(kind);
+    // Bigger footprint -> bold the ASCII glyph (the emoji theme uses background
+    // brightness instead; see `city_cell_style`). fg is respected on letters.
+    if cell.footprint_area > 1 {
+        style = style.add_modifier(Modifier::BOLD);
+    }
     if let Some(modifier) = zone_activity_modifier(cell, kind) {
         style = style.add_modifier(modifier);
     }
 
     style
+}
+
+/// Background brightness multiplier keyed to building size (footprint cell count).
+/// 1x1 stays at the base zone tint; a 2-cell building is brighter and a 4-cell one
+/// brightest, so a grown building glows in its own zone hue. Tiers match the upgrade
+/// levels (L1 -> 1 cell, L2 -> 2, L3 -> 4).
+fn size_brightness_factor(footprint_area: u8) -> f32 {
+    match footprint_area {
+        0 | 1 => 1.0,
+        2 | 3 => 1.45,
+        _ => 1.9,
+    }
+}
+
+/// Scales an `Rgb` colour toward white by `factor` (channels clamped at 255). Other
+/// colour kinds are returned unchanged (the City theme only uses `Rgb` backgrounds).
+fn brighten(color: Color, factor: f32) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(
+            scale_channel(r, factor),
+            scale_channel(g, factor),
+            scale_channel(b, factor),
+        ),
+        other => other,
+    }
+}
+
+fn scale_channel(channel: u8, factor: f32) -> u8 {
+    (f32::from(channel) * factor).round().clamp(0.0, 255.0) as u8
 }
 
 /// A building cell in trouble: not connected to a road, or a powered consumer left unpowered.
@@ -2837,7 +2898,11 @@ fn zone_bg(kind: BuildingKind) -> Color {
 /// Glyphs are bold for contrast against the coloured ground.
 fn city_cell_style(cell: &CellView) -> Style {
     let bg = match cell.building {
-        Some(kind) if !cell_is_problem(cell) && kind != BuildingKind::Road => zone_bg(kind),
+        // Size-brightness: scale the zone tint by footprint size so a bigger building
+        // glows brighter in its own hue (emoji ignore fg colour, so size rides on bg).
+        Some(kind) if !cell_is_problem(cell) && kind != BuildingKind::Road => {
+            brighten(zone_bg(kind), size_brightness_factor(cell.footprint_area))
+        }
         _ => GROUND_BG,
     };
     cell_base_style(cell).bg(bg).add_modifier(Modifier::BOLD)
@@ -4935,6 +5000,86 @@ mod tests {
         assert!(cell.modifier.contains(Modifier::BOLD));
     }
 
+    #[test]
+    fn multi_cell_building_shows_icon_on_anchor_and_fill_elsewhere() {
+        let mut anchor = themed_cell(Some(BuildingKind::Residential), 'R', Some(2), None, None, 0);
+        anchor.footprint_area = 2; // 2x1 building; themed_cell already set anchor = true
+        let mut fill = anchor.clone();
+        fill.footprint_anchor = false;
+
+        // Unicode: the icon shows only on the anchor; the continuation cell is a dim fill.
+        assert_eq!(
+            TileTheme::Unicode.normal_tile(&anchor).tile,
+            building_emoji(BuildingKind::Residential)
+        );
+        assert_eq!(TileTheme::Unicode.normal_tile(&fill).tile, "░░");
+
+        // ASCII detailed: letter+level on the anchor, "::" fill on the continuation cell.
+        assert_ne!(TileTheme::AsciiDetailed.normal_tile(&anchor).tile, "::");
+        assert_eq!(TileTheme::AsciiDetailed.normal_tile(&fill).tile, "::");
+
+        // A non-anchor cell of a building in trouble keeps its problem marker (the fill
+        // must not hide a building-wide power/road warning).
+        let mut problem_fill = themed_cell(
+            Some(BuildingKind::Residential),
+            'R',
+            Some(2),
+            None,
+            Some(false),
+            0,
+        );
+        problem_fill.footprint_area = 2;
+        problem_fill.footprint_anchor = false;
+        assert_eq!(
+            TileTheme::AsciiDetailed.normal_tile(&problem_fill).tile,
+            "R!"
+        );
+    }
+
+    #[test]
+    fn size_brightness_factor_rises_with_footprint() {
+        assert_eq!(size_brightness_factor(1), 1.0);
+        assert!(size_brightness_factor(2) > 1.0);
+        assert!(size_brightness_factor(4) > size_brightness_factor(2));
+    }
+
+    #[test]
+    fn brighten_scales_rgb_and_clamps() {
+        assert_eq!(
+            brighten(Color::Rgb(100, 100, 100), 1.5),
+            Color::Rgb(150, 150, 150)
+        );
+        assert_eq!(
+            brighten(Color::Rgb(200, 200, 200), 2.0),
+            Color::Rgb(255, 255, 255) // clamped
+        );
+        assert_eq!(brighten(Color::Green, 2.0), Color::Green); // non-rgb unchanged
+    }
+
+    #[test]
+    fn larger_building_gets_a_brighter_zone_background() {
+        let small = themed_cell(
+            Some(BuildingKind::Residential),
+            'R',
+            Some(1),
+            Some(true),
+            Some(true),
+            0,
+        );
+        let mut large = small.clone();
+        large.footprint_area = 4;
+
+        let (Some(Color::Rgb(_, small_g, _)), Some(Color::Rgb(_, large_g, _))) =
+            (city_cell_style(&small).bg, city_cell_style(&large).bg)
+        else {
+            panic!("expected rgb zone backgrounds");
+        };
+        assert!(
+            large_g > small_g,
+            "a 4-cell building should glow brighter than a 1-cell one ({large_g} vs {small_g})"
+        );
+    }
+
     fn themed_cell(
         building: Option<BuildingKind>,
         symbol: char,
@@ -4970,6 +5115,8 @@ mod tests {
                 accessibility: 0,
                 desirability: effect_value,
             },
+            footprint_anchor: building.is_some(),
+            footprint_area: u8::from(building.is_some()),
         }
     }
 

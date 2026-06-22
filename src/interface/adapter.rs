@@ -740,6 +740,8 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
             upgrade_level: None,
             job_assignments: Vec::new(),
             local_effects: local_effects_view(world, x, y),
+            footprint_anchor: false,
+            footprint_area: 0,
         };
     };
 
@@ -755,6 +757,18 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
         .map(|consumer| consumer.demand);
     let normal_symbol = building.map_or('?', BuildingKind::symbol);
     let upgrade_level = building.map_or(0, |building| building_level(world, entity, building));
+    // Footprint info for the multi-cell renderer: the grid maps every footprint cell
+    // to the same entity, whose single `Position` is the anchor (top-left).
+    let footprint_area = world
+        .buildings
+        .get(&entity)
+        .map(|building| building.footprint.area().min(u32::from(u8::MAX)) as u8)
+        .unwrap_or(1);
+    let footprint_anchor = world
+        .positions
+        .get(&entity)
+        .map(|anchor| anchor.x == x && anchor.y == y)
+        .unwrap_or(true);
 
     CellView {
         x,
@@ -775,6 +789,8 @@ fn cell_view_with_overlay(world: &World, x: usize, y: usize, overlay: MapOverlay
         upgrade_level: (upgrade_level > 0).then_some(upgrade_level),
         job_assignments: job_assignment_views_for_home(world, entity),
         local_effects: local_effects_view(world, x, y),
+        footprint_anchor,
+        footprint_area,
     }
 }
 

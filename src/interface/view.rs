@@ -37,6 +37,13 @@ pub struct CellView {
     pub upgrade_level: Option<u8>,
     pub job_assignments: Vec<JobAssignmentView>,
     pub local_effects: LocalEffectsView,
+    /// `true` when this cell is the building's anchor (top-left) cell — always true
+    /// for a 1x1 building. Renderers draw the building icon here and a continuation
+    /// fill on the other footprint cells, so a multi-cell building reads as one lot.
+    pub footprint_anchor: bool,
+    /// Number of cells in this building's footprint (1, 2, or 4); 0 for empty cells.
+    /// Drives the multi-cell continuation fill and the size-brightness tint.
+    pub footprint_area: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
