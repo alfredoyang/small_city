@@ -504,17 +504,39 @@ impl RegionalGame {
     }
 
     pub fn tick_all_regions(&self) -> Result<(), RegionalGameError> {
+        self.tick_city().map(|_| ())
+    }
+
+    /// Advances the whole city by one hour: ticks **every** region so all districts
+    /// share one clock and none stay frozen, then returns the selected region's
+    /// result for the UI status line.
+    ///
+    /// ```text
+    ///   tick_city ─┬─ Tick ─► region A: A.time += 1h; run A
+    ///              ├─ Tick ─► region B: B.time += 1h; run B
+    ///              └─ ...                 (all advance one hour together)
+    ///   -> selected region's CommandResult (for the status message)
+    /// ```
+    pub fn tick_city(&self) -> Result<CommandResult, RegionalGameError> {
+        let selected = self.selected_region_or_first()?;
         let requests = self
             .region_ids
             .iter()
             .copied()
             .map(|region_id| (self.next_request_id(), region_id))
             .collect::<Vec<_>>();
-        let results = self.runner.tick_regions(&requests)?;
+        let mut results = self.runner.tick_regions(&requests)?;
         for ((_, region_id), result) in requests.iter().zip(results.iter()) {
             self.record_tick_goods(*region_id, result);
         }
-        Ok(())
+
+        let selected_index = requests
+            .iter()
+            .position(|(_, region_id)| *region_id == selected)
+            .ok_or(RegionalGameError::UnknownRegion {
+                region_id: selected,
+            })?;
+        Ok(results.swap_remove(selected_index))
     }
 
     pub fn tick_selected_region(&self) -> Result<CommandResult, RegionalGameError> {

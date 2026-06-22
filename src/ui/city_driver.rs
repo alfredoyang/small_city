@@ -267,7 +267,9 @@ impl CityDriver {
     pub fn tick(&mut self) -> CommandResult {
         match &mut self.backend {
             CityBackend::RegionalMultiRegion(game) => {
-                game.tick_selected_region().unwrap_or_else(command_failure)
+                // Tick the whole city so every region shares one clock and none stay
+                // frozen; the returned result is the selected region's, for the status line.
+                game.tick_city().unwrap_or_else(command_failure)
             }
             CityBackend::Unavailable { message, .. } => driver_failure(message),
         }

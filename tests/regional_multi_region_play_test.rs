@@ -208,6 +208,47 @@ fn remote_spare_jobs_allow_connected_residential_population_growth() {
     assert!(assignment.is_remote);
 }
 
+fn region_hours(game: &RegionalGame) -> Vec<u64> {
+    game.view()
+        .unwrap()
+        .regions
+        .into_iter()
+        .map(|snapshot| snapshot.view.status.time.total_hours)
+        .collect()
+}
+
+#[test]
+fn tick_city_advances_every_region_to_the_same_hour() {
+    let game = RegionalGame::two_region_default(3, 3).unwrap();
+    assert!(region_hours(&game).iter().all(|hours| *hours == 0));
+
+    game.tick_city().unwrap();
+
+    let hours = region_hours(&game);
+    assert!(
+        hours.iter().all(|h| *h == 1),
+        "every region advances one hour: {hours:?}"
+    );
+    assert!(
+        hours.windows(2).all(|pair| pair[0] == pair[1]),
+        "all regions share one clock: {hours:?}"
+    );
+}
+
+#[test]
+fn city_driver_tick_advances_non_selected_regions_too() {
+    // Regression: before the fix CityDriver::tick() ticked only the selected region,
+    // so a non-selected region stayed frozen at hour 0 (divergent clocks).
+    let mut driver = CityDriver::regional_multi_region().expect("regional driver");
+    driver.tick();
+
+    // The selected region (region 1) advanced.
+    assert_eq!(driver.view().status.time.total_hours, 1);
+    // A different region must have advanced too — not be frozen at 0.
+    driver.select_next_region();
+    assert_eq!(driver.view().status.time.total_hours, 1);
+}
+
 #[test]
 fn remote_workers_at_lists_cross_region_commuters_on_the_workplace() {
     // Region-1 resident at (1,1) commutes to region-2 commercial at (1,2). The
