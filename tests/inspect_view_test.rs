@@ -136,7 +136,11 @@ fn roster_lists_residents_with_their_workplace_and_workers_with_their_home() {
     assert_eq!(commercial.roster.len(), residential.roster.len());
     assert!(matches!(
         commercial.roster[0].relation,
-        CitizenRelation::LivesAt { x: 1, y: 0 }
+        CitizenRelation::LivesAt {
+            region: None,
+            x: 1,
+            y: 0
+        }
     ));
 
     // Road and empty cells carry no roster.

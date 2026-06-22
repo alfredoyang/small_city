@@ -35,10 +35,12 @@ use crate::core::simulation::{
 };
 use crate::core::systems::{build, bulldoze, economy, power, replace, road_connectivity, upgrade};
 use crate::core::world::{CrossRegionGoodsRoutes, World};
-use crate::interface::adapter::{inspect_world, view_world, view_world_with_overlay};
+use crate::interface::adapter::{
+    inspect_world, remote_workers_for, view_world, view_world_with_overlay,
+};
 use crate::interface::events::CommandResult;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
-use crate::interface::view::{BuildPreviewView, GameView, InspectView};
+use crate::interface::view::{BuildPreviewView, CitizenDetailView, GameView, InspectView};
 use serde::{Deserialize, Serialize};
 
 pub mod directory;
@@ -383,6 +385,21 @@ impl RegionState {
     /// Returns a UI-safe inspect model without exposing this region's ECS world.
     pub fn inspect(&self, x: usize, y: usize) -> InspectView {
         inspect_world(&self.world, x, y)
+    }
+
+    /// Local residents who commute to the workplace at `(producer_region, pos)`
+    /// in another region — the reverse of the local-only workplace roster.
+    ///
+    /// The producer's export ledger holds only an opaque slot count, never worker
+    /// identities, so a workplace's remote staff can only be enumerated from the
+    /// consumer regions where they live. This region tags each returned worker
+    /// with itself (`self.id`) as their home region.
+    pub fn remote_workers_for(
+        &self,
+        producer_region: RegionId,
+        position: Position,
+    ) -> Vec<CitizenDetailView> {
+        remote_workers_for(&self.world, self.id, producer_region, position)
     }
 
     /// Number of local citizens currently working in another region (CR3 import).
@@ -1032,6 +1049,65 @@ mod tests {
 
         assert_eq!(region.imported_job_slots(), vec![(RegionId(2), 42)]);
         assert_eq!(region.world.cached_job_counts().unemployment, 0);
+    }
+
+    #[test]
+    fn remote_workers_for_lists_commuters_by_producer_cell() {
+        use crate::interface::view::CitizenRelation;
+
+        // Region 1 (consumer): two residents at (0,0); one takes a remote job at
+        // region 2 cell (1,0), the other stays unemployed.
+        let mut region = RegionState::new(RegionId(1), 2, 1);
+        assert!(region.build(0, 0, BuildingKind::Residential).success);
+        let home = region.world.grid.get(0, 0).expect("home");
+        citizens::spawn_for_home(&mut region.world, home, 2);
+        let mut residents = region.world.citizens.keys().copied().collect::<Vec<_>>();
+        residents.sort_by_key(|entity| entity.0);
+        let commuter = residents[0];
+
+        region.apply_job_export_grant(
+            PendingJobDemand {
+                token: 1,
+                citizen: commuter,
+                caller_network: RegionRoadNetworkId {
+                    region: RegionId(1),
+                    road_network: 0,
+                },
+            },
+            JobExportGrant {
+                token: 1,
+                granted: true,
+                source_region: Some(RegionId(2)),
+                position: Some(Position { x: 1, y: 0 }),
+                slot_id: Some(9),
+                salary: 4,
+            },
+        );
+
+        // Matches the producer (region, cell): one commuter, tagged with its own
+        // region (1) as home, at its home cell (0,0).
+        let workers = region.remote_workers_for(RegionId(2), Position { x: 1, y: 0 });
+        assert_eq!(workers.len(), 1);
+        assert!(matches!(
+            workers[0].relation,
+            CitizenRelation::LivesAt {
+                region: Some(RegionId(1)),
+                x: 0,
+                y: 0
+            }
+        ));
+
+        // Wrong cell, wrong producer region, and the unemployed resident: nothing.
+        assert!(
+            region
+                .remote_workers_for(RegionId(2), Position { x: 0, y: 0 })
+                .is_empty()
+        );
+        assert!(
+            region
+                .remote_workers_for(RegionId(3), Position { x: 1, y: 0 })
+                .is_empty()
+        );
     }
 
     #[test]

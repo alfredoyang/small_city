@@ -1352,7 +1352,10 @@ fn relation_text(citizen: &CitizenDetailView) -> String {
             format!("{location} · ${salary}")
         }
         CitizenRelation::Unemployed => "unemployed".to_string(),
-        CitizenRelation::LivesAt { x, y } => format!("({x},{y})"),
+        CitizenRelation::LivesAt { region, x, y } => match region {
+            Some(region) => format!("region {} ({},{})", region.0, x, y),
+            None => format!("({x},{y})"),
+        },
     }
 }
 
@@ -3841,10 +3844,24 @@ mod tests {
         assert_eq!(relation_text(&remote), "region 2 (1,1) · $4");
 
         let lives = CitizenDetailView {
-            relation: CitizenRelation::LivesAt { x: 1, y: 0 },
+            relation: CitizenRelation::LivesAt {
+                region: None,
+                x: 1,
+                y: 0,
+            },
             ..local
         };
         assert_eq!(relation_text(&lives), "(1,0)");
+
+        let remote_resident = CitizenDetailView {
+            relation: CitizenRelation::LivesAt {
+                region: Some(RegionId(1)),
+                x: 4,
+                y: 11,
+            },
+            ..local
+        };
+        assert_eq!(relation_text(&remote_resident), "region 1 (4,11)");
 
         let jobless = CitizenDetailView {
             relation: CitizenRelation::Unemployed,

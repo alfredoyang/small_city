@@ -103,8 +103,10 @@ touches **no** simulation, balance, tick, or export-protocol code.
 └───────────────────────────────────────────────┬───────────────────────────┘
                                                   │
 ┌─ src/interface  (ECS→VIEW BOUNDARY) ────────────▼───────────────────────────┐
-│  (+) CitizenRelation::LivesAt gains `region: RegionId` (a remote worker's    │
-│      (x,y) is in another region — ambiguous without it)                     │
+│  (+) CitizenRelation::LivesAt gains `region: Option<RegionId>`              │
+│      (None = inspected/local region; Some(r) = remote commuter's home).     │
+│      The bare World is region-agnostic and cannot name "this region", so a  │
+│      non-optional id would force threading a RegionId through inspect_world.│
 │  (+) adapter projection reused for a remote worker (home in its own region)  │
 └───────────────────────────────────────────────┬───────────────────────────┘
                                                   │  synchronous read path
@@ -131,10 +133,11 @@ three one-patch missions, each green through the dev loop before the next.
 
 ### M1 — core read + view model (core/interface)
 
-- `view.rs`: `CitizenRelation::LivesAt { x, y }` → `LivesAt { region, x, y }`.
+- `view.rs`: `CitizenRelation::LivesAt { x, y }` → `LivesAt { region: Option<RegionId>, x, y }`.
   Update every existing roster test/literal (same churn as the original roster
-  feature). For a *local* worker `region` is the inspected region; for a remote
-  worker it is the worker's home region.
+  feature). `None` = a *local* worker (lives in the inspected region — the bare
+  region-agnostic World cannot name itself); `Some(r)` = a remote commuter whose
+  home is in region `r`.
 - `regions/mod.rs` (`RegionState`): `remote_workers_for(producer_region, pos)`
   — filter `citizens` by `assignment.region == producer_region && position == pos
   && matches!(source, Remote{..})`, project each to `CitizenDetailView` (reuse the

@@ -83,8 +83,18 @@ pub enum CitizenRelation {
     },
     /// Residential roster: a resident with no workplace.
     Unemployed,
-    /// Workplace roster: where this local worker lives.
-    LivesAt { x: usize, y: usize },
+    /// Workplace roster: where this worker lives.
+    ///
+    /// `region` is `None` when the worker lives in the inspected region itself (a
+    /// local worker) and `Some(r)` for a remote commuter whose home is in region
+    /// `r`. The bare `World` is region-agnostic, so it cannot name "this region";
+    /// the remote-worker reverse lookup at the `RegionState` layer fills in the
+    /// home region for commuters.
+    LivesAt {
+        region: Option<RegionId>,
+        x: usize,
+        y: usize,
+    },
 }
 
 /// Orthogonal road neighbors for a road cell, exposed as derived UI-safe data.

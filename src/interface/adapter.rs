@@ -1,7 +1,8 @@
 //! Adapter that converts private ECS world data into UI-safe view and inspect models.
 
-use crate::core::components::{Citizen, WorkplaceSource};
+use crate::core::components::{Citizen, Position, WorkplaceSource};
 use crate::core::entity::Entity;
+use crate::core::regions::RegionId;
 use crate::core::systems::{
     business_growth, citizens, economy, population, power, road_connectivity,
     road_network_analysis, upgrade,
@@ -210,15 +211,69 @@ fn citizen_relation(world: &World, kind: BuildingKind, citizen: &Citizen) -> Cit
             },
             None => CitizenRelation::Unemployed,
         },
-        // Workplace roster: locate where this local worker lives.
+        // Workplace roster: locate where this local worker lives. `region: None`
+        // means "the inspected region" — the bare World cannot name itself.
         _ => {
             let home = world.positions.get(&citizen.home);
             CitizenRelation::LivesAt {
+                region: None,
                 x: home.map(|position| position.x).unwrap_or(0),
                 y: home.map(|position| position.y).unwrap_or(0),
             }
         }
     }
+}
+
+/// Citizens of THIS region who commute to a workplace at `(producer_region, pos)`
+/// in another region — the reverse of the local-only workplace roster.
+///
+/// ```text
+///   local roster (citizen_roster):   workers whose source == Local{ this workplace }
+///   remote roster (this fn):         OUR residents whose remote assignment targets
+///                                    (producer_region, pos) in some other region
+/// ```
+///
+/// The match key `(region, position)` lives on each consumer citizen's remote
+/// assignment, so no shared entity id crosses the region boundary. Each worker is
+/// tagged `LivesAt { region: Some(home_region) }` (where they live, i.e. this
+/// region). Order is deterministic by `Entity` id.
+pub(crate) fn remote_workers_for(
+    world: &World,
+    home_region: RegionId,
+    producer_region: RegionId,
+    position: Position,
+) -> Vec<CitizenDetailView> {
+    let mut citizens: Vec<(&Entity, &Citizen)> = world
+        .citizens
+        .iter()
+        .filter(|(_, citizen)| {
+            matches!(
+                citizen.workplace_assignment,
+                Some(assignment)
+                    if assignment.region == producer_region
+                        && assignment.position == position
+                        && matches!(assignment.source, WorkplaceSource::Remote { .. })
+            )
+        })
+        .collect();
+    citizens.sort_by_key(|(entity, _)| entity.0);
+
+    citizens
+        .into_iter()
+        .map(|(_, citizen)| {
+            let home = world.positions.get(&citizen.home);
+            CitizenDetailView {
+                age: citizen.age,
+                happiness: citizen.morale.actual,
+                money: citizen.money,
+                relation: CitizenRelation::LivesAt {
+                    region: Some(home_region),
+                    x: home.map(|position| position.x).unwrap_or(0),
+                    y: home.map(|position| position.y).unwrap_or(0),
+                },
+            }
+        })
+        .collect()
 }
 
 fn inspect_flags(world: &World, x: usize, y: usize) -> Vec<InspectFlag> {
