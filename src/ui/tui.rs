@@ -1241,9 +1241,9 @@ fn cell_has_roster(inspect: &InspectView) -> bool {
 ///
 /// ```text
 /// ┌ Residents of (1,0) — 3 citizen(s) · ↑/↓ · Esc close ┐
-/// │ #   Age  Happy  $    Relation                       │
-/// │ #1  27   72     $14  works (2,0) · $3                │
-/// │>#2  34   41     $3   unemployed             (cursor) │
+/// │ #   Age  Happy  $    Works at                       │  (header: "Works at" on
+/// │ #1  27   72     $14  works (2,0) · $3                │   residential, "Lives at"
+/// │>#2  34   41     $3   unemployed             (cursor) │   on a workplace)
 /// │ (local workers only)  ← footnote on workplaces only  │
 /// └─────────────────────────────────────────────────────┘
 /// ```
@@ -1284,7 +1284,10 @@ fn render_citizen_panel(frame: &mut Frame<'_>, area: Rect, inspect: &InspectView
     if inspect.roster.is_empty() {
         frame.render_widget(Paragraph::new("No citizens yet."), body);
     } else {
-        let header = Row::new(["#", "Age", "Happy", "$", "Relation"]).style(
+        // Last column is context-sensitive: on a workplace it lists where each worker lives;
+        // on a residential it lists where each resident works.
+        let relation_header = if is_workplace { "Lives at" } else { "Works at" };
+        let header = Row::new(["#", "Age", "Happy", "$", relation_header]).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -3895,10 +3898,11 @@ mod tests {
             .expect("render citizen panel");
         let text = buffer_text(terminal.backend().buffer());
 
-        // Column header on top.
+        // Column header on top; the last column is context-sensitive (this is a
+        // residential-style roster — details None is not a workplace — so "Works at").
         assert!(text.contains("Age"));
         assert!(text.contains("Happy"));
-        assert!(text.contains("Relation"));
+        assert!(text.contains("Works at"));
         // Per-row, column-aligned values.
         assert!(text.contains("works (2,0) · $3"));
         assert!(text.contains("unemployed"));
@@ -3915,6 +3919,32 @@ mod tests {
             })
             .expect("render citizen panel");
         assert!(buffer_text(terminal.backend().buffer()).contains("> #2"));
+
+        // On a workplace (Industrial details) the last column flips to "Lives at".
+        let workplace = InspectView {
+            details: Some(InspectDetailsView::Industrial {
+                powered: true,
+                power_demand: 0,
+                road_connected: true,
+                upgrade_level: 0,
+                maintenance_cost: 0,
+                goods_production: 0,
+                business_cash: 0,
+                upgrade_threshold: None,
+                recent_profit: 0,
+                upgrade_ready: false,
+                jobs: 0,
+            }),
+            ..inspect
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_citizen_panel(frame, area, &workplace, 0);
+            })
+            .expect("render citizen panel");
+        assert!(buffer_text(terminal.backend().buffer()).contains("Lives at"));
     }
 
     #[test]
