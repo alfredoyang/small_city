@@ -134,11 +134,14 @@ resident lives in this region and carries the assignment. This matches the
 existing one-way cross-region data model and keeps the feature
 single-region-local.
 
-> **TODO — lift this limitation:** remote workers *can* be listed on a workplace
+> **DONE — limitation lifted:** remote workers are now listed on a workplace
 > roster by reverse-looking-up the consumer regions where they live (keyed on
-> `(producer_region, position)`, which the consumer citizen records). It is a
+> `(producer_region, position)`, which the consumer citizen records). Shipped as a
 > read-only, all-five-layers, 3-mission feature (no simulation/tick/export-protocol
-> change). Design + missions: [remote-workers-roster-plan.md](remote-workers-roster-plan.md).
+> change): commits `e87646d` (M1), `6a90205` (M2), `2e43f13` (M3). The "local
+> workers only" footnote below is therefore superseded by a `N local · M remote`
+> breakdown. Design + implemented architecture:
+> [remote-workers-roster-plan.md](remote-workers-roster-plan.md).
 
 ## Missions (one patch each, per the dev loop)
 

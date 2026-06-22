@@ -195,9 +195,103 @@ Size: 1 file + tests.
   ledger still holds only a count; identities come from the consumer regions where
   the citizens already live.
 
-## Open question (decide before M3)
+## Open question (decided)
 
 How to present a mixed roster: a single table tagging each row local/remote, or
-two sections ("Local" / "Commuters from other regions")? A single table with the
-`Lives at` column showing `region N (x,y)` for remote workers is the lightest and
-matches the existing column model. Confirm before M3.
+two sections? **Resolved: a single table.** Local workers render first, then the
+remote commuters; the `Lives at` column shows `(x,y)` for a local worker and
+`region N (x,y)` for a remote one. The bottom footnote (`N local · M remote`)
+gives the breakdown. This was the lightest option and reuses the existing column
+model unchanged.
+
+---
+
+## Implemented architecture (M1–M3)
+
+Shipped in three patches: `e87646d` (M1), `6a90205` (M2), `2e43f13` (M3).
+
+### End-to-end read path
+
+```text
+TUI: Enter on a Commercial/Industrial cell  (or a tick while the panel is open)
+  │   (residential / other cells: skip — no fan-out)
+  ▼
+CityDriver::remote_workers_at(x,y)                                  [src/ui]
+  ▼
+RegionalGame::remote_workers_at_selected_region → remote_workers_at(region,x,y)
+  ▼
+RegionalGameRunner::remote_workers_at(producer_region, pos)         [FACADE]
+  │  • take operation_lock
+  │  • validate producer_region exists (parity with inspect_region)
+  │  • FAN OUT to EVERY ThreadedRegionWorker (commuters may live on any worker)
+  │  • STABLE-sort merged list by home region id  ──► deterministic order
+  ▼
+ThreadedRegionWorker::remote_workers_at  ── RemoteWorkersAt cmd ──► worker thread
+  ▼
+RegionWorker::remote_workers_at(producer_region, pos)              [WORKER]
+  │  • iterate owned regions, SKIP producer (its workers there are Local)
+  │  • concatenate per-region results (each Entity.0-ordered, contiguous)
+  ▼
+RegionRuntime::remote_workers_for  (ensure_derived_state, mirrors inspect)
+  ▼
+RegionState::remote_workers_for(producer_region, pos)              [CORE]
+  ▼
+adapter::remote_workers_for(world, home_region, producer_region, pos)
+       scan THIS region's citizens:
+         assignment.region == producer_region
+         && assignment.position == pos
+         && source == Remote
+       → project to CitizenDetailView { LivesAt { region: Some(home_region) } }
+```
+
+### Why the producer can't answer for itself
+
+```text
+       region 1 (consumer)                    region 4 (producer)
+  ┌──────────────────────────┐          ┌──────────────────────────┐
+  │ Citizen #7                │          │ Industrial @ (2,6)        │
+  │  home (4,11)              │          │  jobs: 12                 │
+  │  workplace_assignment ────┼────────► │  export ledger: count=12  │
+  │   { region: 4,            │  reverse │   (opaque slots, NO who)  │
+  │     position: (2,6),      │  lookup  │                           │
+  │     Remote { slot 3 } }   │ ◄────────┤  asks every OTHER region: │
+  └──────────────────────────┘          │  "who points at (4,(2,6))?"│
+        identity + attributes lives here └──────────────────────────┘
+```
+
+The match key `(region, position)` is recorded only on the **consumer** citizen,
+so the roster is assembled by scanning consumer regions — never by reading the
+producer's ledger (which holds a count, not identities).
+
+### Determinism of the cross-worker merge
+
+```text
+worker A owns regions [1, 3]   worker B owns region [2]
+   1: [c1, c4]  (Entity.0)         2: [c9]
+   3: [c2]
+fan-out (any worker order) → flat list, each region's run CONTIGUOUS
+   e.g. [c1,c4, c2,  c9]   (regions 1,3 then 2)
+stable sort by home-region id (key = LivesAt.region) keeps within-region order
+   → [c1,c4 (r1),  c9 (r2),  c2 (r3)]   deterministic regardless of layout
+```
+
+Each region is owned by exactly one worker, so its workers form one contiguous,
+already-`Entity.0`-ordered run; a *stable* sort by region id therefore yields a
+fixed `(region, entity)` order no matter how regions map to workers. Cross-region
+reads remain one-tick-stale by design — only within-tick synchronicity is relaxed.
+
+### TUI render (single combined table)
+
+```text
+┌ Workers at (2,6) — 13 worker(s) · ↑/↓ · Esc close ──┐
+│ #   Age  Happy  $    Lives at                       │
+│ #1  29   60     $5   (3,7)               ← local    │
+│>#2  31   70     $9   region 1 (4,11)     ← remote   │
+│ …                                                   │
+│ 1 local · 12 remote                                 │
+└─────────────────────────────────────────────────────┘
+```
+
+`citizen_remote` is cached in `TuiState`, filled on panel open and refreshed on
+tick (never per frame). The panel is modal, so the cursor cannot move to another
+cell while it is open and the cache stays consistent with the inspected cell.
