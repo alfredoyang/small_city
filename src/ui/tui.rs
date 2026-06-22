@@ -17,6 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
 
+use crate::core::regions::RegionId;
 use crate::interface::events::CommandResult;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
@@ -736,12 +737,49 @@ impl TuiRuntime {
         self.state.citizen_remote = self.fetch_citizen_remote(&inspect, x, y);
     }
 
+    /// Jump target (region + cell) of the row the in-list cursor is on, read from
+    /// the combined roster in render order (local workers, then remote commuters).
+    ///
+    /// The index is clamped the same way `render_citizen_panel` clamps the highlight
+    /// (to the last row), so a roster that shrank while the panel was open jumps from
+    /// the row the cursor actually shows, not a stale out-of-range index.
+    fn selected_citizen_target(&mut self) -> Option<(Option<RegionId>, usize, usize)> {
+        let inspect = self.game.inspect(self.state.cursor_x, self.state.cursor_y);
+        let total = inspect.roster.len() + self.state.citizen_remote.len();
+        let index = self.state.citizen_selected.min(total.saturating_sub(1));
+        let citizen = inspect
+            .roster
+            .iter()
+            .chain(self.state.citizen_remote.iter())
+            .nth(index)?;
+        relation_target(citizen.relation)
+    }
+
+    /// Closes the roster and moves the map cursor to the selected citizen's related
+    /// cell (a resident's workplace, or a worker's home), switching the selected
+    /// region first when that cell is in another region.
+    fn jump_to_selected_citizen(&mut self) {
+        self.state.citizen_panel = false;
+        let Some((region, x, y)) = self.selected_citizen_target() else {
+            self.state.message = "No location to jump to.".to_string();
+            return;
+        };
+        if let Some(region) = region {
+            self.game.select_region(region);
+            self.state.region_label = self.game.region_label();
+        }
+        self.state.cursor_x = x;
+        self.state.cursor_y = y;
+        self.state.message = format!("Jumped to ({x},{y}).");
+    }
+
     /// Handles a key while the citizen roster modal is open. Returns `true` when the modal
     /// consumed the key (so it should not fall through to a gameplay action).
     ///
     /// ```text
-    ///   [↑]/[↓]  scroll the roster (clamped to its length)
-    ///   [Esc]/[Enter]/[q]  close the panel
+    ///   [↑]/[↓]  move the in-list cursor (clamped to the roster length)
+    ///   [Enter]  jump: close, move the map cursor to the selected citizen's cell
+    ///   [Esc]/[q]  close the panel without moving
     /// ```
     fn handle_citizen_panel_key(&mut self, key: KeyEvent) -> bool {
         if !self.state.citizen_panel {
@@ -765,7 +803,10 @@ impl TuiRuntime {
                     self.state.citizen_selected += 1;
                 }
             }
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('Q') => {
+            KeyCode::Enter => {
+                self.jump_to_selected_citizen();
+            }
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                 self.state.citizen_panel = false;
             }
             _ => {}
@@ -1396,6 +1437,24 @@ fn render_citizen_panel(
             )),
             footer,
         );
+    }
+}
+
+/// The cell a roster row points at, for the Enter-to-jump action: a resident's
+/// workplace, or a worker's home. The inner `Option<RegionId>` is the region to
+/// switch to — `None` means "stay in the current region" (a local home), `Some(r)`
+/// a remote region. `Unemployed` rows have nowhere to jump.
+///
+/// ```text
+///   WorksAt { region, x, y } -> Some((Some(region), x, y))   resident -> workplace
+///   LivesAt { region, x, y } -> Some((region, x, y))         worker   -> home (region: Option)
+///   Unemployed               -> None
+/// ```
+fn relation_target(relation: CitizenRelation) -> Option<(Option<RegionId>, usize, usize)> {
+    match relation {
+        CitizenRelation::WorksAt { region, x, y, .. } => Some((Some(region), x, y)),
+        CitizenRelation::LivesAt { region, x, y } => Some((region, x, y)),
+        CitizenRelation::Unemployed => None,
     }
 }
 
@@ -3879,6 +3938,109 @@ mod tests {
         assert!(runtime.handle_citizen_panel_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert!(!runtime.state.citizen_panel);
         assert!(!runtime.handle_citizen_panel_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn relation_target_resolves_each_relation() {
+        // Resident -> workplace (always carries a region).
+        assert_eq!(
+            relation_target(CitizenRelation::WorksAt {
+                region: RegionId(2),
+                x: 3,
+                y: 4,
+                salary: 5,
+                is_remote: true,
+            }),
+            Some((Some(RegionId(2)), 3, 4))
+        );
+        // Local worker -> home in the current region (no switch).
+        assert_eq!(
+            relation_target(CitizenRelation::LivesAt {
+                region: None,
+                x: 1,
+                y: 0
+            }),
+            Some((None, 1, 0))
+        );
+        // Remote commuter -> home in another region (switch to it).
+        assert_eq!(
+            relation_target(CitizenRelation::LivesAt {
+                region: Some(RegionId(1)),
+                x: 4,
+                y: 11
+            }),
+            Some((Some(RegionId(1)), 4, 11))
+        );
+        // Unemployed -> nowhere.
+        assert_eq!(relation_target(CitizenRelation::Unemployed), None);
+    }
+
+    #[test]
+    fn enter_on_empty_roster_closes_without_moving() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.game = CityDriver::regional_with_size(4, 3).expect("regional UI driver");
+        runtime.state.citizen_panel = true;
+        runtime.state.cursor_x = 2;
+        runtime.state.cursor_y = 1;
+
+        // Empty roster: Enter closes the panel and reports no destination, cursor unchanged.
+        assert!(
+            runtime.handle_citizen_panel_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        );
+        assert!(!runtime.state.citizen_panel);
+        assert_eq!((runtime.state.cursor_x, runtime.state.cursor_y), (2, 1));
+        assert!(runtime.state.message.contains("No location"));
+    }
+
+    #[test]
+    fn enter_jumps_cursor_to_the_selected_residents_workplace() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.game = CityDriver::regional_with_size(4, 3).expect("regional UI driver");
+        // Residential (1,0) and commercial (3,0) on one powered road network.
+        for (x, y, kind) in [
+            (0, 0, BuildingKind::PowerPlant),
+            (0, 1, BuildingKind::Road),
+            (1, 1, BuildingKind::Road),
+            (2, 1, BuildingKind::Road),
+            (3, 1, BuildingKind::Road),
+            (1, 0, BuildingKind::Residential),
+            (3, 0, BuildingKind::Commercial),
+        ] {
+            assert!(runtime.game.build(x, y, kind).success, "build {kind:?}");
+        }
+        // Let a resident move in and take the local commercial job.
+        for _ in 0..48 {
+            runtime.game.tick();
+        }
+
+        // Precondition: the first resident now works at the commercial cell (3,0).
+        let roster = runtime.game.inspect(1, 0).roster;
+        assert!(
+            matches!(
+                roster.first().map(|c| c.relation),
+                Some(CitizenRelation::WorksAt { x: 3, y: 0, .. })
+            ),
+            "expected an employed resident, got {:?}",
+            roster.first().map(|c| c.relation)
+        );
+
+        // Open the roster on the residential cell and jump from the first row.
+        runtime.state.cursor_x = 1;
+        runtime.state.cursor_y = 0;
+        runtime.state.citizen_panel = true;
+        runtime.state.citizen_selected = 0;
+
+        assert!(
+            runtime.handle_citizen_panel_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        );
+        assert!(!runtime.state.citizen_panel, "panel should close on jump");
+        assert_eq!(
+            (runtime.state.cursor_x, runtime.state.cursor_y),
+            (3, 0),
+            "cursor should land on the workplace"
+        );
     }
 
     #[test]

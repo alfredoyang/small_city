@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::core::regional_game::{
     RegionalGame, RegionalGameError, RegionalGameSaveError, RegionalGameSaveFailure,
 };
-use crate::core::regions::BorderEdge;
+use crate::core::regions::{BorderEdge, RegionId};
 use crate::interface::events::{CommandResult, GameEventView};
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{BuildPreviewView, CitizenDetailView, GameView, InspectView};
@@ -107,6 +107,18 @@ impl CityDriver {
         match &mut self.backend {
             CityBackend::RegionalMultiRegion(game) => game
                 .select_previous_region()
+                .map(|_| self.region_label())
+                .unwrap_or_else(|error| format!("Regional game error: {error:?}")),
+            CityBackend::Unavailable { message, .. } => message.clone(),
+        }
+    }
+
+    /// Selects a specific region by id (used to jump to a remote citizen's region).
+    /// Returns the new region label, or an error message if the id is unknown.
+    pub fn select_region(&mut self, region_id: RegionId) -> String {
+        match &mut self.backend {
+            CityBackend::RegionalMultiRegion(game) => game
+                .select_region_by_id(region_id)
                 .map(|_| self.region_label())
                 .unwrap_or_else(|error| format!("Regional game error: {error:?}")),
             CityBackend::Unavailable { message, .. } => message.clone(),
