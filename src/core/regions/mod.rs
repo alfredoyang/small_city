@@ -272,10 +272,9 @@ pub struct RegionState {
 impl RegionState {
     /// Creates a region with its own private ECS world and empty import cache.
     pub fn new(id: RegionId, width: usize, height: usize) -> Self {
-        Self {
-            id,
-            world: World::new(width, height),
-        }
+        let mut world = World::new(width, height);
+        world.set_region_id(id);
+        Self { id, world }
     }
 
     pub fn id(&self) -> RegionId {
@@ -784,6 +783,9 @@ impl RegionState {
 
     pub(crate) fn from_world(id: RegionId, mut world: World) -> Self {
         world.rebuild_entity_records();
+        // Stamp the owning region onto the world and every loaded citizen's home
+        // (home_serde parks RegionId(0) on load) before derived state reads them.
+        world.set_region_id(id);
         refresh_derived_state_for_world(&mut world, id);
 
         Self { id, world }
@@ -869,7 +871,8 @@ impl RegionState {
             if citizen_data.workplace_assignment.is_some() {
                 continue;
             }
-            let home = citizen_data.home;
+            // Home is always local to this region; `.entity` is its local id.
+            let home = citizen_data.home.entity;
             // A citizen reaches remote slots through the border road network its
             // home connects to, mirroring the power consumer's caller network.
             let Some(caller_network) = networks

@@ -45,7 +45,7 @@ pub(crate) fn run(world: &mut World) {
             }
 
             for citizen in world.citizens.values() {
-                let Some(position) = world.positions.get(&citizen.home) else {
+                let Some(position) = world.positions.get(&citizen.home.entity) else {
                     continue;
                 };
                 let distance = manhattan_distance(x, y, position.x, position.y);

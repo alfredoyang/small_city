@@ -1,5 +1,6 @@
 //! Citizen entity support, including home links, happiness, and aggregate population sync.
 
+use crate::core::city_refs::CityEntityRef;
 use crate::core::components::{Citizen, Morale};
 use crate::core::entity::Entity;
 use crate::core::systems::{road_connectivity, road_network_analysis};
@@ -14,7 +15,7 @@ pub(crate) fn spawn_for_home(world: &mut World, residential: Entity, count: i32)
             citizen,
             Citizen {
                 age: 0,
-                home: residential,
+                home: CityEntityRef::local(world.region_id, residential),
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,
@@ -87,7 +88,7 @@ pub(crate) fn citizen_count_for_home(world: &World, residential: Entity) -> i32 
     world
         .citizens
         .values()
-        .filter(|citizen| citizen.home == residential)
+        .filter(|citizen| citizen.home.entity == residential)
         .count() as i32
 }
 
@@ -95,7 +96,7 @@ pub(crate) fn average_happiness_for_home(world: &World, residential: Entity) -> 
     let mut total = 0;
     let mut count = 0;
     for citizen in world.citizens.values() {
-        if citizen.home != residential {
+        if citizen.home.entity != residential {
             continue;
         }
         total += citizen.morale.actual;
@@ -123,7 +124,7 @@ pub(crate) fn average_happiness_target_for_home(world: &World, residential: Enti
     let mut total = 0;
     let mut count = 0;
     for citizen in world.citizens.values() {
-        if citizen.home != residential {
+        if citizen.home.entity != residential {
             continue;
         }
         total += display_happiness(citizen.morale.target);
@@ -151,7 +152,7 @@ pub(crate) fn average_money_for_home(world: &World, residential: Entity) -> Opti
     let mut total = 0;
     let mut count = 0;
     for citizen in world.citizens.values() {
-        if citizen.home != residential {
+        if citizen.home.entity != residential {
             continue;
         }
         total += citizen.money;
@@ -177,7 +178,7 @@ fn actual_happiness(world: &World, citizen: Entity) -> i32 {
     };
 
     let mut happiness = citizen.morale.target - citizen.morale.decay;
-    if world.positions.contains_key(&citizen.home) {
+    if world.positions.contains_key(&citizen.home.entity) {
         happiness -= citizen.morale.rent_stress * 10;
     }
 
@@ -188,23 +189,25 @@ fn citizen_happiness_target(world: &World, citizen: Entity) -> i32 {
     let Some(citizen) = world.citizens.get(&citizen) else {
         return 50;
     };
-    let Some(position) = world.positions.get(&citizen.home) else {
+    // Home is always local to this region, so `.entity` is its local building id.
+    let home = citizen.home.entity;
+    let Some(position) = world.positions.get(&home) else {
         return 50;
     };
 
     let effects = world.local_effects.get(position.x, position.y);
     let powered = world
         .power_consumers
-        .get(&citizen.home)
+        .get(&home)
         .is_some_and(|consumer| consumer.powered);
-    let road_connected = road_connectivity::is_road_connected(world, citizen.home);
+    let road_connected = road_connectivity::is_road_connected(world, home);
 
     let mut happiness = 35 + effects.desirability * 6 + effects.accessibility;
     happiness -= effects.pollution_pressure * 3;
     if citizen.workplace_assignment.is_none() {
         happiness -= 10;
     }
-    let road_access = road_network_analysis::access_for(world, citizen.home);
+    let road_access = road_network_analysis::access_for(world, home);
     happiness -= road_network_analysis::commute_penalty(road_access.commute_distance);
     if road_access.nearest_shop_distance.is_none() {
         happiness -= 2;

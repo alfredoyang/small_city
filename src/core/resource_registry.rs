@@ -484,7 +484,8 @@ fn job_requests_from_world(world: &World) -> Vec<JobRequest> {
             }
             Some(JobRequest {
                 citizen,
-                home: citizen_data.home,
+                // Home is always local to this region; `.entity` is its local id.
+                home: citizen_data.home.entity,
             })
         })
         .collect()

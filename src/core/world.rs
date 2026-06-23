@@ -2,25 +2,27 @@
 //!
 //! A `World` is **one self-contained city's ECS instance** — the substrate every
 //! `systems/` function operates on (`fn run(world: &mut World)`) and the unit that
-//! is serialized on save. It is deliberately **region-agnostic**: it holds one
-//! region's data but knows nothing about regions, neighbors, threads, or
-//! cross-region sharing. Region identity (`RegionId`) and all cross-region
-//! coordination live one layer up in `RegionState`, which owns a `World`. So the
-//! name follows the ECS convention ("one simulation instance"), not "the whole
-//! game" — there is one `World` per region, and a single-city game is simply a
-//! one-region `RegionalGame`. Owned by exactly one worker thread at a time; moved
-//! between threads, never shared.
+//! is serialized on save. It records its owning `region_id` (a tag stamped by
+//! `RegionState` at construction/load) so citizen references can be city-wide
+//! (`CityEntityRef`), but it still knows nothing about neighbors, threads, or
+//! cross-region coordination — those live one layer up in `RegionState`, which owns a
+//! `World`. So the name follows the ECS convention ("one simulation instance"), not
+//! "the whole game" — there is one `World` per region, and a single-city game is
+//! simply a one-region `RegionalGame`. Owned by exactly one worker thread at a time;
+//! moved between threads, never shared.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::city_refs::CityEntityRef;
 use crate::core::components::{
     Building, Citizen, HappinessEffect, PollutionSource, Population, Position, PowerConsumer,
     PowerProvider,
 };
 use crate::core::entity::Entity;
 use crate::core::grid::Grid;
+use crate::core::regions::RegionId;
 use crate::core::resource_registry::{
     JobCounts, JobResolution, PowerResolution, ResourceRegistryCache,
 };
@@ -29,8 +31,18 @@ use crate::core::systems::road_network_analysis::RoadNetworkAnalysis;
 use crate::interface::input::BuildingKind;
 use std::cell::{Cell, RefCell};
 
+fn default_region_id() -> RegionId {
+    RegionId(0)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct World {
+    // The region that owns this world. Not serialized (region identity is owned by
+    // `RegionState`); stamped at the region load/construction boundary via
+    // `set_region_id`, which also tags every citizen's local home. Used to build
+    // correctly-tagged `CityEntityRef`s and (from CW3 on) to resolve foreign refs.
+    #[serde(skip, default = "default_region_id")]
+    pub(crate) region_id: RegionId,
     #[serde(rename = "next_entity_id")]
     pub next_entity: u32,
     #[serde(default)]
@@ -88,6 +100,7 @@ pub(crate) struct EntityRecord {
 impl World {
     pub fn new(width: usize, height: usize) -> Self {
         Self {
+            region_id: default_region_id(),
             next_entity: 0,
             entities: HashMap::new(),
             grid: Grid::new(width, height),
@@ -108,6 +121,20 @@ impl World {
             power_consumers: HashMap::new(),
             pollution_sources: HashMap::new(),
             happiness_effects: HashMap::new(),
+        }
+    }
+
+    /// Records this world's owning region id and stamps every citizen's local home
+    /// with it.
+    ///
+    /// Homes are always local to the owning region, so on load — where `home_serde`
+    /// parks the placeholder `RegionId(0)` — this is what assigns the real region; for a
+    /// fresh region (no citizens yet) it just records the id. Called from the
+    /// `RegionState` construction/load boundary, which knows the id.
+    pub(crate) fn set_region_id(&mut self, region: RegionId) {
+        self.region_id = region;
+        for citizen in self.citizens.values_mut() {
+            citizen.home = CityEntityRef::local(region, citizen.home.entity);
         }
     }
 
@@ -329,6 +356,36 @@ mod tests {
     }
 
     #[test]
+    fn set_region_id_records_region_and_stamps_citizen_homes() {
+        use crate::core::city_refs::CityEntityRef;
+        use crate::core::regions::RegionId;
+
+        let mut world = World::new(2, 1);
+        let residential = world.spawn();
+        let citizen = world.spawn();
+        // A just-deserialized citizen carries the placeholder region (RegionId(0)).
+        world.attach_citizen(
+            citizen,
+            Citizen {
+                age: 0,
+                home: CityEntityRef::local(RegionId(0), residential),
+                workplace_assignment: None,
+                morale: Morale::default(),
+                money: 0,
+            },
+        );
+
+        world.set_region_id(RegionId(7));
+
+        assert_eq!(world.region_id, RegionId(7));
+        // The home entity is preserved; only the region tag is stamped to the owner.
+        assert_eq!(
+            world.citizens[&citizen].home,
+            CityEntityRef::local(RegionId(7), residential)
+        );
+    }
+
+    #[test]
     fn attach_helpers_record_citizen_shape() {
         let mut world = World::new(2, 2);
         let residential = world.spawn();
@@ -338,7 +395,7 @@ mod tests {
             citizen,
             Citizen {
                 age: 0,
-                home: residential,
+                home: crate::core::city_refs::CityEntityRef::local(world.region_id, residential),
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,

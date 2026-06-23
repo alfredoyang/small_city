@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::city_refs::CityEntityRef;
 use crate::core::entity::Entity;
 use crate::core::regions::RegionId;
 use crate::interface::input::BuildingKind;
@@ -141,7 +142,8 @@ pub struct Population {
 /// Individual resident state for an off-grid citizen entity.
 ///
 /// Citizens do not occupy map cells. Stable citizen-only state is grouped here to keep the custom
-/// ECS simple: `home` links to a residential building, `workplace_assignment`
+/// ECS simple: `home` is a city-wide `CityEntityRef` to a residential building
+/// (always in this region — a citizen is owned by its home region), `workplace_assignment`
 /// stores the current derived local-or-remote job, and `morale` keeps the DT2
 /// derived/time happiness boundary in one nested value.
 /// Future movement/pathfinding state should remain in separate reusable components instead of
@@ -149,7 +151,12 @@ pub struct Population {
 pub struct Citizen {
     #[serde(default)]
     pub age: u32,
-    pub home: crate::core::entity::Entity,
+    /// Home residential building. Stored as a `CityEntityRef` so citizen references are
+    /// uniform city-wide, but a home is always local to the owning region. On disk it is
+    /// still just the bare entity (see `home_serde`); the region is stamped at the region
+    /// load boundary (`RegionState::from_world`), so saves are unchanged.
+    #[serde(with = "home_serde")]
+    pub home: CityEntityRef,
     /// Derived local-or-remote workplace assignment used by simulation and views.
     ///
     /// This is rebuilt by the daily job phase. It is skipped on save for the same
@@ -161,6 +168,37 @@ pub struct Citizen {
     pub morale: Morale,
     #[serde(default)]
     pub money: i32,
+}
+
+/// Serializes `Citizen.home` as the bare home `Entity` (its on-disk form, unchanged
+/// from before homes became city-wide). Deserialization cannot know the region — it is
+/// not in scope at field level — so it parks a placeholder `RegionId(0)`, which the
+/// region load boundary (`RegionState::from_world`) then stamps with the real region id.
+///
+/// ```text
+///   save:  CityEntityRef { region, entity } ──serialize──► <entity u32>
+///   load:  <entity u32> ──deserialize──► CityEntityRef { RegionId(0), entity }
+///                       ──from_world(id)── stamp ──► CityEntityRef { id, entity }
+/// ```
+mod home_serde {
+    use super::{CityEntityRef, Entity, RegionId};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        home: &CityEntityRef,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        home.entity.serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<CityEntityRef, D::Error> {
+        Ok(CityEntityRef::local(
+            RegionId(0),
+            Entity::deserialize(deserializer)?,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,5 +327,31 @@ mod tests {
             .expect("legacy building json deserializes");
         assert_eq!(building.footprint, Footprint::single());
         assert_eq!(building.level, 1);
+    }
+
+    #[test]
+    fn citizen_home_serializes_as_bare_entity_and_loads_with_placeholder_region() {
+        // The on-disk form of `home` is just the entity (region dropped), so saves are
+        // unchanged by the move to CityEntityRef; the region is parked at the
+        // placeholder RegionId(0) on load and stamped later by RegionState::from_world.
+        let citizen = Citizen {
+            age: 1,
+            home: CityEntityRef::local(RegionId(9), Entity(3)),
+            workplace_assignment: None,
+            morale: Morale::default(),
+            money: 5,
+        };
+
+        let json = serde_json::to_value(citizen).expect("serialize citizen");
+        assert_eq!(
+            json["home"],
+            serde_json::json!(3),
+            "home is the bare entity id (region dropped)"
+        );
+
+        // Loading it back (same shape a legacy bare-entity save has) parks the
+        // placeholder region; from_world stamps the real region afterward.
+        let loaded: Citizen = serde_json::from_value(json).expect("deserialize citizen");
+        assert_eq!(loaded.home, CityEntityRef::local(RegionId(0), Entity(3)));
     }
 }

@@ -9,6 +9,7 @@
 //! ```
 
 use crate::core::building_stats::capacity_for;
+use crate::core::city_refs::CityEntityRef;
 use crate::core::components::{BuildingData, Footprint, Position};
 use crate::core::entity::Entity;
 use crate::core::systems::{citizens, economy, entity_cleanup};
@@ -194,9 +195,10 @@ pub(crate) fn upgrade_blocked_for_space(world: &World, entity: Entity) -> bool {
 /// Re-homes every citizen living in `from` to `to`. Called before a merged neighbour is removed so
 /// its residents move into the merged building instead of being despawned with it.
 fn reassign_citizen_homes(world: &mut World, from: Entity, to: Entity) {
+    let region = world.region_id;
     for citizen in world.citizens.values_mut() {
-        if citizen.home == from {
-            citizen.home = to;
+        if citizen.home.entity == from {
+            citizen.home = CityEntityRef::local(region, to);
         }
     }
 }
@@ -247,7 +249,7 @@ fn cap_residents_to_capacity(world: &mut World, entity: Entity) {
     let mut homed: Vec<Entity> = world
         .citizens
         .iter()
-        .filter(|(_, citizen)| citizen.home == entity)
+        .filter(|(_, citizen)| citizen.home.entity == entity)
         .map(|(citizen_entity, _)| *citizen_entity)
         .collect();
     homed.sort_by_key(|citizen_entity| citizen_entity.0);
@@ -557,7 +559,7 @@ mod tests {
         let a_residents = world
             .citizens
             .values()
-            .filter(|citizen| citizen.home == a)
+            .filter(|citizen| citizen.home.entity == a)
             .count();
         assert_eq!(a_residents, 3, "B's residents were re-homed to A, not lost");
     }
@@ -591,7 +593,7 @@ mod tests {
         let a_residents = world
             .citizens
             .values()
-            .filter(|citizen| citizen.home == a)
+            .filter(|citizen| citizen.home.entity == a)
             .count();
         assert_eq!(a_residents, 15, "capped at the new max population");
         assert_eq!(

@@ -172,7 +172,7 @@ fn citizen_roster(world: &World, x: usize, y: usize) -> Vec<CitizenDetailView> {
         BuildingKind::Residential => world
             .citizens
             .iter()
-            .filter(|(_, citizen)| citizen.home == entity)
+            .filter(|(_, citizen)| citizen.home.entity == entity)
             .collect(),
         BuildingKind::Commercial | BuildingKind::Industrial => world
             .citizens
@@ -214,7 +214,7 @@ fn citizen_relation(world: &World, kind: BuildingKind, citizen: &Citizen) -> Cit
         // Workplace roster: locate where this local worker lives. `region: None`
         // means "the inspected region" — the bare World cannot name itself.
         _ => {
-            let home = world.positions.get(&citizen.home);
+            let home = world.positions.get(&citizen.home.entity);
             CitizenRelation::LivesAt {
                 region: None,
                 x: home.map(|position| position.x).unwrap_or(0),
@@ -261,7 +261,7 @@ pub(crate) fn remote_workers_for(
     citizens
         .into_iter()
         .map(|(_, citizen)| {
-            let home = world.positions.get(&citizen.home);
+            let home = world.positions.get(&citizen.home.entity);
             CitizenDetailView {
                 age: citizen.age,
                 happiness: citizen.morale.actual,
@@ -801,7 +801,7 @@ fn job_assignment_views_for_home(
     let mut citizens = world
         .citizens
         .iter()
-        .filter(|(_, citizen)| citizen.home == home)
+        .filter(|(_, citizen)| citizen.home.entity == home)
         .collect::<Vec<_>>();
     citizens.sort_by_key(|(entity, _)| entity.0);
 

@@ -94,9 +94,10 @@ pub enum CitizenRelation {
     ///
     /// `region` is `None` when the worker lives in the inspected region itself (a
     /// local worker) and `Some(r)` for a remote commuter whose home is in region
-    /// `r`. The bare `World` is region-agnostic, so it cannot name "this region";
-    /// the remote-worker reverse lookup at the `RegionState` layer fills in the
-    /// home region for commuters.
+    /// `r`. A local worker is reported as `None` (the view stays relative to the
+    /// inspected region); the remote-worker reverse lookup at the `RegionState` layer
+    /// fills in the home region for commuters. (`World` now records its own
+    /// `region_id`, but this view deliberately keeps the local case relative.)
     LivesAt {
         region: Option<RegionId>,
         x: usize,

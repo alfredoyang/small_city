@@ -145,7 +145,7 @@ pub(crate) fn run_with_goods_exports(
         let (home, workplace_assignment) = world
             .citizens
             .get(&citizen_entity)
-            .map(|citizen| (citizen.home, citizen.workplace_assignment))
+            .map(|citizen| (citizen.home.entity, citizen.workplace_assignment))
             .unwrap_or((Entity(u32::MAX), None));
         // A remote workplace pays the citizen salary captured at grant time but
         // collects no local workplace tax: that tax accrues to the exporting
