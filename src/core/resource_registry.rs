@@ -65,7 +65,7 @@
 
 use std::collections::HashSet;
 
-use crate::core::components::{PowerSource, WorkplaceSource};
+use crate::core::components::PowerSource;
 use crate::core::entity::Entity;
 use crate::core::systems::road_connectivity::{self, RoadNetwork};
 use crate::core::systems::road_network_analysis;
@@ -474,12 +474,12 @@ fn job_requests_from_world(world: &World) -> Vec<JobRequest> {
         .into_iter()
         .filter_map(|citizen| {
             let citizen_data = world.citizens.get(&citizen)?;
-            if matches!(
-                citizen_data
-                    .workplace_assignment
-                    .map(|assignment| assignment.source),
-                Some(WorkplaceSource::Remote { .. })
-            ) {
+            // A citizen already holding a remote job (workplace in another region) is
+            // not seeking local work.
+            if citizen_data
+                .workplace_assignment
+                .is_some_and(|assignment| assignment.workplace.region != world.region_id)
+            {
                 return None;
             }
             Some(JobRequest {

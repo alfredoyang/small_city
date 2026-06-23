@@ -8,10 +8,8 @@
 
 use std::collections::HashMap;
 
-use crate::core::city_refs::CityEntityRef;
-use crate::core::components::{
-    BuildingData, BusinessFinance, Citizen, WorkplaceAssignment, WorkplaceSource,
-};
+use crate::core::city_refs::{CityCellRef, CityEntityRef};
+use crate::core::components::{BuildingData, BusinessFinance, Citizen, WorkplaceAssignment};
 use crate::core::entity::Entity;
 use crate::core::regions::RegionId;
 use crate::core::resource_registry::JobAssignment;
@@ -151,23 +149,17 @@ pub(crate) fn run_with_goods_exports(
         // A remote workplace pays the citizen salary captured at grant time but
         // collects no local workplace tax: that tax accrues to the exporting
         // region instead (see `exported_job_slots` below).
-        let salary = match workplace_assignment.map(|assignment| assignment.source) {
-            Some(WorkplaceSource::Remote { .. }) => (
-                workplace_assignment
-                    .map(|assignment| assignment.salary)
-                    .unwrap_or(0),
-                0,
-            ),
-            Some(WorkplaceSource::Local { workplace }) => {
-                // A local assignment's workplace is in this region, so `.entity` is its
-                // local id. Re-check local workplace effectiveness at settlement time:
-                // the assignment stores salary for UI, but local tax/salary should still
-                // reflect the authoritative current local world state.
-                let workplace = workplace.entity;
-                salary_for_workplace(world, workplace)
+        // A local job (`workplace.region == this region`) re-checks effective local
+        // salary/tax from authoritative world state; a remote job pays the salary
+        // captured at grant time and collects no local workplace tax (that accrues to
+        // the exporting region — see `exported_job_slots`).
+        let salary = match workplace_assignment {
+            Some(assignment) => match assignment.workplace.as_local(world.region_id) {
+                Some(workplace) => salary_for_workplace(world, workplace)
                     .map(|salary| (salary, workplace_tax_for_workplace(world, workplace)))
-                    .unwrap_or((0, 0))
-            }
+                    .unwrap_or((0, 0)),
+                None => (assignment.salary, 0),
+            },
             None => (0, 0),
         };
         let rent = rent_per_citizen(world, home);
@@ -371,19 +363,18 @@ fn apply_workplace_assignments(
 ) {
     for assignment in assignments {
         let workplace_assignment = assignment.workplace.and_then(|workplace| {
+            let position = *world.positions.get(&workplace)?;
             Some(WorkplaceAssignment {
-                region: local_region,
-                position: *world.positions.get(&workplace)?,
+                workplace: CityEntityRef::local(local_region, workplace),
+                location: CityCellRef::local(local_region, position.x, position.y),
                 salary: salary_for_workplace(world, workplace).unwrap_or(0),
-                source: WorkplaceSource::Local {
-                    workplace: CityEntityRef::local(local_region, workplace),
-                },
             })
         });
         if let Some(citizen) = world.citizens.get_mut(&assignment.citizen) {
             match (citizen.workplace_assignment, workplace_assignment) {
-                (Some(existing), _)
-                    if matches!(existing.source, WorkplaceSource::Remote { .. }) => {}
+                // An existing remote job (`workplace.region != this region`) is frozen
+                // until the daily job-export phase rebuilds it; local matching skips it.
+                (Some(existing), _) if existing.workplace.as_local(local_region).is_none() => {}
                 // Paused derived refresh owns local matching only. Remote work
                 // is frozen until the explicit daily job-export phase clears and
                 // rebuilds assignments, which also releases producer allocations
@@ -963,8 +954,8 @@ pub(crate) fn maintenance_for_building(kind: BuildingKind, level: u8) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{EconomyIndex, assign_local_jobs, run};
-    use crate::core::city_refs::CityEntityRef;
-    use crate::core::components::{Position, WorkplaceAssignment, WorkplaceSource};
+    use crate::core::city_refs::{CityCellRef, CityEntityRef};
+    use crate::core::components::WorkplaceAssignment;
     use crate::core::entity::Entity;
     use crate::core::regions::RegionId;
     use crate::core::systems::{citizens, placement, road_network_analysis};
@@ -1013,12 +1004,9 @@ mod tests {
             .get_mut(&citizen)
             .unwrap()
             .workplace_assignment = Some(WorkplaceAssignment {
-            region: RegionId(2),
-            position: Position { x: 3, y: 0 },
+            workplace: CityEntityRef::local(RegionId(2), Entity(7)),
+            location: CityCellRef::local(RegionId(2), 3, 0),
             salary: 4,
-            source: WorkplaceSource::Remote {
-                workplace: CityEntityRef::local(RegionId(2), Entity(7)),
-            },
         });
 
         assign_local_jobs(&mut world, RegionId(1));
@@ -1029,12 +1017,12 @@ mod tests {
             .expect("citizen")
             .workplace_assignment
             .expect("assignment");
-        assert_eq!(assignment.region, RegionId(2));
-        assert!(matches!(
-            assignment.source,
-            WorkplaceSource::Remote { workplace }
-                if workplace == CityEntityRef::local(RegionId(2), Entity(7))
-        ));
+        // The remote assignment (workplace.region != local region 1) is preserved.
+        assert_eq!(
+            assignment.workplace,
+            CityEntityRef::local(RegionId(2), Entity(7))
+        );
+        assert_eq!(assignment.workplace.as_local(RegionId(1)), None);
     }
 
     #[test]

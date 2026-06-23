@@ -1,6 +1,6 @@
 //! Adapter that converts private ECS world data into UI-safe view and inspect models.
 
-use crate::core::components::{Citizen, Position, WorkplaceSource};
+use crate::core::components::{Citizen, Position};
 use crate::core::entity::Entity;
 use crate::core::regions::RegionId;
 use crate::core::systems::{
@@ -178,10 +178,11 @@ fn citizen_roster(world: &World, x: usize, y: usize) -> Vec<CitizenDetailView> {
             .citizens
             .iter()
             .filter(|(_, citizen)| {
-                matches!(
-                    citizen.workplace_assignment.map(|assignment| assignment.source),
-                    Some(WorkplaceSource::Local { workplace }) if workplace.entity == entity
-                )
+                // Local workers of this building: a workplace local to this region
+                // (`as_local` resolves) whose entity is this cell's building.
+                citizen.workplace_assignment.is_some_and(|assignment| {
+                    assignment.workplace.as_local(world.region_id) == Some(entity)
+                })
             })
             .collect(),
         _ => return Vec::new(),
@@ -203,11 +204,11 @@ fn citizen_relation(world: &World, kind: BuildingKind, citizen: &Citizen) -> Cit
     match kind {
         BuildingKind::Residential => match citizen.workplace_assignment {
             Some(assignment) => CitizenRelation::WorksAt {
-                region: assignment.region,
-                x: assignment.position.x,
-                y: assignment.position.y,
+                region: assignment.workplace.region,
+                x: assignment.location.x,
+                y: assignment.location.y,
                 salary: assignment.salary,
-                is_remote: matches!(assignment.source, WorkplaceSource::Remote { .. }),
+                is_remote: assignment.workplace.region != world.region_id,
             },
             None => CitizenRelation::Unemployed,
         },
@@ -247,13 +248,13 @@ pub(crate) fn remote_workers_for(
         .citizens
         .iter()
         .filter(|(_, citizen)| {
-            matches!(
-                citizen.workplace_assignment,
-                Some(assignment)
-                    if assignment.region == producer_region
-                        && assignment.position == position
-                        && matches!(assignment.source, WorkplaceSource::Remote { .. })
-            )
+            citizen.workplace_assignment.is_some_and(|assignment| {
+                // A remote job (workplace in another region) at the producer's cell.
+                assignment.workplace.region == producer_region
+                    && assignment.workplace.region != world.region_id
+                    && assignment.location.x == position.x
+                    && assignment.location.y == position.y
+            })
         })
         .collect();
     citizens.sort_by_key(|(entity, _)| entity.0);
@@ -810,14 +811,11 @@ fn job_assignment_views_for_home(
         .filter_map(|(_, citizen)| {
             let assignment = citizen.workplace_assignment?;
             Some(JobAssignmentView {
-                region: assignment.region,
-                x: assignment.position.x,
-                y: assignment.position.y,
+                region: assignment.workplace.region,
+                x: assignment.location.x,
+                y: assignment.location.y,
                 salary: assignment.salary,
-                is_remote: match assignment.source {
-                    WorkplaceSource::Local { .. } => false,
-                    WorkplaceSource::Remote { .. } => true,
-                },
+                is_remote: assignment.workplace.region != world.region_id,
             })
         })
         .collect()

@@ -86,8 +86,8 @@ fn residential_growth_per_tick(
 #[cfg(test)]
 mod tests {
     use super::{available_jobs_for_growth, residential_growth_per_tick};
-    use crate::core::city_refs::CityEntityRef;
-    use crate::core::components::{Position, WorkplaceAssignment, WorkplaceSource};
+    use crate::core::city_refs::{CityCellRef, CityEntityRef};
+    use crate::core::components::WorkplaceAssignment;
     use crate::core::entity::Entity;
     use crate::core::regions::RegionId;
     use crate::core::systems::{citizens, local_effects::DesirabilityLevel, placement};
@@ -159,12 +159,9 @@ mod tests {
             .next()
             .unwrap()
             .workplace_assignment = Some(WorkplaceAssignment {
-            region: RegionId(2),
-            position: Position { x: 0, y: 0 },
+            workplace: CityEntityRef::local(RegionId(2), Entity(9)),
+            location: CityCellRef::local(RegionId(2), 0, 0),
             salary: 1,
-            source: WorkplaceSource::Remote {
-                workplace: CityEntityRef::local(RegionId(2), Entity(9)),
-            },
         });
         world.importable_remote_jobs = 2;
 

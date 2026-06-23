@@ -87,6 +87,14 @@ impl TickJobPhase {
 /// Regional runtimes can pause after this phase to request producer-exported
 /// power, then call `finish_tick_after_power_phase` once export grants apply.
 pub(crate) fn begin_tick_power_phase(world: &mut World, local_region: RegionId) -> TickPowerPhase {
+    // The world is simulated as `local_region`, so record it (and re-stamp citizen
+    // homes, preserving the CW2 invariant `home.region == region_id`). In production
+    // this already equals the id RegionState stamped, so the guard skips it every tick;
+    // a bare World ticked directly (tests) is stamped once. Keeping region_id consistent
+    // with the assignment region is what local/remote classification relies on.
+    if world.region_id != local_region {
+        world.set_region_id(local_region);
+    }
     // DT1 derived-before-time: bring the derived pass current before the time
     // pass reads it. A paused config change (build/bulldoze) only marks the world
     // dirty; this is where that change is applied for the running step, matching
@@ -256,6 +264,11 @@ pub(crate) fn ensure_derived_state(world: &mut World, local_region: RegionId) {
 /// and local effects. DT2 keeps actual citizen happiness in the time pass while
 /// exposing the conditions-only `happiness_target` from this derived pass.
 pub(crate) fn refresh_derived_state_for_world(world: &mut World, local_region: RegionId) {
+    // Record the simulated region, re-stamping homes only if it actually changed
+    // (no-op in production; keeps a bare World consistent without per-call cost).
+    if world.region_id != local_region {
+        world.set_region_id(local_region);
+    }
     // Cross-region imported power is reserved in the runtime ledger and only
     // (re)applied during a tick's export phase. `power::run` clears every consumer
     // and re-applies only *local* grants, so running this derived pass for a paused

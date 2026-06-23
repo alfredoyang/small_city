@@ -1011,9 +1011,8 @@ impl ExportResource for JobExport {
         JobExportGrant {
             token: request.token,
             granted: false,
-            source_region: None,
-            position: None,
             workplace: None,
+            location: None,
             salary: 0,
         }
     }

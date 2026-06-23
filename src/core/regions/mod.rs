@@ -25,8 +25,8 @@
 //! region stores another region's generic exported-resource cache.
 //! ```
 
-use crate::core::city_refs::CityEntityRef;
-use crate::core::components::{Position, PowerSource, WorkplaceAssignment, WorkplaceSource};
+use crate::core::city_refs::{CityCellRef, CityEntityRef};
+use crate::core::components::{Position, PowerSource, WorkplaceAssignment};
 use crate::core::entity::Entity;
 use crate::core::resources::CityStats;
 use crate::core::simulation::{
@@ -231,17 +231,16 @@ pub struct PowerExportGrant {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Result of an authoritative producer-owned job-slot export allocation request.
 ///
-/// Unlike power, the grant carries identity: the producer's `workplace` (a region-tagged
-/// `CityEntityRef`, owned by the producer; the consumer never dereferences it, only
-/// stores/echoes it) and the `salary` the home region pays the worker. Workplace tax
-/// accrues to the exporting region instead. (`source_region`/`position` stay equal to
-/// `workplace.region`/the workplace cell until CW4 collapses them.)
+/// Unlike power, the grant carries identity as city-wide refs: the producer's
+/// `workplace` (a region-tagged `CityEntityRef`, owned by the producer; the consumer
+/// never dereferences it, only stores/echoes it), its `location` (the self-describing
+/// workplace cell for the consumer's roster/display), and the `salary` the home region
+/// pays the worker. Workplace tax accrues to the exporting region instead.
 pub struct JobExportGrant {
     pub token: u32,
     pub granted: bool,
-    pub source_region: Option<RegionId>,
-    pub position: Option<Position>,
     pub workplace: Option<CityEntityRef>,
+    pub location: Option<CityCellRef>,
     pub salary: i32,
 }
 
@@ -410,12 +409,10 @@ impl RegionState {
             .citizens
             .values()
             .filter(|citizen| {
-                matches!(
-                    citizen
-                        .workplace_assignment
-                        .map(|assignment| assignment.source),
-                    Some(WorkplaceSource::Remote { .. })
-                )
+                // A remote job's workplace is owned by another region.
+                citizen
+                    .workplace_assignment
+                    .is_some_and(|assignment| assignment.workplace.region != self.id)
             })
             .count()
     }
@@ -435,12 +432,9 @@ impl RegionState {
             .values()
             .filter_map(|citizen| {
                 let assignment = citizen.workplace_assignment?;
-                match assignment.source {
-                    WorkplaceSource::Remote { workplace } => {
-                        Some((assignment.region, workplace.entity.0))
-                    }
-                    WorkplaceSource::Local { .. } => None,
-                }
+                let workplace = assignment.workplace;
+                // Only remote jobs (workplace owned by another region) are imports.
+                (workplace.region != self.id).then_some((workplace.region, workplace.entity.0))
             })
             .collect::<Vec<_>>();
         slots.sort();
@@ -685,9 +679,7 @@ impl RegionState {
         if !grant.granted {
             return;
         }
-        let (Some(source_region), Some(position), Some(workplace)) =
-            (grant.source_region, grant.position, grant.workplace)
-        else {
+        let (Some(workplace), Some(location)) = (grant.workplace, grant.location) else {
             return;
         };
         let Some(citizen) = self.world.citizens.get_mut(&demand.citizen) else {
@@ -697,10 +689,9 @@ impl RegionState {
             return;
         }
         citizen.workplace_assignment = Some(WorkplaceAssignment {
-            region: source_region,
-            position,
+            workplace,
+            location,
             salary: grant.salary,
-            source: WorkplaceSource::Remote { workplace },
         });
         self.world.invalidate_jobs_registry();
     }
@@ -1069,9 +1060,8 @@ mod tests {
             JobExportGrant {
                 token: 7,
                 granted: true,
-                source_region: Some(RegionId(2)),
-                position: Some(Position { x: 1, y: 0 }),
                 workplace: Some(CityEntityRef::local(RegionId(2), Entity(42))),
+                location: Some(CityCellRef::local(RegionId(2), 1, 0)),
                 salary: 4,
             },
         );
@@ -1106,9 +1096,8 @@ mod tests {
             JobExportGrant {
                 token: 1,
                 granted: true,
-                source_region: Some(RegionId(2)),
-                position: Some(Position { x: 1, y: 0 }),
                 workplace: Some(CityEntityRef::local(RegionId(2), Entity(9))),
+                location: Some(CityCellRef::local(RegionId(2), 1, 0)),
                 salary: 4,
             },
         );

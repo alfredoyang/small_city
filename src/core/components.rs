@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::city_refs::CityEntityRef;
+use crate::core::city_refs::{CityCellRef, CityEntityRef};
 use crate::core::entity::Entity;
 use crate::core::regions::RegionId;
 use crate::interface::input::BuildingKind;
@@ -231,30 +231,20 @@ impl Default for Morale {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-/// Owned job assignment that can describe either local or producer-exported work.
+/// Owned job assignment describing local or producer-exported work via city-wide refs.
 ///
-/// UI adapters convert this to a view-safe shape and never expose the local ECS
-/// entity or the remote opaque slot id. Core simulation still keeps that source
-/// identity so local salary/tax and producer-owned export allocation stay
-/// deterministic.
+/// `workplace` is the building's city-wide `CityEntityRef`; `location` is its
+/// self-describing cell (kept because a remote workplace's entity cannot be
+/// dereferenced locally — it is the only way to show where the job is). There is no
+/// separate local/remote tag: a job is **local iff `workplace.region` is this region**
+/// (`workplace.as_local(self_region).is_some()`), otherwise it is a remote/exported job
+/// whose `workplace.region` is the producer. `location.region == workplace.region`.
+///
+/// UI adapters convert this to a view-safe shape and never expose the raw entity.
 pub struct WorkplaceAssignment {
-    pub region: RegionId,
-    pub position: Position,
+    pub workplace: CityEntityRef,
+    pub location: CityCellRef,
     pub salary: i32,
-    pub source: WorkplaceSource,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-/// Internal source identity for a workplace assignment.
-///
-/// Both variants now carry a city-wide `CityEntityRef` to the workplace building: a
-/// `Local` job's `workplace.region` is this region (so `as_local` resolves it), a
-/// `Remote` job's is the producer region (a foreign ref the consumer never
-/// dereferences — it only echoes it / reads its cell). The enum tag is redundant with
-/// `workplace.region` and is removed in CW4.
-pub enum WorkplaceSource {
-    Local { workplace: CityEntityRef },
-    Remote { workplace: CityEntityRef },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

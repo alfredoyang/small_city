@@ -80,7 +80,7 @@
 //!                  West:offset 0
 //! ```
 
-use crate::core::city_refs::CityEntityRef;
+use crate::core::city_refs::{CityCellRef, CityEntityRef};
 use crate::core::entity::Entity;
 use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionCommandResponse, RegionSnapshotResponse,
@@ -724,8 +724,9 @@ impl RegionRuntime {
 
     fn remember_job_export_producer(&mut self, grant: &JobExportGrant) {
         if grant.granted {
-            if let Some(source_region) = grant.source_region {
-                insert_sorted_unique(&mut self.job_export_producers, source_region);
+            // The granting producer is the owner of the granted workplace ref.
+            if let Some(workplace) = grant.workplace {
+                insert_sorted_unique(&mut self.job_export_producers, workplace.region);
             }
         }
     }
@@ -1104,14 +1105,17 @@ impl RegionRuntime {
             return JobExportGrant {
                 token: request.request.token,
                 granted: false,
-                source_region: None,
-                position: None,
                 workplace: None,
+                location: None,
                 salary: 0,
             };
         };
         let salary = self.state.workplace_salary(workplace);
-        let position = self.state.workplace_position(workplace);
+        let region = self.region_id();
+        let location = self
+            .state
+            .workplace_position(workplace)
+            .map(|position| CityCellRef::local(region, position.x, position.y));
 
         self.job_export_allocations.upsert(
             allocation_key,
@@ -1123,9 +1127,8 @@ impl RegionRuntime {
         JobExportGrant {
             token: request.request.token,
             granted: true,
-            source_region: Some(self.region_id()),
-            position,
-            workplace: Some(CityEntityRef::local(self.region_id(), workplace)),
+            workplace: Some(CityEntityRef::local(region, workplace)),
+            location,
             salary,
         }
     }
@@ -1558,11 +1561,14 @@ mod tick_state_tests {
         runtime.push_event(RegionEvent::ApplyJobExportGrant(JobExportGrant {
             token: 0,
             granted: true,
-            source_region: Some(RegionId(2)),
-            position: Some(crate::core::components::Position { x: 0, y: 0 }),
             workplace: Some(crate::core::city_refs::CityEntityRef::local(
                 RegionId(2),
                 crate::core::entity::Entity(0),
+            )),
+            location: Some(crate::core::city_refs::CityCellRef::local(
+                RegionId(2),
+                0,
+                0,
             )),
             salary: 4,
         }));
