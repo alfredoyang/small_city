@@ -258,6 +258,23 @@ Only after CW1-CW4 are working:
 
 - Consider storing `Citizen.id: CitizenId` if deriving it at call sites becomes noisy.
 - Consider replacing more view-facing `(region, x, y)` tuples with `CityCellRef`.
+- Consider making `Entity` itself city-wide unique. **Weigh whether it earns its keep
+  first:** `CityEntityRef { region, entity }` already provides city-wide uniqueness at
+  the reference layer (that is what CW1–CW4 deliver), so the only gain is ergonomic
+  (passing one value instead of a `(region, entity)` pair).
+  - If pursued, the **only** determinism- and share-nothing-safe scheme is a
+    **region-partitioned id** minted locally at `World::spawn` from `world.region_id`
+    (CW2): e.g. `Entity { region: RegionId, local: u32 }` or packed
+    `Entity(u64) = (region.0 << 32) | local`, with a cheap `Entity::region()` extractor.
+    Each region keeps its own deterministic `local` counter, so ids stay reproducible
+    with no cross-thread allocator.
+  - A **global/shared atomic counter is rejected**: it makes ids depend on thread
+    interleaving (breaking saves/replays/parity) and reintroduces cross-region
+    coordination the share-nothing model forbids.
+  - Note this effectively *merges* `Entity` and `CityEntityRef` (a region-tagged
+    `Entity` is `CityEntityRef`), and is a **save-format migration**: either re-encode
+    every stored entity id, or keep bare-local ids on disk and re-pack at the load
+    boundary (mirroring CW2's `home_serde` placeholder-then-stamp pattern).
 
 Skip these until the code asks for them.
 
