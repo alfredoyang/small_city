@@ -2,17 +2,15 @@
 
 ## Goal
 
-Make citizen/travel references city-wide so cross-region travel can pass a
-traveler between regions without moving the whole `Citizen` component or leaking
-region-local `Entity` ids into another `World`.
+Make durable citizen references (home and workplace) city-wide so cross-region
+features can identify a citizen or a building without moving the whole `Citizen`
+component or leaking region-local `Entity` ids into another `World`.
 
 Current local-only shape:
 
 ```text
-Citizen.home:              Entity
-WorkplaceSource::Local:    Entity
-TravelState.current_cell:  Entity
-TravelState.destination:   Entity
+Citizen.home:           Entity
+WorkplaceSource::Local: Entity
 ```
 
 Those `Entity` values only mean something inside one region. A region receiving
@@ -25,8 +23,7 @@ CitizenId      = stable city-wide person id
 CityEntityRef  = { region, entity }       // internal city-wide ECS reference
 CityCellRef    = { region, x, y }         // portable crossing/save/display reference
 
-Citizen stays owned by home region.
-Travel state may move between regions, keyed by CitizenId.
+Citizen stays owned by its home region; only city-wide refs cross regions.
 ```
 
 ## Non-Goals
@@ -39,38 +36,43 @@ Travel state may move between regions, keyed by CitizenId.
 ## Architecture
 
 ```text
-                 durable owner                         temporary host
-REGION A                                      REGION B
+REGION A (owns its citizens)                  REGION B (owns its citizens)
 ──────────────────────────────               ──────────────────────────────
-citizens[local_entity] = Citizen              visiting_travel[CitizenId]
-  id: CitizenId                                 current_cell: B-local road
-  home: CityEntityRef(A, home)                  destination: B-local target
-  workplace: CityCellRef(B, x, y)
+citizens[local_entity] = Citizen              citizens[local_entity] = Citizen
+  id: CitizenId                                 id: CitizenId
+  home: CityEntityRef(A, home)                  home: CityEntityRef(B, home)
+  workplace: CityEntityRef(B, wkpl)             workplace: CityEntityRef(A, wkpl)
 
-CitizenId crosses regions.
+CitizenId / city-wide refs cross regions (in messages).
 Region-local Entity refs do not.
 ```
 
 Each region still stores and mutates only its own ECS. City-wide refs are handles
 that include `RegionId`; a region may only dereference refs whose `region == self.id`.
-Cross-region messages use `CitizenId` plus cell/link data, and the receiver resolves
-that into its own local road/building entities.
+Cross-region messages use `CitizenId`, `CityEntityRef`, and cell/link data
+(`CityCellRef`); the receiver resolves a ref into a local building entity only when its
+`region == self.id`, and otherwise just carries/echoes it.
 
 ## Types
 
 Add small plain data types near the existing `Entity`/regional types:
 
 ```rust
+// All three are plain Copy data. Ord/Hash give deterministic ordering for the CW1
+// test and for use as map keys; Serialize/Deserialize for save records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CitizenId {
     pub home_region: RegionId,
     pub local: Entity,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CityEntityRef {
     pub region: RegionId,
     pub entity: Entity,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CityCellRef {
     pub region: RegionId,
     pub x: usize,
@@ -85,6 +87,12 @@ justify the field.
 ## Patch CW1 — Add City-Wide Reference Types
 
 Add `CitizenId`, `CityEntityRef`, and `CityCellRef`.
+
+**Prerequisite:** the `Ord`/`PartialOrd` derives above require `Entity` to be
+orderable, but on master `Entity` derives only `PartialEq, Eq, Hash`. Add
+`PartialOrd, Ord` to `Entity` (it's a `u32` newtype, so the derive is trivial and
+deterministic). Lazy and correct; avoids hand-written `(region.0, entity.0)` sorts at
+every call site.
 
 Add helpers:
 
@@ -104,160 +112,160 @@ No behavior change.
 
 ## Patch CW2 — City-Wide Citizen Home
 
-Change `Citizen.home` from `Entity` to `CityEntityRef`.
+Change `Citizen.home` from `Entity` to `CityEntityRef`, then resolve in local systems
+with `citizen.home.as_local(self_region)`.
 
-Local systems must resolve with:
+### Decision (required first): how a bare `World` knows its own region
 
-```text
-citizen.home.as_local(local_region)
-```
+Most systems that read `home` only receive `&World`, never a `RegionId` (job
+registry, economy, citizens, the adapter). `as_local` needs the region, so we must
+pick a source. **Decision: store `region_id: RegionId` on `World`.**
 
-If the home is not local, treat the citizen as invalid for that local system and
-skip/fall back to home. In normal data, a citizen's home is always local to its
-owning region.
+- Set it in `RegionState::new` and `RegionState::from_world(id, ..)` (both already
+  know the id). Bare `World::new(w, h)` test construction defaults it to `RegionId(0)`.
+- Every `&World` system reads `world.region_id`; no signature churn across the system
+  layer.
+- This **revisits the "the bare `World` is region-agnostic" note** (today in
+  `view.rs` on `CitizenRelation::LivesAt`). That stance was only viable while no
+  durable field needed the region; `CityEntityRef` makes the region part of the data
+  model, so `World` owning its id is the consistent move. Update that note.
 
-Save compatibility:
+> Rejected alternative: thread `RegionId` into every affected system signature. More
+> churn, and the id is constant per `World` anyway — a field is the lazy-correct fit.
 
-- Legacy saves with `home: Entity` load as `CityEntityRef { region: local_region, entity: home }`.
-- New saves write the city-wide form.
+If a resolved home is somehow not local (should never happen — a citizen is owned by
+its home region), local systems skip it rather than panic.
+
+### Save compatibility (concrete load boundary)
+
+Field-level serde **cannot** do this: when `Citizen` deserializes, the region id is
+not in scope. So:
+
+- **On disk, `home` stays a bare entity** (custom `serialize_with`/`deserialize_with`,
+  or `#[serde(with)]`) — no save-format change, legacy and new saves read identically.
+- Deserialization can't know the region, so it constructs a **placeholder**:
+  `home = CityEntityRef { region: RegionId(0), entity }`.
+- The region is then **stamped at the region load boundary**, where the id is known:
+  `RegionState::from_world(id, world)` / `from_save_record` replaces the placeholder
+  region `0` with `id` for every citizen (homes are always local, so `region = self.id`
+  is unconditionally correct). This is the same pass that already calls
+  `rebuild_entity_records` / `refresh_derived_state_for_world`.
 
 Tests:
 
-- Legacy save loads and residents still count at their home.
-- Population cache refresh still counts local homes.
-- Non-local home ref is ignored by local-only systems instead of panicking.
+- Legacy save loads and residents still count at their home (region stamped to `id`).
+- Population cache refresh still counts local homes via `as_local(world.region_id)`.
+- A home ref with `region != world.region_id` is skipped by local-only systems, not
+  panicked on.
 
-## Patch CW3 — City-Wide Workplace Reference
+## Patch CW3 — City-Wide Workplace Reference (keep the enum)
 
-Change local workplace identity from region-local only:
+Make the workplace identity city-wide **without** removing `WorkplaceSource` yet. The
+enum's two variants stay; only the data they carry becomes typed/portable. Dropping
+the enum is a separate, larger patch (CW4).
+
+Local variant — region-local `Entity` → `CityEntityRef`:
 
 ```text
-WorkplaceSource::Local { entity: Entity }
+WorkplaceSource::Local { workplace: CityEntityRef }     // was { entity: Entity }
+WorkplaceSource::Remote { workplace: CityEntityRef }    // was { slot_id: u32 }  (see wire change)
 ```
 
-to city-wide:
+### Wire change: the grant must carry a typed producer entity, not `slot_id`
 
-```text
-WorkplaceSource::Local { workplace: CityEntityRef }
-```
+Today `JobExportGrant.slot_id: Option<u32>` is **documented as opaque**, even though
+the producer happens to set it to `workplace.0`. The discovery layer also carries
+opaque ids (`RegionalAvailabilityHint.spare_job_slot_ids` in `worker.rs` /
+`directory.rs`). Do **not** rely on "slot_id is literally the entity." Instead:
 
-Keep remote job data as cell/slot based:
+- Change the authoritative grant to carry the producer's workplace explicitly:
+  `JobExportGrant { workplace: CityEntityRef, location: CityCellRef, salary, .. }`
+  (replacing `source_region` + `position` + `slot_id`). The producer already has the
+  `Entity` and its `Position` when it grants — it just packages them typed.
+- `apply_job_export_grant` stores `Remote { workplace }` directly; no `u32`
+  reinterpretation anywhere.
+- Update the consumers of the old `slot_id`: `imported_job_slots` (test summary),
+  `imported_job_count`, and the `remote_workers_for` reverse lookup (match by
+  `workplace`/`location` instead of `(region, position)`).
+- **Leave the discovery hints alone.** `spare_job_slot_ids` stays an opaque
+  stale-tolerant availability counter; it is a *hint*, not bound identity, and the
+  authoritative binding now lives in the grant's `CityEntityRef`.
+
+### `WorkplaceAssignment` shape
 
 ```text
 WorkplaceAssignment {
-    region,
-    position,
-    salary,
-    source,
+    source:   WorkplaceSource,   // Local { workplace } | Remote { workplace }
+    location: CityCellRef,       // { region, x, y } self-describing workplace cell, for
+                                 //   display/roster (a remote entity can't be deref'd)
+    salary:   i32,
 }
 ```
 
-For local jobs, `region/position` and `source.workplace` describe the same local
-building. For remote jobs, `region/position` stays the portable target and
-`Remote { slot_id }` stays producer-owned.
+`location.region` must equal the `workplace.region` inside `source`; keep them in sync
+at the single write site (local assignment / `apply_job_export_grant`). The redundant
+top-level `region`/`position` fields collapse into `source.workplace` + `location`.
+
+- **Local job:** `Local { workplace: { region: self, entity } }`; `as_local(self)`
+  resolves the entity — local systems behave exactly as today.
+- **Remote job:** `Remote { workplace: { region: producer, entity } }`; `as_local(self)`
+  is `None`. The producer still settles workplace tax from its own export ledger (keyed
+  by its own entity), so this changes no economy behavior.
 
 Tests:
 
-- Local job assignment still pays salary and shows workplace location.
-- Remote job assignment remains unchanged.
-- UI roster still resolves local workers' homes through the adapter only.
+- Local job: `as_local(self)` resolves the workplace; salary paid; `location` shown.
+- Remote job: grant round-trips a typed `CityEntityRef`; `as_local(self)` is `None`;
+  the roster resolves through `location`.
+- `location.region` matches the `source.workplace.region` for every assignment.
+- No `slot_id`→entity reinterpretation remains; discovery hints unchanged.
 
-## Patch CW4 — Split Travel Identity From Local Route State
+## Patch CW4 — Drop `WorkplaceSource`
 
-Replace "cross the same raw `TravelState`" with a city-wide traveler record.
+Only after CW3 proves the `CityEntityRef` path. The enum's `Local`/`Remote` tag is now
+redundant with the region tag, so collapse `source: WorkplaceSource` to a single
+`workplace: CityEntityRef`; local-vs-remote becomes `workplace.region == self.id`.
 
-Keep local `TravelState` using local entities for route stepping:
+This is **deliberately its own patch** because it is broad — it touches the adapter
+roster, economy salary logic, `imported_job_count`, the `remote_workers_for` reverse
+lookup, the export-release assumptions, and their tests. Splitting it keeps CW3 small
+and lets the typed-ref path land and bake before the enum disappears.
 
 ```text
-TravelState {
-    current_cell: Option<Entity>,
-    destination: Option<Entity>,
-    status: TravelStatus,
+WorkplaceAssignment {
+    workplace: CityEntityRef,    // local iff workplace.region == self.id
+    location:  CityCellRef,
+    salary:    i32,
 }
-```
-
-Add a wrapper for ownership/identity:
-
-```text
-TravelerState {
-    citizen: CitizenId,
-    travel: TravelState,
-}
-```
-
-For local residents, `world.travel` can stay keyed by local citizen `Entity` until
-P5 needs the crossing path. For visiting travelers, use:
-
-```text
-visiting_travel: HashMap<CitizenId, TravelState>
 ```
 
 Tests:
 
-- Local movement remains unchanged.
-- Adapter can render local travel and visiting travel through the same
-  `CitizenTravelView`.
+- Every former `Local`/`Remote` match site now branches on `workplace.as_local(self)`.
+- Adapter derives `is_remote` from `workplace.region != self.id` (no view-model change).
+- Imported-job count and remote-worker lookup give the same results as before CW4.
 
-## Patch CW5 — Cross-Region Travel Uses Portable Handoff
+## Patch CW5 — Optional Cleanup
 
-Update P5 in `traffic-pathfinding-plan.md` to use a portable handoff instead of
-raw `TravelState`:
+Only after CW1-CW4 are working:
 
-```text
-TravelerHandoff {
-    citizen: CitizenId,
-    from_region: RegionId,
-    to_region: RegionId,
-    entry_link: BorderLinkId,
-    destination: CityCellRef,
-    return_path: Vec<ReturnHop>,
-    purpose: Outbound | Return,
-}
-```
-
-Receiver behavior:
-
-```text
-Receive Outbound:
-  map entry_link -> local entry road
-  map destination CityCellRef -> local workplace/building if destination.region == self
-  create local TravelState in visiting_travel[citizen]
-
-Receive Return:
-  if return_path has a hop, route one hop back
-  if empty and self is citizen.home_region, clear away mark
-```
-
-Owner-side stale guard:
-
-```text
-accept Return only if citizen is currently away for that same CitizenId/generation
-otherwise ignore
-```
-
-Tests:
-
-- A handoff never contains raw region-local `Entity` refs from another region.
-- A→B commute creates a B-local visiting `TravelState`.
-- Stale return is ignored.
-- A→B→C return unwinds through B.
-
-## Patch CW6 — Optional Cleanup
-
-Only after CW1-CW5 are working:
-
-- Consider keying `world.travel` by `CitizenId` instead of local `Entity`.
 - Consider storing `Citizen.id: CitizenId` if deriving it at call sites becomes noisy.
 - Consider replacing more view-facing `(region, x, y)` tuples with `CityCellRef`.
 
 Skip these until the code asks for them.
 
+> Cross-region travel itself (passing a traveler between regions) is **out of scope
+> here** — it belongs to the future pathfinding/traffic work and will build on these
+> city-wide refs. This plan only makes the references portable.
+
 ## Invariants
 
 - UI still sees only view models.
 - `World` remains private to its owning region.
-- Regions only dereference `CityEntityRef` when `region == self.id`.
-- Cross-region messages carry `CitizenId` and `CityCellRef`, not foreign `Entity`.
+- Cross-region messages may carry city-wide refs (`CitizenId`, `CityEntityRef`,
+  `CityCellRef`) — but **never a bare region-local `Entity`** stripped of its region tag.
+- A region dereferences a `CityEntityRef` (or `CitizenId.local`) **only** when
+  `region == self.id`; a foreign ref is carried/echoed, never resolved to a local entity.
 - Local simulation remains deterministic: sorted entity/citizen order, integer logic,
   no live reads from neighbor regions.
 
