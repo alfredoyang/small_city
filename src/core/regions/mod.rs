@@ -25,6 +25,7 @@
 //! region stores another region's generic exported-resource cache.
 //! ```
 
+use crate::core::city_refs::CityEntityRef;
 use crate::core::components::{Position, PowerSource, WorkplaceAssignment, WorkplaceSource};
 use crate::core::entity::Entity;
 use crate::core::resources::CityStats;
@@ -230,15 +231,17 @@ pub struct PowerExportGrant {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Result of an authoritative producer-owned job-slot export allocation request.
 ///
-/// Unlike power, the grant carries identity: the producer's `slot_id` (an opaque
-/// owned id, not a remote ECS entity to the consumer) and the `salary` the home
-/// region pays the worker. Workplace tax accrues to the exporting region instead.
+/// Unlike power, the grant carries identity: the producer's `workplace` (a region-tagged
+/// `CityEntityRef`, owned by the producer; the consumer never dereferences it, only
+/// stores/echoes it) and the `salary` the home region pays the worker. Workplace tax
+/// accrues to the exporting region instead. (`source_region`/`position` stay equal to
+/// `workplace.region`/the workplace cell until CW4 collapses them.)
 pub struct JobExportGrant {
     pub token: u32,
     pub granted: bool,
     pub source_region: Option<RegionId>,
     pub position: Option<Position>,
-    pub slot_id: Option<u32>,
+    pub workplace: Option<CityEntityRef>,
     pub salary: i32,
 }
 
@@ -418,10 +421,13 @@ impl RegionState {
     }
 
     #[cfg(test)]
-    /// Owned `(source region, slot id)` pairs for citizens working remotely.
+    /// Owned `(source region, producer workplace entity id)` pairs for citizens
+    /// working remotely.
     ///
-    /// This test-only summary verifies remote jobs store owned opaque ids, never a
-    /// remote ECS entity. UI should use facade snapshots instead.
+    /// This test-only summary reads the producer-owned `CityEntityRef` a remote job
+    /// stores. The consumer never dereferences that ref locally (its region is the
+    /// producer's); the region tag is what makes carrying it safe. UI should use facade
+    /// snapshots instead.
     pub(crate) fn imported_job_slots(&self) -> Vec<(RegionId, u32)> {
         let mut slots = self
             .world
@@ -430,7 +436,9 @@ impl RegionState {
             .filter_map(|citizen| {
                 let assignment = citizen.workplace_assignment?;
                 match assignment.source {
-                    WorkplaceSource::Remote { slot_id } => Some((assignment.region, slot_id)),
+                    WorkplaceSource::Remote { workplace } => {
+                        Some((assignment.region, workplace.entity.0))
+                    }
                     WorkplaceSource::Local { .. } => None,
                 }
             })
@@ -677,8 +685,8 @@ impl RegionState {
         if !grant.granted {
             return;
         }
-        let (Some(source_region), Some(position), Some(slot_id)) =
-            (grant.source_region, grant.position, grant.slot_id)
+        let (Some(source_region), Some(position), Some(workplace)) =
+            (grant.source_region, grant.position, grant.workplace)
         else {
             return;
         };
@@ -692,7 +700,7 @@ impl RegionState {
             region: source_region,
             position,
             salary: grant.salary,
-            source: WorkplaceSource::Remote { slot_id },
+            source: WorkplaceSource::Remote { workplace },
         });
         self.world.invalidate_jobs_registry();
     }
@@ -1063,7 +1071,7 @@ mod tests {
                 granted: true,
                 source_region: Some(RegionId(2)),
                 position: Some(Position { x: 1, y: 0 }),
-                slot_id: Some(42),
+                workplace: Some(CityEntityRef::local(RegionId(2), Entity(42))),
                 salary: 4,
             },
         );
@@ -1100,7 +1108,7 @@ mod tests {
                 granted: true,
                 source_region: Some(RegionId(2)),
                 position: Some(Position { x: 1, y: 0 }),
-                slot_id: Some(9),
+                workplace: Some(CityEntityRef::local(RegionId(2), Entity(9))),
                 salary: 4,
             },
         );

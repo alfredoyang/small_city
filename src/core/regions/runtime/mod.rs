@@ -80,6 +80,7 @@
 //!                  West:offset 0
 //! ```
 
+use crate::core::city_refs::CityEntityRef;
 use crate::core::entity::Entity;
 use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionCommandResponse, RegionSnapshotResponse,
@@ -1105,7 +1106,7 @@ impl RegionRuntime {
                 granted: false,
                 source_region: None,
                 position: None,
-                slot_id: None,
+                workplace: None,
                 salary: 0,
             };
         };
@@ -1124,7 +1125,7 @@ impl RegionRuntime {
             granted: true,
             source_region: Some(self.region_id()),
             position,
-            slot_id: Some(workplace.0),
+            workplace: Some(CityEntityRef::local(self.region_id(), workplace)),
             salary,
         }
     }
@@ -1559,7 +1560,10 @@ mod tick_state_tests {
             granted: true,
             source_region: Some(RegionId(2)),
             position: Some(crate::core::components::Position { x: 0, y: 0 }),
-            slot_id: Some(0),
+            workplace: Some(crate::core::city_refs::CityEntityRef::local(
+                RegionId(2),
+                crate::core::entity::Entity(0),
+            )),
             salary: 4,
         }));
         let outbound = runtime.process_next_event();
@@ -1666,7 +1670,10 @@ mod tick_state_tests {
                 networks[0],
             ));
             assert!(grant.granted, "caller A takes bridge slot {token}");
-            assert_eq!(grant.slot_id, Some(bridge[0].0));
+            assert_eq!(
+                grant.workplace.map(|workplace| workplace.entity),
+                Some(bridge[0])
+            );
         }
 
         // Caller B (a different component) requests a slot of the same building via

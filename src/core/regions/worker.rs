@@ -1013,7 +1013,7 @@ impl ExportResource for JobExport {
             granted: false,
             source_region: None,
             position: None,
-            slot_id: None,
+            workplace: None,
             salary: 0,
         }
     }

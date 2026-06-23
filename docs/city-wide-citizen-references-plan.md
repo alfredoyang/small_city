@@ -179,52 +179,59 @@ opaque ids (`RegionalAvailabilityHint.spare_job_slot_ids` in `worker.rs` /
 `directory.rs`). Do **not** rely on "slot_id is literally the entity." Instead:
 
 - Change the authoritative grant to carry the producer's workplace explicitly:
-  `JobExportGrant { workplace: CityEntityRef, location: CityCellRef, salary, .. }`
-  (replacing `source_region` + `position` + `slot_id`). The producer already has the
-  `Entity` and its `Position` when it grants — it just packages them typed.
+  swap `slot_id: Option<u32>` for `workplace: Option<CityEntityRef>`. The producer
+  already has the `Entity` when it grants — it just packages it region-tagged. Keep
+  `source_region` / `position` / `salary` for now (they stay equal to
+  `workplace.region` / the workplace cell; the redundancy is removed in CW4).
 - `apply_job_export_grant` stores `Remote { workplace }` directly; no `u32`
   reinterpretation anywhere.
-- Update the consumers of the old `slot_id`: `imported_job_slots` (test summary),
-  `imported_job_count`, and the `remote_workers_for` reverse lookup (match by
-  `workplace`/`location` instead of `(region, position)`).
+- Update the old `slot_id` consumer `imported_job_slots` (test summary) to read
+  `workplace.entity.0`.
 - **Leave the discovery hints alone.** `spare_job_slot_ids` stays an opaque
   stale-tolerant availability counter; it is a *hint*, not bound identity, and the
   authoritative binding now lives in the grant's `CityEntityRef`.
 
-### `WorkplaceAssignment` shape
+### `WorkplaceAssignment` shape (unchanged in CW3)
+
+CW3 keeps the existing shape and only retypes what the `source` variants carry — this
+is the minimal, behavior-neutral retype:
 
 ```text
 WorkplaceAssignment {
-    source:   WorkplaceSource,   // Local { workplace } | Remote { workplace }
-    location: CityCellRef,       // { region, x, y } self-describing workplace cell, for
-                                 //   display/roster (a remote entity can't be deref'd)
+    region:   RegionId,          // == source.workplace.region (collapsed away in CW4)
+    position: Position,          // workplace cell (becomes a CityCellRef in CW4)
     salary:   i32,
+    source:   WorkplaceSource,   // Local { workplace: CityEntityRef } | Remote { workplace: CityEntityRef }
 }
 ```
 
-`location.region` must equal the `workplace.region` inside `source`; keep them in sync
-at the single write site (local assignment / `apply_job_export_grant`). The redundant
-top-level `region`/`position` fields collapse into `source.workplace` + `location`.
+- **Local job:** `Local { workplace: { region: self, entity } }`; salary/tax read
+  `workplace.entity` (a local assignment's workplace is local) — behaves exactly as
+  today.
+- **Remote job:** `Remote { workplace: { region: producer, entity } }`. The producer
+  still settles workplace tax from its own export ledger (keyed by its own entity), so
+  this changes no economy behavior.
 
-- **Local job:** `Local { workplace: { region: self, entity } }`; `as_local(self)`
-  resolves the entity — local systems behave exactly as today.
-- **Remote job:** `Remote { workplace: { region: producer, entity } }`; `as_local(self)`
-  is `None`. The producer still settles workplace tax from its own export ledger (keyed
-  by its own entity), so this changes no economy behavior.
+The `region`/`position` → `CityCellRef location` collapse and the `as_local`-based
+local/remote discriminator land in **CW4** with the enum removal.
 
 Tests:
 
-- Local job: `as_local(self)` resolves the workplace; salary paid; `location` shown.
-- Remote job: grant round-trips a typed `CityEntityRef`; `as_local(self)` is `None`;
-  the roster resolves through `location`.
-- `location.region` matches the `source.workplace.region` for every assignment.
+- Local job: salary paid; assignment still exposes the workplace cell.
+- Remote job: grant round-trips a typed `CityEntityRef`; `imported_job_slots` reports
+  the producer entity id.
 - No `slot_id`→entity reinterpretation remains; discovery hints unchanged.
 
 ## Patch CW4 — Drop `WorkplaceSource`
 
-Only after CW3 proves the `CityEntityRef` path. The enum's `Local`/`Remote` tag is now
-redundant with the region tag, so collapse `source: WorkplaceSource` to a single
-`workplace: CityEntityRef`; local-vs-remote becomes `workplace.region == self.id`.
+Only after CW3 proves the `CityEntityRef` path. Two collapses land together here:
+
+- The enum's `Local`/`Remote` tag is now redundant with the region tag, so collapse
+  `source: WorkplaceSource` to a single `workplace: CityEntityRef`; local-vs-remote
+  becomes `workplace.region == self.id`.
+- The now-redundant `region`/`position` fields collapse into a self-describing
+  `location: CityCellRef` (`location.region == workplace.region`), and the grant drops
+  its `source_region`/`position` in favor of `workplace` + `location`.
 
 This is **deliberately its own patch** because it is broad — it touches the adapter
 roster, economy salary logic, `imported_job_count`, the `remote_workers_for` reverse

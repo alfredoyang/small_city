@@ -180,7 +180,7 @@ fn citizen_roster(world: &World, x: usize, y: usize) -> Vec<CitizenDetailView> {
             .filter(|(_, citizen)| {
                 matches!(
                     citizen.workplace_assignment.map(|assignment| assignment.source),
-                    Some(WorkplaceSource::Local { entity: workplace }) if workplace == entity
+                    Some(WorkplaceSource::Local { workplace }) if workplace.entity == entity
                 )
             })
             .collect(),

@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use crate::core::city_refs::CityEntityRef;
 use crate::core::components::{
     BuildingData, BusinessFinance, Citizen, WorkplaceAssignment, WorkplaceSource,
 };
@@ -157,10 +158,12 @@ pub(crate) fn run_with_goods_exports(
                     .unwrap_or(0),
                 0,
             ),
-            Some(WorkplaceSource::Local { entity: workplace }) => {
-                // Re-check local workplace effectiveness at settlement time. The
-                // assignment stores salary for UI, but local tax/salary should
-                // still reflect the authoritative current local world state.
+            Some(WorkplaceSource::Local { workplace }) => {
+                // A local assignment's workplace is in this region, so `.entity` is its
+                // local id. Re-check local workplace effectiveness at settlement time:
+                // the assignment stores salary for UI, but local tax/salary should still
+                // reflect the authoritative current local world state.
+                let workplace = workplace.entity;
                 salary_for_workplace(world, workplace)
                     .map(|salary| (salary, workplace_tax_for_workplace(world, workplace)))
                     .unwrap_or((0, 0))
@@ -372,7 +375,9 @@ fn apply_workplace_assignments(
                 region: local_region,
                 position: *world.positions.get(&workplace)?,
                 salary: salary_for_workplace(world, workplace).unwrap_or(0),
-                source: WorkplaceSource::Local { entity: workplace },
+                source: WorkplaceSource::Local {
+                    workplace: CityEntityRef::local(local_region, workplace),
+                },
             })
         });
         if let Some(citizen) = world.citizens.get_mut(&assignment.citizen) {
@@ -958,6 +963,7 @@ pub(crate) fn maintenance_for_building(kind: BuildingKind, level: u8) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{EconomyIndex, assign_local_jobs, run};
+    use crate::core::city_refs::CityEntityRef;
     use crate::core::components::{Position, WorkplaceAssignment, WorkplaceSource};
     use crate::core::entity::Entity;
     use crate::core::regions::RegionId;
@@ -1010,7 +1016,9 @@ mod tests {
             region: RegionId(2),
             position: Position { x: 3, y: 0 },
             salary: 4,
-            source: WorkplaceSource::Remote { slot_id: 7 },
+            source: WorkplaceSource::Remote {
+                workplace: CityEntityRef::local(RegionId(2), Entity(7)),
+            },
         });
 
         assign_local_jobs(&mut world, RegionId(1));
@@ -1024,7 +1032,8 @@ mod tests {
         assert_eq!(assignment.region, RegionId(2));
         assert!(matches!(
             assignment.source,
-            WorkplaceSource::Remote { slot_id: 7 }
+            WorkplaceSource::Remote { workplace }
+                if workplace == CityEntityRef::local(RegionId(2), Entity(7))
         ));
     }
 

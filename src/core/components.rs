@@ -246,9 +246,15 @@ pub struct WorkplaceAssignment {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Internal source identity for a workplace assignment.
+///
+/// Both variants now carry a city-wide `CityEntityRef` to the workplace building: a
+/// `Local` job's `workplace.region` is this region (so `as_local` resolves it), a
+/// `Remote` job's is the producer region (a foreign ref the consumer never
+/// dereferences — it only echoes it / reads its cell). The enum tag is redundant with
+/// `workplace.region` and is removed in CW4.
 pub enum WorkplaceSource {
-    Local { entity: Entity },
-    Remote { slot_id: u32 },
+    Local { workplace: CityEntityRef },
+    Remote { workplace: CityEntityRef },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
