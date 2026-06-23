@@ -89,8 +89,8 @@ fn inspect_and_cell_view_show_local_citizen_workplace_tile() {
         .and_then(|cell| cell.job_assignments.first().copied())
         .expect("cell assignment");
 
-    assert_eq!(assignment.region.0, 1);
-    assert_eq!((assignment.x, assignment.y), (2, 0));
+    assert_eq!(assignment.cell.region.0, 1);
+    assert_eq!((assignment.cell.x, assignment.cell.y), (2, 0));
     assert_eq!(assignment.salary, 3);
     assert!(!assignment.is_remote);
     assert_eq!(cell_assignment, assignment);
@@ -123,12 +123,10 @@ fn roster_lists_residents_with_their_workplace_and_workers_with_their_home() {
     assert!(matches!(
         residential.roster[0].relation,
         CitizenRelation::WorksAt {
-            x: 2,
-            y: 0,
+            cell,
             salary: 3,
             is_remote: false,
-            ..
-        }
+        } if cell.x == 2 && cell.y == 0
     ));
 
     // Workplace roster: the local worker, tagged with where they live.

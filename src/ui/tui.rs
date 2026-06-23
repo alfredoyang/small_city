@@ -1473,13 +1473,13 @@ fn render_citizen_panel(
 /// a remote region. `Unemployed` rows have nowhere to jump.
 ///
 /// ```text
-///   WorksAt { region, x, y } -> Some((Some(region), x, y))   resident -> workplace
-///   LivesAt { region, x, y } -> Some((region, x, y))         worker   -> home (region: Option)
+///   WorksAt { cell, .. }     -> Some((Some(cell.region), cell.x, cell.y))   resident -> workplace
+///   LivesAt { region, x, y } -> Some((region, x, y))                        worker   -> home (region: Option)
 ///   Unemployed               -> None
 /// ```
 fn relation_target(relation: CitizenRelation) -> Option<(Option<RegionId>, usize, usize)> {
     match relation {
-        CitizenRelation::WorksAt { region, x, y, .. } => Some((Some(region), x, y)),
+        CitizenRelation::WorksAt { cell, .. } => Some((Some(cell.region), cell.x, cell.y)),
         CitizenRelation::LivesAt { region, x, y } => Some((region, x, y)),
         CitizenRelation::Unemployed => None,
     }
@@ -1490,16 +1490,14 @@ fn relation_target(relation: CitizenRelation) -> Option<(Option<RegionId>, usize
 fn relation_text(citizen: &CitizenDetailView) -> String {
     match citizen.relation {
         CitizenRelation::WorksAt {
-            region,
-            x,
-            y,
+            cell,
             salary,
             is_remote,
         } => {
             let location = if is_remote {
-                format!("region {} ({},{})", region.0, x, y)
+                format!("region {} ({},{})", cell.region.0, cell.x, cell.y)
             } else {
-                format!("({x},{y})")
+                format!("({},{})", cell.x, cell.y)
             };
             format!("{location} · ${salary}")
         }
@@ -3117,6 +3115,7 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::city_refs::CityCellRef;
     use crate::core::regional_game::RegionalGame;
     use crate::core::regions::RegionId;
     use crate::interface::view::{InspectFlag, LocalEffectsView, RoadLinks};
@@ -4010,9 +4009,7 @@ mod tests {
         // Resident -> workplace (always carries a region).
         assert_eq!(
             relation_target(CitizenRelation::WorksAt {
-                region: RegionId(2),
-                x: 3,
-                y: 4,
+                cell: CityCellRef::local(RegionId(2), 3, 4),
                 salary: 5,
                 is_remote: true,
             }),
@@ -4085,7 +4082,7 @@ mod tests {
         assert!(
             matches!(
                 roster.first().map(|c| c.relation),
-                Some(CitizenRelation::WorksAt { x: 3, y: 0, .. })
+                Some(CitizenRelation::WorksAt { cell, .. }) if cell.x == 3 && cell.y == 0
             ),
             "expected an employed resident, got {:?}",
             roster.first().map(|c| c.relation)
@@ -4115,9 +4112,7 @@ mod tests {
             happiness: 72,
             money: 14,
             relation: CitizenRelation::WorksAt {
-                region: RegionId(1),
-                x: 2,
-                y: 0,
+                cell: CityCellRef::local(RegionId(1), 2, 0),
                 salary: 3,
                 is_remote: false,
             },
@@ -4126,9 +4121,7 @@ mod tests {
 
         let remote = CitizenDetailView {
             relation: CitizenRelation::WorksAt {
-                region: RegionId(2),
-                x: 1,
-                y: 1,
+                cell: CityCellRef::local(RegionId(2), 1, 1),
                 salary: 4,
                 is_remote: true,
             },
@@ -4183,9 +4176,7 @@ mod tests {
                     happiness: 72,
                     money: 14,
                     relation: CitizenRelation::WorksAt {
-                        region: RegionId(1),
-                        x: 2,
-                        y: 0,
+                        cell: CityCellRef::local(RegionId(1), 2, 0),
                         salary: 3,
                         is_remote: false,
                     },

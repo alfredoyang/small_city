@@ -941,8 +941,8 @@ fn cross_region_job_export_is_visible_as_producer_workplace_tile() {
         .and_then(|cell| cell.job_assignments.first().copied())
         .expect("cell remote assignment");
 
-    assert_eq!(assignment.region, RegionId(61));
-    assert_eq!((assignment.x, assignment.y), (0, 1));
+    assert_eq!(assignment.cell.region, RegionId(61));
+    assert_eq!((assignment.cell.x, assignment.cell.y), (0, 1));
     assert_eq!(assignment.salary, 4);
     assert!(assignment.is_remote);
     assert_eq!(cell_assignment, assignment);

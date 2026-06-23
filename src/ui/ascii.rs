@@ -816,7 +816,11 @@ fn format_job_assignments(assignments: &[crate::interface::view::JobAssignmentVi
             };
             format!(
                 "{} R{} ({}, {}) salary {}",
-                scope, assignment.region.0, assignment.x, assignment.y, assignment.salary
+                scope,
+                assignment.cell.region.0,
+                assignment.cell.x,
+                assignment.cell.y,
+                assignment.salary
             )
         })
         .collect::<Vec<_>>()

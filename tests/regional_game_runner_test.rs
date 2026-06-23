@@ -308,7 +308,7 @@ fn three_worker_runner_routes_cross_worker_job_export_in_3x3_region_grid() {
         .first()
         .copied()
         .expect("remote job assignment");
-    assert_eq!(assignment.region, producer);
+    assert_eq!(assignment.cell.region, producer);
     assert!(assignment.is_remote);
     runner.shutdown().unwrap();
 }

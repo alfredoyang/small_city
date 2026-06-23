@@ -1,5 +1,6 @@
 //! UI-safe view models used by renderers instead of exposing ECS internals.
 
+use crate::core::city_refs::CityCellRef;
 use crate::core::regions::RegionId;
 use crate::interface::input::BuildingKind;
 
@@ -51,9 +52,9 @@ pub struct CellView {
 ///
 /// Local ECS entity ids and remote producer slot ids are intentionally omitted.
 pub struct JobAssignmentView {
-    pub region: RegionId,
-    pub x: usize,
-    pub y: usize,
+    /// The workplace cell, region-tagged (self-describing). `is_remote` is derived from
+    /// whether `cell.region` is the inspected region.
+    pub cell: CityCellRef,
     pub salary: i32,
     pub is_remote: bool,
 }
@@ -82,9 +83,8 @@ pub struct CitizenDetailView {
 pub enum CitizenRelation {
     /// Residential roster: where this resident works (local or remote region).
     WorksAt {
-        region: RegionId,
-        x: usize,
-        y: usize,
+        /// The workplace cell, region-tagged (self-describing).
+        cell: CityCellRef,
         salary: i32,
         is_remote: bool,
     },

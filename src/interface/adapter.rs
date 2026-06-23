@@ -204,9 +204,7 @@ fn citizen_relation(world: &World, kind: BuildingKind, citizen: &Citizen) -> Cit
     match kind {
         BuildingKind::Residential => match citizen.workplace_assignment {
             Some(assignment) => CitizenRelation::WorksAt {
-                region: assignment.workplace.region,
-                x: assignment.location.x,
-                y: assignment.location.y,
+                cell: assignment.location,
                 salary: assignment.salary,
                 is_remote: assignment.workplace.region != world.region_id,
             },
@@ -811,9 +809,7 @@ fn job_assignment_views_for_home(
         .filter_map(|(_, citizen)| {
             let assignment = citizen.workplace_assignment?;
             Some(JobAssignmentView {
-                region: assignment.workplace.region,
-                x: assignment.location.x,
-                y: assignment.location.y,
+                cell: assignment.location,
                 salary: assignment.salary,
                 is_remote: assignment.workplace.region != world.region_id,
             })

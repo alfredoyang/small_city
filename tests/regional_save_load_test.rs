@@ -300,8 +300,8 @@ fn save_load_rebuilds_local_job_assignment_visibility_immediately() {
         .expect("loaded local assignment");
 
     assert_eq!(loaded_assignment, before_assignment);
-    assert_eq!(loaded_assignment.region, RegionId(1));
-    assert_eq!((loaded_assignment.x, loaded_assignment.y), (2, 0));
+    assert_eq!(loaded_assignment.cell.region, RegionId(1));
+    assert_eq!((loaded_assignment.cell.x, loaded_assignment.cell.y), (2, 0));
     assert!(!loaded_assignment.is_remote);
 
     remove_save_file(path);

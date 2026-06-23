@@ -204,7 +204,7 @@ fn remote_spare_jobs_allow_connected_residential_population_growth() {
         .first()
         .copied()
         .expect("remote job assignment");
-    assert_eq!(assignment.region, RegionId(2));
+    assert_eq!(assignment.cell.region, RegionId(2));
     assert!(assignment.is_remote);
 }
 
@@ -369,7 +369,7 @@ fn bridged_remote_workplace_is_not_double_counted_for_population_growth() {
     assert!(
         job_assignments
             .iter()
-            .all(|assignment| { assignment.region == RegionId(2) && assignment.is_remote })
+            .all(|assignment| { assignment.cell.region == RegionId(2) && assignment.is_remote })
     );
 }
 
