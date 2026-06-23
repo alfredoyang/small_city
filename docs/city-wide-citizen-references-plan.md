@@ -259,11 +259,15 @@ Only after CW1-CW4 are working:
 - Consider storing `Citizen.id: CitizenId` if deriving it at call sites becomes noisy.
 - Consider replacing more view-facing `(region, x, y)` tuples with `CityCellRef`.
 - **Make `Entity` city-wide unique — prerequisite for Model B (citizen relocation).**
-  Chosen direction: a citizen's `Citizen` component can be *moved* into another region's
-  `World` (permanent relocation, where it then ticks in the new region), so a migrated
-  entity must never collide with the destination's own local ids. (Model A — only a
-  `CityEntityRef`/`CitizenId` crosses while the entity stays home — does **not** need
-  this; Model B does.)
+  The two cross-region paths **coexist**, by scope:
+  - **Commute (temporary, daily) → Model A, unchanged.** Refs cross
+    (`CityEntityRef`/`CitizenId`), the entity stays in its home `World`. This is the
+    traffic plan §5 token handoff and keeps its "entity never migrates" rule. Needs no
+    `Entity` change.
+  - **Relocation (permanent, rare) → Model B.** A citizen's `Citizen` component is
+    *moved* into another region's `World` and ticks there. The migrated entity must
+    never collide with the destination's own local ids — hence a city-wide-unique
+    `Entity`.
   - **Design: birth-tagged region-partitioned id.** `World::spawn` mints
     `Entity { region: RegionId /* birth */, local: u32 }` (or packed
     `Entity(u64) = (region.0 << 32) | local`) from `world.region_id`. The region is the
@@ -286,9 +290,9 @@ Only after CW1-CW4 are working:
   > Model B is bigger than this id change: relocating a `Citizen` also needs a
   > cross-region **migration message** that transfers the serialized component across the
   > share-nothing boundary, re-homes it to a destination building, and removes it from the
-  > origin's maps — and it **reopens the traffic plan §5 assumption** that "the entity
-  > never migrates." Those belong in a dedicated relocation mission; the city-wide-unique
-  > `Entity` here is its foundation.
+  > origin's maps. It does **not** replace §5 — commuting still uses Model A; relocation
+  > is the separate path that migrates. Those belong in a dedicated relocation mission;
+  > the city-wide-unique `Entity` here is its foundation.
 
 Skip the other items until the code asks for them; the `Entity` change lands with the
 relocation mission, not before.
