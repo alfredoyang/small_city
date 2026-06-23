@@ -258,25 +258,40 @@ Only after CW1-CW4 are working:
 
 - Consider storing `Citizen.id: CitizenId` if deriving it at call sites becomes noisy.
 - Consider replacing more view-facing `(region, x, y)` tuples with `CityCellRef`.
-- Consider making `Entity` itself city-wide unique. **Weigh whether it earns its keep
-  first:** `CityEntityRef { region, entity }` already provides city-wide uniqueness at
-  the reference layer (that is what CW1–CW4 deliver), so the only gain is ergonomic
-  (passing one value instead of a `(region, entity)` pair).
-  - If pursued, the **only** determinism- and share-nothing-safe scheme is a
-    **region-partitioned id** minted locally at `World::spawn` from `world.region_id`
-    (CW2): e.g. `Entity { region: RegionId, local: u32 }` or packed
-    `Entity(u64) = (region.0 << 32) | local`, with a cheap `Entity::region()` extractor.
-    Each region keeps its own deterministic `local` counter, so ids stay reproducible
-    with no cross-thread allocator.
-  - A **global/shared atomic counter is rejected**: it makes ids depend on thread
-    interleaving (breaking saves/replays/parity) and reintroduces cross-region
-    coordination the share-nothing model forbids.
-  - Note this effectively *merges* `Entity` and `CityEntityRef` (a region-tagged
-    `Entity` is `CityEntityRef`), and is a **save-format migration**: either re-encode
-    every stored entity id, or keep bare-local ids on disk and re-pack at the load
-    boundary (mirroring CW2's `home_serde` placeholder-then-stamp pattern).
+- **Make `Entity` city-wide unique — prerequisite for Model B (citizen relocation).**
+  Chosen direction: a citizen's `Citizen` component can be *moved* into another region's
+  `World` (permanent relocation, where it then ticks in the new region), so a migrated
+  entity must never collide with the destination's own local ids. (Model A — only a
+  `CityEntityRef`/`CitizenId` crosses while the entity stays home — does **not** need
+  this; Model B does.)
+  - **Design: birth-tagged region-partitioned id.** `World::spawn` mints
+    `Entity { region: RegionId /* birth */, local: u32 }` (or packed
+    `Entity(u64) = (region.0 << 32) | local`) from `world.region_id`. The region is the
+    **birth** region, fixed for life: a citizen born in A keeps `Entity(A, n)` after
+    moving to B, and never collides with B's own `Entity(B, _)`. Per-region deterministic
+    counter, no shared allocator (share-nothing + determinism preserved). This converges
+    `Entity`, `CitizenId`, and `CityEntityRef` — a birth-tagged `Entity` already is a
+    stable city-wide id; decide whether to collapse the aliases.
+  - **A global/shared atomic counter is rejected**: non-deterministic across worker
+    threads (breaks saves/replays/parity) and reintroduces forbidden cross-region
+    coordination.
+  - **Save migration — birth region is now persisted per entity.** Unlike `Citizen.home`
+    (always local, so CW2 could placeholder-then-stamp at load), a migrated entity's
+    birth region is **not** derivable from the `World` it currently lives in, so the id
+    must be serialized *with* its region. No placeholder trick.
+  - **Ownership semantics shift:** after migration the region bits mean "born in," not
+    "owned by." Owner = whichever `World` holds the entity; `Entity::region()` is no
+    longer an owner lookup.
 
-Skip these until the code asks for them.
+  > Model B is bigger than this id change: relocating a `Citizen` also needs a
+  > cross-region **migration message** that transfers the serialized component across the
+  > share-nothing boundary, re-homes it to a destination building, and removes it from the
+  > origin's maps — and it **reopens the traffic plan §5 assumption** that "the entity
+  > never migrates." Those belong in a dedicated relocation mission; the city-wide-unique
+  > `Entity` here is its foundation.
+
+Skip the other items until the code asks for them; the `Entity` change lands with the
+relocation mission, not before.
 
 > Cross-region travel itself (passing a traveler between regions) is **out of scope
 > here** — it belongs to the future pathfinding/traffic work and will build on these
