@@ -2,6 +2,7 @@
 
 pub mod building_rules;
 pub mod building_stats;
+pub mod city_refs;
 pub mod components;
 pub mod entity;
 pub mod grid;
