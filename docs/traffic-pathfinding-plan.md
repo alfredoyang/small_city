@@ -1,7 +1,7 @@
 # Traveling Citizens — pathfinding, movement, and animation
 
-Status: **planned (not implemented).** Core/simulation feature with a thin UI
-surface. Supersedes the earlier "traffic via path reconstruction" draft; the
+Status: **P1–P4 implemented** (see "Implemented (P1–P4)" at the end); P5/P6 optional
+and unbuilt. Core/simulation feature with a thin UI surface. Supersedes the earlier "traffic via path reconstruction" draft; the
 headline goal changed from a per-cell heatmap to **citizens that visibly move to
 their destinations**, so the architecture is built around per-citizen movement, not
 an aggregate load scalar. (A heatmap can still fall out as an optional consumer —
@@ -33,7 +33,8 @@ Region (World):                                    adapter ─► CitizenTravelV
   per-citizen travel state:
     TravelState { destination, current_cell, status }
   movement system: advance travelers each tick
-  cross-region: each region animates its own half (no handoff — §5)
+  cross-region: the SAME token crosses on a RegionEvent to the neighbor's travel
+    map (entity never migrates; no separate proxy) — §5
 ```
 
 Two hard rules this design exists to honour:
@@ -167,7 +168,7 @@ remove building E ─► scan citizens for references to E:
                        home == E       ─► citizen is homeless (existing residential-
                                            removal path handles despawn/rehome)
                        workplace == E   ─► clear workplace_assignment (job phase)
-                       destination == E ─► redirect to home (status Returning)
+                       destination == E ─► retarget the token to home
                      drop route_cache entries where destination == E
 ```
 
@@ -218,7 +219,7 @@ If the target has **no road route** from the origin (different `RoadNetwork`, or
 disconnected), the citizen does **not** teleport: its destination falls back to
 **home**. If home is also unreachable or it is already home, it stays put (`AtHome`,
 no dot). "Return home if it happens." (A *cross-region* workplace is not unreachable —
-it targets the border-exit cell instead; see §5.)
+it targets the border-exit cell, then hands a token across the border; see §5.)
 
 ### 4c. Granularity / determinism / persistence
 
@@ -234,66 +235,153 @@ it targets the border-exit cell instead; see §5.)
   movement system rebuilds placement from the current hour and each citizen's
   assignments. No save-format change.
 
-`TravelStatus` sketch: `AtHome | Commuting | AtWork | AtLeisure | CommutingAway | Returning`.
+`TravelStatus` sketch: `AtHome | Commuting | AtWork | AtLeisure | Away` (the token is
+out in a neighbor region; the home side neither draws nor dispatches W until `Return`).
 `Direction`: a 4-way orthogonal enum (roads are orthogonal); at a destination (no
 next cell) keep the last facing.
 
 ---
 
-## 5. Cross-region travel — two independent halves, no handoff
+## 5. Cross-region travel — a real token handoff over a crossing message
 
-The UI shows **one region at a time**, so a single dot crossing the seam is never
-visible. So we don't move one dot across — each region animates **its own half**, and
-the two halves are never synchronized or shared.
+A cross-region commuter must **cross**: one logical traveler leaves region A at the
+border, its **token** is handed to region B and walks to the workplace, where it
+**waits**; when the workday ends the token is removed and a **return** message tells A
+the traveler is home again — all carried by an explicit **crossing message**. This is
+the authoritative design (it replaces the earlier "no handoff" sketch).
 
-A cross-region worker `W` already has everything we need: `W.workplace_assignment =
-Remote { region: B, position }` (built by the job-export phase), and `B` already
-computes how many remote workers each of its workplaces hosts (the remote-workers
-feature). Nothing else is added.
+Share-nothing still holds: the citizen **entity never migrates**, and there is no
+separate "proxy" — there is just the one **token** (the §2 `TravelState`), the same
+thing that already represents *local* movement. What crosses is that token, routed as a
+`RegionEvent` over the *same* border topology (`RegionNeighborLink` / `BorderLinkId`)
+and worker routing that already carry power/job/goods exports. While the token is
+visiting B it is the **single representation** of the away traveler and the only thing
+drawn as a dot; the home side keeps no parked movement state — while the token is out it
+simply does not dispatch or draw W.
 
 ```text
-   REGION A  (home — owns W's entity)              REGION B  (hosts the job)
-   ┌──────────────────────────────────┐            ┌──────────────────────────────────┐
-   │ when viewing A you see W's dot:   │            │ when viewing B you see anon dots: │
-   │   09:00 home ─►(route cache)─►    │            │   per local workplace with        │
-   │         A.border-exit toward B    │  ░░ border │     remote_count > 0:             │
-   │         arrive ─► CommutingAway   │  ░░░░░░░░░  │     spawn remote_count dots,      │
-   │   15:00 border-exit ─► leisure    │  ░░ never  │     looping                       │
-   │   22:00 ─► home                   │     seen   │     B.border-entry ─► workplace   │
-   │                                   │     at the │                                   │
-   │ input: W.workplace_assignment     │     same   │ input: remote-worker count per    │
-   │        (Remote → region B)        │     time   │        workplace (already known), │
-   │        + A's border-exit cell     │            │        + B's border-entry cell    │
-   │ ALL LOCAL to A — no neighbour read │            │ ALL LOCAL to B — no neighbour read │
-   └──────────────────────────────────┘            └──────────────────────────────────┘
+   REGION A  (home — owns W's entity)         border          REGION B  (hosts the token while away)
+   ┌─────────────────────────────────┐    RegionNeighborLink  ┌─────────────────────────────────┐
+   │ W's token: home ─route─► exit    │       (topology)       │ ReceiveTraveler(token, Outbound)│
+   │ on exit cell ─► EMIT ───────────┼──►  TravelerHandoff ──► ┼─► insert token AT entry cell    │
+   │   handoff{ token, id, link }    │     (crossing msg,      │   token: entry ─route─► workplace│
+   │ remove local token, mark W away │      one-tick-stale)    │   token WAITS at workplace (dot)│
+   │   no dot, schedule skips W       │                         │   ── workday ends ──            │
+   │                                 │                         │   EMIT return ─┐  remove token  │
+   │ ReceiveTraveler(Return) ◄───────┼──  TravelerHandoff   ◄──┼────────────────┘  (dot gone)    │
+   │ clear away mark ─► W = AtHome   │     (crossing msg)      │                                 │
+   └─────────────────────────────────┘                        └─────────────────────────────────┘
+   owns W's entity the whole time;            entity NEVER copied across;       the token IS the dot;
+   the token is the only thing that crosses    token is owned + serializable    removed on return ⇒ no dot
 ```
 
-### How a worker "crosses"
+### One token concept — local and cross-region
 
-- **Home side (A), real entity.** During work hours `W`'s travel target is the
-  **border-exit cell** — the road cell on A's edge whose border link reaches B's road
-  network (the same link the job export was assigned over; pick deterministically by
-  `sort_entities_by_position`). `W` routes there with the normal route cache, then
-  idles `CommutingAway` (no dot drawn — it has "left the map"). The schedule walks it
-  back home at 15:00/22:00. **This is just §4b's border-exit target — no new code in
-  the movement system.**
-- **Destination side (B), anonymous proxies.** Purely cosmetic, generated in the
-  adapter, **not** citizens: for each B workplace, read its remote-worker *count* and
-  emit that many dots that loop **B.border-entry → workplace** along B's own route
-  cache. They carry no identity, no link to `W`. (Optional P5; skip it and the worker
-  simply vanishes at A's edge.)
+There is exactly **one** moving thing in this whole design: the **travel token** (the
+`TravelState` from §2 — `{ destination, current_cell, status }`). The `Citizen` entity
+**never moves**; it has no grid position, and locally only the token's `current_cell`
+advances along roads (already true in P3). Cross-region is the *same* token, just
+**handed to the neighbor** — there is no separate "proxy" type. A token is either
+**local** (in its home region's travel map) or **visiting** (handed to a neighbor's
+travel map); same struct, same stepping, same dot renderer either way.
 
-### Why this is enough
+The crossing message wraps that token with the routing it needs to reach the neighbor:
 
-The two halves only have to *look* right from one viewpoint at a time, which they do.
-Nothing crosses the share-nothing boundary: A reads only A's `World`, B reads only
-B's. No token, no proxy lifecycle, no handoff event, no one-tick reconciliation, no
-in-flight save state. Determinism is trivial (each side is a local, deterministic
-animation). If a worker commutes A→B→C, it's just A→border and C drawing arrivals —
-still two independent halves.
+```text
+TravelerHandoff {                         // a RegionEvent, routed by the worker
+    token:      TravelState,              // THE token — same type used for local travel
+    traveler:   TravelerId,               // owned id = (home_region, W.entity, generation)
+    from_region, to_region: RegionId,     // routed by RegionNeighborLink, like an export request
+    entry_link: BorderLinkId,             // sender's exit link; receiver maps it via matching_neighbor_link()
+    return_path: Vec<ReturnHop>,          // multi-hop: push on outbound, pop on return
+    purpose:    Outbound | Return,
+}
 
-Border cells come from the existing `RegionNeighborLink` / `BorderLink` topology that
-already carries the cross-region job export, so even the border lookup is reuse.
+ReturnHop { region: RegionId, entry_link: BorderLinkId }
+```
+
+`TravelerId` carries `W.entity` so the **return** message lets the home region find
+exactly which away citizen to clear — the round-trip identity the handoff guarantees.
+`TravelerId` is **owned data**, never an ECS reference: the neighbor never learns
+`W.entity` *as an entity*, only as an opaque id it echoes back.
+
+### The crossing message (new, mandatory)
+
+Two additions, mirroring the existing export plumbing:
+
+- `RegionEvent::ReceiveTraveler(TravelerHandoff)` — inbox event on the receiving region.
+- `OutboundMessage::TravelerHandedOff(TravelerHandoff)` — the worker routes it to
+  `to_region` by the same `RegionNeighborLink` topology used for job export.
+
+**Key simplification vs. power/jobs/goods:** a handoff is **display-only and
+fire-and-forget**. It does **not** pause the tick — there is no `WaitingFor…`
+continuation, no grant/deny, no reservation ledger. A emits it and finishes its tick;
+B consumes it on its next event pass (**one-tick-stale**, exactly the cross-region
+boundary the rest of the model uses). Nothing blocks, so no deadlock surface and no
+4th `TickState` phase.
+
+### Lifecycle (round trip)
+
+The token is the only moving thing; it crosses on the way out and is simply **removed**
+on the way back (no return walk).
+
+```text
+REGION A  (owns W's entity; entity never moves)        REGION B  (hosts the token while away)
+────────────────────────────────────────────          ───────────────────────────────────────
+09:00 schedule: W's token target = border-exit cell       (no token yet)
+      (§4b reuse: a Remote workplace targets the exit
+       cell toward B, chosen deterministically from
+       RegionNeighborLink + sort_entities_by_position)
+token steps home ─► exit cell  (local route cache, P3)
+token on exit cell:
+  emit TravelerHandoff(Outbound, token, dest=workplace)
+  HAND OFF: remove the local token, mark W "away"     ── worker routes ──►  ReceiveTraveler(Outbound):
+    (so the schedule won't re-create or draw it)                              insert token at entry cell,
+                                                                              dest = workplace
+                                                                            token steps entry ─► workplace
+                                                                              (B's route cache)  — drawn as a dot
+                                                                            token WAITS at workplace (dot stays)
+                                                       ── workday ends ──
+ReceiveTraveler(Return): ◄── worker routes ──            emit TravelerHandoff(Return, token id);
+  remove W's "away" mark ─► W = AtHome                   REMOVE the token (its dot disappears)
+  (next work hour, schedule sends it out again)
+```
+
+Edge cases (all local, deterministic):
+
+- **Token can't reach the workplace** in B (road torn up mid-trip): B removes the token
+  and emits `Return` at once — W goes back to `AtHome`, same as §4b. (No dot lingers.)
+- **W's remote job ends** while away: the next daily job phase clears
+  `workplace_assignment`; with no remote target the schedule keeps W home. A token still
+  out in B self-heals on its own unreachable/return path; the `Return` clears the away
+  mark. No cross-region "cancel" message needed.
+  - TODO(P5): accept `Return` only when `(TravelerId, generation)` matches W's current
+    away token; ignore stale returns from an old trip.
+- **A→B→C chain:** the token carries a `return_path` stack. Each outbound hop pushes the
+  region/link it came from, then hands the same token to the next region. A return pops
+  the stack and routes one hop back; when the stack is empty, the home region clears W's
+  away mark. This keeps multi-hop explicit without adding a second proxy type.
+
+### Determinism, persistence, balance
+
+- **Determinism:** the handoff is a `RegionEvent` processed in FIFO order like every
+  other event; token ids are derived from `(region, entity, generation)`; border cell,
+  entry link, and return-path hops are chosen by `sort_entities_by_position`. Same
+  inputs → same crossing.
+- **One-tick-stale:** B sees the token the tick after A emits it — the standard
+  cross-region latency, not within-tick sync.
+- **Persistence:** the token in flight, the home "away" mark, and any visiting token a
+  neighbor holds are **transient runtime state** (`#[serde(skip)]`), just like local
+  travel state. Save/load drops in-flight crossings; on load the schedule rebuilds
+  placement from the hour and each citizen's assignments (an away W simply restarts its
+  commute). No save-format change.
+- **Balance:** the crossing is **display-only**. Salary, workplace tax, and job
+  identity stay entirely on the existing job-export flow; the token moves no money and
+  feeds no formula. Removing the animation would not change a single economic number.
+
+Border cells come from the existing `RegionNeighborLink` / `BorderLinkId` topology that
+already carries the cross-region job export, so the exit-cell lookup and the
+`matching_neighbor_link()` entry mapping are both reuse.
 
 ---
 
@@ -333,12 +421,17 @@ already carries the cross-region job export, so even the border lookup is reuse.
 - **P4 — view model + UI dots.** adapter `CitizenTravelView`; TUI renders moving
   dots (position + facing). Tests: a moving traveler appears on its current cell with
   the right facing; empty roads show none.
-- **P5 (optional) — incoming-commuter dots.** The home-region leg is already free
-  (P3 + §4b routes a cross-region commuter to its border-exit). This patch only adds
-  the destination-side anonymous dots from border-entry → workplaces, off the
-  remote-worker count. No token/proxy/handoff/event.
-  Tests: a region with N remote workers shows dots moving border-entry → workplace;
-  zero remote workers → none.
+- **P5 (optional) — cross-region token handoff (§5).** The real crossing: route a
+  cross-region commuter's token to its border-exit (P3 + §4b), then **hand the token
+  off** over a new `RegionEvent`. Add `RegionEvent::ReceiveTraveler` +
+  `OutboundMessage::TravelerHandedOff`, worker routing by `RegionNeighborLink`, a
+  small "visiting tokens" map so the neighbor steps the *same* token type entry-cell →
+  workplace (no new proxy type), and an "away" mark on the home side so it stops
+  dispatching/drawing W. Workday-end removes the token (dot gone) and emits `Return`,
+  which clears the away mark. Fire-and-forget (no tick pause, no grant). Tests: a token
+  handed off at A's exit cell arrives at B and steps entry→workplace; `Return` clears
+  the away mark so W is home; an unreachable token returns immediately; round-trip is
+  deterministic.
 - **P6 (optional, parallel).** Aggregate per-cell **traffic load** + `Traffic`
   overlay as a second consumer of P1 routes (the old heatmap); and/or the cosmetic
   sub-cell movement tween. Gameplay coupling (congestion → commute penalty / land
@@ -389,14 +482,19 @@ core TravelState ─► adapter ─► Vec<CitizenTravelView{ x,y,direction,stat
 ```
 UI reads the view model only. Test: a traveler shows on its cell with the right facing; empty roads → none.
 
-**P5 (optional) — incoming-commuter dots** · layer: **interface + ui** · `adapter.rs`, `ui/tui.rs`
+**P5 (optional) — cross-region token handoff** · layer: **core + regions** (+ reuses P4 UI) · `components.rs`, `systems/travel.rs`, `regions/{mod,runtime,worker}.rs`
 ```
-remote-worker count per workplace (existing) ─► adapter: emit N anonymous dots/workplace
-                                                  routing border-entry ─► workplace (reuse route cache)
-                                              ─► tui: same dot renderer as P4
-no new core code/event; home-region leg already done by P3/§4b
+A travel::run: W's token on border-exit cell ─► OutboundMessage::TravelerHandedOff(token)
+               then remove local token + mark W away (schedule skips, no dot)
+worker: route the handoff to to_region by RegionNeighborLink   (same routing as job export)
+B runtime: RegionEvent::ReceiveTraveler ─► insert the SAME token into B's visiting-token map
+B travel::run: step token entry─►workplace or next border; outbound pushes return_path
+               workday ends/unreachable ─► emit Return; return pops one hop at a time
+A runtime: ReceiveTraveler(Return) with empty return_path ─► clear W's away mark ─► W = AtHome
+the token, the away mark, and B's visiting tokens are #[serde(skip)] transient; fire-and-forget (no TickState pause, no grant)
+adapter: B's visiting tokens feed the SAME CitizenTravelView path as P4 (one token type, one dot renderer)
 ```
-Test: region with N remote workers → N dots border-entry→workplace; zero → none.
+Test: token handed off at A.exit arrives at B and steps entry→workplace; Return clears the away mark so W is home; unreachable token returns; stale Return is ignored; A→B→C unwinds through B; round-trip deterministic.
 
 **P6 (optional, parallel)** · layer: varies
 ```
@@ -418,8 +516,11 @@ Each a separate mission; heatmap is a 2nd consumer of P1, tween is pure UI.
   heuristic ceiling in a `// traffic:` comment.
 - **Layering:** core computes status/position/direction; the UI renders the view
   model only and never reads ECS or paths.
-- **Cross-region:** no handoff — each region animates only its own roads (§5), so
-  there is no neighbour read at all. A commuter just routes to its border-exit.
+- **Cross-region:** a real token handoff (§5) over a new `RegionEvent`, routed by the
+  existing border topology. The entity never migrates and there is no separate proxy —
+  the *same* token is handed to the neighbor's travel map. The token is
+  owned/serializable-skip, fire-and-forget (no tick pause, no grant), one-tick-stale —
+  so it adds no deadlock surface and no economic coupling.
 - **Balance:** movement/animation through P5 is display-only — it must feed no
   economy/happiness formula. Gameplay coupling is a deliberately separate, balanced
   mission (P6+).
@@ -440,7 +541,50 @@ Each a separate mission; heatmap is a 2nd consumer of P1, tween is pure UI.
 - Movement is **deterministic transient core runtime state**, **tick-cadence** v1
   (stepped is accepted; smooth tween deferred to P6), **derived/`skip`** on save
   (load places by schedule).
-- **Cross-region has no handoff** (§5): a commuter routes to its border-exit and
-  idles `CommutingAway` in its own region; destination-side incoming dots (P5) are an
-  optional, isolated add off the remote-worker count. No token/proxy/event.
+- **Cross-region uses a real token handoff** (§5): the citizen entity never moves —
+  movement is always the **token** (the same one used locally; no separate proxy). At
+  the border-exit the token **crosses on a new `RegionEvent`** routed by the existing
+  topology; the neighbor steps that token to the workplace and it **waits** there. The
+  home side marks W "away" (no dot, not dispatched). When the workday ends the token is
+  **removed** (dot gone) and a `Return` message clears the away mark — no return walk.
+  Fire-and-forget, one-tick-stale, display-only. This is P5.
 - Animation/movement is **display-only** until a separate gameplay-coupling mission.
+
+---
+
+## Implemented (P1–P4) — as built
+
+Shipped: `e926761` (P1), `8b5ff0b` (P2), `60263ff` (P3), `e33092c` (P4). P5/P6 remain
+optional and unbuilt.
+
+```text
+CORE (deterministic)                                    UI
+────────────────────────────────────────────────       ──────────────────────────
+P1 road_network_analysis::road_predecessors             P4 render_map overlay:
+     dest-rooted BFS came_from  ───────────────┐          for each view.travelers cell
+                                               │          draw a 2-col dot '•·'
+P2 World::routes_to(dest, network) ◄───────────┘             (Normal overlay)
+     RefCell route_cache, keyed (dest, net id)                    ▲
+     cleared in invalidate_resource_registry                      │
+                  ▲                                                │
+P3 systems::travel::run(world)  (tick, after happiness)     P4 adapter::traveler_views
+     schedule(hour): 09..15 work else home                       GameView.travelers
+     step current_cell = routes_to(dest)[current_cell]           = live Traveling cells
+     unreachable/no-shared-net -> home (no teleport)             (deduped, sorted)
+     prune dead citizens from world.travel                            ▲
+     writes world.travel: HashMap<Entity, TravelState> ───────────────┘
+```
+
+- **P1** is a pure function; **P2** a region-owned derived cache (mirrors
+  `ResourceRegistryCache`); **P3** the only writer of `world.travel`, run each tick;
+  **P4** the only reader, through the adapter — the UI never sees paths or the graph.
+- Determinism: fixed citizen order + deterministic BFS + integer hours. Display-only:
+  `world.travel` is read by no other system, so zero economy/balance impact.
+- Deviations from the plan, all ponytail simplifications:
+  - `TravelState` lives in a `world.travel` component map, not a `Citizen` field
+    (per the existing `Citizen` doc-note).
+  - Schedule is commute-only (15–22 "free time" = home); leisure→commercial deferred.
+  - Facing **direction** deferred — P4 draws a plain dot, not an arrow.
+  - §3a explicit removal handling dropped: a removed destination self-heals via the
+    per-tick schedule recompute + P2 cache clear + §4b; `travel::run` prunes dead
+    citizens and the adapter filters to live ones.
