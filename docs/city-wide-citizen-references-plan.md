@@ -276,3 +276,81 @@ Skip these until the code asks for them.
 - Local simulation remains deterministic: sorted entity/citizen order, integer logic,
   no live reads from neighbor regions.
 
+---
+
+## Implemented (CW1–CW4) — as built
+
+Shipped: `15238f2` (CW1), `337aac3` (CW2), `a3c2672` (CW3), `d4efab4` (CW4). **CW5 is
+optional and intentionally not built** (no call site has asked for it yet).
+
+### The model that landed
+
+```text
+core::city_refs (CW1)            one rule, everywhere
+────────────────────             ───────────────────────────────────────────────
+CitizenId     { home_region, local }     a ref is "local" to a region R iff
+CityEntityRef { region, entity }           ref.region == R
+CityCellRef   { region, x, y }           CityEntityRef::as_local(R) -> Option<Entity>
+  (Entity gained Ord so these               Some(entity)  when region == R  (use it)
+   derive Ord deterministically)            None          otherwise        (carry, never deref)
+```
+
+`World` now records the region it is simulated as in `region_id` (`#[serde(skip)]`):
+`RegionState::new`/`from_world` stamp it, and `begin_tick_power_phase` /
+`refresh_derived_state_for_world` re-stamp it (guarded, so production — where it already
+matches — pays nothing). That single field is what every local/remote decision reads.
+
+```text
+   CW2  Citizen.home : CityEntityRef          CW3→CW4  WorkplaceAssignment
+   ─────────────────────────────────          ──────────────────────────────────────
+   on disk: bare entity  (home_serde)          { workplace: CityEntityRef,
+   load: placeholder RegionId(0)                  location:  CityCellRef,   // self-describing cell
+   from_world(id): set_region_id(id)              salary }
+     stamps region_id + every home              local job  : workplace.region == world.region_id
+   home read: home.entity                       remote job : workplace.region != world.region_id
+     (home is always local, so the                (no enum tag — CW3 retyped the old
+      region tag is informational)                 WorkplaceSource, CW4 deleted it)
+```
+
+### Cross-region job export, now typed end to end (CW3/CW4)
+
+```text
+PRODUCER region B                         consumer region A
+─────────────────                         ─────────────────
+process_job_export_request:               apply_job_export_grant:
+  workplace = local Entity                  store WorkplaceAssignment {
+  grant.workplace  = CityEntityRef(B, e) ─►   workplace,  // B-tagged: as_local(A) = None
+  grant.location   = CityCellRef(B, x, y) ─►  location,   // shown on A's roster
+  grant.salary                                salary }
+        │                                          │
+        └ producer ledger still keyed by its       └ A never dereferences a B-entity;
+          own Entity; tax accrues to B               imported_job_count/remote_workers_for
+          (unchanged)                                discriminate by workplace.region != A
+```
+
+The old opaque `slot_id: u32` is gone; the discovery hints (`spare_job_slot_ids`) stay
+opaque on purpose — they are stale-tolerant availability counters, not bound identity.
+
+### Why this is behavior-neutral
+
+- Every read that used to test the `WorkplaceSource` tag now tests
+  `workplace.region == region_id`; because `region_id` is always stamped to the region
+  jobs are assigned under (production via `RegionState`, tests via the guarded
+  phase-entry stamp), the two are equivalent for all valid data.
+- `Citizen.home`'s on-disk form is unchanged (bare entity), so saves load identically;
+  the region is reconstructed at the load boundary.
+- Salary/tax accounting, determinism (sorted iteration + integer math), and the view
+  models (`JobAssignmentView`, `CitizenRelation`) are untouched — only how the adapter
+  *derives* their fields changed, to the same values.
+
+### Deviations from the plan (all intentional)
+
+- CW3 kept `WorkplaceSource` (retype only) and CW4 removed it, exactly as the split was
+  rewritten after review — keeping each diff's risk bounded.
+- Home reads use `home.entity` directly rather than `as_local(region_id)`: a home is a
+  structural always-local ref, so the guard would only ever return `Some`; `as_local`
+  is reserved for genuinely-foreign refs (workplaces).
+- `region_id` is stamped at the phase entry points (guarded), not only at construction,
+  so a bare `World` ticked directly in tests classifies jobs with the same region it is
+  assigned under — no production behavior change.
+
