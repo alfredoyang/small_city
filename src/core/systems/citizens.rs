@@ -1,6 +1,6 @@
 //! Citizen entity support, including home links, happiness, and aggregate population sync.
 
-use crate::core::city_refs::CityEntityRef;
+use crate::core::city_refs::{CitizenId, CityEntityRef};
 use crate::core::components::{Citizen, Morale};
 use crate::core::entity::Entity;
 use crate::core::systems::{road_connectivity, road_network_analysis};
@@ -14,6 +14,10 @@ pub(crate) fn spawn_for_home(world: &mut World, residential: Entity, count: i32)
         world.attach_citizen(
             citizen,
             Citizen {
+                id: CitizenId {
+                    home_region: world.region_id,
+                    local: citizen,
+                },
                 age: 0,
                 home: CityEntityRef::local(world.region_id, residential),
                 workplace_assignment: None,

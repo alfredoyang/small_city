@@ -133,8 +133,13 @@ impl World {
     /// `RegionState` construction/load boundary, which knows the id.
     pub(crate) fn set_region_id(&mut self, region: RegionId) {
         self.region_id = region;
-        for citizen in self.citizens.values_mut() {
+        for (entity, citizen) in self.citizens.iter_mut() {
             citizen.home = CityEntityRef::local(region, citizen.home.entity);
+            // Stable city-wide id: home region + this citizen's own entity (the key).
+            citizen.id = crate::core::city_refs::CitizenId {
+                home_region: region,
+                local: *entity,
+            };
         }
     }
 
@@ -357,7 +362,7 @@ mod tests {
 
     #[test]
     fn set_region_id_records_region_and_stamps_citizen_homes() {
-        use crate::core::city_refs::CityEntityRef;
+        use crate::core::city_refs::{CitizenId, CityEntityRef};
         use crate::core::regions::RegionId;
 
         let mut world = World::new(2, 1);
@@ -367,6 +372,10 @@ mod tests {
         world.attach_citizen(
             citizen,
             Citizen {
+                id: CitizenId {
+                    home_region: RegionId(0),
+                    local: citizen,
+                },
                 age: 0,
                 home: CityEntityRef::local(RegionId(0), residential),
                 workplace_assignment: None,
@@ -383,6 +392,14 @@ mod tests {
             world.citizens[&citizen].home,
             CityEntityRef::local(RegionId(7), residential)
         );
+        // The city-wide id is stamped to the owning region + this citizen's entity.
+        assert_eq!(
+            world.citizens[&citizen].id,
+            CitizenId {
+                home_region: RegionId(7),
+                local: citizen
+            }
+        );
     }
 
     #[test]
@@ -394,6 +411,10 @@ mod tests {
         world.attach_citizen(
             citizen,
             Citizen {
+                id: crate::core::city_refs::CitizenId {
+                    home_region: world.region_id,
+                    local: citizen,
+                },
                 age: 0,
                 home: crate::core::city_refs::CityEntityRef::local(world.region_id, residential),
                 workplace_assignment: None,

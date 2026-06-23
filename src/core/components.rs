@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::city_refs::{CityCellRef, CityEntityRef};
+use crate::core::city_refs::{CitizenId, CityCellRef, CityEntityRef};
 use crate::core::entity::Entity;
 use crate::core::regions::RegionId;
 use crate::interface::input::BuildingKind;
@@ -149,6 +149,15 @@ pub struct Population {
 /// Future movement/pathfinding state should remain in separate reusable components instead of
 /// growing this record.
 pub struct Citizen {
+    /// Stable city-wide identity (CW5): home region + this citizen's own entity. It is
+    /// never serialized — `RegionState` rebuilds it at the load boundary from the map
+    /// key and region id, like `home`.
+    ///
+    /// ponytail: no consumer reads `id` yet. It is stored ahead of the relocation
+    /// mission (Model B), which needs a relocation-stable identity; drop it if that
+    /// mission never lands.
+    #[serde(skip, default = "placeholder_citizen_id")]
+    pub id: CitizenId,
     #[serde(default)]
     pub age: u32,
     /// Home residential building. Stored as a `CityEntityRef` so citizen references are
@@ -180,6 +189,15 @@ pub struct Citizen {
 ///   load:  <entity u32> ──deserialize──► CityEntityRef { RegionId(0), entity }
 ///                       ──from_world(id)── stamp ──► CityEntityRef { id, entity }
 /// ```
+/// Default for the `#[serde(skip)]` `Citizen::id`; the real value is rebuilt at the
+/// region load boundary from the citizen's map key and region id.
+fn placeholder_citizen_id() -> CitizenId {
+    CitizenId {
+        home_region: RegionId(0),
+        local: Entity(0),
+    }
+}
+
 mod home_serde {
     use super::{CityEntityRef, Entity, RegionId};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -331,6 +349,10 @@ mod tests {
         // unchanged by the move to CityEntityRef; the region is parked at the
         // placeholder RegionId(0) on load and stamped later by RegionState::from_world.
         let citizen = Citizen {
+            id: CitizenId {
+                home_region: RegionId(9),
+                local: Entity(3),
+            },
             age: 1,
             home: CityEntityRef::local(RegionId(9), Entity(3)),
             workplace_assignment: None,
