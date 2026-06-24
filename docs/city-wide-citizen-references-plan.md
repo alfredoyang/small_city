@@ -390,3 +390,62 @@ opaque on purpose — they are stale-tolerant availability counters, not bound i
   so a bare `World` ticked directly in tests classifies jobs with the same region it is
   assigned under — no production behavior change.
 
+
+---
+
+## Implemented (CW5a–CW5c) — as built
+
+Shipped: `c293633` (CW5a), `8d46ab2` (CW5b), `f1a116a` (CW5c). All three optional
+cleanups were built at the user's request (overriding the "skip until the code asks"
+gating). CW5a/CW5b are behavior-neutral; **CW5c changes the save format** (old-save
+compatibility intentionally dropped) and is foundation-only — nothing reads its new
+region bits until the relocation/Model B mission.
+
+### CW5a — stored `Citizen.id`
+
+```text
+Citizen { id: CitizenId { home_region, local: <this citizen's own entity> }, .. }
+  #[serde(skip)]  ─ rebuilt at the load boundary, never persisted
+  set at spawn (citizens::spawn_for_home)
+  rebuilt in World::set_region_id  (iterates (entity, citizen): id = { region, *entity })
+no production reader yet  ── ponytail: groundwork for relocation; drop if it never lands
+```
+
+### CW5b — view job-cell tuples → `CityCellRef`
+
+```text
+            before                              after
+  JobAssignmentView { region, x, y, .. }   { cell: CityCellRef, .. }
+  WorksAt           { region, x, y, .. }   { cell: CityCellRef, .. }
+  adapter: cell = assignment.location  (already a CityCellRef since CW4 — a simplification)
+  LivesAt { region: Option<RegionId>, x, y }   ── KEPT: "None = inspected region"
+                                                  can't be expressed by CityCellRef
+```
+
+Behavior-neutral: identical region+coords, just regrouped; still no ECS entity in any
+view model.
+
+### CW5c — birth-tagged city-wide-unique `Entity`
+
+```text
+   Entity(u64) = (region.0 as u64) << 32 | local
+   ┌──────── high 32: birth region ────────┬──────── low 32: region-local counter ───────┐
+   │  RegionId.0                            │  World.next_entity++                         │
+   └───────────────────────────────────────┴──────────────────────────────────────────────┘
+   World::spawn → Entity::new(self.region_id, next_entity)     (no shared allocator)
+   region() / local() accessors
+
+   region 0  ⇒  packed == local          → bare-World tests & Entity(n) literals unchanged
+   one World ⇒  region bits constant      → Ord/sort order = local-counter order (unchanged)
+   two regions ⇒ distinct high bits       → ids never collide city-wide (relocation-safe)
+```
+
+- **Behavior-neutral for running play:** entities never mix across `World`s today, and
+  production stamps `region_id` before any spawn, so each region mints stable ids and
+  in-region ordering is unchanged.
+- **Not on-disk-neutral:** serialized ids now carry region bits; old saves are not
+  migrated (dropped by choice). Kept a numeric newtype so it still serializes as a JSON
+  map key.
+- **Foundation only:** no consumer reads the region bits yet — it exists so the future
+  relocation mission can move a `Citizen` into another region's `World` without id
+  collision (Model B). The hint/summary ids that needed a `u32` use `entity.local()`.
