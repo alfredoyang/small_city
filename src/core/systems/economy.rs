@@ -145,7 +145,7 @@ pub(crate) fn run_with_goods_exports(
             .citizens
             .get(&citizen_entity)
             .map(|citizen| (citizen.home.entity, citizen.workplace_assignment))
-            .unwrap_or((Entity(u32::MAX), None));
+            .unwrap_or((Entity(u64::MAX), None));
         // A remote workplace pays the citizen salary captured at grant time but
         // collects no local workplace tax: that tax accrues to the exporting
         // region instead (see `exported_job_slots` below).
@@ -681,7 +681,7 @@ fn next_shopping_offer(world: &World, home: Entity, shopping_slots: &[Entity]) -
     let commercial = slot_index.and_then(|index| shopping_slots.get(index).copied());
     let Some(commercial) = commercial else {
         return ShoppingOffer {
-            commercial: Entity(u32::MAX),
+            commercial: Entity(u64::MAX),
             cost: 0,
             sales_tax: 0,
             happiness_bonus: 0,

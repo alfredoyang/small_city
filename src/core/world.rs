@@ -155,7 +155,9 @@ impl World {
     }
 
     pub fn spawn(&mut self) -> Entity {
-        let entity = Entity(self.next_entity);
+        // City-wide-unique id: this region (birth) in the high bits, the local counter
+        // in the low bits. region 0 worlds keep packed == local (legacy-shaped ids).
+        let entity = Entity::new(self.region_id, self.next_entity);
         self.next_entity += 1;
         self.entities.insert(entity, EntityRecord::default());
         entity

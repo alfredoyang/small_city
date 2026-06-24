@@ -488,8 +488,8 @@ mod tests {
     struct DerivedSnapshot {
         stats: CityStats,
         local_effects: LocalEffectsMap,
-        morale_targets: Vec<(u32, i32)>,
-        assignments: Vec<(u32, Option<WorkplaceAssignment>)>,
+        morale_targets: Vec<(u64, i32)>,
+        assignments: Vec<(u64, Option<WorkplaceAssignment>)>,
     }
 
     impl DerivedSnapshot {

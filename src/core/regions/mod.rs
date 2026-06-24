@@ -434,7 +434,8 @@ impl RegionState {
                 let assignment = citizen.workplace_assignment?;
                 let workplace = assignment.workplace;
                 // Only remote jobs (workplace owned by another region) are imports.
-                (workplace.region != self.id).then_some((workplace.region, workplace.entity.0))
+                (workplace.region != self.id)
+                    .then_some((workplace.region, workplace.entity.local()))
             })
             .collect::<Vec<_>>();
         slots.sort();
@@ -499,7 +500,7 @@ impl RegionState {
                 let mut spare_job_slot_ids = self
                     .spare_job_slots_on_network(network)
                     .into_iter()
-                    .map(|slot| slot.0)
+                    .map(|slot| slot.local())
                     .collect::<Vec<_>>();
                 spare_job_slot_ids.sort();
                 RegionalAvailabilityHint {
