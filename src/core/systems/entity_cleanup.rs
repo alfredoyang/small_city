@@ -73,7 +73,7 @@ fn remove_citizens_for_home(world: &mut World, residential: Entity) {
     let citizens: Vec<_> = world
         .citizens
         .iter()
-        .filter_map(|(entity, citizen)| (citizen.home.entity == residential).then_some(*entity))
+        .filter_map(|(entity, citizen)| (citizen.home == residential).then_some(*entity))
         .collect();
 
     for citizen in citizens {

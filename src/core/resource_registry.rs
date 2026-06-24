@@ -478,14 +478,14 @@ fn job_requests_from_world(world: &World) -> Vec<JobRequest> {
             // not seeking local work.
             if citizen_data
                 .workplace_assignment
-                .is_some_and(|assignment| assignment.workplace.region != world.region_id)
+                .is_some_and(|assignment| assignment.workplace.region() != world.region_id)
             {
                 return None;
             }
             Some(JobRequest {
                 citizen,
-                // Home is always local to this region; `.entity` is its local id.
-                home: citizen_data.home.entity,
+                // Home is always local to this region; it's already the local id.
+                home: citizen_data.home,
             })
         })
         .collect()
@@ -879,7 +879,6 @@ mod tests {
         let cached_power = world.cached_power_resolution();
         let forced_power = ResourceRegistry::for_power(world).resolve_local_power();
         assert_eq!(cached_power, forced_power);
-
         let cached_jobs = world.cached_job_resolution();
         let forced_jobs = ResourceRegistry::for_jobs(world).resolve_local_jobs();
         assert_eq!(cached_jobs, forced_jobs);
@@ -908,6 +907,9 @@ mod tests {
 
     fn parity_world() -> World {
         let mut world = World::new(6, 3);
+        // tick_world simulates as RegionId(1); stamp it before spawning so entity
+        // birth regions match the tick region (Entity packs its birth region).
+        world.set_region_id(RegionId(1));
         placement::place_building(&mut world, 0, 0, BuildingKind::PowerPlant);
         placement::place_building(&mut world, 1, 0, BuildingKind::Residential);
         placement::place_building(&mut world, 2, 0, BuildingKind::Commercial);
@@ -923,9 +925,11 @@ mod tests {
     fn roundtrip_world(world: World) -> World {
         let encoded = serde_json::to_vec(&world).expect("serialize world");
         let mut loaded: World = serde_json::from_slice(&encoded).expect("deserialize world");
+        loaded.set_region_id(RegionId(1));
         loaded.rebuild_entity_records();
         road_network_analysis::run(&mut loaded);
         power::run(&mut loaded);
+        loaded.invalidate_resource_registry();
         loaded
     }
 

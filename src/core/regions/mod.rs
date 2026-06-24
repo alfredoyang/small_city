@@ -25,7 +25,7 @@
 //! region stores another region's generic exported-resource cache.
 //! ```
 
-use crate::core::city_refs::{CityCellRef, CityEntityRef};
+use crate::core::city_refs::CityCellRef;
 use crate::core::components::{Position, PowerSource, WorkplaceAssignment};
 use crate::core::entity::Entity;
 use crate::core::resources::CityStats;
@@ -232,14 +232,14 @@ pub struct PowerExportGrant {
 /// Result of an authoritative producer-owned job-slot export allocation request.
 ///
 /// Unlike power, the grant carries identity as city-wide refs: the producer's
-/// `workplace` (a region-tagged `CityEntityRef`, owned by the producer; the consumer
+/// `workplace` (a region-tagged `Entity`, owned by the producer; the consumer
 /// never dereferences it, only stores/echoes it), its `location` (the self-describing
 /// workplace cell for the consumer's roster/display), and the `salary` the home region
 /// pays the worker. Workplace tax accrues to the exporting region instead.
 pub struct JobExportGrant {
     pub token: u32,
     pub granted: bool,
-    pub workplace: Option<CityEntityRef>,
+    pub workplace: Option<Entity>,
     pub location: Option<CityCellRef>,
     pub salary: i32,
 }
@@ -412,7 +412,7 @@ impl RegionState {
                 // A remote job's workplace is owned by another region.
                 citizen
                     .workplace_assignment
-                    .is_some_and(|assignment| assignment.workplace.region != self.id)
+                    .is_some_and(|assignment| assignment.workplace.region() != self.id)
             })
             .count()
     }
@@ -421,7 +421,7 @@ impl RegionState {
     /// Owned `(source region, producer workplace entity id)` pairs for citizens
     /// working remotely.
     ///
-    /// This test-only summary reads the producer-owned `CityEntityRef` a remote job
+    /// This test-only summary reads the producer-owned `Entity` a remote job
     /// stores. The consumer never dereferences that ref locally (its region is the
     /// producer's); the region tag is what makes carrying it safe. UI should use facade
     /// snapshots instead.
@@ -434,8 +434,7 @@ impl RegionState {
                 let assignment = citizen.workplace_assignment?;
                 let workplace = assignment.workplace;
                 // Only remote jobs (workplace owned by another region) are imports.
-                (workplace.region != self.id)
-                    .then_some((workplace.region, workplace.entity.local()))
+                (workplace.region() != self.id).then_some((workplace.region(), workplace.local()))
             })
             .collect::<Vec<_>>();
         slots.sort();
@@ -783,8 +782,9 @@ impl RegionState {
 
     pub(crate) fn from_world(id: RegionId, mut world: World) -> Self {
         world.rebuild_entity_records();
-        // Stamp the owning region onto the world and every loaded citizen's home
-        // (home_serde parks RegionId(0) on load) before derived state reads them.
+        // Stamp the owning region onto the world (and rebuild each citizen's `id`
+        // from its map key) before derived state reads it. Homes need no stamping:
+        // the `home` Entity already packs its birth region.
         world.set_region_id(id);
         refresh_derived_state_for_world(&mut world, id);
 
@@ -871,8 +871,8 @@ impl RegionState {
             if citizen_data.workplace_assignment.is_some() {
                 continue;
             }
-            // Home is always local to this region; `.entity` is its local id.
-            let home = citizen_data.home.entity;
+            // Home is always local to this region; it's already the local id.
+            let home = citizen_data.home;
             // A citizen reaches remote slots through the border road network its
             // home connects to, mirroring the power consumer's caller network.
             let Some(caller_network) = networks
@@ -1061,7 +1061,7 @@ mod tests {
             JobExportGrant {
                 token: 7,
                 granted: true,
-                workplace: Some(CityEntityRef::local(RegionId(2), Entity(42))),
+                workplace: Some(Entity::new(RegionId(2), 42)),
                 location: Some(CityCellRef::local(RegionId(2), 1, 0)),
                 salary: 4,
             },
@@ -1097,7 +1097,7 @@ mod tests {
             JobExportGrant {
                 token: 1,
                 granted: true,
-                workplace: Some(CityEntityRef::local(RegionId(2), Entity(9))),
+                workplace: Some(Entity::new(RegionId(2), 9)),
                 location: Some(CityCellRef::local(RegionId(2), 1, 0)),
                 salary: 4,
             },

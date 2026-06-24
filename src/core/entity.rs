@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::regions::RegionId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub struct Entity(pub u64);
 
 impl Entity {
@@ -37,6 +39,14 @@ impl Entity {
     /// The region-local counter value packed into this id.
     pub fn local(self) -> u32 {
         self.0 as u32
+    }
+
+    /// Returns `Some(self)` iff this entity was born in `region`; `None` for a foreign entity.
+    ///
+    /// This is the single guard that keeps one region from dereferencing another region's
+    /// entity as a local key. Since nothing relocates yet, birth region == owning region.
+    pub fn as_local(self, region: RegionId) -> Option<Entity> {
+        (self.region() == region).then_some(self)
     }
 }
 
@@ -56,5 +66,18 @@ mod tests {
         assert_ne!(Entity::new(RegionId(1), 5), Entity::new(RegionId(2), 5));
         // Within one region, ordering follows the local counter.
         assert!(Entity::new(RegionId(9), 1) < Entity::new(RegionId(9), 2));
+    }
+
+    #[test]
+    fn as_local_returns_entity_for_matching_region() {
+        let r = RegionId(1);
+        let id = Entity::new(r, 7);
+        assert_eq!(id.as_local(r), Some(id));
+    }
+
+    #[test]
+    fn as_local_returns_none_for_a_different_region() {
+        let id = Entity::new(RegionId(1), 7);
+        assert_eq!(id.as_local(RegionId(2)), None);
     }
 }

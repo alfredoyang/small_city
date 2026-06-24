@@ -172,7 +172,7 @@ fn citizen_roster(world: &World, x: usize, y: usize) -> Vec<CitizenDetailView> {
         BuildingKind::Residential => world
             .citizens
             .iter()
-            .filter(|(_, citizen)| citizen.home.entity == entity)
+            .filter(|(_, citizen)| citizen.home == entity)
             .collect(),
         BuildingKind::Commercial | BuildingKind::Industrial => world
             .citizens
@@ -206,14 +206,14 @@ fn citizen_relation(world: &World, kind: BuildingKind, citizen: &Citizen) -> Cit
             Some(assignment) => CitizenRelation::WorksAt {
                 cell: assignment.location,
                 salary: assignment.salary,
-                is_remote: assignment.workplace.region != world.region_id,
+                is_remote: assignment.workplace.region() != world.region_id,
             },
             None => CitizenRelation::Unemployed,
         },
         // Workplace roster: locate where this local worker lives. `region: None`
         // means "the inspected region" — the bare World cannot name itself.
         _ => {
-            let home = world.positions.get(&citizen.home.entity);
+            let home = world.positions.get(&citizen.home);
             CitizenRelation::LivesAt {
                 region: None,
                 x: home.map(|position| position.x).unwrap_or(0),
@@ -248,8 +248,8 @@ pub(crate) fn remote_workers_for(
         .filter(|(_, citizen)| {
             citizen.workplace_assignment.is_some_and(|assignment| {
                 // A remote job (workplace in another region) at the producer's cell.
-                assignment.workplace.region == producer_region
-                    && assignment.workplace.region != world.region_id
+                assignment.workplace.region() == producer_region
+                    && assignment.workplace.region() != world.region_id
                     && assignment.location.x == position.x
                     && assignment.location.y == position.y
             })
@@ -260,7 +260,7 @@ pub(crate) fn remote_workers_for(
     citizens
         .into_iter()
         .map(|(_, citizen)| {
-            let home = world.positions.get(&citizen.home.entity);
+            let home = world.positions.get(&citizen.home);
             CitizenDetailView {
                 age: citizen.age,
                 happiness: citizen.morale.actual,
@@ -800,7 +800,7 @@ fn job_assignment_views_for_home(
     let mut citizens = world
         .citizens
         .iter()
-        .filter(|(_, citizen)| citizen.home.entity == home)
+        .filter(|(_, citizen)| citizen.home == home)
         .collect::<Vec<_>>();
     citizens.sort_by_key(|(entity, _)| entity.0);
 
@@ -811,7 +811,7 @@ fn job_assignment_views_for_home(
             Some(JobAssignmentView {
                 cell: assignment.location,
                 salary: assignment.salary,
-                is_remote: assignment.workplace.region != world.region_id,
+                is_remote: assignment.workplace.region() != world.region_id,
             })
         })
         .collect()

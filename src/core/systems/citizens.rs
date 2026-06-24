@@ -1,6 +1,5 @@
 //! Citizen entity support, including home links, happiness, and aggregate population sync.
 
-use crate::core::city_refs::{CitizenId, CityEntityRef};
 use crate::core::components::{Citizen, Morale};
 use crate::core::entity::Entity;
 use crate::core::systems::{road_connectivity, road_network_analysis};
@@ -14,12 +13,9 @@ pub(crate) fn spawn_for_home(world: &mut World, residential: Entity, count: i32)
         world.attach_citizen(
             citizen,
             Citizen {
-                id: CitizenId {
-                    home_region: world.region_id,
-                    local: citizen,
-                },
+                id: citizen,
                 age: 0,
-                home: CityEntityRef::local(world.region_id, residential),
+                home: residential,
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,
@@ -92,7 +88,7 @@ pub(crate) fn citizen_count_for_home(world: &World, residential: Entity) -> i32 
     world
         .citizens
         .values()
-        .filter(|citizen| citizen.home.entity == residential)
+        .filter(|citizen| citizen.home == residential)
         .count() as i32
 }
 
@@ -100,7 +96,7 @@ pub(crate) fn average_happiness_for_home(world: &World, residential: Entity) -> 
     let mut total = 0;
     let mut count = 0;
     for citizen in world.citizens.values() {
-        if citizen.home.entity != residential {
+        if citizen.home != residential {
             continue;
         }
         total += citizen.morale.actual;
@@ -128,7 +124,7 @@ pub(crate) fn average_happiness_target_for_home(world: &World, residential: Enti
     let mut total = 0;
     let mut count = 0;
     for citizen in world.citizens.values() {
-        if citizen.home.entity != residential {
+        if citizen.home != residential {
             continue;
         }
         total += display_happiness(citizen.morale.target);
@@ -156,7 +152,7 @@ pub(crate) fn average_money_for_home(world: &World, residential: Entity) -> Opti
     let mut total = 0;
     let mut count = 0;
     for citizen in world.citizens.values() {
-        if citizen.home.entity != residential {
+        if citizen.home != residential {
             continue;
         }
         total += citizen.money;
@@ -182,7 +178,7 @@ fn actual_happiness(world: &World, citizen: Entity) -> i32 {
     };
 
     let mut happiness = citizen.morale.target - citizen.morale.decay;
-    if world.positions.contains_key(&citizen.home.entity) {
+    if world.positions.contains_key(&citizen.home) {
         happiness -= citizen.morale.rent_stress * 10;
     }
 
@@ -193,8 +189,8 @@ fn citizen_happiness_target(world: &World, citizen: Entity) -> i32 {
     let Some(citizen) = world.citizens.get(&citizen) else {
         return 50;
     };
-    // Home is always local to this region, so `.entity` is its local building id.
-    let home = citizen.home.entity;
+    // Home is always local to this region, so it's its local building id.
+    let home = citizen.home;
     let Some(position) = world.positions.get(&home) else {
         return 50;
     };

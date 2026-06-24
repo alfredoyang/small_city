@@ -659,10 +659,7 @@ fn wrong_region_export_grants_are_ignored_without_mutating_state() {
             RegionEvent::ApplyJobExportGrant(JobExportGrant {
                 token: 0,
                 granted: true,
-                workplace: Some(small_city::core::city_refs::CityEntityRef::local(
-                    RegionId(80),
-                    small_city::core::entity::Entity(0),
-                )),
+                workplace: Some(small_city::core::entity::Entity::new(RegionId(80), 0)),
                 location: Some(small_city::core::city_refs::CityCellRef::local(
                     RegionId(80),
                     0,

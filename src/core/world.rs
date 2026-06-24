@@ -4,7 +4,7 @@
 //! `systems/` function operates on (`fn run(world: &mut World)`) and the unit that
 //! is serialized on save. It records its owning `region_id` (a tag stamped by
 //! `RegionState` at construction/load) so citizen references can be city-wide
-//! (`CityEntityRef`), but it still knows nothing about neighbors, threads, or
+//! (`Entity`), but it still knows nothing about neighbors, threads, or
 //! cross-region coordination — those live one layer up in `RegionState`, which owns a
 //! `World`. So the name follows the ECS convention ("one simulation instance"), not
 //! "the whole game" — there is one `World` per region, and a single-city game is
@@ -15,7 +15,6 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::city_refs::CityEntityRef;
 use crate::core::components::{
     Building, Citizen, HappinessEffect, PollutionSource, Population, Position, PowerConsumer,
     PowerProvider,
@@ -40,7 +39,7 @@ pub(crate) struct World {
     // The region that owns this world. Not serialized (region identity is owned by
     // `RegionState`); stamped at the region load/construction boundary via
     // `set_region_id`, which also tags every citizen's local home. Used to build
-    // correctly-tagged `CityEntityRef`s and (from CW3 on) to resolve foreign refs.
+    // correctly-tagged `Entity`s and (from CW3 on) to resolve foreign refs.
     #[serde(skip, default = "default_region_id")]
     pub(crate) region_id: RegionId,
     #[serde(rename = "next_entity_id")]
@@ -127,19 +126,16 @@ impl World {
     /// Records this world's owning region id and stamps every citizen's local home
     /// with it.
     ///
-    /// Homes are always local to the owning region, so on load — where `home_serde`
-    /// parks the placeholder `RegionId(0)` — this is what assigns the real region; for a
-    /// fresh region (no citizens yet) it just records the id. Called from the
-    /// `RegionState` construction/load boundary, which knows the id.
+    /// Homes are always local to the owning region. The `Entity` already packs its
+    /// birth region, so no stamping is needed for `home`. The citizen's `id` is the
+    /// map key (its own `Entity`), which already carries the birth region.
+    /// Called from the `RegionState` construction/load boundary, which knows the id.
     pub(crate) fn set_region_id(&mut self, region: RegionId) {
         self.region_id = region;
         for (entity, citizen) in self.citizens.iter_mut() {
-            citizen.home = CityEntityRef::local(region, citizen.home.entity);
-            // Stable city-wide id: home region + this citizen's own entity (the key).
-            citizen.id = crate::core::city_refs::CitizenId {
-                home_region: region,
-                local: *entity,
-            };
+            // Entity already carries its birth region; no stamping needed.
+            // Citizen.id is the map key (its own Entity), so it's already correct.
+            citizen.id = *entity;
         }
     }
 
@@ -335,6 +331,7 @@ mod tests {
     use crate::core::components::{
         Building, BuildingData, Citizen, Footprint, Morale, Population, Position,
     };
+    use crate::core::entity::Entity;
     use crate::interface::input::BuildingKind;
 
     #[test]
@@ -364,22 +361,18 @@ mod tests {
 
     #[test]
     fn set_region_id_records_region_and_stamps_citizen_homes() {
-        use crate::core::city_refs::{CitizenId, CityEntityRef};
         use crate::core::regions::RegionId;
 
         let mut world = World::new(2, 1);
         let residential = world.spawn();
         let citizen = world.spawn();
-        // A just-deserialized citizen carries the placeholder region (RegionId(0)).
+        // A just-deserialized citizen has Entity home (already packed with region).
         world.attach_citizen(
             citizen,
             Citizen {
-                id: CitizenId {
-                    home_region: RegionId(0),
-                    local: citizen,
-                },
+                id: Entity(0), // placeholder, will be overwritten
                 age: 0,
-                home: CityEntityRef::local(RegionId(0), residential),
+                home: residential, // Entity already packs its birth region
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,
@@ -389,19 +382,10 @@ mod tests {
         world.set_region_id(RegionId(7));
 
         assert_eq!(world.region_id, RegionId(7));
-        // The home entity is preserved; only the region tag is stamped to the owner.
-        assert_eq!(
-            world.citizens[&citizen].home,
-            CityEntityRef::local(RegionId(7), residential)
-        );
-        // The city-wide id is stamped to the owning region + this citizen's entity.
-        assert_eq!(
-            world.citizens[&citizen].id,
-            CitizenId {
-                home_region: RegionId(7),
-                local: citizen
-            }
-        );
+        // The home entity is preserved; Entity already carries its region.
+        assert_eq!(world.citizens[&citizen].home, residential);
+        // The city-wide id is the citizen's own entity (the map key).
+        assert_eq!(world.citizens[&citizen].id, citizen);
     }
 
     #[test]
@@ -413,12 +397,9 @@ mod tests {
         world.attach_citizen(
             citizen,
             Citizen {
-                id: crate::core::city_refs::CitizenId {
-                    home_region: world.region_id,
-                    local: citizen,
-                },
+                id: citizen, // map key is the citizen's entity
                 age: 0,
-                home: crate::core::city_refs::CityEntityRef::local(world.region_id, residential),
+                home: residential,
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,

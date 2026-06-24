@@ -80,7 +80,7 @@
 //!                  West:offset 0
 //! ```
 
-use crate::core::city_refs::{CityCellRef, CityEntityRef};
+use crate::core::city_refs::CityCellRef;
 use crate::core::entity::Entity;
 use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionCommandResponse, RegionSnapshotResponse,
@@ -726,7 +726,7 @@ impl RegionRuntime {
         if grant.granted {
             // The granting producer is the owner of the granted workplace ref.
             if let Some(workplace) = grant.workplace {
-                insert_sorted_unique(&mut self.job_export_producers, workplace.region);
+                insert_sorted_unique(&mut self.job_export_producers, workplace.region());
             }
         }
     }
@@ -1127,7 +1127,7 @@ impl RegionRuntime {
         JobExportGrant {
             token: request.request.token,
             granted: true,
-            workplace: Some(CityEntityRef::local(region, workplace)),
+            workplace: Some(workplace),
             location,
             salary,
         }
@@ -1561,10 +1561,7 @@ mod tick_state_tests {
         runtime.push_event(RegionEvent::ApplyJobExportGrant(JobExportGrant {
             token: 0,
             granted: true,
-            workplace: Some(crate::core::city_refs::CityEntityRef::local(
-                RegionId(2),
-                crate::core::entity::Entity(0),
-            )),
+            workplace: Some(crate::core::entity::Entity::new(RegionId(2), 0)),
             location: Some(crate::core::city_refs::CityCellRef::local(
                 RegionId(2),
                 0,
@@ -1676,10 +1673,7 @@ mod tick_state_tests {
                 networks[0],
             ));
             assert!(grant.granted, "caller A takes bridge slot {token}");
-            assert_eq!(
-                grant.workplace.map(|workplace| workplace.entity),
-                Some(bridge[0])
-            );
+            assert_eq!(grant.workplace, Some(bridge[0]));
         }
 
         // Caller B (a different component) requests a slot of the same building via

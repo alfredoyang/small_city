@@ -86,7 +86,7 @@ fn residential_growth_per_tick(
 #[cfg(test)]
 mod tests {
     use super::{available_jobs_for_growth, residential_growth_per_tick};
-    use crate::core::city_refs::{CityCellRef, CityEntityRef};
+    use crate::core::city_refs::CityCellRef;
     use crate::core::components::WorkplaceAssignment;
     use crate::core::entity::Entity;
     use crate::core::regions::RegionId;
@@ -153,13 +153,15 @@ mod tests {
         let workplace = world.grid.get(1, 0).expect("workplace");
         world.power_consumers.get_mut(&workplace).unwrap().powered = true;
         citizens::spawn_for_home(&mut world, home, 1);
+        // Remote workplace: Entity with birth region 2
+        let remote_workplace = Entity::new(RegionId(2), 9);
         world
             .citizens
             .values_mut()
             .next()
             .unwrap()
             .workplace_assignment = Some(WorkplaceAssignment {
-            workplace: CityEntityRef::local(RegionId(2), Entity(9)),
+            workplace: remote_workplace,
             location: CityCellRef::local(RegionId(2), 0, 0),
             salary: 1,
         });
