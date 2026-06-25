@@ -117,6 +117,12 @@ pub(crate) fn grow_to_level(world: &mut World, entity: Entity, next_level: u8) -
             .get(&neighbour)
             .map(|position| (position.x, position.y))
             .unwrap_or((anchor.x, anchor.y));
+        // P2: the absorbed neighbour is deleted here. The P2 chokepoint
+        // in `entity_cleanup::remove_entity` fires the per-destination
+        // evict for `neighbour`, so any route-cache entries that used
+        // `neighbour` as a destination (citizens routing TO the neighbour
+        // as a workplace, etc.) are dropped. The surviving building's
+        // evict is handled separately below.
         entity_cleanup::remove_entity(world, neighbour, nx, ny);
     }
 
@@ -141,6 +147,10 @@ pub(crate) fn grow_to_level(world: &mut World, entity: Entity, next_level: u8) -
     // P2: route cache chokepoint — the surviving building's footprint just
     // changed, so its destination entry cells may have moved (or the building
     // may now touch different road networks). Per-destination evict.
+    //
+    // Note: the absorbed neighbours' cache entries are already evicted
+    // above via `entity_cleanup::remove_entity` (the P2 chokepoint fires
+    // for each deleted neighbour).
     world.evict_route_cache(entity);
     apply_upgrade_effect(world, entity, building.kind);
 

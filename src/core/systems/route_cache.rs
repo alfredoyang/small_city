@@ -430,4 +430,73 @@ mod tests {
             "commercial key must be evicted after footprint growth"
         );
     }
+
+    /// P2: `upgrade::grow_to_level` evicts the absorbed neighbour's cache
+    /// entries. The neighbour is deleted via `entity_cleanup::remove_entity`
+    /// (which fires the per-destination evict chokepoint), so its entries
+    /// must be gone after the upgrade — even if the surviving building's
+    /// footprint didn't change.
+    #[test]
+    fn grow_to_level_evicts_absorbed_neighbour() {
+        use crate::core::components::{BuildingData, BusinessFinance};
+        use crate::core::systems::upgrade::grow_to_level;
+
+        let mut world = World::new(4, 4);
+        // Row 1 is a 4-cell road. Two adjacent commercials at (1, 0) and
+        // (2, 0) — upgrading A to level 2 absorbs B. The commercials are
+        // adjacent to roads at (1, 1) and (2, 1).
+        place_building(&mut world, 0, 1, BuildingKind::Road);
+        place_building(&mut world, 1, 1, BuildingKind::Road);
+        place_building(&mut world, 2, 1, BuildingKind::Road);
+        place_building(&mut world, 3, 1, BuildingKind::Road);
+        place_building(&mut world, 1, 0, BuildingKind::Commercial);
+        place_building(&mut world, 2, 0, BuildingKind::Commercial);
+        let commercial_a = world.grid.get(1, 0).expect("A placed");
+        let commercial_b = world.grid.get(2, 0).expect("B placed");
+
+        // Give both commercials finance data so the upgrade is allowed.
+        for &entity in &[commercial_a, commercial_b] {
+            if let Some(building) = world.buildings.get_mut(&entity) {
+                building.data = BuildingData::Commercial {
+                    local_goods_stored: 0,
+                    business: BusinessFinance::default(),
+                };
+            }
+        }
+
+        let network = first_network(&world);
+        // Populate the cache for BOTH buildings. B is the absorbed neighbour.
+        let _ = world.routes_to(commercial_a, &network);
+        let _ = world.routes_to(commercial_b, &network);
+        assert!(
+            world.route_cache_contains(commercial_a, network.id),
+            "A should be cached before upgrade"
+        );
+        assert!(
+            world.route_cache_contains(commercial_b, network.id),
+            "B (absorbed) should be cached before upgrade"
+        );
+
+        // Upgrade A — this absorbs B. The absorb goes through
+        // `entity_cleanup::remove_entity(B)`, which fires the
+        // per-destination evict for B. The surviving building (A) gets
+        // its own evict because its footprint grew.
+        assert!(
+            grow_to_level(&mut world, commercial_a, 2),
+            "upgrade should succeed and absorb B"
+        );
+
+        // B's entries must be evicted (the absorbed neighbour is deleted).
+        assert!(
+            !world.route_cache_contains(commercial_b, network.id),
+            "absorbed neighbour B's cache entries must be evicted via \
+             entity_cleanup::remove_entity chokepoint"
+        );
+        // A's entries must be evicted (footprint grew).
+        assert!(
+            !world.route_cache_contains(commercial_a, network.id),
+            "surviving building A's cache entries must be evicted after \
+             footprint growth"
+        );
+    }
 }
