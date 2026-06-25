@@ -68,6 +68,12 @@ pub(crate) struct World {
     // an empty cache and the first access recomputes.
     #[serde(skip, default)]
     route_cache: RefCell<RouteCache>,
+    // P3: per-citizen movement state, keyed by the citizen entity. `#[serde(skip)]`
+    // because it is transient display/derived state — `travel::run` rebuilds it
+    // from the daily schedule each tick, so a freshly-loaded world starts empty
+    // and re-derives placement on the next tick.
+    #[serde(skip, default)]
+    pub(crate) travel: HashMap<Entity, crate::core::components::TravelState>,
     // DT1: marks the applied derived state (powered flags, stats, pollution,
     // local effects, happiness) out of date after a config change. Unlike the
     // registry cache above (which stores derived *resolution data* recomputed
@@ -120,6 +126,7 @@ impl World {
             importable_remote_jobs: 0,
             cross_region_goods_routes: CrossRegionGoodsRoutes::default(),
             route_cache: RefCell::default(),
+            travel: HashMap::new(),
             derived_dirty: Cell::new(false),
             building_rules: crate::core::building_rules::BuildingRules::default(),
             positions: HashMap::new(),

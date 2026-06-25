@@ -244,7 +244,7 @@ TICK PIPELINE (src/core/simulation.rs) — where the schedule plugs in
                                   ├─ pollution::run
                                   ├─ happiness::run
                                   │
-                                  ├─ ★ travel::run(world)  ◄── NEW (P3, not yet built)
+                                  ├─ ★ travel::run(world)  ◄── P3 (simulation.rs:199)
                                   │    │  reads: world.resources.time.hour_of_day()
                                   │    │         (the NEW hour, advanced at :105)
                                   │    │         world.citizens[citizen].home
@@ -260,7 +260,7 @@ TICK PIPELINE (src/core/simulation.rs) — where the schedule plugs in
                                   │    │  uses:  world.routes_to(target, network)  (P2 cache)
                                   │    │         road_predecessors  (P1 Dijkstra + crossing penalty)
                                   │    │  writes: world.travel[citizen] = TravelState {
-                                  │    │            status, current_cell, destination }
+                                  │    │            status, current_cell, destination, building }
                                   │    │
                                   │    │  ┌─ schedule_intent(hour, citizen) ─────────┐
                                   │    │  │  THIS DOC'S CORE FUNCTION                         │
@@ -286,7 +286,7 @@ TICK PIPELINE (src/core/simulation.rs) — where the schedule plugs in
                                   │           Some(cell) → step(cell, target)  [§4 state machine]
                                   │           None → depart or idle            [§4 state machine]
                                   │
-                                  └─ world.resources.turn += 1          simulation.rs:197
+                                  └─ world.resources.turn += 1          simulation.rs:200
 
 
 DATA TYPES (src/core/components.rs, src/core/resources.rs, src/core/entity.rs)
@@ -320,12 +320,13 @@ DATA TYPES (src/core/components.rs, src/core/resources.rs, src/core/entity.rs)
     .local()  -> u32       (low 32 bits)                :40
     .as_local(region) -> Option<Entity>  (guard)        :48
 
-  TravelState { (NEW — P3, not yet built)               pathfinding §2
+  TravelState { (P3, components.rs)                     pathfinding §2
     status: TravelStatus,                               P3: AtHome|AtWork|Traveling
                                                       P5 adds: Away
-    current_cell: Option<Entity>,
-    destination: Option<Entity>,
-  }
+    current_cell: Option<Entity>,                       road cell now (None = idle)
+    destination: Option<Entity>,                        building walked toward
+    building: Option<Entity>,                           building occupied while idle
+  }                                                       (origin of the next depart)
     stored in: world.travel: HashMap<Entity, TravelState>  #[serde(skip)]
     P5 adds: world.visiting_travel: HashMap<TravelerId, TravelState>  #[serde(skip)]
 
@@ -370,9 +371,9 @@ CROSS-DOC INTERACTION
    by local citizens). The movement system resolves `ScheduleIntent` to a target
    `Entity` (local workplace, home, or border-exit). The schedule never picks a
    border-exit or commercial building — those are pathfinding-side decisions.
-2. **It plugs into the tick pipeline** at `travel::run(world)` (P3, not yet built),
+2. **It plugs into the tick pipeline** at `travel::run(world)` (P3, `simulation.rs:199`),
    which runs after `happiness::run` and before `world.resources.turn += 1`
-   (`simulation.rs:197`). The hour was advanced earlier at `simulation.rs:105`, so
+   (`simulation.rs:200`). The hour was advanced earlier at `simulation.rs:105`, so
    travel observes the **new** hour.
 3. **The boundary is clean**: the schedule never touches roads, Dijkstra, route
    caches, or token handoffs. The pathfinding plan's §4b (unreachable → stay at

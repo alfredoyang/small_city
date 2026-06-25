@@ -25,7 +25,7 @@ explained in detail where first introduced; this is a one-page cheat sheet.
 | **`route_epoch`** | A *hypothetical* `u64` counter on `World` that would track "which version of the road graph each cache entry was built against." **Not built** — the plan rejected it in favor of wholesale `clear()`. See §3. |
 | **destination-rooted search** | Dijkstra starts from the *destination's* entry cells and expands outward to every origin. One search serves all origins on that road network. Per-citizen origin-rooted search (e.g. A*) is not used — it would break the shared-cache design. See §2. |
 | **`crossing_penalty`** | The extra weight added to a road cell that has > 2 road neighbors (T-junction or 4-way intersection). Default = 2. `edge_weight = 1 + crossing_penalty`. See §7b P1. |
-| **`TravelState`** | The per-citizen travel *token* — `{ status, current_cell, destination }`. The citizen entity never moves; the token's `current_cell` advances along roads. Stored in `world.travel: HashMap<Entity, TravelState>`. P3, see §2 + §5. |
+| **`TravelState`** | The per-citizen travel *token* — `{ status, current_cell, destination, building }` (`building` = the building occupied while idle, i.e. the next departure origin; `None` while travelling). The citizen entity never moves; the token's `current_cell` advances along roads. Stored in `world.travel: HashMap<Entity, TravelState>`. P3 (`components.rs`), see §2 + §5. |
 | **`TravelStatus`** | `AtHome | AtWork | Traveling` (P3); P5 adds `Away` (token is in another region). |
 | **`TravelerId`** | `(citizen: Entity, generation: u32)` — round-trip identity for a cross-region token. `citizen.region()` IS the home region. See §5c. |
 | **`TravelerHandoff`** | The cross-region message: `TravelState` + `TravelerId` + `to_region` + `entry_link` + `return_path` + `purpose` (Outbound/Return). Routed by the worker like an export request. See §5c. |
@@ -74,7 +74,7 @@ Region (World):                                    adapter ─► CitizenTravelV
       (chokepoint-specific dispatch — see §3)
   per-citizen travel state:
     world.travel: HashMap<Entity, TravelState {
-      status, current_cell, destination }>
+      status, current_cell, destination, building }>
   movement system: advance travelers each tick
   cross-region (P5): the SAME token crosses on a
     RegionEvent to the neighbor's visiting_travel map
@@ -433,6 +433,17 @@ workplace is not unreachable — it targets the border-exit cell, then hands a t
 across the border; see §5. If the workplace region is not a direct neighbor, v1
 treats it as unreachable → stay at current location.)
 
+**Exception — destroyed origin (not a degenerate route).** The no-teleport rule
+above applies when the origin building *still exists* but cannot reach the target.
+If the building a citizen is idling in is **bulldozed/replaced**, the origin itself
+is gone — there is no "current location" to stay at — so the displaced citizen
+returns **home** (`travel::run` falls back to `home` when `state.building` no longer
+exists in `world.buildings`). This is intentionally distinct from §4b's stranded
+case: a stranded citizen's origin still exists and it stays put; a displaced
+citizen's origin was deleted. Relocating onto the building's adjacent road instead
+would require capturing the road at the removal chokepoint (coupling movement into
+`entity_cleanup`); the home fallback avoids that for a corner case.
+
 ### 4c. Granularity / determinism / persistence
 
 - **v1 granularity: tick-cadence (accepted).** A traveler advances one cell per tick;
@@ -440,9 +451,9 @@ treats it as unreachable → stay at current location.)
   *only* thing that could ever live in the UI (off `anim_frame`, between two
   core-provided positions) — deferred (P6), add only if the stepping looks too coarse.
   **Travel runs on ticks only** — `travel::run` is wired into the tick path
-  (after `happiness::run` at `simulation.rs:196`, before `turn += 1` at `:197`),
-  not into the paused-config re-derive (`ensure_derived_state` at
-  `simulation.rs:253` calling `refresh_derived_state_for_world` at `:266`). A
+  (at `simulation.rs:199`, after `happiness::run` at `:196`, before `turn += 1`
+  at `:200`), not into the paused-config re-derive (`ensure_derived_state` at
+  `simulation.rs:256` calling `refresh_derived_state_for_world` at `:269`). A
   build while paused won't restep travelers until the next tick. This is
   acceptable: travel state is `#[serde(skip)]` display-only, so a one-tick
   re-derive is free.
@@ -493,7 +504,7 @@ citizen stays home.
 ### 5b. Share-nothing: one token, no proxy, entity never migrates
 
 The citizen **entity never migrates**, and there is no separate "proxy" — there is just
-the one **token** (the `TravelState` from §2 — `{ status, current_cell, destination }`).
+the one **token** (the `TravelState` from §2 — `{ status, current_cell, destination, building }`).
 What crosses is that token, routed as a `RegionEvent` over the *same* border topology
 (`RegionNeighborLink` / `BorderLinkId`) and worker routing that already carry
 power/job/goods exports. While the token is visiting B it is the **single
@@ -1102,7 +1113,7 @@ tick (after happiness) ─► travel::run(world):
         step    = current_cell = routes_to(target)[current_cell]  // O(1)
         unreachable ─► stay at current location                  // §4b (no teleport)
     prune dead citizens from world.travel
-World { + #[serde(skip)] travel: HashMap<Entity, TravelState { status, current_cell, destination }> }
+World { + #[serde(skip)] travel: HashMap<Entity, TravelState { status, current_cell, destination, building }> }
 ```
 No interface/ui yet. Test: 09:00 home→work exact cells; unreachable→stay put; remote worker stays home.
 
@@ -1176,7 +1187,7 @@ Each a separate mission; heatmap is a 2nd consumer of P1, tween is pure UI.
 
 - Route table is **region-owned**, keyed by `(destination, road_network_id)` (not
   per-citizen, not city).
-- Per-citizen state is just `{ status, current_cell, destination }`; movement steps
+- Per-citizen state is just `{ status, current_cell, destination, building }`; movement steps
   in O(1) via the region's `came_from` (no stored path, no re-walk).
 - Dirtying via a **chokepoint-specific strategy** (§3): **coarse `route_cache.clear()`**
   on a **road** change (any tree might be affected); **per-destination eviction** on a
@@ -1454,3 +1465,82 @@ Topology change (e.g., new road):
 - **One-tick staleness**: not introduced. The cache is invalidated at the
   same chokepoints as the resource registry, so cross-region effects
   remain one-tick-stale (the target snapshot model).
+
+---
+
+## Implemented — P3 (movement sim + schedule) · `systems/travel.rs`
+
+`travel::run(world)` is wired into the tick at `simulation.rs:199` (after
+`happiness::run` at `:196`, before `turn += 1` at `:200`). It is the consumer the
+P-schedule layer was built for: the schedule answers *what* a citizen wants, this
+system walks them there one road cell per tick over the P2 route cache. Core-only;
+no interface/ui (that is P4).
+
+### The per-tick state machine (per citizen, sorted by `entity.0`)
+
+```text
+  intent = schedule_intent(hour, citizen)        // schedule.rs (P-schedule)
+  target = resolve_target(intent):               // movement-side resolution
+             Home/Leisure          → citizen.home
+             Work(wp)              → wp.as_local(region) ? local workplace : home
+                                       (remote idles at home in v1; P5 → border-exit)
+  state  = world.travel[citizen]  (or default: AtHome, no cell, no building)
+
+  ┌─ current_cell = None  (idle in a building) ──────────────────────────────┐
+  │   origin = state.building  IF it still exists  ELSE home   (§4b exception)│
+  │   origin == target ?  → idle(arrived_status, target)        (stay put)    │
+  │   else                → depart(origin → target):                          │
+  │        first position-sorted entry road of origin that can reach target   │
+  │          reachable → Traveling, current_cell = that entry road            │
+  │          none       → stay idle at origin             (§4b, no teleport)   │
+  └───────────────────────────────────────────────────────────────────────────┘
+  ┌─ current_cell = Some(cell)  (en route) ──────────────────────────────────┐
+  │   cell adjacent to target ? → arrive: idle(AtHome/AtWork), cell = None    │
+  │   else                       → step: current_cell = came_from[cell]       │
+  │          unreachable          → stay on the same cell  (§4b, no teleport)  │
+  └───────────────────────────────────────────────────────────────────────────┘
+
+  after the loop: prune world.travel entries whose citizen no longer exists
+```
+
+### `TravelState` — why the `building` field exists
+
+```text
+  TravelState { status, current_cell, destination, building }   (components.rs, Copy)
+    idle:      current_cell = None,        building = Some(b)   (inside building b)
+    en route:  current_cell = Some(road),  building = None      (on that road cell)
+```
+
+The departure **origin is read from `state.building`** — the building actually
+occupied — *not* re-inferred from the (mutable) workplace assignment. Re-inferring
+would teleport a citizen whose assignment changed while idle (origin would jump to
+the new workplace), or strand one whose assignment cleared. The
+`reassigned_worker_departs_from_old_workplace` test pins this.
+
+### Two distinct "can't move" cases
+
+```text
+  §4b stranded   : origin EXISTS but no road route → STAY PUT (retry on reconnect)
+  §4b exception  : origin DESTROYED (bulldozed)    → return HOME (no location to hold)
+```
+
+`state.building.filter(|b| world.buildings.contains_key(b)).unwrap_or(home)`
+collapses the destroyed-origin case to a home fallback; capturing the building's
+adjacent road at the removal chokepoint (the teleport-free alternative) would
+couple movement into `entity_cleanup`, which isn't worth it for a corner case.
+
+### Determinism / persistence / balance
+
+Citizens visited in `entity.0` order; networks discovered deterministically;
+`routes_to` is the deterministic P1 tree; entry cells sorted by position. Movement
+is transient `#[serde(skip)]` display/derived state — not saved; the first tick
+after load re-derives placement from the schedule. No economy/resource mutation
+(the route cache is read, never written here), so balance-neutral.
+
+### Reviewed via `claude-city-dev`
+
+codex (`reviewer`) over three rounds — fixed a medium origin-teleport/strand bug
+(added the `building` field), the destroyed-origin void-strand (home fallback +
+documented §4b exception), and stale plan line numbers; then opencode
+(`ses_108ae15e8ffel8UmUzUFJQ94IF`) clean ("ship it"), plus a test-helper
+readability fix (`set_hour` now absolute). 9 travel tests; gates green.

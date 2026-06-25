@@ -18,4 +18,5 @@ pub mod road_network_analysis;
 pub mod route_cache;
 pub mod schedule;
 pub mod stats;
+pub mod travel;
 pub mod upgrade;

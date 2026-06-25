@@ -288,6 +288,58 @@ pub struct HappinessEffect {
     pub amount: i32,
 }
 
+/// P3 movement: where a citizen is in its daily commute. Lives only in the
+/// `#[serde(skip)]` `World::travel` map (transient display/derived state — it is
+/// rebuilt from the schedule each tick and never saved), so it carries no serde.
+///
+/// `AtHome`/`AtWork` are the idle endpoints (citizen inside a building, off the
+/// road graph); `Traveling` means the citizen is on a road cell stepping toward
+/// its destination. P5 will add an `Away` variant for a token out in a neighbor
+/// region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TravelStatus {
+    AtHome,
+    AtWork,
+    Traveling,
+}
+
+/// P3 movement: one citizen's per-tick trip state.
+///
+/// ```text
+///   idle:      current_cell = None,       building = Some(b)   (inside building b)
+///   en route:  current_cell = Some(road), building = None      (on that road cell)
+///   destination = Some(b) while travelling toward b; None when idle.
+/// ```
+///
+/// `building` records the building the citizen actually occupies while idle, so
+/// the departure origin is read from movement state — **not** re-inferred from
+/// the (mutable) workplace assignment. Re-inferring would teleport a citizen
+/// whose assignment changed while idle, or strand one whose assignment cleared.
+///
+/// No stored path: the citizen re-reads the region route cache (`came_from`)
+/// each tick and steps one cell, so this stays tiny and `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TravelState {
+    pub status: TravelStatus,
+    pub current_cell: Option<Entity>,
+    pub destination: Option<Entity>,
+    /// The building occupied while idle (`None` while travelling).
+    pub building: Option<Entity>,
+}
+
+impl Default for TravelState {
+    fn default() -> Self {
+        // A citizen with no recorded trip is assumed home and idle; the movement
+        // system fills `building` with the citizen's home on the first tick.
+        Self {
+            status: TravelStatus::AtHome,
+            current_cell: None,
+            destination: None,
+            building: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
