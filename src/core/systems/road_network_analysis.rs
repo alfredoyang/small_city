@@ -1,6 +1,13 @@
 //! Derived road-network distances used by economy, happiness, and inspect explanations.
+//!
+//! P1 (pathfinding) adds `road_predecessors` — a destination-rooted, multi-source
+//! Dijkstra that records `came_from` for path reconstruction. Edge weight is
+//! `1 + crossing_penalty(current)` (the cell being entered in the forward
+//! direction, in the destination-rooted reverse search). See
+//! `docs/traffic-pathfinding-plan.md` §7b P1 for the full spec.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use crate::core::entity::Entity;
 use crate::core::systems::road_connectivity::{self, RoadNetwork};
@@ -233,6 +240,135 @@ fn road_distances(
     distances
 }
 
+/// Destination-rooted, multi-source Dijkstra that records `came_from` for
+/// every road cell reachable from `sources` (P1, pathfinding).
+///
+/// `sources` are the destination's entry road cells. The search expands
+/// outward and records `came_from[child] = parent` so the citizen can
+/// reconstruct the path by walking the tree inward (one HashMap lookup per
+/// tick — see the pathfinding plan §2a).
+///
+/// **Edge weight** — `1 + crossing_penalty(current)` (destination-rooted
+/// reverse search: relaxing `current → neighbor` represents the forward
+/// step `neighbor → current` toward the destination, so the penalty
+/// charges the cell being entered, which is `current`). `crossing_penalty = 2`
+/// if the road cell has > 2 road neighbors (T-junction or 4-way), else `0`.
+/// This makes paths prefer fewer crossings on equal-hop routes.
+///
+/// **Determinism** — `BinaryHeap` does not guarantee pop order for equal
+/// priorities, so the heap key is `Reverse<(cost, entity)>`. The tuple
+/// orders equal-cost heap pops by entity id deterministically (lower entity
+/// id pops first). It does not *directly* select parents, but it determines
+/// which equal-cost relaxation is *recorded first*; strict `<` then
+/// preserves that first parent.
+///
+/// **Sources** must be road cells in the `network` — sources outside the
+/// network's `roads` set are ignored (the relax loop filters by
+/// `network.roads.contains(...)`). Empty `sources` returns an empty
+/// `HashMap`. Sources are roots and are absent from the returned `came_from`.
+///
+/// **Stale-heap skip** — `if cost != dist[current] { continue; }` ignores
+/// stale heap entries from a relaxed update (a node may be in the heap with
+/// an old cost before its `dist` is lowered).
+#[allow(dead_code)] // P1 is a standalone patch; P2 wires this into the route cache.
+pub(crate) fn road_predecessors(
+    world: &World,
+    network: &RoadNetwork,
+    sources: &[Entity],
+) -> HashMap<Entity, Entity> {
+    road_predecessors_inner(world, network, sources).0
+}
+
+/// Shared implementation: returns `(came_from, dist)`. The cost is the road
+/// cost under the crossing-penalty weight: `1 + crossing_penalty(current)`.
+/// Used by [`road_predecessors`] (production) and [`road_predecessors_with_dist`]
+/// (test helper).
+fn road_predecessors_inner(
+    world: &World,
+    network: &RoadNetwork,
+    sources: &[Entity],
+) -> (HashMap<Entity, Entity>, HashMap<Entity, u32>) {
+    let mut came_from: HashMap<Entity, Entity> = HashMap::new();
+    let mut dist: HashMap<Entity, u32> = HashMap::new();
+    let mut heap: BinaryHeap<Reverse<(u32, Entity)>> = BinaryHeap::new();
+
+    // Seed: source cells get distance 0 and are pushed onto the heap.
+    // Sources outside the network are ignored (the relax loop filters by
+    // network.roads anyway, but skipping them here avoids a useless entry
+    // for a source that would never be reached).
+    for source in sources {
+        if network.roads.contains(source) && dist.insert(*source, 0).is_none() {
+            heap.push(Reverse((0, *source)));
+        }
+    }
+
+    while let Some(Reverse((cost, current))) = heap.pop() {
+        // Stale-heap skip: this entry was pushed before a later relaxation
+        // lowered `dist[current]`. The current top-of-heap value is stale.
+        if cost != *dist.get(&current).unwrap_or(&u32::MAX) {
+            continue;
+        }
+
+        // Relax neighbors. Destination-rooted: relaxing `current → neighbor`
+        // represents the forward step `neighbor → current` toward the
+        // destination, so the penalty charges `current`.
+        let mut neighbors: Vec<_> = road_connectivity::adjacent_road_entities(world, current)
+            .filter(|neighbor| network.roads.contains(neighbor))
+            .collect();
+        // Neighbour order does not affect correctness (the heap reorders by
+        // key) or determinism (the heap key is (cost, entity_id)). Sort only
+        // so the test is reproducible across runs without relying on
+        // HashMap iteration order.
+        road_connectivity::sort_entities_by_position(world, &mut neighbors);
+
+        // `neighbors` are exactly the road neighbors of `current` in the
+        // network, so the degree is `neighbors.len()` (no second scan).
+        let degree = neighbors.len() as u32;
+        let crossing_penalty = if degree > 2 { 2 } else { 0 };
+
+        for neighbor in neighbors {
+            // Destination-rooted reverse search: relaxing `current →
+            // neighbor` represents the forward step `neighbor → current`
+            // toward the destination, so the penalty charges the cell
+            // being entered in the forward direction — which is `current`,
+            // not `neighbor`.
+            let nd = cost + 1 + crossing_penalty;
+            if nd < *dist.get(&neighbor).unwrap_or(&u32::MAX) {
+                dist.insert(neighbor, nd);
+                came_from.insert(neighbor, current);
+                heap.push(Reverse((nd, neighbor)));
+            }
+        }
+    }
+
+    (came_from, dist)
+}
+
+/// Number of road cells in `network` that are orthogonally adjacent to
+/// `road_entity`. Used to compute the crossing penalty (> 2 → T-junction
+/// or 4-way intersection). A 2-neighbor cell is a straight segment or
+/// corner (no penalty).
+#[allow(dead_code)] // P1 standalone; test-only sanity check.
+fn road_degree_in_network(world: &World, road_entity: Entity, network: &RoadNetwork) -> u32 {
+    road_connectivity::adjacent_road_entities(world, road_entity)
+        .filter(|neighbor| network.roads.contains(neighbor))
+        .count() as u32
+}
+
+/// Test helper: returns the `dist` map (shortest cost from any source to each
+/// reachable cell) alongside the `came_from` tree. Thin wrapper over the
+/// shared [`road_predecessors_inner`]; exists so tests can assert on the
+/// cost values directly. `pub(crate)` for test access; not part of the P1
+/// production API.
+#[allow(dead_code)] // P1 standalone; helper is used by tests.
+pub(crate) fn road_predecessors_with_dist(
+    world: &World,
+    network: &RoadNetwork,
+    sources: &[Entity],
+) -> (HashMap<Entity, Entity>, HashMap<Entity, u32>) {
+    road_predecessors_inner(world, network, sources)
+}
+
 fn nearest_distance(roads: &[Entity], distances: &HashMap<Entity, u32>) -> Option<u32> {
     roads
         .iter()
@@ -293,6 +429,249 @@ mod tests {
         assert_eq!(
             access_for(&world, industrial).import_export_distance,
             Some(3)
+        );
+    }
+
+    // P1 tests (pathfinding) — destination-rooted Dijkstra with crossing penalty.
+
+    use super::{
+        Entity, RoadNetwork, road_degree_in_network, road_predecessors, road_predecessors_with_dist,
+    };
+    use crate::core::systems::road_connectivity::discover_road_networks;
+
+    /// Helper: place a single road cell and return its entity.
+    fn place_road(world: &mut World, x: usize, y: usize) -> crate::core::entity::Entity {
+        place(world, x, y, BuildingKind::Road)
+    }
+
+    /// Helper: build a single-network `Vec<RoadNetwork>` and return the only
+    /// network (panics if there's not exactly one).
+    fn single_network(world: &World) -> RoadNetwork {
+        let networks = discover_road_networks(world);
+        assert_eq!(networks.len(), 1, "expected exactly one road network");
+        networks.into_iter().next().unwrap()
+    }
+
+    /// P1: determinism. Two calls with the same input produce structurally
+    /// equal `came_from` trees, and the tree routes the path correctly.
+    #[test]
+    fn road_predecessors_deterministic_across_runs() {
+        let mut world = World::new(5, 1);
+        // Linear road A-B-C-D-E (left to right); source = E (rightmost).
+        let _a = place_road(&mut world, 0, 0);
+        let _b = place_road(&mut world, 1, 0);
+        let _c = place_road(&mut world, 2, 0);
+        let _d = place_road(&mut world, 3, 0);
+        let e = place_road(&mut world, 4, 0);
+        let network = single_network(&world);
+
+        let first = road_predecessors(&world, &network, &[e]);
+        let second = road_predecessors(&world, &network, &[e]);
+
+        // Two calls produce equal trees (determinism).
+        assert_eq!(first, second);
+
+        // Sanity: the tree routes D → E (D's parent is E), C → D, B → C, A → B.
+        // Entity ids are spawned left-to-right: 0, 1, 2, 3, 4.
+        let a_id = entity_at(&world, 0, 0);
+        let b_id = entity_at(&world, 1, 0);
+        let c_id = entity_at(&world, 2, 0);
+        let d_id = entity_at(&world, 3, 0);
+        let e_id = entity_at(&world, 4, 0);
+        assert!(!first.contains_key(&e_id), "source E must be absent");
+        assert_eq!(first.get(&d_id), Some(&e_id), "D → E");
+        assert_eq!(first.get(&c_id), Some(&d_id), "C → D");
+        assert_eq!(first.get(&b_id), Some(&c_id), "B → C");
+        assert_eq!(first.get(&a_id), Some(&b_id), "A → B");
+    }
+
+    fn entity_at(world: &World, x: usize, y: usize) -> Entity {
+        world.grid.get(x, y).expect("entity at cell")
+    }
+
+    /// P1: crossing penalty. Verify the algorithm charges the penalty on a
+    /// degree-4 cell (4-way intersection) by checking the cost map. Build a
+    /// "+" shape where the center has 4 road neighbors and a single source.
+    /// The cost of reaching X from the source arm is 1 (no penalty on the
+    /// arm, which is degree 1). The cost of reaching the opposite arm via X
+    /// is `1 + (1 + penalty(X)) = 1 + 3 = 4` (penalty 2 because X is
+    /// degree 4). If the penalty were not applied, the opposite arm would
+    /// cost 2.
+    #[test]
+    fn road_predecessors_crossing_penalty_charged() {
+        // Layout (3x3 grid, 5 roads — a "+" shape):
+        //   row 0:  . R .
+        //   row 1:  R X R
+        //   row 2:  . R .
+        //
+        // X is degree 4 (all 4 arm cells are road neighbors). Arm cells (R)
+        // are degree 1 (only X is a road neighbor — the opposite arm is
+        // not orthogonally adjacent).
+        let mut world = World::new(3, 3);
+        let r_north = place_road(&mut world, 1, 0);
+        let r_east = place_road(&mut world, 2, 1);
+        let r_south = place_road(&mut world, 1, 2);
+        let r_west = place_road(&mut world, 0, 1);
+        let x = place_road(&mut world, 1, 1);
+        let network = single_network(&world);
+
+        // Sanity: verify the topology before testing the algorithm.
+        let degree_x = road_degree_in_network(&world, x, &network);
+        assert_eq!(degree_x, 4, "X should be a 4-way intersection");
+        let degree_arm = road_degree_in_network(&world, r_north, &network);
+        assert_eq!(degree_arm, 1, "arm cells should be degree 1 (leaves)");
+
+        let (_, dist) = road_predecessors_with_dist(&world, &network, &[r_north]);
+
+        // The source has cost 0.
+        assert_eq!(dist.get(&r_north), Some(&0));
+
+        // X is reached from the source. The reverse relaxation goes from
+        // r_north to x with edge weight `1 + penalty(current)` where
+        // current = r_north (degree 1, no penalty). So dist[x] = 0 + 1 = 1.
+        // The penalty on X is charged when LEAVING X (in reverse), which
+        // is equivalent to ENTERING X in the forward direction.
+        let dist_x = dist.get(&x).copied().expect("X must be reached");
+        assert_eq!(
+            dist_x, 1,
+            "X should be reached with cost 1 (from r_north, no penalty on r_north); \
+             the penalty on X is charged on the next step"
+        );
+
+        // The other R's are reached via X. The reverse relaxation goes from
+        // x to r_south with edge weight `1 + penalty(x) = 1 + 2 = 3`.
+        // So dist[r_south] = dist[x] + 3 = 1 + 3 = 4.
+        // If the penalty were 0, dist[r_south] would be 1 + 1 = 2.
+        let dist_south = dist
+            .get(&r_south)
+            .copied()
+            .expect("south R must be reached");
+        assert_eq!(
+            dist_south, 4,
+            "south R should be reached with cost 4 (through X with penalty 2); \
+             if penalty were 0, cost would be 2"
+        );
+        // r_east and r_west are reached the same way (both arm cells have
+        // the same cost from the source through X).
+        assert_eq!(
+            dist.get(&r_east).copied(),
+            Some(4),
+            "east R should also have cost 4 (symmetric arm)"
+        );
+        assert_eq!(
+            dist.get(&r_west).copied(),
+            Some(4),
+            "west R should also have cost 4 (symmetric arm)"
+        );
+    }
+
+    /// P1: unreachable / empty sources. Empty `sources` returns an empty
+    /// tree (no cells were ever reached). Sources outside the network are
+    /// ignored.
+    #[test]
+    fn road_predecessors_empty_or_foreign_sources_yield_empty_tree() {
+        let mut world = World::new(3, 1);
+        let a = place_road(&mut world, 0, 0);
+        let b = place_road(&mut world, 1, 0);
+        let c = place_road(&mut world, 2, 0);
+        let network = single_network(&world);
+
+        // Empty sources → empty tree.
+        let tree = road_predecessors(&world, &network, &[]);
+        assert!(tree.is_empty());
+
+        // Foreign-network source: an entity not in the network's roads set
+        // is ignored. (The existing `road_distances` does the same filtering.)
+        let foreign = world.spawn();
+        let tree = road_predecessors(&world, &network, &[foreign]);
+        assert!(tree.is_empty(), "foreign source should be ignored");
+
+        // Sanity: a real source returns a non-empty tree.
+        let tree = road_predecessors(&world, &network, &[c]);
+        assert!(!tree.is_empty());
+        // c is the source — absent from came_from.
+        assert!(!tree.contains_key(&c));
+        // a and b are both reached (one step from c each).
+        assert!(tree.contains_key(&a), "a must be reached");
+        assert!(tree.contains_key(&b), "b must be reached");
+    }
+
+    /// P1: cross-network filtering. Sources from network 2 are ignored when
+    /// called on network 1.
+    #[test]
+    fn road_predecessors_cross_network_source_is_ignored() {
+        // Two disconnected road networks:
+        //   network 1: row 0 (horizontal road)
+        //   network 2: row 2 (horizontal road)
+        let mut world = World::new(3, 3);
+        let n1_a = place_road(&mut world, 0, 0);
+        let n1_b = place_road(&mut world, 1, 0);
+        let n1_c = place_road(&mut world, 2, 0);
+        let n2_a = place_road(&mut world, 0, 2);
+        let n2_b = place_road(&mut world, 1, 2);
+        let n2_c = place_road(&mut world, 2, 2);
+
+        // The two networks are disconnected (no vertical road between row 0 and row 2).
+        let networks = discover_road_networks(&world);
+        assert_eq!(networks.len(), 2, "expected two disconnected networks");
+
+        // Get network 1 (its id is 0 or 1 depending on discovery order).
+        let net1 = networks.iter().find(|n| n.roads.contains(&n1_a)).unwrap();
+
+        // Foreign source: pass an n2 cell to network 1. It must be ignored.
+        let tree = road_predecessors(&world, net1, &[n2_a]);
+        assert!(
+            tree.is_empty(),
+            "n2 source must be ignored when calling on n1"
+        );
+        // Network 1 cells are also absent (no valid source).
+        assert!(!tree.contains_key(&n1_a));
+        assert!(!tree.contains_key(&n1_b));
+        assert!(!tree.contains_key(&n1_c));
+
+        // Real source: n1_c on n1 returns n1 cells only (n2 cells are not
+        // reached because they're not in the network's roads set).
+        let tree = road_predecessors(&world, net1, &[n1_c]);
+        assert!(tree.contains_key(&n1_a));
+        assert!(tree.contains_key(&n1_b));
+        assert!(
+            !tree.contains_key(&n2_a),
+            "n2 cells must not be reached from n1"
+        );
+        assert!(!tree.contains_key(&n2_b));
+        assert!(!tree.contains_key(&n2_c));
+    }
+
+    /// P1: multi-source. Two destination entry cells as sources — both are
+    /// absent from `came_from`. An ambiguous cell (directly adjacent to both
+    /// sources with equal cost and equal penalty) records the lower-entity-id
+    /// source as its parent.
+    #[test]
+    fn road_predecessors_multi_source_deterministic_tie_break() {
+        // Linear road: A — B — C. Sources = {A, C}. B is directly adjacent
+        // to both, with equal cost (1 hop) and equal penalty (B is degree 2).
+        let mut world = World::new(3, 1);
+        let a = place_road(&mut world, 0, 0);
+        let b = place_road(&mut world, 1, 0);
+        let c = place_road(&mut world, 2, 0);
+        let network = single_network(&world);
+
+        let tree = road_predecessors(&world, &network, &[a, c]);
+
+        // Both sources are absent (roots have no parent).
+        assert!(!tree.contains_key(&a), "source a must be absent");
+        assert!(!tree.contains_key(&c), "source c must be absent");
+
+        // B's parent is the lower-entity-id source. The reverse
+        // relaxation charges the source cell being entered (A or C are
+        // degree 1 → no penalty; B is degree 2 → no penalty; the only
+        // cost difference is the entity-id tie-break). Since a and c are
+        // 0-indexed and spawned in order, a.0 < c.0, so the canonical
+        // parent is a (the first source in entity-id order).
+        let parent = tree.get(&b).expect("b must have a parent");
+        assert_eq!(
+            *parent, a,
+            "tie-break should pick the lower-entity-id source"
         );
     }
 
