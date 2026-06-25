@@ -23,6 +23,13 @@ pub(crate) fn place_building(world: &mut World, x: usize, y: usize, kind: Buildi
     );
 
     attach_building_components(world, entity, kind);
+
+    // P2: route cache chokepoint. A new road can connect previously-
+    // disconnected areas, so coarse-clear the whole cache. A new building
+    // is a cache miss on first access, not a stale entry — no invalidation.
+    if kind == BuildingKind::Road {
+        world.clear_route_cache();
+    }
 }
 
 fn attach_building_components(

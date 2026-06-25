@@ -1312,3 +1312,145 @@ path if profiling ever demands more.
   Ceiling: the penalty is a compile-time const; if it becomes dynamic (e.g.
   congestion-weighted in P6), it must enter the route cache key `(dest, network_id,
   penalty_version)` or the cache serves stale trees.
+
+---
+
+## 9. P2 implementation record (route cache)
+
+P2 was implemented in commit `9dcd774..P2`. The patch is **standalone**: the
+cache and chokepoints are wired, but `World::routes_to` is not yet called by
+the movement system (that's P3).
+
+### 9a. What the patch added
+
+- **New file** `src/core/systems/route_cache.rs`:
+  `RouteCache` struct (`RefCell<HashMap<(Entity, u32), HashMap<Entity, Entity>>>`)
+  with `clear()`, `evict(dest)`, `get_or_compute(key, compute)`, and a
+  test-only `contains(key)` helper.
+- **`World` field** `route_cache: RefCell<RouteCache>` — `#[serde(skip, default)]`
+  because the cache is derived state; a freshly-loaded world starts empty
+  and the first access recomputes.
+- **`World::routes_to(dest, network) -> Ref<'_, HashMap<Entity, Entity>>`** —
+  the accessor. Picks sources (building → adjacent roads in network;
+  road entity → `[dest]`), looks up or computes the tree via
+  `get_or_compute`, returns a `Ref` to the cached tree.
+- **`World::clear_route_cache()` / `evict_route_cache(dest)`** — the two
+  invalidation methods called from the chokepoints.
+- **Chokepoints** (the only places that touch the cache from the command
+  layer):
+  - `placement::place_building` — road → `clear_route_cache`; building → no
+    invalidation (cache miss on first access).
+  - `entity_cleanup::remove_entity` — road → `clear_route_cache`; building
+    → `evict_route_cache(entity)`. Dispatched on the pre-removal kind
+    (read before the building record is dropped). Two identical match arms
+    (fallback path + normal path) because the fallback may lack an
+    `entities` record.
+  - `upgrade::grow_to_level` — after the footprint changes,
+    `evict_route_cache(surviving_entity)`. Absorbed neighbours each go
+    through `entity_cleanup::remove_entity` and fire their own building-evict.
+- **11 tests** in `route_cache::tests`:
+  - `RouteCache` direct: `clear`, `evict`, `get_or_compute` closure
+    invocation count.
+  - `World::routes_to`: building-as-dest, road-as-dest (P5), determinism,
+    wrong network (edge case).
+  - Chokepoints: road placement → coarse clear; building bulldoze →
+    per-destination evict (selective, verified by key presence before
+    and after); road bulldoze → coarse clear; upgrade footprint growth →
+    per-destination evict.
+
+### 9b. Why two chokepoints in `entity_cleanup::remove_entity`
+
+The function has a fallback path for entities that lack an `entities`
+record (the legacy `remove_from_all_component_maps` branch). Both paths
+dispatch the route cache invalidation because the route cache doesn't
+care about the `entities` record — it only cares about the pre-removal
+building kind. The two match arms are intentionally identical (not
+extracted to a closure) because the dispatch is four lines and a closure
+would obscure the invariant.
+
+### 9c. Reentrancy invariant in `routes_to`
+
+`get_or_compute` holds a `borrow_mut` on the `RefCell` while the closure
+runs. The closure is `road_predecessors`, which today is a pure graph walk
+that never touches `route_cache` — so the reentrancy is safe. A comment
+in `routes_to` pins the invariant: "compute must not touch route_cache."
+If `road_predecessors` ever needs to read the cache (e.g. for a
+congestion-aware penalty that looks at a cell's current traffic), the
+borrow pattern must be restructured (e.g. compute the tree into a local
+variable, then insert into the cache after releasing the borrow).
+
+### 9d. Negative-result caching
+
+A call to `routes_to(dest, network)` with a disconnected or wrong
+network caches an empty tree under `(dest, network.id)`. The cache
+stores negatives intentionally — the tree is the correct "no route"
+answer for the current topology. A subsequent chokepoint (road change)
+will clear it, and a subsequent call with the correct network id will
+compute a fresh tree. This is the expected behavior: don't recompute
+empty trees on every tick.
+
+### 9e. ASCII diagram — what P2 is
+
+```
++-----------------------+      +------------------------+
+|   World::routes_to    |      |   RouteCache (P2)      |
+|   (production API)    | ---> |   RefCell<HashMap<     |
+|   returns Ref<...>    |      |     (dest, net_id),    |
++-----------------------+      |     came_from tree>>   |
+         |                     +------------------------+
+         |                              ^
+         |                              | get_or_compute
+         |                              |
+         v                              |
++-----------------------+               |
+|  road_predecessors    |  on miss ───> |
+|  (P1, deterministic)  |               |
++-----------------------+               |
+
+Chokepoints (the only places that touch the cache):
+  placement::place_building      road ──> clear
+                                  building ──> (none)
+  entity_cleanup::remove_entity  road ──> clear
+                                  building ──> evict(dest)
+  upgrade::grow_to_level          surviving ──> evict(entity)
+                                  absorbed   ──> (via remove_entity above)
+```
+
+### 9f. ASCII diagram — the problem P2 solves
+
+```
+Without route cache (P0):
+  09:00 home → work:  Dijkstra for citizen A (10 ms)
+  09:00 home → work:  Dijkstra for citizen B (10 ms)  ← same path!
+  09:00 home → work:  Dijkstra for citizen C (10 ms)  ← same path!
+  ...15 citizens, 1 shared workplace, 1 shared network...
+  Total: 150 ms per tick for routing. Wasteful.
+
+With route cache (P2):
+  09:00 home → work:  citizen A → cache miss → Dijkstra (10 ms) + insert
+  09:00 home → work:  citizen B → cache HIT (O(1) HashMap lookup)  (0.01 ms)
+  09:00 home → work:  citizen C → cache HIT (O(1) HashMap lookup)  (0.01 ms)
+  ...15 citizens...
+  Total: ~10 ms per tick for routing. 15x speedup.
+
+Topology change (e.g., new road):
+  chokepoint → coarse clear
+  next access: cache miss → Dijkstra (10 ms) + insert
+  subsequent: cache hit
+```
+
+### 9g. Determinism and cross-region notes
+
+- **Determinism**: `RouteCache` is a pure function of `(road topology,
+  destination, network_id)`. The cache key is `(dest, network.id)` where
+  `network.id` is discovery-order-deterministic (from P0's
+  `discover_road_networks`). `get_or_compute` always runs the same closure
+  for the same key, so two regions with the same topology produce the
+  same trees.
+- **Cross-region**: not relevant for P2. The cache lives on `World` (one
+  per region), and P2 doesn't touch the region layer. P5 (cross-region
+  token handoff) will use `routes_to` with a road-entity destination (the
+  border-exit cell) — already supported by the road-as-source path.
+- **One-tick staleness**: not introduced. The cache is invalidated at the
+  same chokepoints as the resource registry, so cross-region effects
+  remain one-tick-stale (the target snapshot model).

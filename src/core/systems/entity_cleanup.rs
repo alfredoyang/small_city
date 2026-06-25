@@ -2,8 +2,16 @@
 
 use crate::core::entity::Entity;
 use crate::core::world::World;
+use crate::interface::input::BuildingKind;
 
 pub(crate) fn remove_entity(world: &mut World, entity: Entity, x: usize, y: usize) {
+    // P2: route cache chokepoint. Read the kind *before* removing the
+    // building record so we know whether to coarse-clear (road) or
+    // per-destination evict (building). Done up front so the dispatch
+    // happens even if the entity is missing from `world.entities`
+    // (the `record.kind.is_some()` path is the legacy fallback).
+    let removed_kind = world.buildings.get(&entity).map(|b| b.kind);
+
     // Clear every cell the building occupies. Multi-cell buildings store their footprint, so
     // bulldozing any one of their cells removes the whole building; fall back to (x, y) for
     // off-grid entities (citizens) or anything without a position/building. Read before removal.
@@ -26,6 +34,13 @@ pub(crate) fn remove_entity(world: &mut World, entity: Entity, x: usize, y: usiz
     let Some(record) = world.entities.remove(&entity) else {
         remove_from_all_component_maps(world, entity);
         world.invalidate_resource_registry();
+        // P2: still dispatch the route cache invalidation based on the
+        // pre-removal kind (the legacy fallback path may not have a record).
+        match removed_kind {
+            Some(BuildingKind::Road) => world.clear_route_cache(),
+            Some(_) => world.evict_route_cache(entity),
+            None => {}
+        }
         return;
     };
 
@@ -55,6 +70,15 @@ pub(crate) fn remove_entity(world: &mut World, entity: Entity, x: usize, y: usiz
     }
     remove_citizens_for_home(world, entity);
     world.invalidate_resource_registry();
+
+    // P2: route cache chokepoint (normal path). A removed road can disconnect
+    // previously-connected areas (coarse clear). A removed building means
+    // this destination's entry cells no longer exist (per-destination evict).
+    match removed_kind {
+        Some(BuildingKind::Road) => world.clear_route_cache(),
+        Some(_) => world.evict_route_cache(entity),
+        None => {}
+    }
 }
 
 fn remove_from_all_component_maps(world: &mut World, entity: Entity) {

@@ -138,6 +138,10 @@ pub(crate) fn grow_to_level(world: &mut World, entity: Entity, next_level: u8) -
             height: new_rect.h as u8,
         };
     }
+    // P2: route cache chokepoint — the surviving building's footprint just
+    // changed, so its destination entry cells may have moved (or the building
+    // may now touch different road networks). Per-destination evict.
+    world.evict_route_cache(entity);
     apply_upgrade_effect(world, entity, building.kind);
 
     // Apply absorbed contents now that the merged building's new capacity is set: cash sums, goods

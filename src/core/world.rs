@@ -26,7 +26,9 @@ use crate::core::resource_registry::{
     JobCounts, JobResolution, PowerResolution, ResourceRegistryCache,
 };
 use crate::core::resources::{CityResources, CityStats, LocalEffectsMap};
-use crate::core::systems::road_network_analysis::RoadNetworkAnalysis;
+use crate::core::systems::road_connectivity::RoadNetwork;
+use crate::core::systems::road_network_analysis::{RoadNetworkAnalysis, road_predecessors};
+use crate::core::systems::route_cache::RouteCache;
 use crate::interface::input::BuildingKind;
 use std::cell::{Cell, RefCell};
 
@@ -59,6 +61,13 @@ pub(crate) struct World {
     pub(crate) importable_remote_jobs: i32,
     #[serde(skip, default)]
     pub(crate) cross_region_goods_routes: CrossRegionGoodsRoutes,
+    // P2: region-owned route cache. `came_from` trees keyed by
+    // (destination, road_network_id), recomputed on miss, invalidated at the
+    // placement / entity_cleanup / upgrade chokepoints. `#[serde(skip)]`
+    // because the cache is derived state — a freshly-loaded world starts with
+    // an empty cache and the first access recomputes.
+    #[serde(skip, default)]
+    route_cache: RefCell<RouteCache>,
     // DT1: marks the applied derived state (powered flags, stats, pollution,
     // local effects, happiness) out of date after a config change. Unlike the
     // registry cache above (which stores derived *resolution data* recomputed
@@ -110,6 +119,7 @@ impl World {
             registry_cache: RefCell::default(),
             importable_remote_jobs: 0,
             cross_region_goods_routes: CrossRegionGoodsRoutes::default(),
+            route_cache: RefCell::default(),
             derived_dirty: Cell::new(false),
             building_rules: crate::core::building_rules::BuildingRules::default(),
             positions: HashMap::new(),
@@ -242,6 +252,73 @@ impl World {
     /// Mark only job entries dirty after citizen or workplace-effect changes.
     pub(crate) fn invalidate_jobs_registry(&self) {
         self.registry_cache.borrow_mut().invalidate_jobs();
+    }
+
+    /// P2: drop every entry in the route cache. Called when a road is created
+    /// or removed (the affected set isn't computable from a single road change
+    /// — a new road can connect previously-disconnected areas, a removed road
+    /// can disconnect them).
+    pub(crate) fn clear_route_cache(&self) {
+        self.route_cache.borrow_mut().clear();
+    }
+
+    /// P2: drop every entry whose key's destination is `dest`. Called when a
+    /// building is removed or its footprint grows (only this destination's
+    /// trees are affected — other destinations' entry cells and reachability
+    /// don't change).
+    pub(crate) fn evict_route_cache(&self, dest: Entity) {
+        self.route_cache.borrow_mut().evict(dest);
+    }
+
+    /// P2: cached destination-rooted `came_from` tree for `dest` on `network`.
+    /// Returns a `Ref` to the cached or freshly-computed tree; the tree is
+    /// stored in the cache on miss and reused on subsequent calls.
+    ///
+    /// **Destination roots.** A non-road **building** uses its adjacent road
+    /// cells (in `network`) as Dijkstra sources. A **road entity** (P5
+    /// border-exit routing) uses `[dest]` as the single source.
+    #[allow(dead_code)] // P2 standalone; P3 wires this into the movement system.
+    pub(crate) fn routes_to<'a>(
+        &'a self,
+        dest: Entity,
+        network: &RoadNetwork,
+    ) -> std::cell::Ref<'a, HashMap<Entity, Entity>> {
+        use crate::core::systems::road_network_analysis::adjacent_roads_in_network;
+
+        let key = (dest, network.id);
+        let sources: Vec<Entity> = match self.buildings.get(&dest) {
+            Some(building) if building.kind == BuildingKind::Road => vec![dest],
+            Some(_) => adjacent_roads_in_network(self, dest, network),
+            None => vec![dest],
+        };
+        // Compute (or reuse) the tree. `get_or_compute` returns a `&HashMap`
+        // tied to the `borrow_mut` borrow, which we release before the
+        // `Ref::map` below re-borrows immutably to return a `Ref` to the
+        // caller. The returned `&HashMap` is intentionally discarded — its
+        // lifetime ends when the `borrow_mut` goes out of scope.
+        //
+        // **Reentrancy invariant:** `compute` (`road_predecessors`) must
+        // not touch `self.route_cache`. The `borrow_mut` is held while
+        // `compute` runs, so any access to `route_cache` from inside the
+        // Dijkstra would panic with `BorrowMutError`. This is fine today
+        // because `road_predecessors` is a pure graph walk over the road
+        // topology.
+        let _ = self
+            .route_cache
+            .borrow_mut()
+            .get_or_compute(key, || road_predecessors(self, network, &sources));
+        std::cell::Ref::map(self.route_cache.borrow(), |cache| {
+            cache.get(&key).expect("just inserted; key must be present")
+        })
+    }
+
+    /// P2 test helper: whether `(dest, network_id)` is currently cached.
+    /// Asserts selective eviction by checking key presence before and after
+    /// the operation (a full clear + recompute would also yield a non-empty
+    /// tree, but only a selective evict leaves the commercial's key intact).
+    #[cfg(test)]
+    pub(crate) fn route_cache_contains(&self, dest: Entity, network_id: u32) -> bool {
+        self.route_cache.borrow().contains(&(dest, network_id))
     }
 
     /// Marks the applied derived state stale after an out-of-tick config change (DT1).

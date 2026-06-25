@@ -15,5 +15,6 @@ pub mod power;
 pub mod replace;
 pub mod road_connectivity;
 pub mod road_network_analysis;
+pub mod route_cache;
 pub mod stats;
 pub mod upgrade;

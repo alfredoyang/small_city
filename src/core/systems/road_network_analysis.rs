@@ -180,7 +180,11 @@ fn connected_buildings(world: &World, network: &RoadNetwork) -> Vec<Entity> {
         .collect()
 }
 
-fn adjacent_roads_in_network(world: &World, entity: Entity, network: &RoadNetwork) -> Vec<Entity> {
+pub(crate) fn adjacent_roads_in_network(
+    world: &World,
+    entity: Entity,
+    network: &RoadNetwork,
+) -> Vec<Entity> {
     let mut roads: Vec<_> = road_connectivity::adjacent_road_entities(world, entity)
         .filter(|road| network.roads.contains(road))
         .collect();
