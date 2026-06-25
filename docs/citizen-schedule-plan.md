@@ -412,3 +412,67 @@ CROSS-DOC INTERACTION
 - **Unreachable target → stay put** (no teleport). The movement system keeps the
   citizen at its current building/cell if no route exists; the schedule re-derives
   "home" each tick, and the movement system routes home as soon as a road reconnects.
+
+---
+
+## Implemented — v1 schedule layer (`src/core/systems/schedule.rs`)
+
+The commute-only schedule shipped as a standalone, pure core patch (no tick
+wiring yet — pathfinding **P3 (movement)** is the consumer that wires it in).
+
+### What it adds
+
+Two pure functions and two enums, nothing else. The module owns *only* the
+hour→intent decision; it never touches roads, the route cache, `as_local`, or
+border-exit selection (those are movement-side, per "Decisions locked").
+
+```text
+  ┌──────────────────────── schedule.rs (pure, deterministic) ────────────────────────┐
+  │                                                                                    │
+  │  schedule_phase(hour: u8) ─────────────► SchedulePhase { Work, Home, Leisure }     │
+  │     (9..15) → Work ; else → Home          (Leisure reserved/deferred; never        │
+  │     no citizen data needed                 constructed in v1 → #[allow(dead_code)]) │
+  │     └─ used by P5 visiting tokens that don't own the Citizen record                │
+  │                                                                                    │
+  │  schedule_intent(hour, &Citizen) ──────► ScheduleIntent { Home, Work(Entity),      │
+  │     Work phase + employed → Work(a.workplace)                          Leisure }    │
+  │     Work phase + jobless  → Home          (Work carries the workplace Entity        │
+  │     else                  → Home           verbatim — local OR remote; the          │
+  │     └─ #[allow(dead_code)] until P3        movement system calls as_local, not us)  │
+  │                                                                                    │
+  └────────────────────────────────────────────────────────────────────────────────────┘
+                                    │ emits intent
+                                    ▼
+                    movement system (pathfinding P3, NOT in this patch)
+                    resolves intent → target → route via the P2 route cache
+```
+
+### Where the boundary sits (why two functions)
+
+```text
+  WHO ASKS                        CALLS                  WHY
+  ───────────────────────────────────────────────────────────────────────────
+  local citizen (home region)     schedule_intent(h,c)   needs the semantic
+                                                          intent incl. workplace
+  P5 visiting token (host region,  schedule_phase(h)      only needs to detect
+  no Citizen record on hand)                              workday end (→ Home)
+```
+
+`schedule_phase` is the hour-only half so a host region can run it without the
+traveler's `Citizen` data; `schedule_intent` layers the employed/jobless lookup
+on top for a locally-owned citizen.
+
+### Determinism / balance
+
+Pure functions of `(hour, &citizen.workplace_assignment)` — no time read, no RNG,
+no hidden state, no resource mutation. Balance-neutral (decision layer only).
+`Leisure` in both enums is forward-declared for the deferred 15:00–22:00 block;
+v1 folds that window into `Home`, so the `Leisure` *phase* is never constructed.
+
+### Reviewed via `claude-city-dev`
+
+codex (`reviewer`) + opencode (`ses_108ae15e8ffel8UmUzUFJQ94IF`) both clean after
+two low-severity codex fixes: (1) the remote-workplace test cell now satisfies
+`location.region == workplace.region()`; (2) the module's ascii timeline was made
+non-overlapping. Gates: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test -q` all green (6 new schedule tests, full suite unaffected).
