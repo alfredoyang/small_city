@@ -1,6 +1,7 @@
 //! Panel-based ratatui terminal frontend built only from facade view models.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::env;
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
@@ -432,6 +433,21 @@ impl TileTheme {
 pub(crate) struct TileGlyph {
     pub tile: String,
     pub style: Style,
+}
+
+/// P4: overlay a moving-citizen dot on a tile. Drawn only in the Normal overlay
+/// and never on the cursor cell (the cursor highlight wins); when drawn it becomes
+/// a two-column yellow bold `•·`, keeping the tile's existing background.
+fn overlay_traveler_dot(
+    glyph: &mut TileGlyph,
+    overlay: MapOverlayInput,
+    has_traveler: bool,
+    is_cursor: bool,
+) {
+    if has_traveler && !is_cursor && overlay == MapOverlayInput::Normal {
+        glyph.tile = "•·".to_string();
+        glyph.style = glyph.style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1586,6 +1602,16 @@ fn render_map(
     }
     lines.push(Line::from(header));
 
+    // P4: moving-citizen cells as an O(1) lookup, built only for the Normal overlay
+    // (no other overlay draws dots). `overlay_traveler_dot` also gates on Normal +
+    // cursor, so the set is the perf guard and the fn is the correctness guard.
+    let traveler_cells: HashSet<(usize, usize)> =
+        if state.current_overlay == MapOverlayInput::Normal {
+            view.travelers.iter().map(|t| (t.x, t.y)).collect()
+        } else {
+            HashSet::new()
+        };
+
     for y in state.viewport_y..end_y {
         let mut row = vec![Span::raw(format!("{y:>2} "))];
         for x in state.viewport_x..end_x {
@@ -1620,6 +1646,14 @@ fn render_map(
                     .fg(Color::Black)
                     .add_modifier(Modifier::BOLD);
             }
+            // P4: a moving citizen draws a yellow bold dot on its cell (Normal
+            // overlay only; the cursor wins).
+            overlay_traveler_dot(
+                &mut glyph,
+                state.current_overlay,
+                traveler_cells.contains(&(x, y)),
+                is_cursor,
+            );
             // Each tile is exactly two display columns. The optional gap is outside the styled
             // tile so cursor highlighting never changes map width.
             row.push(Span::styled(glyph.tile, glyph.style));
@@ -3121,6 +3155,65 @@ mod tests {
     use crate::interface::view::{InspectFlag, LocalEffectsView, RoadLinks};
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
+
+    fn plain_glyph() -> TileGlyph {
+        TileGlyph {
+            tile: "R.".to_string(),
+            style: Style::default().bg(Color::Blue),
+        }
+    }
+
+    /// A moving citizen on a cell draws a yellow bold two-column dot in the Normal
+    /// overlay, keeping the tile's existing background.
+    #[test]
+    fn traveler_dot_drawn_in_normal_overlay() {
+        let mut glyph = plain_glyph();
+        overlay_traveler_dot(&mut glyph, MapOverlayInput::Normal, true, false);
+        assert_eq!(glyph.tile, "•·");
+        assert_eq!(
+            Span::raw(glyph.tile.as_str()).width(),
+            2,
+            "dot stays two display columns"
+        );
+        assert!(glyph.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(glyph.style.fg, Some(Color::Yellow));
+        assert_eq!(
+            glyph.style.bg,
+            Some(Color::Blue),
+            "keeps the cell background"
+        );
+    }
+
+    /// The dot is suppressed outside the Normal overlay.
+    #[test]
+    fn traveler_dot_hidden_on_other_overlays() {
+        let base = plain_glyph();
+        for overlay in [
+            MapOverlayInput::Power,
+            MapOverlayInput::Pollution,
+            MapOverlayInput::Population,
+            MapOverlayInput::LandValue,
+            MapOverlayInput::Desirability,
+        ] {
+            let mut glyph = base.clone();
+            overlay_traveler_dot(&mut glyph, overlay, true, false);
+            assert_eq!(glyph, base, "no dot on {overlay:?}");
+        }
+    }
+
+    /// The cursor highlight wins over the dot; an empty cell is untouched.
+    #[test]
+    fn traveler_dot_loses_to_cursor_and_absent_when_no_traveler() {
+        let base = plain_glyph();
+
+        let mut on_cursor = base.clone();
+        overlay_traveler_dot(&mut on_cursor, MapOverlayInput::Normal, true, true);
+        assert_eq!(on_cursor, base, "cursor cell keeps its glyph");
+
+        let mut no_traveler = base.clone();
+        overlay_traveler_dot(&mut no_traveler, MapOverlayInput::Normal, false, false);
+        assert_eq!(no_traveler, base, "no traveler → no dot");
+    }
 
     #[test]
     fn building_emoji_icons_are_exactly_two_columns_wide() {

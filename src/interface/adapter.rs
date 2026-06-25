@@ -10,9 +10,9 @@ use crate::core::systems::{
 use crate::core::world::World;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
-    BuildOptionView, CellView, CitizenDetailView, CitizenRelation, CityDemand, CityStatusView,
-    DemandLevel, GameTimeView, GameView, InspectDetailsView, InspectFlag, InspectView,
-    JobAssignmentView, LocalEffectsView, MapView, PowerStatusView, RoadLinks,
+    BuildOptionView, CellView, CitizenDetailView, CitizenRelation, CitizenTravelView, CityDemand,
+    CityStatusView, DemandLevel, GameTimeView, GameView, InspectDetailsView, InspectFlag,
+    InspectView, JobAssignmentView, LocalEffectsView, MapView, PowerStatusView, RoadLinks,
 };
 
 /// Converts the private ECS World into the only render model the UI may consume.
@@ -35,6 +35,7 @@ pub(crate) fn view_world_with_overlay(world: &World, overlay: MapOverlayInput) -
             height: world.grid.height(),
             cells,
         },
+        travelers: traveler_views(world),
         status: CityStatusView {
             money: world.resources.money,
             turn: world.resources.turn,
@@ -92,6 +93,30 @@ fn game_time_view(time: crate::core::resources::GameTime) -> GameTimeView {
         hour: time.hour_of_day(),
         label: time.label(),
     }
+}
+
+/// P4: the map cells currently holding a moving citizen, deduped and sorted for a
+/// deterministic, presentation-agnostic render list. Only en-route citizens have a
+/// `current_cell`; idle citizens (inside a building) contribute nothing. Multiple
+/// citizens sharing a cell collapse to one marker. No entity id or path leaks out.
+fn traveler_views(world: &World) -> Vec<CitizenTravelView> {
+    let mut cells: Vec<(usize, usize)> = world
+        .travel
+        .iter()
+        // A citizen removed between ticks (e.g. its home bulldozed) leaves a travel
+        // entry until the next tick prunes it; the view renders every frame, so skip
+        // any token whose citizen no longer exists to avoid a stale dot.
+        .filter(|(id, _)| world.citizens.contains_key(id))
+        .filter_map(|(_, state)| state.current_cell)
+        .filter_map(|cell| world.positions.get(&cell))
+        .map(|position| (position.x, position.y))
+        .collect();
+    cells.sort_unstable();
+    cells.dedup();
+    cells
+        .into_iter()
+        .map(|(x, y)| CitizenTravelView { x, y })
+        .collect()
 }
 
 pub(crate) fn calculate_demand(
@@ -941,8 +966,108 @@ fn digit_symbol(value: i32) -> char {
 
 #[cfg(test)]
 mod tests {
-    use super::calculate_demand;
-    use crate::interface::view::{CityDemand, DemandLevel};
+    use super::{calculate_demand, traveler_views, view_world};
+    use crate::core::components::{Citizen, Morale, TravelState, TravelStatus};
+    use crate::core::entity::Entity;
+    use crate::core::systems::placement::place_building;
+    use crate::core::world::World;
+    use crate::interface::input::BuildingKind;
+    use crate::interface::view::{CitizenTravelView, CityDemand, DemandLevel};
+
+    /// Inserts a citizen and its travel state. `cell = None` ⇒ idle.
+    fn add_citizen(world: &mut World, local: u32, cell: Option<Entity>) -> Entity {
+        let id = Entity::new(world.region_id, local);
+        world.citizens.insert(
+            id,
+            Citizen {
+                id,
+                age: 1,
+                home: id,
+                workplace_assignment: None,
+                morale: Morale::default(),
+                money: 0,
+            },
+        );
+        world.travel.insert(
+            id,
+            TravelState {
+                status: if cell.is_some() {
+                    TravelStatus::Traveling
+                } else {
+                    TravelStatus::AtHome
+                },
+                current_cell: cell,
+                destination: None,
+                building: None,
+            },
+        );
+        id
+    }
+
+    /// No moving citizens (or empty roads) → no markers.
+    #[test]
+    fn traveler_views_empty_when_nobody_is_moving() {
+        let mut world = World::new(3, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        add_citizen(&mut world, 1, None); // idle citizen contributes nothing
+        assert!(traveler_views(&world).is_empty());
+    }
+
+    /// Each moving citizen's cell is reported, deduped (shared cell → one marker)
+    /// and sorted; idle citizens are excluded.
+    #[test]
+    fn traveler_views_reports_moving_cells_deduped_and_sorted() {
+        let mut world = World::new(3, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        place_building(&mut world, 1, 0, BuildingKind::Road);
+        let r0 = world.grid.get(0, 0).expect("r0");
+        let r1 = world.grid.get(1, 0).expect("r1");
+
+        // Two citizens on r0 (collapse to one marker), one on r1, one idle.
+        add_citizen(&mut world, 1, Some(r0));
+        add_citizen(&mut world, 2, Some(r0));
+        add_citizen(&mut world, 3, Some(r1));
+        add_citizen(&mut world, 4, None);
+
+        assert_eq!(
+            traveler_views(&world),
+            vec![
+                CitizenTravelView { x: 0, y: 0 },
+                CitizenTravelView { x: 1, y: 0 },
+            ]
+        );
+    }
+
+    /// A travel entry whose citizen was removed (not yet pruned) is skipped, so a
+    /// paused frame never shows a stale dot.
+    #[test]
+    fn traveler_views_excludes_removed_citizen() {
+        let mut world = World::new(2, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        let r0 = world.grid.get(0, 0).expect("r0");
+        let id = add_citizen(&mut world, 1, Some(r0));
+        assert_eq!(traveler_views(&world).len(), 1);
+
+        // Remove the citizen but leave the (not-yet-pruned) travel entry.
+        world.citizens.remove(&id);
+        assert!(world.travel.contains_key(&id));
+        assert!(
+            traveler_views(&world).is_empty(),
+            "stale dot must not render"
+        );
+    }
+
+    /// The marker list reaches the public `view_world` render model.
+    #[test]
+    fn view_world_carries_traveler_markers() {
+        let mut world = World::new(2, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        let r0 = world.grid.get(0, 0).expect("r0");
+        add_citizen(&mut world, 1, Some(r0));
+
+        let view = view_world(&world);
+        assert_eq!(view.travelers, vec![CitizenTravelView { x: 0, y: 0 }]);
+    }
 
     #[test]
     fn demand_is_low_without_population_or_available_jobs() {

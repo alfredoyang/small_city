@@ -10,6 +10,18 @@ pub struct GameView {
     pub map: MapView,
     pub status: CityStatusView,
     pub build_options: Vec<BuildOptionView>,
+    /// P4: road cells that currently hold a moving citizen (deduped, sorted).
+    /// Pure derived data — renderers draw a dot here (the TUI only in the Normal
+    /// overlay). No entity ids, paths, or graph leak through.
+    pub travelers: Vec<CitizenTravelView>,
+}
+
+/// P4: a single moving-citizen marker — just the map cell it occupies this tick.
+/// No identity, heading, or destination (P4 draws a plain dot; facing is deferred).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CitizenTravelView {
+    pub x: usize,
+    pub y: usize,
 }
 
 /// Map dimensions plus cells in row-major order.

@@ -1544,3 +1544,55 @@ codex (`reviewer`) over three rounds — fixed a medium origin-teleport/strand b
 documented §4b exception), and stale plan line numbers; then opencode
 (`ses_108ae15e8ffel8UmUzUFJQ94IF`) clean ("ship it"), plus a test-helper
 readability fix (`set_hour` now absolute). 9 travel tests; gates green.
+
+---
+
+## Implemented — P4 (view model + moving-citizen dots) · `view.rs`, `adapter.rs`, `ui/tui.rs`
+
+Renders the P3 travel state as dots on the map. Pure read path: the core never
+changes; the adapter turns `world.travel` into a presentation-agnostic marker
+list, and the TUI draws it.
+
+```text
+  world.travel (P3) ──► adapter::traveler_views(world) ──► Vec<CitizenTravelView{ x,y }>
+     │  for each (id, state):                               on GameView.travelers
+     │    keep if world.citizens.contains_key(id)   ← stale-dot guard (removed-but-
+     │    take state.current_cell (en route only)            not-yet-pruned citizen)
+     │    map cell → world.positions → (x, y)
+     │  sort + dedup (shared cell → one marker; deterministic)
+     ▼
+  ui/tui.rs render_map:
+     traveler_cells = HashSet of (x,y)   ── built ONLY when overlay == Normal  (perf guard)
+     per cell: overlay_traveler_dot(&mut glyph, overlay, has_traveler, is_cursor)
+                 draws 2-col yellow bold "•·", keeps cell bg               (correctness guard)
+                 gated: Normal overlay AND not the cursor cell
+```
+
+### Why the shape
+
+- **`CitizenTravelView { x, y }` only** — no entity id, status, heading, or
+  destination leaks to the UI (P4 is a plain dot; facing deferred). The view model
+  stays a pure coordinate list.
+- **Live-citizen filter in the adapter** — the view renders every frame (including
+  paused), but `travel::run` only prunes on a tick, so a citizen removed mid-pause
+  would otherwise leave a dangling dot. The `world.citizens.contains_key(id)` filter
+  closes that window.
+- **Two-layer Normal-overlay gate** — the `HashSet` is built only for the Normal
+  overlay (perf), and `overlay_traveler_dot` re-checks Normal + `!is_cursor`
+  (correctness + unit-testability, since it takes the overlay directly with no
+  frame buffer).
+
+### Determinism / layering / balance
+
+The marker list is `sort_unstable` + `dedup` over `(x, y)` — stable across runs.
+UI reads only `GameView`; the adapter is the sole ECS→view boundary. Pure display:
+no core/economy mutation, balance-neutral. ASCII fallback untouched (dots are a
+TUI-only affordance for v1).
+
+### Reviewed via `claude-city-dev`
+
+codex (`reviewer`) over three rounds — added the stale-dot live-citizen filter,
+extracted `overlay_traveler_dot` for a real renderer unit test, restored the
+Normal-only `HashSet` build, and switched the width assert to display width; then
+opencode (`ses_108ae15e8ffel8UmUzUFJQ94IF`) clean ("ship it"). 7 tests (4 adapter
++ 3 tui); gates green.
