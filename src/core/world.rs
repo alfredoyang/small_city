@@ -74,6 +74,29 @@ pub(crate) struct World {
     // and re-derives placement on the next tick.
     #[serde(skip, default)]
     pub(crate) travel: HashMap<Entity, crate::core::components::TravelState>,
+    // P5: tokens handed in by neighbor regions, stepping toward a local workplace
+    // and drawn as dots here while their home-region citizen is `Away`. Keyed by
+    // the round-trip `TravelerId`. `#[serde(skip)]` like `travel`.
+    #[serde(skip, default)]
+    pub(crate) visiting_travel:
+        HashMap<crate::core::components::TravelerId, crate::core::components::VisitingToken>,
+    // P5: crossings this region decided on this tick (outbound exits and returns),
+    // drained by the regions layer (P5b), which adds border-link routing and sends
+    // them. The core only produces them; it never routes.
+    #[serde(skip, default)]
+    pub(crate) outgoing_handoffs: Vec<crate::core::components::PendingHandoff>,
+    // P5 input: "to reach neighbor region R, a local commuter can exit via one of
+    // these border road cells" (sorted candidates, possibly on different home road
+    // networks). The mover picks the first candidate reachable from its position, so
+    // two disconnected home networks touching the same neighbor each work. Populated
+    // by the regions layer (P5b) from the border-neighbor hint + `network_border_links`;
+    // empty here means no remote commuting (P1–P4 behaviour: remote workers idle home).
+    #[serde(skip, default)]
+    pub(crate) remote_exit_cells: HashMap<RegionId, Vec<Entity>>,
+    // P5: per-citizen generation of the trip currently out of region, so a stale
+    // `Return` (generation mismatch) is ignored. Bumped on each outbound emit.
+    #[serde(skip, default)]
+    pub(crate) away_generation: HashMap<Entity, u32>,
     // DT1: marks the applied derived state (powered flags, stats, pollution,
     // local effects, happiness) out of date after a config change. Unlike the
     // registry cache above (which stores derived *resolution data* recomputed
@@ -127,6 +150,10 @@ impl World {
             cross_region_goods_routes: CrossRegionGoodsRoutes::default(),
             route_cache: RefCell::default(),
             travel: HashMap::new(),
+            visiting_travel: HashMap::new(),
+            outgoing_handoffs: Vec::new(),
+            remote_exit_cells: HashMap::new(),
+            away_generation: HashMap::new(),
             derived_dirty: Cell::new(false),
             building_rules: crate::core::building_rules::BuildingRules::default(),
             positions: HashMap::new(),

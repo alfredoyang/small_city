@@ -1596,3 +1596,78 @@ extracted `overlay_traveler_dot` for a real renderer unit test, restored the
 Normal-only `HashSet` build, and switched the width assert to display width; then
 opencode (`ses_108ae15e8ffel8UmUzUFJQ94IF`) clean ("ship it"). 7 tests (4 adapter
 + 3 tui); gates green.
+
+---
+
+## Implemented — P5a (cross-region token handoff: core half) · `components.rs`, `world.rs`, `systems/travel.rs`, `adapter.rs`
+
+The **core** half of §5: the token state machine, the `Away` lifecycle, and
+visiting-token stepping — everything testable with a bare `World`, no threading.
+The regions/worker wiring (border-link routing, the `border_neighbor_map` hint,
+`RegionEvent`/`OutboundMessage` variants) is the follow-up **P5b**.
+
+### The P5a / P5b seam — link-free crossings
+
+The core never touches border-link topology. When a commuter reaches its exit
+cell it buffers a **link-free** `PendingHandoff`; P5b adds the `BorderLinkId`
+routing and sends it.
+
+```text
+  CORE (P5a, this patch)                         REGIONS (P5b, next)
+  ─────────────────────────────────────          ───────────────────────────────────
+  remote_exit_cells: RegionId → [exit cells] ◄──  populated from border_neighbor_map
+  travel::run walks W to an exit cell             + network_border_links
+     │ on the exit cell:                          drains world.outgoing_handoffs:
+     ├─ push PendingHandoff::Outbound ───────────► fills entry_link from exit_cell,
+     │    { traveler, token(dest=workplace),         routes TravelerHandoff to to_region
+     │      to_region, exit_cell }                 inbound ReceiveTraveler →
+     ├─ bump away_generation[W]                       travel::receive_traveler(entry_cell)
+     └─ travel[W] = Away (no dot, skipped)         Return / unroutable →
+  step_visiting_tokens walks visiting tokens          travel::apply_traveler_return
+     │ to their local workplace (dots), and
+     └─ on workday-end / unreachable:
+        push PendingHandoff::Return ─────────────► routes it back to the home region
+```
+
+### Lifecycle (direct-neighbor v1)
+
+```text
+  HOME REGION A                                   HOST REGION B
+  W has remote job in B, reachable:
+   resolve_target → BorderExit{candidates,…}
+   walk home → exit cell (route cache, road dest)
+   on exit cell → Cross:
+     emit Outbound(token.dest = workplace) ─────►  receive_traveler: token at entry cell
+     away_generation[W]++ ; travel[W]=Away         step token entry → workplace (B's cache)
+     (skipped each tick, no dot)                    hold at workplace (dot stays)
+                                                    workday ends OR unreachable →
+   apply_traveler_return(traveler): ◄────────────    emit Return ; remove token (dot gone)
+     status==Away && gen match → AtHome
+     (idempotent: stale/duplicate ignored)
+```
+
+### Key correctness choices
+
+- **Origin from state, candidate selection** — the departure origin is read from
+  `state.building` (P3), and the exit is the **first candidate reachable from the
+  mover's home network**, so two disconnected home networks touching the same
+  neighbor each work (§5d). En route the committed exit is `state.destination`.
+- **`away_generation` + idempotent return** — each outbound bumps a per-citizen
+  generation; `apply_traveler_return` clears `Away` only when the citizen is *still
+  `Away`* **and** the generation matches. So a duplicate/stale `Return` — or one
+  arriving after the citizen re-commuted — is ignored, and the same call is the
+  **rollback** P5b uses when an outbound can't be routed.
+- **Unreachable visiting token returns now** (§5g) — `step_visiting` returns home
+  immediately if the workplace is off-graph/disconnected, rather than holding a
+  stuck dot until the workday ends.
+- **Display** — `traveler_views` renders dots from both `travel` and
+  `visiting_travel` (deduped). All P5 state is `#[serde(skip)]`; on load an away
+  citizen simply restarts its commute from home.
+
+### Reviewed via `claude-city-dev`
+
+codex (`reviewer`) over three rounds — fixed unreachable-visiting (return now),
+duplicate-Return idempotency + rollback contract, the one-exit-per-neighbor
+limitation (→ candidate lists), a wrong stay-status, and added the multi-network
++ adapter tests; then opencode (`ses_108ae15e8ffel8UmUzUFJQ94IF`) clean ("ship
+it"). 6 P5a tests; gates green. **P5b still to do:** the regions event wiring.

@@ -35,12 +35,43 @@
 
 use std::collections::HashSet;
 
-use crate::core::components::{TravelState, TravelStatus};
+use crate::core::components::{
+    PendingHandoff, ReturnHop, TravelState, TravelStatus, TravelerId, VisitingToken,
+};
 use crate::core::entity::Entity;
 use crate::core::regions::RegionId;
 use crate::core::systems::road_connectivity::{self, RoadNetwork};
-use crate::core::systems::schedule::{ScheduleIntent, schedule_intent};
+use crate::core::systems::schedule::{
+    ScheduleIntent, SchedulePhase, schedule_intent, schedule_phase,
+};
 use crate::core::world::World;
+
+/// Where a citizen is headed this tick.
+enum Target<'a> {
+    /// A local building (home or local workplace) — normal P3 movement.
+    Building(Entity),
+    /// A remote-but-reachable workplace (P5): the mover walks to whichever of the
+    /// `candidates` border-exit cells it can reach, then crosses to `to_region`
+    /// carrying `workplace`.
+    BorderExit {
+        candidates: &'a [Entity],
+        workplace: Entity,
+        to_region: RegionId,
+    },
+}
+
+/// Outcome of advancing one local citizen.
+enum Advance {
+    /// Update the citizen's travel state in place.
+    Stay(TravelState),
+    /// The token reached its border-exit cell — hand it off and mark the citizen
+    /// `Away` (P5). `token.destination` is the remote workplace.
+    Cross {
+        to_region: RegionId,
+        exit_cell: Entity,
+        token: TravelState,
+    },
+}
 
 /// Steps every citizen's commute one cell. Runs once per tick.
 pub(crate) fn run(world: &mut World) {
@@ -54,6 +85,13 @@ pub(crate) fn run(world: &mut World) {
     ids.sort_unstable_by_key(|entity| entity.0);
 
     for id in &ids {
+        let state = world.travel.get(id).copied().unwrap_or_default();
+        // P5: an Away citizen's token is out in a neighbor region — the home side
+        // neither steps nor draws it until a Return clears the mark.
+        if state.status == TravelStatus::Away {
+            continue;
+        }
+
         // Pull the citizen-side inputs out up front, releasing the `world.citizens`
         // borrow before the road-graph reads (`routes_to` borrows the whole world).
         let Some((intent, home)) = world
@@ -64,29 +102,233 @@ pub(crate) fn run(world: &mut World) {
             continue;
         };
 
-        let target = resolve_target(region, home, intent);
-        let state = world.travel.get(id).copied().unwrap_or_default();
-        let next = advance(world, &networks, home, target, state);
-        world.travel.insert(*id, next);
+        let target = resolve_target(world, region, home, intent);
+        match advance(world, &networks, home, target, state) {
+            Advance::Stay(next) => {
+                world.travel.insert(*id, next);
+            }
+            Advance::Cross {
+                to_region,
+                exit_cell,
+                token,
+            } => {
+                // Bump the trip generation so a later stale Return is ignored.
+                let generation = {
+                    let counter = world.away_generation.entry(*id).or_insert(0);
+                    *counter += 1;
+                    *counter
+                };
+                world.outgoing_handoffs.push(PendingHandoff::Outbound {
+                    traveler: TravelerId {
+                        citizen: *id,
+                        generation,
+                    },
+                    token,
+                    to_region,
+                    exit_cell,
+                });
+                // Remove the local token (no dot here) and mark the citizen Away.
+                world.travel.insert(*id, away_state());
+            }
+        }
     }
 
-    // Drop trip state for citizens that no longer exist (died/relocated).
+    // Drop trip state for citizens that no longer exist (died/relocated). Away
+    // citizens stay (they still exist), so their mark survives until Return.
     let live: HashSet<Entity> = world.citizens.keys().copied().collect();
     world.travel.retain(|id, _| live.contains(id));
+
+    step_visiting_tokens(world, hour, &networks);
 }
 
-/// The building a citizen should be at right now. Everything that isn't a *local*
-/// job resolves to home: a remote job idles at home in v1 (P5 adds border-exit
-/// routing), a jobless/off-hours citizen wants home, and Leisure is deferred.
-fn resolve_target(region: RegionId, home: Entity, intent: ScheduleIntent) -> Entity {
-    match intent {
-        ScheduleIntent::Home | ScheduleIntent::Leisure => home,
-        ScheduleIntent::Work(workplace) => workplace.as_local(region).unwrap_or(home),
+/// P5: steps the tokens neighbor regions handed in, drawing them as dots until the
+/// workday ends, when each is returned home and removed.
+fn step_visiting_tokens(world: &mut World, hour: u8, networks: &[RoadNetwork]) {
+    let phase = schedule_phase(hour);
+    let mut ids: Vec<TravelerId> = world.visiting_travel.keys().copied().collect();
+    ids.sort_unstable_by_key(|traveler| (traveler.citizen.0, traveler.generation));
+
+    for traveler in &ids {
+        let visiting = world
+            .visiting_travel
+            .get(traveler)
+            .expect("id from keys")
+            .clone();
+        match step_visiting(world, networks, phase, &visiting.token) {
+            Some(token) => {
+                world
+                    .visiting_travel
+                    .get_mut(traveler)
+                    .expect("id from keys")
+                    .token = token;
+            }
+            None => {
+                // Workday over (or malformed) — return the traveler home and drop
+                // the token (its dot disappears).
+                world.outgoing_handoffs.push(PendingHandoff::Return {
+                    traveler: *traveler,
+                    return_path: visiting.return_path.clone(),
+                });
+                world.visiting_travel.remove(traveler);
+            }
+        }
     }
 }
 
-/// Advances one citizen's `TravelState` by one tick toward `target`.
+/// One step for a visiting token toward its workplace. `Some(token)` keeps it
+/// (walking, or holding at the workplace so the dot stays); `None` means it should
+/// be returned home — either the workday ended or the workplace is unreachable
+/// (disconnected / bulldozed), which returns the traveler immediately (§5g).
+fn step_visiting(
+    world: &World,
+    networks: &[RoadNetwork],
+    phase: SchedulePhase,
+    token: &TravelState,
+) -> Option<TravelState> {
+    if phase != SchedulePhase::Work {
+        return None; // workday over → return home
+    }
+    let dest = token.destination?; // the local workplace in this host region
+    let cell = token.current_cell?;
+    if is_adjacent(world, dest, cell) {
+        return Some(*token); // arrived: wait at the workplace, keep the dot
+    }
+    // Step toward the workplace; if the cell is off-graph or the workplace is
+    // unreachable from here, the trip can't complete → return home now (§5g).
+    let network = network_of_cell(networks, cell)?;
+    let next = {
+        let tree = world.routes_to(dest, network);
+        tree.get(&cell).copied()
+    };
+    next.map(|next| travelling(next, dest))
+}
+
+/// The target a citizen is headed for. A *local* job routes to the workplace; a
+/// remote job routes to a known border-exit cell (P5, reachable direct neighbor)
+/// or else falls back home; everything else routes home.
+fn resolve_target<'a>(
+    world: &'a World,
+    region: RegionId,
+    home: Entity,
+    intent: ScheduleIntent,
+) -> Target<'a> {
+    match intent {
+        ScheduleIntent::Home | ScheduleIntent::Leisure => Target::Building(home),
+        ScheduleIntent::Work(workplace) => match workplace.as_local(region) {
+            Some(local) => Target::Building(local),
+            None => match world.remote_exit_cells.get(&workplace.region()) {
+                // Remote but reachable via a direct neighbor → commute to an exit.
+                Some(candidates) if !candidates.is_empty() => Target::BorderExit {
+                    candidates,
+                    workplace,
+                    to_region: workplace.region(),
+                },
+                // Remote and not directly reachable → idle at home (P1–P4 behaviour).
+                _ => Target::Building(home),
+            },
+        },
+    }
+}
+
+/// The idle "out of region" state for an away citizen.
+fn away_state() -> TravelState {
+    TravelState {
+        status: TravelStatus::Away,
+        current_cell: None,
+        destination: None,
+        building: None,
+    }
+}
+
+/// Advances one citizen one tick toward `target`.
 fn advance(
+    world: &World,
+    networks: &[RoadNetwork],
+    home: Entity,
+    target: Target,
+    state: TravelState,
+) -> Advance {
+    match target {
+        Target::Building(building) => {
+            Advance::Stay(advance_to_building(world, networks, home, building, state))
+        }
+        Target::BorderExit {
+            candidates,
+            workplace,
+            to_region,
+        } => advance_to_exit(
+            world, networks, home, candidates, workplace, to_region, state,
+        ),
+    }
+}
+
+/// Walks a remote commuter toward a border-exit cell; once it lands on the exit
+/// cell it crosses, carrying the workplace as the token's destination.
+///
+/// While en route the chosen exit is `state.destination` (a candidate cell). When
+/// idle, the first candidate reachable from the origin is chosen — so candidates on
+/// a different home road network are skipped (§5d).
+fn advance_to_exit(
+    world: &World,
+    networks: &[RoadNetwork],
+    home: Entity,
+    candidates: &[Entity],
+    workplace: Entity,
+    to_region: RegionId,
+    state: TravelState,
+) -> Advance {
+    match state.current_cell {
+        None => {
+            let origin = state
+                .building
+                .filter(|building| world.buildings.contains_key(building))
+                .unwrap_or(home);
+            // Pick the first candidate this origin can actually reach.
+            for &exit_cell in candidates {
+                if let Some(entry) = depart_to_cell(world, networks, origin, exit_cell) {
+                    return Advance::Stay(travelling(entry, exit_cell));
+                }
+            }
+            // No reachable exit → idle at the origin (remote-but-unreachable, §4b).
+            let stay_status = if origin == home {
+                TravelStatus::AtHome
+            } else {
+                TravelStatus::AtWork
+            };
+            Advance::Stay(idle(stay_status, origin))
+        }
+        Some(cell) => {
+            // The committed exit is the destination we were walking to; if it is
+            // somehow unset/invalid, re-pick a candidate reachable from here.
+            let exit_cell = state
+                .destination
+                .filter(|exit| candidates.contains(exit))
+                .or_else(|| {
+                    candidates.iter().copied().find(|&exit| {
+                        cell == exit || step_toward_cell(world, networks, cell, exit).is_some()
+                    })
+                });
+            let Some(exit_cell) = exit_cell else {
+                return Advance::Stay(state); // unreachable from here → stay put
+            };
+            if cell == exit_cell {
+                // On the exit cell → cross (it already had its one-tick dot here).
+                return Advance::Cross {
+                    to_region,
+                    exit_cell,
+                    token: travelling(exit_cell, workplace),
+                };
+            }
+            match step_toward_cell(world, networks, cell, exit_cell) {
+                Some(next) => Advance::Stay(travelling(next, exit_cell)),
+                None => Advance::Stay(travelling(cell, exit_cell)), // unreachable → stay
+            }
+        }
+    }
+}
+
+/// Advances one citizen one tick toward a local `target` building (P3 movement).
+fn advance_to_building(
     world: &World,
     networks: &[RoadNetwork],
     home: Entity,
@@ -184,6 +426,42 @@ fn step(world: &World, networks: &[RoadNetwork], cell: Entity, target: Entity) -
     }
 }
 
+/// P5: depart from `origin` toward a road `dest_cell` (a border-exit cell, not a
+/// building). Returns the first reachable position-sorted entry road cell.
+fn depart_to_cell(
+    world: &World,
+    networks: &[RoadNetwork],
+    origin: Entity,
+    dest_cell: Entity,
+) -> Option<Entity> {
+    for entry in adjacent_roads_sorted(world, origin) {
+        let Some(network) = network_of_cell(networks, entry) else {
+            continue;
+        };
+        let reachable = entry == dest_cell || {
+            let tree = world.routes_to(dest_cell, network);
+            tree.contains_key(&entry)
+        };
+        if reachable {
+            return Some(entry);
+        }
+    }
+    None
+}
+
+/// P5: one step from `cell` toward a road `dest_cell`. `None` if off-graph or
+/// unreachable (caller holds the current cell, §4b).
+fn step_toward_cell(
+    world: &World,
+    networks: &[RoadNetwork],
+    cell: Entity,
+    dest_cell: Entity,
+) -> Option<Entity> {
+    let network = network_of_cell(networks, cell)?;
+    let tree = world.routes_to(dest_cell, network);
+    tree.get(&cell).copied()
+}
+
 fn idle(status: TravelStatus, building: Entity) -> TravelState {
     TravelState {
         status,
@@ -220,6 +498,49 @@ fn network_of_cell(networks: &[RoadNetwork], cell: Entity) -> Option<&RoadNetwor
     networks
         .iter()
         .find(|network| network.roads.contains(&cell))
+}
+
+/// P5: accept a token handed in by a neighbor region and place it on `entry_cell`,
+/// where it begins walking to its workplace (`token.destination`, local here). The
+/// regions layer (P5b) resolves `entry_cell` from the handoff's border link.
+#[allow(dead_code)] // P5a; the regions event handler (P5b) calls this.
+pub(crate) fn receive_traveler(
+    world: &mut World,
+    traveler: TravelerId,
+    mut token: TravelState,
+    entry_cell: Entity,
+    return_path: Vec<ReturnHop>,
+) {
+    token.status = TravelStatus::Traveling;
+    token.current_cell = Some(entry_cell);
+    token.building = None;
+    world
+        .visiting_travel
+        .insert(traveler, VisitingToken { token, return_path });
+}
+
+/// P5: bring an away citizen home — clear its `Away` mark (back to AtHome idle).
+///
+/// This is the single "trip is over" entry point, used both when a neighbor
+/// region returns the token **and** when P5b cannot route an outbound handoff (a
+/// stale `exit_cell` no longer maps to a valid border link) and must roll the
+/// crossing back. It only acts when the citizen is **still `Away` with a matching
+/// generation**, so it is idempotent: a duplicate or stale `Return` — including one
+/// arriving after the citizen has already commuted again — is ignored and never
+/// resets an active trip.
+#[allow(dead_code)] // P5a; the regions event handler (P5b) calls this.
+pub(crate) fn apply_traveler_return(world: &mut World, traveler: TravelerId) {
+    let still_away = world
+        .travel
+        .get(&traveler.citizen)
+        .is_some_and(|state| state.status == TravelStatus::Away);
+    let generation_matches =
+        world.away_generation.get(&traveler.citizen) == Some(&traveler.generation);
+    if still_away && generation_matches {
+        world
+            .travel
+            .insert(traveler.citizen, TravelState::default());
+    }
 }
 
 #[cfg(test)]
@@ -535,5 +856,280 @@ mod tests {
         ta.sort_by_key(|(k, _)| k.0);
         tb.sort_by_key(|(k, _)| k.0);
         assert_eq!(ta, tb);
+    }
+
+    // ---- P5: cross-region token handoff (core half) ----
+
+    use super::{apply_traveler_return, receive_traveler};
+    use crate::core::components::{PendingHandoff, ReturnHop, TravelState, TravelerId};
+    use crate::core::regions::{BorderEdge, BorderLinkId};
+
+    fn a_return_hop() -> ReturnHop {
+        ReturnHop {
+            region: RegionId(0),
+            entry_link: BorderLinkId {
+                edge: BorderEdge::East,
+                offset: 0,
+            },
+        }
+    }
+
+    /// A remote-but-reachable worker walks to its border-exit cell, then crosses:
+    /// the local token becomes `Away` and an Outbound handoff is buffered carrying
+    /// the workplace as the token's destination.
+    #[test]
+    fn remote_worker_walks_to_exit_then_crosses_away() {
+        // Road r0..r3 on row 0; home at (0,1) touches r0; exit cell is r3.
+        let mut world = World::new(4, 2);
+        let mut roads = [Entity::default(); 4];
+        for (x, slot) in roads.iter_mut().enumerate() {
+            place_building(&mut world, x, 0, BuildingKind::Road);
+            *slot = world.grid.get(x, 0).expect("road");
+        }
+        place_building(&mut world, 0, 1, BuildingKind::Residential);
+        let home = world.grid.get(0, 1).expect("home");
+        let exit = roads[3];
+        let workplace = Entity::new(RegionId(7), 99); // remote (different region)
+        world.remote_exit_cells.insert(RegionId(7), vec![exit]);
+        let id = add_citizen(&mut world, 1, home, Some(workplace));
+
+        // Walk home → r0 → r1 → r2 → r3, then (on r3) cross.
+        set_hour(&mut world, 9);
+        for _ in 0..6 {
+            run(&mut world);
+        }
+
+        assert_eq!(world.travel[&id].status, TravelStatus::Away, "crossed away");
+        assert_eq!(world.away_generation.get(&id), Some(&1), "first trip gen");
+        assert_eq!(world.outgoing_handoffs.len(), 1, "one outbound crossing");
+        match &world.outgoing_handoffs[0] {
+            PendingHandoff::Outbound {
+                traveler,
+                token,
+                to_region,
+                exit_cell,
+            } => {
+                assert_eq!(traveler.citizen, id);
+                assert_eq!(traveler.generation, 1);
+                assert_eq!(*to_region, RegionId(7));
+                assert_eq!(*exit_cell, exit);
+                assert_eq!(
+                    token.destination,
+                    Some(workplace),
+                    "token aims at workplace"
+                );
+                assert_eq!(token.current_cell, Some(exit));
+            }
+            other => panic!("expected Outbound, got {other:?}"),
+        }
+
+        // An Away citizen is skipped — no further movement or handoff.
+        run(&mut world);
+        assert_eq!(world.travel[&id].status, TravelStatus::Away);
+        assert_eq!(
+            world.outgoing_handoffs.len(),
+            1,
+            "no new handoff while away"
+        );
+    }
+
+    /// With exit candidates on two disconnected networks, the commuter walks to the
+    /// one reachable from its home network and skips the unreachable candidate (§5d).
+    #[test]
+    fn remote_commuter_picks_reachable_exit_candidate() {
+        // Home at (0,0) touches r_a (1,0) — a one-cell network A. r_b (2,2) is an
+        // isolated one-cell network B, unreachable from home.
+        let mut world = World::new(3, 3);
+        place_building(&mut world, 0, 0, BuildingKind::Residential);
+        place_building(&mut world, 1, 0, BuildingKind::Road);
+        place_building(&mut world, 2, 2, BuildingKind::Road);
+        let home = world.grid.get(0, 0).expect("home");
+        let r_a = world.grid.get(1, 0).expect("r_a");
+        let r_b = world.grid.get(2, 2).expect("r_b");
+        let workplace = Entity::new(RegionId(7), 99);
+        // r_b listed first (unreachable) must be skipped in favour of r_a.
+        world.remote_exit_cells.insert(RegionId(7), vec![r_b, r_a]);
+        let id = add_citizen(&mut world, 1, home, Some(workplace));
+
+        set_hour(&mut world, 9);
+        run(&mut world); // departs onto the reachable exit r_a
+        assert_eq!(
+            world.travel[&id].current_cell,
+            Some(r_a),
+            "chose the reachable candidate, not r_b"
+        );
+        run(&mut world); // on r_a → cross
+        assert_eq!(world.travel[&id].status, TravelStatus::Away);
+        match world.outgoing_handoffs.last().expect("a crossing") {
+            PendingHandoff::Outbound { exit_cell, .. } => {
+                assert_eq!(*exit_cell, r_a, "crossed via the reachable exit")
+            }
+            other => panic!("expected Outbound, got {other:?}"),
+        }
+    }
+
+    /// A matching Return clears the Away mark; a stale (wrong-generation) Return is
+    /// ignored.
+    #[test]
+    fn return_clears_away_only_on_matching_generation() {
+        let mut world = World::new(1, 1);
+        let id = Entity::new(world.region_id, 1);
+        world.travel.insert(id, super::away_state());
+        world.away_generation.insert(id, 3);
+
+        // Stale generation → ignored.
+        apply_traveler_return(
+            &mut world,
+            TravelerId {
+                citizen: id,
+                generation: 2,
+            },
+        );
+        assert_eq!(
+            world.travel[&id].status,
+            TravelStatus::Away,
+            "stale ignored"
+        );
+
+        // Matching generation → back home.
+        apply_traveler_return(
+            &mut world,
+            TravelerId {
+                citizen: id,
+                generation: 3,
+            },
+        );
+        assert_eq!(world.travel[&id].status, TravelStatus::AtHome, "cleared");
+
+        // A duplicate Return (same generation) must NOT reset a citizen that has
+        // since started commuting again.
+        world.travel.insert(
+            id,
+            TravelState {
+                status: TravelStatus::Traveling,
+                current_cell: None,
+                destination: None,
+                building: None,
+            },
+        );
+        apply_traveler_return(
+            &mut world,
+            TravelerId {
+                citizen: id,
+                generation: 3,
+            },
+        );
+        assert_eq!(
+            world.travel[&id].status,
+            TravelStatus::Traveling,
+            "duplicate Return must not reset an active trip"
+        );
+    }
+
+    /// A visiting token whose workplace is unreachable (disconnected road) returns
+    /// home immediately rather than lingering as a stuck dot until the workday end.
+    #[test]
+    fn unreachable_visiting_token_returns_immediately() {
+        // Two disconnected roads: r0 (entry) and r2 (touches the workplace).
+        let mut world = World::new(3, 2);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        place_building(&mut world, 2, 0, BuildingKind::Road);
+        place_building(&mut world, 2, 1, BuildingKind::Commercial);
+        let r0 = world.grid.get(0, 0).expect("r0");
+        let workplace = world.grid.get(2, 1).expect("workplace");
+
+        let traveler = TravelerId {
+            citizen: Entity::new(RegionId(2), 5),
+            generation: 1,
+        };
+        let token = TravelState {
+            status: TravelStatus::Traveling,
+            current_cell: None,
+            destination: Some(workplace),
+            building: None,
+        };
+        // Entry at r0, but the workplace is on the disconnected r2.
+        receive_traveler(&mut world, traveler, token, r0, vec![a_return_hop()]);
+
+        set_hour(&mut world, 9); // work hours — yet it can't reach the workplace
+        run(&mut world);
+        assert!(
+            !world.visiting_travel.contains_key(&traveler),
+            "unreachable token returned immediately"
+        );
+        assert!(
+            world
+                .outgoing_handoffs
+                .iter()
+                .any(|h| matches!(h, PendingHandoff::Return { .. })),
+            "a Return was emitted"
+        );
+    }
+
+    /// A visiting token walks to its workplace, waits there (dot stays), and on the
+    /// workday end is returned home and removed.
+    #[test]
+    fn visiting_token_walks_waits_then_returns_at_workday_end() {
+        // Road r0..r3; commercial workplace at (3,1) touches r3.
+        let mut world = World::new(4, 2);
+        let mut roads = [Entity::default(); 4];
+        for (x, slot) in roads.iter_mut().enumerate() {
+            place_building(&mut world, x, 0, BuildingKind::Road);
+            *slot = world.grid.get(x, 0).expect("road");
+        }
+        place_building(&mut world, 3, 1, BuildingKind::Commercial);
+        let workplace = world.grid.get(3, 1).expect("workplace");
+
+        let traveler = TravelerId {
+            citizen: Entity::new(RegionId(2), 5),
+            generation: 1,
+        };
+        let token = TravelState {
+            status: TravelStatus::Traveling,
+            current_cell: None,
+            destination: Some(workplace),
+            building: None,
+        };
+        receive_traveler(&mut world, traveler, token, roads[0], vec![a_return_hop()]);
+
+        // During work hours it walks r0 → r1 → r2 → r3 and holds at r3 (adjacent
+        // to the workplace) — the dot keeps showing.
+        set_hour(&mut world, 9);
+        for _ in 0..6 {
+            run(&mut world);
+        }
+        let visiting = world
+            .visiting_travel
+            .get(&traveler)
+            .expect("still visiting");
+        assert_eq!(
+            visiting.token.current_cell,
+            Some(roads[3]),
+            "waiting at workplace"
+        );
+
+        // Workday ends → the token is returned home and removed (its dot is gone).
+        set_hour(&mut world, 16);
+        run(&mut world);
+        assert!(
+            !world.visiting_travel.contains_key(&traveler),
+            "token removed at workday end"
+        );
+        let returns: Vec<_> = world
+            .outgoing_handoffs
+            .iter()
+            .filter(|h| matches!(h, PendingHandoff::Return { .. }))
+            .collect();
+        assert_eq!(returns.len(), 1, "one Return emitted");
+        match returns[0] {
+            PendingHandoff::Return {
+                traveler: returned,
+                return_path,
+            } => {
+                assert_eq!(*returned, traveler);
+                assert_eq!(return_path, &vec![a_return_hop()]);
+            }
+            _ => unreachable!(),
+        }
     }
 }

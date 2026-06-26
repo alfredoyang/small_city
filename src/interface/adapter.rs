@@ -100,14 +100,21 @@ fn game_time_view(time: crate::core::resources::GameTime) -> GameTimeView {
 /// `current_cell`; idle citizens (inside a building) contribute nothing. Multiple
 /// citizens sharing a cell collapse to one marker. No entity id or path leaks out.
 fn traveler_views(world: &World) -> Vec<CitizenTravelView> {
-    let mut cells: Vec<(usize, usize)> = world
+    // Local citizens en route (P3), filtered to live citizens so a removed-but-not-
+    // yet-pruned entry never renders a stale dot on a paused frame.
+    let local = world
         .travel
         .iter()
-        // A citizen removed between ticks (e.g. its home bulldozed) leaves a travel
-        // entry until the next tick prunes it; the view renders every frame, so skip
-        // any token whose citizen no longer exists to avoid a stale dot.
         .filter(|(id, _)| world.citizens.contains_key(id))
-        .filter_map(|(_, state)| state.current_cell)
+        .filter_map(|(_, state)| state.current_cell);
+    // P5: tokens visiting from neighbor regions render the same way.
+    let visiting = world
+        .visiting_travel
+        .values()
+        .filter_map(|visiting| visiting.token.current_cell);
+
+    let mut cells: Vec<(usize, usize)> = local
+        .chain(visiting)
         .filter_map(|cell| world.positions.get(&cell))
         .map(|position| (position.x, position.y))
         .collect();
@@ -1054,6 +1061,61 @@ mod tests {
         assert!(
             traveler_views(&world).is_empty(),
             "stale dot must not render"
+        );
+    }
+
+    /// P5: visiting tokens (handed in by neighbor regions) render dots too, and
+    /// dedupe against a local traveller sharing the same cell.
+    #[test]
+    fn traveler_views_includes_visiting_tokens() {
+        use crate::core::components::{ReturnHop, TravelState, TravelerId, VisitingToken};
+        use crate::core::regions::{BorderEdge, BorderLinkId, RegionId};
+
+        let mut world = World::new(2, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        place_building(&mut world, 1, 0, BuildingKind::Road);
+        let r0 = world.grid.get(0, 0).expect("r0");
+        let r1 = world.grid.get(1, 0).expect("r1");
+
+        // A local traveller on r0 and a visiting token on r0 collapse to one marker;
+        // a second visiting token on r1 adds another.
+        add_citizen(&mut world, 1, Some(r0));
+        let visiting_on = |cell| VisitingToken {
+            token: TravelState {
+                status: TravelStatus::Traveling,
+                current_cell: Some(cell),
+                destination: None,
+                building: None,
+            },
+            return_path: vec![ReturnHop {
+                region: RegionId(0),
+                entry_link: BorderLinkId {
+                    edge: BorderEdge::East,
+                    offset: 0,
+                },
+            }],
+        };
+        world.visiting_travel.insert(
+            TravelerId {
+                citizen: Entity::new(RegionId(3), 1),
+                generation: 1,
+            },
+            visiting_on(r0),
+        );
+        world.visiting_travel.insert(
+            TravelerId {
+                citizen: Entity::new(RegionId(3), 2),
+                generation: 1,
+            },
+            visiting_on(r1),
+        );
+
+        assert_eq!(
+            traveler_views(&world),
+            vec![
+                CitizenTravelView { x: 0, y: 0 },
+                CitizenTravelView { x: 1, y: 0 },
+            ]
         );
     }
 

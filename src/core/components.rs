@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::city_refs::CityCellRef;
 use crate::core::entity::Entity;
-use crate::core::regions::RegionId;
+use crate::core::regions::{BorderLinkId, RegionId};
 use crate::interface::input::BuildingKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,13 +294,66 @@ pub struct HappinessEffect {
 ///
 /// `AtHome`/`AtWork` are the idle endpoints (citizen inside a building, off the
 /// road graph); `Traveling` means the citizen is on a road cell stepping toward
-/// its destination. P5 will add an `Away` variant for a token out in a neighbor
-/// region.
+/// its destination. `Away` (P5) means the citizen's token is out in a neighbor
+/// region — the home side neither steps nor draws it until a `Return` clears the
+/// mark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TravelStatus {
     AtHome,
     AtWork,
     Traveling,
+    Away,
+}
+
+/// P5 cross-region travel: round-trip identity for a traveler whose token is out
+/// in a neighbor region. `citizen.region()` is the home region; the neighbor
+/// echoes the whole id back on `Return` and never dereferences the `Entity` as an
+/// ECS key (the same opaque-id trust boundary as `JobExportGrant.workplace`).
+/// `generation` disambiguates successive trips so a stale `Return` is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TravelerId {
+    pub citizen: Entity,
+    pub generation: u32,
+}
+
+/// P5: one hop on the outbound path, pushed on the way out and popped on the way
+/// back so a `Return` retraces the exact crossing chain. v1 is direct-neighbor
+/// only (the stack holds one hop), but the shape supports the deferred multi-hop
+/// extension (§5f). The regions layer (P5b) fills `entry_link` from topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReturnHop {
+    pub region: RegionId,
+    pub entry_link: BorderLinkId,
+}
+
+/// P5: a token visiting this region (the host) on behalf of a neighbor's citizen.
+/// `token` is stepped and drawn like any local traveller; `return_path` is the
+/// crossing chain to route the `Return` back home when the workday ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisitingToken {
+    pub token: TravelState,
+    pub return_path: Vec<ReturnHop>,
+}
+
+/// P5: a crossing the core has decided on this tick, buffered for the regions
+/// layer (P5b) to route. The core never touches border-link topology, so an
+/// `Outbound` carries the local `exit_cell` (P5b maps it to a `BorderLinkId`) and
+/// a `Return` carries the `return_path` it was handed on the way in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingHandoff {
+    /// A local commuter reached its border-exit cell and wants to cross.
+    Outbound {
+        traveler: TravelerId,
+        /// The token on the exit cell; its `destination` is the remote workplace.
+        token: TravelState,
+        to_region: RegionId,
+        exit_cell: Entity,
+    },
+    /// A visiting token's workday ended; tell the home region the trip is done.
+    Return {
+        traveler: TravelerId,
+        return_path: Vec<ReturnHop>,
+    },
 }
 
 /// P3 movement: one citizen's per-tick trip state.
