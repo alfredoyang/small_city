@@ -1671,3 +1671,70 @@ duplicate-Return idempotency + rollback contract, the one-exit-per-neighbor
 limitation (→ candidate lists), a wrong stay-status, and added the multi-network
 + adapter tests; then opencode (`ses_108ae15e8ffel8UmUzUFJQ94IF`) clean ("ship
 it"). 6 P5a tests; gates green. **P5b still to do:** the regions event wiring.
+
+---
+
+## Implemented — P5b (cross-region token handoff: regions wiring) · `components.rs`, `world.rs`, `regions/{mod,runtime,worker,directory}.rs`
+
+The **regions** half of §5: wires the P5a token machinery into the threaded actor
+model. Direct-neighbor only (multi-hop §5f still deferred). Fire-and-forget — no
+`TickState` pause, no grant, one-tick-stale like every other cross-region effect.
+
+### The crossing, end to end
+
+```text
+  REGION A (home)                          worker                       REGION B (host)
+  ───────────────                          ──────                       ───────────────
+  worker sets A.border_neighbor_map  ◄── border_neighbor_map_for_region(topology,
+    (BorderLinkId → neighbor; unowned        owners) — excludes unowned neighbors
+     neighbors excluded)
+  RegionState.set_border_neighbor_map → rebuilds remote_exit_cells (P5a input)
+  tick: travel::run walks W to an exit cell, buffers PendingHandoff::Outbound, Away
+  tick completes → drain_traveler_handoffs:
+     Outbound: exit_cell ─exit_link_for─► BorderLinkId (faces to_region)
+               return_path = [ReturnHop{A, link}]
+               (no facing link → apply_traveler_return rollback, never strands)
+     ── OutboundMessage::TravelerHandedOff ──►  route_region_event(to_region)
+                                                  ── RegionEvent::ReceiveTraveler ──►
+                                                  receive_traveler_handoff (Outbound):
+                                                    matching_neighbor_link(entry_link)
+                                                    → local entry cell → receive_traveler
+                                                    (no local cell → bounce a Return)
+                                                  token walks entry → workplace (dots)
+                                                  workday end → PendingHandoff::Return
+  receive_traveler_handoff (Return):  ◄── ReceiveTraveler ◄── drain pops the last hop
+    apply_traveler_return → W = AtHome
+```
+
+### Border link ↔ cell math (self-inverse)
+
+A border road cell at the grid edge has `BorderLinkId{edge, offset}` (offset = x on
+N/S, y on W/E — `border_links_for_cell`). The sender ships its **exit** link; the
+receiver maps it with `matching_neighbor_link` (complementary edge, same offset) back
+to a local cell via `cell_at_border_link`. `exit_link_for` is the forward direction
+(cell → the link facing `to_region`, by the `border_neighbor_map`).
+
+### No-strand: three layers
+
+1. **Hint exclusion** — `border_neighbor_map_for_region` drops neighbors with no live
+   owner, so the mover never *picks* an exit toward an unroutable region.
+2. **Drain rollback** — an already-buffered outbound whose exit faces nothing calls
+   `apply_traveler_return` (home), so it never crosses.
+3. **Receive bounce** — if the host can't place an inbound token (topology drift), it
+   emits a `Return` so the home `Away` mark is cleared.
+   (A within-tick owner race past all three resolves on restore — accepted under
+   one-tick-staleness.)
+
+### Determinism / single-region
+
+The cross-worker order key ranks travel after every export (`resource_rank 3`) and
+disambiguates by the home citizen's `local()` id; the hint is rebuilt identically
+each pass. All P5 state is `#[serde(skip)]`. With no topology the maps are empty:
+`resolve_target` falls back to home (P1–P4), the new event variants are inert.
+
+### Reviewed via `claude-city-dev`
+
+codex (`reviewer`) — fixed the unowned-neighbor strand (owner-filtered hint); then
+opencode (`ses_108ae15e8ffel8UmUzUFJQ94IF`, model `opencode-go/glm-5.2`) clean ("ship
+it"). 8 tests (5 RegionState + 3 worker); gates green. **P5 is now complete
+(direct-neighbor v1).**

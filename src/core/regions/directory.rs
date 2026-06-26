@@ -110,6 +110,16 @@ impl RegionDirectory {
         }
     }
 
+    /// P5b: the current region topology (read by the worker to build the
+    /// per-region border-neighbor hint for travel routing).
+    pub fn topology(&self) -> Vec<RegionNeighborLink> {
+        self.publish_state
+            .lock()
+            .expect("region directory publish state lock poisoned")
+            .topology
+            .clone()
+    }
+
     pub fn set_topology(&self, topology: Vec<RegionNeighborLink>) {
         let mut state = self
             .publish_state

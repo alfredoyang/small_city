@@ -25,8 +25,13 @@
 //! region stores another region's generic exported-resource cache.
 //! ```
 
+use std::collections::HashMap;
+
 use crate::core::city_refs::CityCellRef;
-use crate::core::components::{Position, PowerSource, WorkplaceAssignment};
+use crate::core::components::{
+    PendingHandoff, Position, PowerSource, ReturnHop, TravelPurpose, TravelState, TravelerHandoff,
+    WorkplaceAssignment,
+};
 use crate::core::entity::Entity;
 use crate::core::resources::CityStats;
 use crate::core::simulation::{
@@ -34,7 +39,9 @@ use crate::core::simulation::{
     ensure_derived_state, finish_tick_after_goods_phase, finish_tick_after_job_phase,
     refresh_derived_state_for_world,
 };
-use crate::core::systems::{build, bulldoze, economy, power, replace, road_connectivity, upgrade};
+use crate::core::systems::{
+    build, bulldoze, economy, power, replace, road_connectivity, travel, upgrade,
+};
 use crate::core::world::{CrossRegionGoodsRoutes, World};
 use crate::interface::adapter::{
     inspect_world, remote_workers_for, view_world, view_world_with_overlay,
@@ -464,6 +471,177 @@ impl RegionState {
         }
         links.sort();
         links
+    }
+
+    /// P5b: install the worker-supplied border→neighbor hint and rebuild the
+    /// per-mover exit-cell map from it. Called before each region's processing
+    /// slice (like `set_importable_remote_jobs`).
+    pub(crate) fn set_border_neighbor_map(&mut self, map: HashMap<BorderLinkId, RegionId>) {
+        self.world.border_neighbor_map = map;
+        self.refresh_remote_exit_cells();
+    }
+
+    /// Rebuilds `remote_exit_cells` (neighbor region → local exit road cells) from
+    /// the current border-neighbor hint. Every border road cell whose link faces a
+    /// neighbor is an exit toward that neighbor.
+    fn refresh_remote_exit_cells(&mut self) {
+        let mut map: HashMap<RegionId, Vec<Entity>> = HashMap::new();
+        for (cell, link) in self.border_road_links() {
+            if let Some(&neighbor) = self.world.border_neighbor_map.get(&link) {
+                map.entry(neighbor).or_default().push(cell);
+            }
+        }
+        for cells in map.values_mut() {
+            cells.sort();
+            cells.dedup();
+        }
+        self.world.remote_exit_cells = map;
+    }
+
+    /// P5b: drain this tick's buffered crossings into routed handoffs, resolving
+    /// each border link from the topology. An outbound whose exit cell no longer
+    /// maps to a link toward its region is rolled back home (never strands `Away`).
+    pub(crate) fn drain_traveler_handoffs(&mut self) -> Vec<TravelerHandoff> {
+        let pending = std::mem::take(&mut self.world.outgoing_handoffs);
+        let mut handoffs = Vec::new();
+        for handoff in pending {
+            match handoff {
+                PendingHandoff::Outbound {
+                    traveler,
+                    token,
+                    to_region,
+                    exit_cell,
+                } => match self.exit_link_for(exit_cell, to_region) {
+                    Some(entry_link) => handoffs.push(TravelerHandoff {
+                        token,
+                        traveler,
+                        to_region,
+                        entry_link,
+                        return_path: vec![ReturnHop {
+                            region: self.id,
+                            entry_link,
+                        }],
+                        purpose: TravelPurpose::Outbound,
+                    }),
+                    None => travel::apply_traveler_return(&mut self.world, traveler),
+                },
+                PendingHandoff::Return {
+                    traveler,
+                    mut return_path,
+                } => {
+                    // Pop the last hop: it names the region to return to and the link.
+                    if let Some(hop) = return_path.pop() {
+                        handoffs.push(TravelerHandoff {
+                            token: TravelState::default(), // unused on Return
+                            traveler,
+                            to_region: hop.region,
+                            entry_link: hop.entry_link,
+                            return_path,
+                            purpose: TravelPurpose::Return,
+                        });
+                    }
+                }
+            }
+        }
+        handoffs
+    }
+
+    /// P5b: apply an inbound crossing. Outbound → place the token at the local
+    /// entry cell (mapped from the sender's exit link) so it walks to the
+    /// workplace; if the link can't be placed (topology drift), bounce a `Return`
+    /// so the home citizen is never stranded. Return → clear the `Away` mark.
+    /// Returns any handoffs the worker must route onward (the bounce).
+    pub(crate) fn receive_traveler_handoff(
+        &mut self,
+        handoff: TravelerHandoff,
+    ) -> Vec<TravelerHandoff> {
+        match handoff.purpose {
+            TravelPurpose::Outbound => {
+                let local_link = handoff.entry_link.matching_neighbor_link();
+                match self.cell_at_border_link(local_link) {
+                    Some(entry_cell) => {
+                        travel::receive_traveler(
+                            &mut self.world,
+                            handoff.traveler,
+                            handoff.token,
+                            entry_cell,
+                            handoff.return_path,
+                        );
+                        Vec::new()
+                    }
+                    None => {
+                        // Can't place — bounce a Return along the path it came in on.
+                        let mut return_path = handoff.return_path;
+                        return_path
+                            .pop()
+                            .map(|hop| TravelerHandoff {
+                                token: TravelState::default(),
+                                traveler: handoff.traveler,
+                                to_region: hop.region,
+                                entry_link: hop.entry_link,
+                                return_path,
+                                purpose: TravelPurpose::Return,
+                            })
+                            .into_iter()
+                            .collect()
+                    }
+                }
+            }
+            TravelPurpose::Return => {
+                travel::apply_traveler_return(&mut self.world, handoff.traveler);
+                Vec::new()
+            }
+        }
+    }
+
+    /// `(cell, border link)` for every border road cell, in deterministic order.
+    fn border_road_links(&self) -> Vec<(Entity, BorderLinkId)> {
+        let width = self.world.grid.width();
+        let height = self.world.grid.height();
+        // The network id only tags the returned `NetworkBorderLink`; the
+        // `BorderLinkId` itself is network-independent, so a placeholder is fine.
+        let network = RegionRoadNetworkId {
+            region: self.id,
+            road_network: 0,
+        };
+        let mut out = Vec::new();
+        for road in road_connectivity::road_entities_by_position(&self.world) {
+            if let Some(position) = self.world.positions.get(&road) {
+                for link in border_links_for_cell(network, position.x, position.y, width, height) {
+                    out.push((road, link.link));
+                }
+            }
+        }
+        out
+    }
+
+    /// The border link from `exit_cell` that faces `to_region`, if any.
+    fn exit_link_for(&self, exit_cell: Entity, to_region: RegionId) -> Option<BorderLinkId> {
+        let position = self.world.positions.get(&exit_cell)?;
+        let width = self.world.grid.width();
+        let height = self.world.grid.height();
+        let network = RegionRoadNetworkId {
+            region: self.id,
+            road_network: 0,
+        };
+        border_links_for_cell(network, position.x, position.y, width, height)
+            .into_iter()
+            .map(|link| link.link)
+            .find(|link| self.world.border_neighbor_map.get(link) == Some(&to_region))
+    }
+
+    /// The local road cell sitting on `link`, if it exists and is a road.
+    fn cell_at_border_link(&self, link: BorderLinkId) -> Option<Entity> {
+        let width = self.world.grid.width();
+        let height = self.world.grid.height();
+        let (x, y) = match link.edge {
+            BorderEdge::North => (link.offset, 0),
+            BorderEdge::South => (link.offset, height.checked_sub(1)?),
+            BorderEdge::West => (0, link.offset),
+            BorderEdge::East => (width.checked_sub(1)?, link.offset),
+        };
+        let cell = self.world.grid.get(x, y)?;
+        road_connectivity::is_road_entity(&self.world, cell).then_some(cell)
     }
 
     /// Returns aggregate spare local capacity without exposing ECS storage.
@@ -1204,5 +1382,186 @@ mod tests {
         assert_eq!(summary, copied);
         assert_eq!(summary.power_capacity, 0);
         assert_eq!(summary.job_slots, 0);
+    }
+
+    // ---- P5b: cross-region token handoff (regions wiring) ----
+
+    use crate::core::components::{PendingHandoff, TravelStatus, TravelerId};
+
+    /// An East-edge road in region A; the worker hint says East faces region B.
+    /// `set_border_neighbor_map` must record that cell as an exit toward B.
+    #[test]
+    fn border_hint_populates_remote_exit_cells() {
+        let mut a = RegionState::new(RegionId(1), 2, 1);
+        assert!(a.build(1, 0, BuildingKind::Road).success); // East edge (x = width-1)
+        let exit = a.world.grid.get(1, 0).expect("road");
+        let link = BorderLinkId {
+            edge: BorderEdge::East,
+            offset: 0,
+        };
+        a.set_border_neighbor_map(HashMap::from([(link, RegionId(2))]));
+        assert_eq!(
+            a.world.remote_exit_cells.get(&RegionId(2)),
+            Some(&vec![exit])
+        );
+    }
+
+    /// Draining an outbound resolves the facing border link and seeds the return path.
+    #[test]
+    fn drain_outbound_resolves_border_link() {
+        let mut a = RegionState::new(RegionId(1), 2, 1);
+        assert!(a.build(1, 0, BuildingKind::Road).success);
+        let exit = a.world.grid.get(1, 0).expect("road");
+        let link = BorderLinkId {
+            edge: BorderEdge::East,
+            offset: 0,
+        };
+        a.set_border_neighbor_map(HashMap::from([(link, RegionId(2))]));
+
+        let traveler = TravelerId {
+            citizen: Entity::new(RegionId(1), 5),
+            generation: 1,
+        };
+        let workplace = Entity::new(RegionId(2), 9);
+        a.world.outgoing_handoffs.push(PendingHandoff::Outbound {
+            traveler,
+            token: TravelState {
+                status: TravelStatus::Traveling,
+                current_cell: Some(exit),
+                destination: Some(workplace),
+                building: None,
+            },
+            to_region: RegionId(2),
+            exit_cell: exit,
+        });
+
+        let handoffs = a.drain_traveler_handoffs();
+        assert_eq!(handoffs.len(), 1);
+        let handoff = &handoffs[0];
+        assert_eq!(handoff.to_region, RegionId(2));
+        assert_eq!(handoff.entry_link, link);
+        assert_eq!(handoff.purpose, TravelPurpose::Outbound);
+        assert_eq!(
+            handoff.return_path,
+            vec![ReturnHop {
+                region: RegionId(1),
+                entry_link: link
+            }]
+        );
+        assert!(a.world.outgoing_handoffs.is_empty(), "buffer drained");
+    }
+
+    /// An unroutable outbound (no facing link) rolls the away citizen back home
+    /// rather than stranding it.
+    #[test]
+    fn drain_outbound_rolls_back_when_unroutable() {
+        let mut a = RegionState::new(RegionId(1), 2, 1);
+        assert!(a.build(1, 0, BuildingKind::Road).success);
+        let exit = a.world.grid.get(1, 0).expect("road");
+        // No border_neighbor_map entry → the exit faces nothing.
+        let citizen = Entity::new(RegionId(1), 5);
+        a.world.travel.insert(
+            citizen,
+            TravelState {
+                status: TravelStatus::Away,
+                current_cell: None,
+                destination: None,
+                building: None,
+            },
+        );
+        a.world.away_generation.insert(citizen, 1);
+        a.world.outgoing_handoffs.push(PendingHandoff::Outbound {
+            traveler: TravelerId {
+                citizen,
+                generation: 1,
+            },
+            token: TravelState::default(),
+            to_region: RegionId(2),
+            exit_cell: exit,
+        });
+
+        let handoffs = a.drain_traveler_handoffs();
+        assert!(handoffs.is_empty(), "nothing routed");
+        assert_eq!(
+            a.world.travel[&citizen].status,
+            TravelStatus::AtHome,
+            "rolled back home"
+        );
+    }
+
+    /// Receiving an outbound places the token at the matching local entry cell.
+    #[test]
+    fn receive_outbound_places_token_at_entry_cell() {
+        // Region B with a West-edge road at (0,0).
+        let mut b = RegionState::new(RegionId(2), 2, 1);
+        assert!(b.build(0, 0, BuildingKind::Road).success);
+        let entry = b.world.grid.get(0, 0).expect("road");
+
+        let traveler = TravelerId {
+            citizen: Entity::new(RegionId(1), 5),
+            generation: 1,
+        };
+        let workplace = Entity::new(RegionId(2), 9);
+        // Sender's exit link was East/offset 0; B maps it via matching_neighbor_link.
+        let handoff = TravelerHandoff {
+            token: TravelState {
+                status: TravelStatus::Traveling,
+                current_cell: None,
+                destination: Some(workplace),
+                building: None,
+            },
+            traveler,
+            to_region: RegionId(2),
+            entry_link: BorderLinkId {
+                edge: BorderEdge::East,
+                offset: 0,
+            },
+            return_path: vec![ReturnHop {
+                region: RegionId(1),
+                entry_link: BorderLinkId {
+                    edge: BorderEdge::East,
+                    offset: 0,
+                },
+            }],
+            purpose: TravelPurpose::Outbound,
+        };
+        let bounce = b.receive_traveler_handoff(handoff);
+        assert!(bounce.is_empty(), "placed, no bounce");
+        let visiting = b.world.visiting_travel.get(&traveler).expect("visiting");
+        assert_eq!(visiting.token.current_cell, Some(entry));
+    }
+
+    /// Receiving a Return clears the home citizen's Away mark.
+    #[test]
+    fn receive_return_clears_away() {
+        let mut a = RegionState::new(RegionId(1), 1, 1);
+        let citizen = Entity::new(RegionId(1), 5);
+        a.world.travel.insert(
+            citizen,
+            TravelState {
+                status: TravelStatus::Away,
+                current_cell: None,
+                destination: None,
+                building: None,
+            },
+        );
+        a.world.away_generation.insert(citizen, 1);
+
+        let bounce = a.receive_traveler_handoff(TravelerHandoff {
+            token: TravelState::default(),
+            traveler: TravelerId {
+                citizen,
+                generation: 1,
+            },
+            to_region: RegionId(1),
+            entry_link: BorderLinkId {
+                edge: BorderEdge::East,
+                offset: 0,
+            },
+            return_path: Vec::new(),
+            purpose: TravelPurpose::Return,
+        });
+        assert!(bounce.is_empty());
+        assert_eq!(a.world.travel[&citizen].status, TravelStatus::AtHome);
     }
 }

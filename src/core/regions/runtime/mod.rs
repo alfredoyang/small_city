@@ -81,6 +81,7 @@
 //! ```
 
 use crate::core::city_refs::CityCellRef;
+use crate::core::components::TravelerHandoff;
 use crate::core::entity::Entity;
 use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionCommandResponse, RegionSnapshotResponse,
@@ -130,6 +131,9 @@ pub enum RegionEvent {
     ReleaseGoodsExportAllocations(GoodsExportAllocationRelease),
     /// Caller-side goods export grant result.
     ApplyGoodsExportGrant(GoodsExportGrant),
+    /// P5b: a cross-region travel token handed in by a neighbor region (fire and
+    /// forget — no grant, no tick pause).
+    ReceiveTraveler(TravelerHandoff),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +283,9 @@ pub enum OutboundMessage {
         grant: GoodsExportGrant,
     },
     GoodsExportAllocationsReleased(GoodsExportAllocationRelease),
+    /// P5b: a travel token to route to `handoff.to_region` (worker delivers it as
+    /// `RegionEvent::ReceiveTraveler`).
+    TravelerHandedOff(TravelerHandoff),
     RuntimeError(RegionRuntimeError),
 }
 
@@ -564,6 +571,15 @@ impl RegionRuntime {
         self.state.set_importable_remote_jobs(jobs);
     }
 
+    /// P5b: install the worker-built border→neighbor hint (rebuilds the mover's
+    /// `remote_exit_cells`).
+    pub(crate) fn set_border_neighbor_map(
+        &mut self,
+        map: std::collections::HashMap<crate::core::regions::BorderLinkId, RegionId>,
+    ) {
+        self.state.set_border_neighbor_map(map);
+    }
+
     pub(crate) fn set_cross_region_goods_routes(&mut self, routes: CrossRegionGoodsRoutes) {
         self.state.set_cross_region_goods_routes(routes);
     }
@@ -711,7 +727,22 @@ impl RegionRuntime {
                 Vec::new()
             }
             RegionEvent::ApplyGoodsExportGrant(grant) => self.apply_goods_export_grant(grant),
+            RegionEvent::ReceiveTraveler(handoff) => self
+                .state
+                .receive_traveler_handoff(handoff)
+                .into_iter()
+                .map(OutboundMessage::TravelerHandedOff)
+                .collect(),
         }
+    }
+
+    /// P5b: this tick's buffered crossings, routed by the worker.
+    fn drained_traveler_handoff_messages(&mut self) -> Vec<OutboundMessage> {
+        self.state
+            .drain_traveler_handoffs()
+            .into_iter()
+            .map(OutboundMessage::TravelerHandedOff)
+            .collect()
     }
 
     fn remember_power_export_producer(&mut self, grant: &PowerExportGrant) {
@@ -866,9 +897,10 @@ impl RegionRuntime {
         if !phase.is_daily() {
             // Jobs resolve only on a daily boundary; an hourly tick neither makes
             // nor invalidates job reservations, so it sends no release or requests.
-            return vec![OutboundMessage::RegionTickCompleted(
-                self.finish_job_phase(request_id, phase),
-            )];
+            let response = self.finish_job_phase(request_id, phase);
+            let mut outbound = vec![OutboundMessage::RegionTickCompleted(response)];
+            outbound.extend(self.drained_traveler_handoff_messages());
+            return outbound;
         }
         self.reconcile_job_export_allocations(request_id, phase)
     }
@@ -955,10 +987,10 @@ impl RegionRuntime {
                 producer_regions: std::mem::take(&mut self.goods_export_producers),
             });
         if phase.goods_demands.is_empty() {
-            return vec![
-                release,
-                OutboundMessage::RegionTickCompleted(self.finish_goods_phase(request_id, phase)),
-            ];
+            let response = self.finish_goods_phase(request_id, phase);
+            let mut outbound = vec![release, OutboundMessage::RegionTickCompleted(response)];
+            outbound.extend(self.drained_traveler_handoff_messages());
+            return outbound;
         }
 
         let pending_demands = phase.goods_demands.clone();
@@ -1288,9 +1320,10 @@ impl RegionRuntime {
             return Vec::new();
         }
 
-        vec![OutboundMessage::RegionTickCompleted(
-            self.finish_goods_phase(continuation.request_id, continuation.phase),
-        )]
+        let response = self.finish_goods_phase(continuation.request_id, continuation.phase);
+        let mut outbound = vec![OutboundMessage::RegionTickCompleted(response)];
+        outbound.extend(self.drained_traveler_handoff_messages());
+        outbound
     }
 
     fn run_command(

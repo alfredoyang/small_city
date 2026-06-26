@@ -4,6 +4,7 @@
 //! reads or mutates ECS state directly; all simulation work stays inside each
 //! `RegionRuntime`.
 
+use crate::core::components::TravelerHandoff;
 use crate::core::regional_types::{
     RegionCommandResponse, RegionSnapshotResponse, RegionTickResponse, UiRequestId,
 };
@@ -15,8 +16,9 @@ use crate::core::regions::runtime::{
     OutboundMessage, PowerExportRequest, RegionEvent, RegionRuntime, RegionRuntimeError,
 };
 use crate::core::regions::{
-    GoodsExportGrant, JobExportGrant, NetworkBorderLink, PowerExportGrant, RegionId,
-    RegionNeighborLink, RegionRoadNetworkId, RegionState, RegionalAvailabilityHint,
+    BorderEdge, BorderLinkId, GoodsExportGrant, JobExportGrant, NetworkBorderLink,
+    PowerExportGrant, RegionId, RegionNeighborLink, RegionRoadNetworkId, RegionState,
+    RegionalAvailabilityHint,
 };
 use crate::core::world::CrossRegionGoodsRoutes;
 use std::collections::{BTreeSet, HashMap};
@@ -504,6 +506,16 @@ impl RegionWorker {
                 &runtime.state().network_border_links(),
             );
             runtime.set_importable_remote_jobs(importable_remote_jobs);
+            // P5b: refresh the travel border-neighbor hint from the topology, like
+            // the import hint above. Owned-region check excludes stale neighbors.
+            let owners = Arc::clone(&self.owners);
+            let border_neighbor_map = border_neighbor_map_for_region(
+                &self.directory.topology(),
+                runtime.region_id(),
+                &runtime.state().network_border_links(),
+                |neighbor| owners.owner_of(neighbor).is_some(),
+            );
+            runtime.set_border_neighbor_map(border_neighbor_map);
             let source_region = runtime.region_id();
             outbound.extend(
                 runtime
@@ -614,11 +626,45 @@ impl RegionWorker {
             OutboundMessage::GoodsExportAllocationsReleased(release) => {
                 self.route_export_allocation_release::<GoodsExport>(release, routing_mode)
             }
+            OutboundMessage::TravelerHandedOff(handoff) => {
+                self.route_traveler_handoff(handoff, routing_mode)
+            }
             OutboundMessage::RuntimeError(error) => Err(WorkerRoutingError::RuntimeError {
                 source_region,
                 error,
             }),
         }
+    }
+
+    /// P5b: routes a travel token to its destination region's inbox as a
+    /// `ReceiveTraveler` event, by the same `RegionNeighborLink` topology as
+    /// exports. Fire-and-forget: no grant, no tick pause.
+    fn route_traveler_handoff(
+        &mut self,
+        handoff: TravelerHandoff,
+        routing_mode: RegionRoutingMode,
+    ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
+        let target_region = handoff.to_region;
+        if self.owners.owner_of(target_region).is_none() {
+            return Err(WorkerRoutingError::MissingTargetRegion { target_region });
+        }
+        // Travel sorts after every export (rank 3); the token disambiguates by the
+        // home citizen's local id for a deterministic cross-worker merge.
+        let order_key = ForwardedEventOrderKey {
+            target_region,
+            source_region: handoff.traveler.citizen.region(),
+            request_id: UiRequestId(0),
+            token: handoff.traveler.citizen.local(),
+            resource_rank: 3,
+            event_rank: 0,
+        };
+        self.route_region_event(
+            target_region,
+            handoff.traveler.citizen.region(),
+            RegionEvent::ReceiveTraveler(handoff),
+            order_key,
+            routing_mode,
+        )
     }
 
     /// Routes a fresh consumer export request to the first reachable candidate.
@@ -788,6 +834,38 @@ impl RegionWorker {
     ) {
         self.directory.publish_region(region_id, links, hints);
     }
+}
+
+/// P5b: builds the `BorderLinkId → neighbor RegionId` hint for one region from the
+/// region topology — "this border link faces this neighbor." Each region edge
+/// (north/south/west/east) faces at most one neighbor in the v1 grid layout.
+fn border_neighbor_map_for_region(
+    topology: &[RegionNeighborLink],
+    region_id: RegionId,
+    border_links: &[NetworkBorderLink],
+    is_owned: impl Fn(RegionId) -> bool,
+) -> HashMap<BorderLinkId, RegionId> {
+    let mut neighbor_by_edge: HashMap<BorderEdge, RegionId> = HashMap::new();
+    for link in topology {
+        if link.region == region_id {
+            neighbor_by_edge.insert(link.edge, link.neighbor);
+        }
+    }
+    let mut map = HashMap::new();
+    for border in border_links {
+        if border.network.region != region_id {
+            continue;
+        }
+        if let Some(&neighbor) = neighbor_by_edge.get(&border.link.edge) {
+            // Skip a neighbor with no live owner (stale topology): a mover must not
+            // pick an exit toward a region the worker can't route to, or it would
+            // cross, mark Away, and strand when the handoff fails to deliver.
+            if is_owned(neighbor) {
+                map.insert(border.link, neighbor);
+            }
+        }
+    }
+    map
 }
 
 fn importable_remote_jobs_for_region(
@@ -1229,5 +1307,74 @@ mod tests {
             region: RegionId(region),
             road_network,
         }
+    }
+
+    /// P5b: the topology edge A-East→B maps A's East border link to neighbor B.
+    #[test]
+    fn border_neighbor_map_maps_edge_to_neighbor() {
+        let topology = vec![RegionNeighborLink::new(
+            RegionId(1),
+            BorderEdge::East,
+            RegionId(2),
+        )];
+        let link = BorderLinkId {
+            edge: BorderEdge::East,
+            offset: 0,
+        };
+        let border_links = vec![NetworkBorderLink {
+            network: network(1, 0),
+            link,
+        }];
+        let map = border_neighbor_map_for_region(&topology, RegionId(1), &border_links, |_| true);
+        assert_eq!(map.get(&link), Some(&RegionId(2)));
+
+        // A neighbor with no live owner is excluded, so a mover never picks an exit
+        // toward an unroutable region (and so can't strand Away).
+        let empty =
+            border_neighbor_map_for_region(&topology, RegionId(1), &border_links, |_| false);
+        assert!(empty.is_empty(), "unowned neighbor excluded from the hint");
+    }
+
+    /// P5b: an outbound handoff is delivered as a `ReceiveTraveler` event on the
+    /// destination region's inbox.
+    #[test]
+    fn traveler_handoff_routes_to_destination_inbox() {
+        use crate::core::components::{TravelState, TravelerId};
+        use crate::core::entity::Entity;
+
+        let mut worker = RegionWorker::new(WorkerId(7));
+        worker
+            .add_region(RegionRuntime::new(RegionState::new(RegionId(1), 2, 1)))
+            .unwrap();
+        worker
+            .add_region(RegionRuntime::new(RegionState::new(RegionId(2), 2, 1)))
+            .unwrap();
+
+        let handoff = TravelerHandoff {
+            token: TravelState::default(),
+            traveler: TravelerId {
+                citizen: Entity::new(RegionId(1), 5),
+                generation: 1,
+            },
+            to_region: RegionId(2),
+            entry_link: BorderLinkId {
+                edge: BorderEdge::East,
+                offset: 0,
+            },
+            return_path: Vec::new(),
+            purpose: crate::core::components::TravelPurpose::Outbound,
+        };
+        worker
+            .route_outbound(
+                RegionId(1),
+                OutboundMessage::TravelerHandedOff(handoff),
+                RegionRoutingMode::Immediate,
+            )
+            .unwrap();
+        assert_eq!(
+            worker.region(RegionId(2)).unwrap().pending_event_count(),
+            1,
+            "destination received a ReceiveTraveler event"
+        );
     }
 }

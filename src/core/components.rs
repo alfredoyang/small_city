@@ -335,6 +335,35 @@ pub struct VisitingToken {
     pub return_path: Vec<ReturnHop>,
 }
 
+/// P5: which way a [`TravelerHandoff`] is going. `Outbound` walks the token to the
+/// workplace in the host region; `Return` tells the home region the trip is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TravelPurpose {
+    Outbound,
+    Return,
+}
+
+/// P5b: the crossing message routed over the region border topology (the same
+/// `RegionNeighborLink` flow that carries power/job/goods exports). Built by the
+/// regions layer from a [`PendingHandoff`] — it adds the `BorderLinkId` routing the
+/// core left out. The *only* thing that crosses a border; the citizen entity never
+/// migrates and the receiver treats `traveler.citizen` as opaque id data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TravelerHandoff {
+    /// The token itself (its `destination` is the workplace, on `Outbound`).
+    pub token: TravelState,
+    /// Round-trip identity (home-region entity + trip generation).
+    pub traveler: TravelerId,
+    /// Routed to this region by the worker (like an export request).
+    pub to_region: RegionId,
+    /// The sender's exit link; the receiver maps it via `matching_neighbor_link`.
+    pub entry_link: BorderLinkId,
+    /// Outbound: the hops walked so far (push on the way out). Return: what remains
+    /// to retrace (pop on the way back).
+    pub return_path: Vec<ReturnHop>,
+    pub purpose: TravelPurpose,
+}
+
 /// P5: a crossing the core has decided on this tick, buffered for the regions
 /// layer (P5b) to route. The core never touches border-link topology, so an
 /// `Outbound` carries the local `exit_cell` (P5b maps it to a `BorderLinkId`) and

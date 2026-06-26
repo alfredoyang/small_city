@@ -93,6 +93,12 @@ pub(crate) struct World {
     // empty here means no remote commuting (P1–P4 behaviour: remote workers idle home).
     #[serde(skip, default)]
     pub(crate) remote_exit_cells: HashMap<RegionId, Vec<Entity>>,
+    // P5b input from the worker: "this border link faces this neighbor region"
+    // (built from the RegionNeighborLink topology). RegionState derives both
+    // `remote_exit_cells` (for the mover) and the exit/entry link resolution from
+    // it. Empty here means no cross-region travel.
+    #[serde(skip, default)]
+    pub(crate) border_neighbor_map: HashMap<crate::core::regions::BorderLinkId, RegionId>,
     // P5: per-citizen generation of the trip currently out of region, so a stale
     // `Return` (generation mismatch) is ignored. Bumped on each outbound emit.
     #[serde(skip, default)]
@@ -153,6 +159,7 @@ impl World {
             visiting_travel: HashMap::new(),
             outgoing_handoffs: Vec::new(),
             remote_exit_cells: HashMap::new(),
+            border_neighbor_map: HashMap::new(),
             away_generation: HashMap::new(),
             derived_dirty: Cell::new(false),
             building_rules: crate::core::building_rules::BuildingRules::default(),
