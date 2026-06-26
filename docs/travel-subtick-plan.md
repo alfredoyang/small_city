@@ -521,3 +521,62 @@ takes 4 hourly ticks); **P7c** rebases `run` → `resolve` (hourly) + `step_trav
 `road_degree_in_network` is now `pub(crate)`. New test `dwell_holds_a_traveller_on_a_4way`
 (the 4-way holds for 4 sub-ticks); the 23 existing travel tests pass unchanged (their
 roads are straight, cost 1). codex clean; gates green.
+
+---
+
+## Implemented — P7c (lockstep sub-tick driver + cadence) · `simulation.rs`, `travel.rs`, `regions/{mod,runtime}.rs`, `regional_game_runner.rs`, `regional_game.rs`, `ui/city_driver.rs`
+
+Decouples movement from the hourly economy tick and drives it as a 10-minute
+sub-tick across all regions in lockstep.
+
+```text
+  UI: CityDriver::tick()  (one key press = one game hour)
+        │  calls 6×
+        ▼
+  RegionalGame::advance()            sub_tick 0..6 under a Mutex (serialised cadence)
+        ├─ if sub_tick == 0 → tick_city()      // hourly economy (unchanged)
+        ├─ step_travel_city()                  // one movement sub-tick (all regions)
+        └─ sub_tick = (sub_tick + 1) % 6
+        ▼
+  RegionalGameRunner::step_travel_city()       ONE barrier pass (not looped):
+        ├─ broadcast RegionEvent::StepTravel to every region mailbox
+        ├─ each worker: process_region_events_for_barrier(usize::MAX)
+        │     └─ region: [pending ReceiveTravelers] then StepTravel
+        │            RegionEvent::StepTravel → RegionState::step_travel()  (travel::step_travel)
+        │                                    + drain crossings → TravelerHandedOff
+        └─ collect forwarded handoffs → sort by order key → deliver_forwarded_events
+               (delivered to neighbour inboxes for the NEXT sub-tick — one-sub-tick-stale)
+```
+
+### Key changes
+
+- **`simulation.rs`**: `travel::run` removed from `finish_tick_after_goods_phase` — the
+  hourly tick no longer moves travellers.
+- **`travel.rs`**: `run` → `step_travel` (the sub-tick pass). It **re-resolves the
+  schedule each call** — cheap, and `advance` already no-ops on an unchanged target, so
+  no separate `resolve`/`goal` was needed (a simplification over §4b). dwell (P7b) is now
+  in 10-minute units (6 calls/hour).
+- **`RegionEvent::StepTravel`** + **`RegionState::step_travel`**: one movement sub-tick,
+  then the P5b drain emits the crossings it buffered.
+- **`RegionalGameRunner::step_travel_city`**: the single-pass, full-inbox barrier (reuses
+  `process_region_events_for_barrier` + `deliver_forwarded_events` — no new worker command).
+- **`RegionalGame::advance`** + `sub_tick: Mutex<u8>`: the runner-owned cadence; the whole
+  read→tick→step→bump sequence is held under the mutex so concurrent `Arc` callers can't
+  interleave (an `AtomicU8` would protect the byte but not the sequence).
+- **`CityDriver::tick`**: now `advance()` ×6 — one press = one hour = 1 economy tick + 6
+  movement sub-ticks, preserving the existing UI feel while routing all movement through
+  the sub-tick path.
+
+### Determinism / balance
+
+The cross-worker barrier sort (`sort_forwarded_events` by the rank-3 order key) is
+independent of thread timing; cross-region crossings are one-**sub**-tick-stale (the same
+model as P5, finer). The economy still runs exactly once per game hour. Movement is
+display-only (`road_distances`/economy untouched), so balance is unaffected.
+
+New test `advance_fires_economy_once_per_six_subticks`; the dwell/travel/cross-region
+unit tests cover movement; full suite green. codex clean (opencode skipped by request).
+
+**P7 is complete** (P7a cost · P7b dwell · P7c sub-tick driver). A smooth per-frame
+render (calling `advance` once per animation frame instead of 6× per press) is the only
+remaining polish, deferable to a future patch.

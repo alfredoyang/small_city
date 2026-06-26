@@ -134,6 +134,10 @@ pub enum RegionEvent {
     /// P5b: a cross-region travel token handed in by a neighbor region (fire and
     /// forget — no grant, no tick pause).
     ReceiveTraveler(TravelerHandoff),
+    /// P7c: advance movement by one 10-minute sub-tick (no economy). Broadcast to
+    /// every region by the runner's `step_travel_city`; emits the crossings it
+    /// buffers as `TravelerHandedOff` for the barrier to route.
+    StepTravel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -733,6 +737,12 @@ impl RegionRuntime {
                 .into_iter()
                 .map(OutboundMessage::TravelerHandedOff)
                 .collect(),
+            RegionEvent::StepTravel => {
+                // P7c: one movement sub-tick, then drain the crossings it buffered
+                // so the barrier routes them to neighbours for the next sub-tick.
+                self.state.step_travel();
+                self.drained_traveler_handoff_messages()
+            }
         }
     }
 

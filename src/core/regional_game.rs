@@ -215,7 +215,19 @@ pub struct RegionalGame {
     latest_goods_by_region: Mutex<BTreeMap<RegionId, CityGoodsView>>,
     /// Tunable building rules in effect for this city; written into saves and restored on load.
     building_rules: BuildingRules,
+    /// P7c: 0..6 movement sub-tick within the current game hour. `advance` runs one
+    /// movement sub-tick per call and fires the hourly `tick_city` on sub-tick 0, so
+    /// 1 game hour = 1 economy tick + 6 movement sub-ticks. A `Mutex` (not an atomic)
+    /// because the whole `advance` sequence — read counter, maybe `tick_city`,
+    /// `step_travel_city`, bump — must be serialized as one cadence operation across
+    /// `Arc` callers, not just the byte. (`tick_city`/`step_travel_city` take the
+    /// runner's separate lock internally; the order is always sub_tick → runner lock,
+    /// so there is no deadlock.)
+    sub_tick: Mutex<u8>,
 }
+
+/// P7c: movement sub-ticks per game hour.
+const SUB_TICKS_PER_HOUR: u8 = 6;
 
 impl RegionalGame {
     pub fn single_region(width: usize, height: usize) -> Result<Self, RegionalGameError> {
@@ -308,6 +320,7 @@ impl RegionalGame {
             next_request_id: AtomicU64::new(1),
             latest_goods_by_region: Mutex::new(BTreeMap::new()),
             building_rules,
+            sub_tick: Mutex::new(0),
         };
 
         Ok(game)
@@ -537,6 +550,36 @@ impl RegionalGame {
                 region_id: selected,
             })?;
         Ok(results.swap_remove(selected_index))
+    }
+
+    /// P7c: advance the timeline by one 10-minute movement sub-tick. The UI calls
+    /// only this and never distinguishes ticks from sub-ticks: every call steps
+    /// movement across all regions (in lockstep), and on the first sub-tick of each
+    /// hour it also runs the heavy hourly `tick_city` (economy). One game hour =
+    /// 1 economy tick + `SUB_TICKS_PER_HOUR` movement sub-ticks. Returns the hourly
+    /// economy result on the sub-tick it fired, else `None`.
+    pub fn advance(&self) -> Result<Option<CommandResult>, RegionalGameError> {
+        // Hold the counter lock across the whole sequence so concurrent `Arc`
+        // callers can't both run the economy, or interleave a movement step between
+        // another caller's economy tick and its movement step.
+        let mut sub_tick = self
+            .sub_tick
+            .lock()
+            .expect("regional game sub-tick lock poisoned");
+        let economy = if *sub_tick == 0 {
+            Some(self.tick_city()?)
+        } else {
+            None
+        };
+        self.step_travel_city()?;
+        *sub_tick = (*sub_tick + 1) % SUB_TICKS_PER_HOUR;
+        Ok(economy)
+    }
+
+    /// P7c: one movement sub-tick across all regions (no economy). Usually driven
+    /// via [`advance`]; exposed for tests/tools that want movement alone.
+    pub fn step_travel_city(&self) -> Result<(), RegionalGameError> {
+        self.runner.step_travel_city().map_err(Into::into)
     }
 
     pub fn tick_selected_region(&self) -> Result<CommandResult, RegionalGameError> {
@@ -1011,6 +1054,28 @@ impl From<RegionalGameRunnerError> for RegionalGameError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P7c: `advance` runs the hourly economy on the first sub-tick of each hour and
+    /// is movement-only on the other five — 1 game hour = 1 economy tick + 6
+    /// movement sub-ticks.
+    #[test]
+    fn advance_fires_economy_once_per_six_subticks() {
+        let game = RegionalGame::single_region(4, 4).expect("single-region game");
+        assert!(
+            game.advance().expect("advance").is_some(),
+            "sub-tick 0 runs the hourly economy"
+        );
+        for i in 1..SUB_TICKS_PER_HOUR {
+            assert!(
+                game.advance().expect("advance").is_none(),
+                "sub-tick {i} is movement-only"
+            );
+        }
+        assert!(
+            game.advance().expect("advance").is_some(),
+            "the next hour runs the economy again"
+        );
+    }
 
     #[test]
     fn save_stamps_building_rules_and_restores_them_on_load() {

@@ -267,9 +267,19 @@ impl CityDriver {
     pub fn tick(&mut self) -> CommandResult {
         match &mut self.backend {
             CityBackend::RegionalMultiRegion(game) => {
-                // Tick the whole city so every region shares one clock and none stay
-                // frozen; the returned result is the selected region's, for the status line.
-                game.tick_city().unwrap_or_else(command_failure)
+                // P7c: one tick press = one game hour = 6 movement sub-ticks (which
+                // also runs the hourly economy on the first). `advance` keeps every
+                // region on one clock and steps movement in lockstep; the economy
+                // result (from sub-tick 0) is the selected region's status line.
+                let mut economy = None;
+                for _ in 0..6 {
+                    match game.advance() {
+                        Ok(Some(result)) => economy = Some(result),
+                        Ok(None) => {}
+                        Err(error) => return command_failure(error),
+                    }
+                }
+                economy.unwrap_or_else(|| driver_failure("no economy result this hour"))
             }
             CityBackend::Unavailable { message, .. } => driver_failure(message),
         }

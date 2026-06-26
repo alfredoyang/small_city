@@ -1,37 +1,32 @@
-//! P3 movement — steps each citizen one road cell per tick along the route
-//! cache, driven by the daily schedule (`systems/schedule.rs`).
+//! Citizen movement — steps each citizen along the P2 route cache, driven by the
+//! daily schedule (`systems/schedule.rs`).
 //!
-//! This is the consumer the schedule layer was built for: the schedule answers
-//! *what* a citizen wants (Home / Work / Leisure), and this system resolves that
-//! to a concrete target building and walks the citizen there over the road graph
-//! using the P2 route cache (`World::routes_to`). It owns no pathfinding of its
-//! own — only the per-citizen state machine.
+//! The schedule answers *what* a citizen wants (Home / Work / Leisure); this system
+//! resolves that to a concrete target and walks the citizen there over the road
+//! graph using `World::routes_to`. It owns no pathfinding of its own — only the
+//! per-citizen state machine.
+//!
+//! `step_travel` is the **10-minute movement sub-tick** (P7c): it is *not* part of
+//! the hourly economy tick. The runner broadcasts a `RegionEvent::StepTravel` to
+//! every region 6× per game hour, so a traveller advances ~6 cells/hour — gated by
+//! `dwell` (P7b) so a crossing/turn cell holds it 2×/4× longer.
 //!
 //! ```text
-//!   tick (after happiness::run, before turn += 1)
-//!     │
-//!     ▼  for each citizen, sorted by entity.0 (determinism):
-//!   intent = schedule_intent(hour, citizen)         // schedule.rs
-//!   target = resolve_target(intent)                 // Home→home, Work→local|home
-//!            (remote Work idles at home in v1; P5 routes to a border-exit cell)
-//!     │
-//!     ├─ idle in a building (current_cell = None)
-//!     │     at target?      → stay idle (normalise AtHome/AtWork)
-//!     │     target changed? → depart onto an entry road cell of the *origin*
-//!     │                        building if a route exists, else stay put (§4b)
-//!     │
-//!     └─ en route (current_cell = Some(cell))
-//!           adjacent to target? → arrive (status AtHome/AtWork, cell = None)
-//!           else                → step current_cell = came_from[cell] (one cell),
-//!                                  or stay put if unreachable (§4b, no teleport)
+//!   step_travel (one 10-min sub-tick), each citizen sorted by entity.0:
+//!     dwell gate: still traversing this cell? (dwell+1 < step_cost) → stay, dwell++
+//!     else advance one transition:
+//!       idle in a building → depart onto an entry road cell (or stay, §4b)
+//!       en route, adjacent to target → arrive (AtHome/AtWork, cell = None)
+//!       en route, on a border-exit cell → cross (buffer handoff, mark Away — P5)
+//!       en route otherwise → step current_cell = came_from[cell] (or stay, §4b)
 //! ```
 //!
 //! Determinism: citizens are visited in `entity.0` order; networks are discovered
-//! deterministically; `routes_to` is a deterministic Dijkstra tree; building entry
-//! cells are sorted by position. Same inputs → same movement.
+//! deterministically; `routes_to` is a deterministic Dijkstra tree; entry cells are
+//! sorted by position. Same inputs → same movement.
 //!
 //! Persistence: `World::travel` is `#[serde(skip)]`; trips are not saved. On load
-//! the first tick re-derives placement from the schedule.
+//! the first sub-tick re-derives placement from the schedule.
 
 use std::collections::HashSet;
 
@@ -47,7 +42,7 @@ use crate::core::systems::schedule::{
 };
 use crate::core::world::World;
 
-/// Where a citizen is headed this tick.
+/// Where a citizen is headed this sub-tick.
 enum Target<'a> {
     /// A local building (home or local workplace) — normal P3 movement.
     Building(Entity),
@@ -74,11 +69,13 @@ enum Advance {
     },
 }
 
-/// Steps every citizen's commute one cell. Runs once per tick.
-pub(crate) fn run(world: &mut World) {
+/// Advances every citizen's commute by one 10-minute movement sub-tick (gated by
+/// `dwell` so a crossing/turn cell holds the traveller for 2×/4× as long). Driven
+/// 6× per game hour by the runner, separately from the hourly economy tick.
+pub(crate) fn step_travel(world: &mut World) {
     let hour = world.resources.time.hour_of_day();
     let region = world.region_id;
-    // Discovered once per tick and reused for every citizen's cell→network lookup.
+    // Discovered once per sub-tick and reused for every citizen's cell→network lookup.
     let networks = road_connectivity::discover_road_networks(world);
 
     // Visit citizens in a fixed order so movement is deterministic.
@@ -318,7 +315,7 @@ fn dwell_cost_for(
     Some(step_cost(world, state.prev_cell, cell, Some(next), degree))
 }
 
-/// Advances one citizen one tick toward `target`.
+/// Advances one citizen one sub-tick toward `target`.
 fn advance(
     world: &World,
     networks: &[RoadNetwork],
@@ -390,7 +387,7 @@ fn advance_to_exit(
                 return Advance::Stay(state); // unreachable from here → stay put
             };
             if cell == exit_cell {
-                // On the exit cell → cross (it already had its one-tick dot here).
+                // On the exit cell → cross (it already had its one-sub-tick dot here).
                 return Advance::Cross {
                     to_region,
                     exit_cell,
@@ -405,7 +402,7 @@ fn advance_to_exit(
     }
 }
 
-/// Advances one citizen one tick toward a local `target` building (P3 movement).
+/// Advances one citizen one sub-tick toward a local `target` building.
 fn advance_to_building(
     world: &World,
     networks: &[RoadNetwork],
@@ -421,7 +418,7 @@ fn advance_to_building(
 
     match state.current_cell {
         // Idle inside a building. The origin is read from movement state (the
-        // building actually occupied), defaulting to home on the first tick
+        // building actually occupied), defaulting to home on the first sub-tick
         // before `building` has been recorded.
         None => {
             // Origin = the building actually occupied. If it was bulldozed/replaced
@@ -475,7 +472,7 @@ fn depart(
         let Some(network) = network_of_cell(networks, entry) else {
             continue;
         };
-        // Reachable iff the entry already touches the target (arrive next tick) or
+        // Reachable iff the entry already touches the target (arrive next sub-tick) or
         // the target's route tree on this network includes the entry cell.
         let reachable = is_adjacent(world, target, entry) || {
             let tree = world.routes_to(target, network);
@@ -630,7 +627,7 @@ pub(crate) fn apply_traveler_return(world: &mut World, traveler: TravelerId) {
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::step_travel;
     use crate::core::city_refs::CityCellRef;
     use crate::core::components::{Citizen, Morale, TravelStatus, WorkplaceAssignment};
     use crate::core::entity::Entity;
@@ -712,7 +709,7 @@ mod tests {
         set_hour(&mut world, 9);
         let mut on_x = 0;
         for _ in 0..12 {
-            run(&mut world);
+            step_travel(&mut world);
             if world.travel[&id].current_cell == Some(x_cell) {
                 on_x += 1;
             }
@@ -734,19 +731,19 @@ mod tests {
         // Departs onto r0, then steps one cell per tick to r3.
         let mut seen = Vec::new();
         for _ in 0..4 {
-            run(&mut world);
+            step_travel(&mut world);
             seen.push(world.travel[&id].current_cell.expect("on a road cell"));
         }
         assert_eq!(seen, roads.to_vec(), "exact route cells r0..r3");
 
         // Next tick: r3 touches work → arrived, idling AtWork.
-        run(&mut world);
+        step_travel(&mut world);
         let state = world.travel[&id];
         assert_eq!(state.status, TravelStatus::AtWork);
         assert_eq!(state.current_cell, None);
 
         // Stays idle at work for subsequent work-hour ticks.
-        run(&mut world);
+        step_travel(&mut world);
         assert_eq!(world.travel[&id].status, TravelStatus::AtWork);
         assert_eq!(world.travel[&id].current_cell, None);
     }
@@ -760,14 +757,14 @@ mod tests {
         // Commute to work first (run through the morning until idle AtWork).
         set_hour(&mut world, 9);
         for _ in 0..6 {
-            run(&mut world);
+            step_travel(&mut world);
         }
         assert_eq!(world.travel[&id].status, TravelStatus::AtWork);
 
         // Jump to the evening home phase and run until idle.
         set_hour(&mut world, 16); // evening Home phase
         for _ in 0..6 {
-            run(&mut world);
+            step_travel(&mut world);
         }
         let state = world.travel[&id];
         assert_eq!(state.status, TravelStatus::AtHome);
@@ -790,7 +787,7 @@ mod tests {
 
         set_hour(&mut world, 10);
         for _ in 0..5 {
-            run(&mut world);
+            step_travel(&mut world);
         }
         let state = world.travel[&id];
         assert_eq!(state.status, TravelStatus::AtHome, "no route → stay home");
@@ -809,7 +806,7 @@ mod tests {
         // Commute to work and idle there.
         set_hour(&mut world, 9);
         for _ in 0..6 {
-            run(&mut world);
+            step_travel(&mut world);
         }
         assert_eq!(world.travel[&id].status, TravelStatus::AtWork);
 
@@ -819,7 +816,7 @@ mod tests {
         // Evening home phase: no route home → stays AtWork (stranded, no teleport).
         set_hour(&mut world, 16); // evening Home phase
         for _ in 0..6 {
-            run(&mut world);
+            step_travel(&mut world);
         }
         let state = world.travel[&id];
         assert_eq!(
@@ -832,7 +829,7 @@ mod tests {
         // Rebuild r1 → route home reappears → citizen walks home.
         place_building(&mut world, 1, 0, BuildingKind::Road);
         for _ in 0..6 {
-            run(&mut world);
+            step_travel(&mut world);
         }
         assert_eq!(
             world.travel[&id].status,
@@ -853,7 +850,7 @@ mod tests {
 
         set_hour(&mut world, 9);
         for _ in 0..6 {
-            run(&mut world);
+            step_travel(&mut world);
         }
         assert_eq!(world.travel[&id].status, TravelStatus::AtWork);
         assert_eq!(world.travel[&id].building, Some(work));
@@ -861,7 +858,7 @@ mod tests {
         // Bulldoze the workplace the citizen is standing in.
         remove_entity(&mut world, work, 3, 1);
         for _ in 0..6 {
-            run(&mut world);
+            step_travel(&mut world);
         }
         let state = world.travel[&id];
         assert_eq!(
@@ -895,7 +892,7 @@ mod tests {
         // Commute to workA and idle there.
         set_hour(&mut world, 9);
         for _ in 0..8 {
-            run(&mut world);
+            step_travel(&mut world);
         }
         assert_eq!(world.travel[&id].status, TravelStatus::AtWork);
         assert_eq!(world.travel[&id].building, Some(work_a));
@@ -912,7 +909,7 @@ mod tests {
         });
 
         // One tick: depart from workA's entry road r2 — not teleport to B.
-        run(&mut world);
+        step_travel(&mut world);
         let state = world.travel[&id];
         assert_eq!(state.status, TravelStatus::Traveling);
         assert_eq!(
@@ -930,7 +927,7 @@ mod tests {
         let id = add_citizen(&mut world, 100, home, Some(remote));
 
         set_hour(&mut world, 10);
-        run(&mut world);
+        step_travel(&mut world);
         let state = world.travel[&id];
         assert_eq!(state.status, TravelStatus::AtHome);
         assert_eq!(state.current_cell, None);
@@ -942,11 +939,11 @@ mod tests {
         let (mut world, _roads, home, work) = commute_world();
         let id = add_citizen(&mut world, 100, home, Some(work));
         set_hour(&mut world, 9);
-        run(&mut world);
+        step_travel(&mut world);
         assert!(world.travel.contains_key(&id));
 
         world.citizens.remove(&id);
-        run(&mut world);
+        step_travel(&mut world);
         assert!(
             !world.travel.contains_key(&id),
             "pruned after citizen removed"
@@ -965,8 +962,8 @@ mod tests {
         let mut a = build();
         let mut b = build();
         for _ in 0..3 {
-            run(&mut a);
-            run(&mut b);
+            step_travel(&mut a);
+            step_travel(&mut b);
         }
         let mut ta: Vec<_> = a.travel.iter().map(|(k, v)| (*k, *v)).collect();
         let mut tb: Vec<_> = b.travel.iter().map(|(k, v)| (*k, *v)).collect();
@@ -1013,7 +1010,7 @@ mod tests {
         // Walk home → r0 → r1 → r2 → r3, then (on r3) cross.
         set_hour(&mut world, 9);
         for _ in 0..6 {
-            run(&mut world);
+            step_travel(&mut world);
         }
 
         assert_eq!(world.travel[&id].status, TravelStatus::Away, "crossed away");
@@ -1041,7 +1038,7 @@ mod tests {
         }
 
         // An Away citizen is skipped — no further movement or handoff.
-        run(&mut world);
+        step_travel(&mut world);
         assert_eq!(world.travel[&id].status, TravelStatus::Away);
         assert_eq!(
             world.outgoing_handoffs.len(),
@@ -1069,13 +1066,13 @@ mod tests {
         let id = add_citizen(&mut world, 1, home, Some(workplace));
 
         set_hour(&mut world, 9);
-        run(&mut world); // departs onto the reachable exit r_a
+        step_travel(&mut world); // departs onto the reachable exit r_a
         assert_eq!(
             world.travel[&id].current_cell,
             Some(r_a),
             "chose the reachable candidate, not r_b"
         );
-        run(&mut world); // on r_a → cross
+        step_travel(&mut world); // on r_a → cross
         assert_eq!(world.travel[&id].status, TravelStatus::Away);
         match world.outgoing_handoffs.last().expect("a crossing") {
             PendingHandoff::Outbound { exit_cell, .. } => {
@@ -1173,7 +1170,7 @@ mod tests {
         receive_traveler(&mut world, traveler, token, r0, vec![a_return_hop()]);
 
         set_hour(&mut world, 9); // work hours — yet it can't reach the workplace
-        run(&mut world);
+        step_travel(&mut world);
         assert!(
             !world.visiting_travel.contains_key(&traveler),
             "unreachable token returned immediately"
@@ -1219,7 +1216,7 @@ mod tests {
         // to the workplace) — the dot keeps showing.
         set_hour(&mut world, 9);
         for _ in 0..6 {
-            run(&mut world);
+            step_travel(&mut world);
         }
         let visiting = world
             .visiting_travel
@@ -1233,7 +1230,7 @@ mod tests {
 
         // Workday ends → the token is returned home and removed (its dot is gone).
         set_hour(&mut world, 16);
-        run(&mut world);
+        step_travel(&mut world);
         assert!(
             !world.visiting_travel.contains_key(&traveler),
             "token removed at workday end"

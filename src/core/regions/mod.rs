@@ -307,6 +307,14 @@ impl RegionState {
         finish_tick_after_job_phase(&mut self.world, job_phase, &[])
     }
 
+    /// P7c: advances movement by one 10-minute sub-tick (no economy). Driven 6×
+    /// per game hour by the runner, separately from `tick_local`/the hourly tick.
+    /// Buffers any cross-region crossings into `outgoing_handoffs` for the regions
+    /// layer to drain (`drain_traveler_handoffs`).
+    pub(crate) fn step_travel(&mut self) {
+        travel::step_travel(&mut self.world);
+    }
+
     /// Applies one player build command through the core systems.
     ///
     /// DT1: the build only mutates config (which marks the derived state dirty);

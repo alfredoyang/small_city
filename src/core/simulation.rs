@@ -42,7 +42,7 @@ use crate::core::regions::RegionId;
 use crate::core::resources::{GameTime, is_new_day, is_new_week};
 use crate::core::systems::{
     business_growth, citizens, economy, happiness, local_effects, pollution, population, power,
-    road_network_analysis, stats, travel,
+    road_network_analysis, stats,
 };
 use crate::core::world::World;
 use crate::interface::events::{CommandResult, EconomyBreakdownView, GameEventView, MetricChange};
@@ -194,9 +194,10 @@ pub(crate) fn finish_tick_after_goods_phase(
     stats::refresh_population_and_jobs(world);
     pollution::run(world);
     happiness::run(world);
-    // P3 movement: step each citizen's commute one cell. Runs on ticks only
-    // (not the paused re-derive) — travel state is transient/display-only.
-    travel::run(world);
+    // P7c: movement no longer runs on the hourly tick. It is driven separately by
+    // `RegionState::step_travel` (the 10-minute sub-tick), 6× per game hour via the
+    // runner's `advance`, so crossings/turns cost realistic time. Travel state is
+    // transient/display-only, so decoupling it from the economy tick is free.
     world.resources.turn += 1;
     let after = TickSummarySnapshot::from_world(world);
 

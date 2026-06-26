@@ -407,6 +407,38 @@ impl RegionalGameRunner {
             .ok_or(RegionalGameRunnerError::WorkerStopped { worker_id })
     }
 
+    /// P7c: advance movement by one 10-minute sub-tick across EVERY region, as a
+    /// single deterministic barrier pass. Broadcasts `StepTravel` to all region
+    /// mailboxes, then drains each region's inbox (any `ReceiveTraveler`s handed in
+    /// last sub-tick — processed first, FIFO, inserting their visiting tokens — plus
+    /// the one `StepTravel`) at a full-inbox budget, and delivers the crossings
+    /// `StepTravel` emitted to neighbour inboxes for the NEXT sub-tick. ONE pass, not
+    /// looped: looping would re-consume freshly-delivered handoffs in the same
+    /// sub-tick and break the one-sub-tick-stale, can't-skip-two-regions guarantee.
+    pub fn step_travel_city(&self) -> Result<(), RegionalGameRunnerError> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .expect("regional runner operation lock poisoned");
+        for handle in &self.handles {
+            handle.send(crate::core::regions::runtime::RegionEvent::StepTravel);
+        }
+        let mut forwarded = Vec::new();
+        for worker in &self.workers {
+            let mut summary = worker
+                .process_region_events_for_barrier(usize::MAX)
+                .map_err(RegionalGameRunnerError::from)?;
+            if let Some(error) = summary.routing_errors.first().copied() {
+                return Err(RegionalGameRunnerError::WorkerRoutingFailed {
+                    worker_id: worker.worker_id(),
+                    error,
+                });
+            }
+            forwarded.append(&mut summary.forwarded_events);
+        }
+        self.deliver_forwarded_events(forwarded)
+    }
+
     /// Pumps every worker once while a synchronous runner call waits for its reply.
     ///
     /// This does not mean "produce exactly one reply." Region runtimes are event
