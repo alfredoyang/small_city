@@ -457,3 +457,33 @@ frozen (unchanged policy).
   if profiling shows it).
 - Cross-region crossings now resolve mid-hour but remain **one-sub-tick-stale** — the same
   guarantee as P5, finer. A handoff still cannot skip two regions in one sub-tick (barrier).
+
+---
+
+## Implemented — P7a (turn-aware cost unification) · `systems/road_network_analysis.rs`
+
+The routing half of the cost change: P1's degree-only `1 + crossing_penalty` becomes
+the geometric `step_cost` that P7b's mover will also use.
+
+```text
+  road_predecessors_inner relax (current → neighbor), per neighbor:
+    forward = came_from[current]            // current's fixed exit (None at a root)
+    nd = cost + step_cost(world, Some(neighbor), current, forward, degree)
+
+  step_cost(in, current, out, degree):
+    degree ≥ 4                         → 4   4-way
+    degree = 3  OR  in ⊥ out (a turn)  → 2   T-junction or 90° corner
+    else (straight, in ∥ out)          → 1
+    turn ⇔ !collinear(in, current, out)      // midpoint check: in.x+out.x == 2·cur.x
+                                             //               && in.y+out.y == 2·cur.y
+```
+
+The turn is charged against `current`'s **single** forward direction in the `came_from`
+tree (the standard approximation of `(cell, direction)` turn-penalty routing — see §3
+ceiling). Weights move from `1/3` to `1/2/4`-with-turns; this feeds **only** the travel
+route cache — `road_distances` (economy/happiness/inspect) stays plain BFS, so gameplay
+balance is untouched.
+
+Re-baselined `road_predecessors_crossing_penalty_charged` (an arm reached through the
+4-way now costs 5, was 4) and added `road_predecessors_turn_costs_like_a_junction` (a
+corner costs 2 vs a straight pass 1). codex clean; gates green.

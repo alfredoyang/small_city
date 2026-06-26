@@ -1,10 +1,10 @@
 //! Derived road-network distances used by economy, happiness, and inspect explanations.
 //!
 //! P1 (pathfinding) adds `road_predecessors` — a destination-rooted, multi-source
-//! Dijkstra that records `came_from` for path reconstruction. Edge weight is
-//! `1 + crossing_penalty(current)` (the cell being entered in the forward
-//! direction, in the destination-rooted reverse search). See
-//! `docs/traffic-pathfinding-plan.md` §7b P1 for the full spec.
+//! Dijkstra that records `came_from` for path reconstruction. Edge weight is the
+//! geometric `step_cost(current)` of the cell entered in the forward direction
+//! (1 straight / 2 turn or T-junction / 4 four-way; see `step_cost`). See
+//! `docs/traffic-pathfinding-plan.md` §7b P1 and `docs/travel-subtick-plan.md`.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -252,12 +252,12 @@ fn road_distances(
 /// reconstruct the path by walking the tree inward (one HashMap lookup per
 /// tick — see the pathfinding plan §2a).
 ///
-/// **Edge weight** — `1 + crossing_penalty(current)` (destination-rooted
-/// reverse search: relaxing `current → neighbor` represents the forward
-/// step `neighbor → current` toward the destination, so the penalty
-/// charges the cell being entered, which is `current`). `crossing_penalty = 2`
-/// if the road cell has > 2 road neighbors (T-junction or 4-way), else `0`.
-/// This makes paths prefer fewer crossings on equal-hop routes.
+/// **Edge weight** — `step_cost(current)` (destination-rooted reverse search:
+/// relaxing `current → neighbor` represents the forward step `neighbor →
+/// current` toward the destination, so the cost charges the cell being entered,
+/// which is `current`). `step_cost` is geometric: 1 for a straight pass, 2 for a
+/// turn or T-junction, 4 for a 4-way (see `step_cost`). This makes paths prefer
+/// fewer/cheaper crossings and turns.
 ///
 /// **Determinism** — `BinaryHeap` does not guarantee pop order for equal
 /// priorities, so the heap key is `Reverse<(cost, entity)>`. The tuple
@@ -283,8 +283,8 @@ pub(crate) fn road_predecessors(
     road_predecessors_inner(world, network, sources).0
 }
 
-/// Shared implementation: returns `(came_from, dist)`. The cost is the road
-/// cost under the crossing-penalty weight: `1 + crossing_penalty(current)`.
+/// Shared implementation: returns `(came_from, dist)`. The cost is the geometric
+/// `step_cost(current)` (1 straight / 2 turn or T-junction / 4 four-way).
 /// Used by [`road_predecessors`] (production) and [`road_predecessors_with_dist`]
 /// (test helper).
 fn road_predecessors_inner(
@@ -328,15 +328,18 @@ fn road_predecessors_inner(
         // `neighbors` are exactly the road neighbors of `current` in the
         // network, so the degree is `neighbors.len()` (no second scan).
         let degree = neighbors.len() as u32;
-        let crossing_penalty = if degree > 2 { 2 } else { 0 };
+        // `current`'s fixed forward direction in the tree (toward the
+        // destination); `None` at a source/root. The turn at `current` is
+        // between the incoming edge `neighbor → current` and this exit.
+        let forward = came_from.get(&current).copied();
 
         for neighbor in neighbors {
-            // Destination-rooted reverse search: relaxing `current →
-            // neighbor` represents the forward step `neighbor → current`
-            // toward the destination, so the penalty charges the cell
-            // being entered in the forward direction — which is `current`,
-            // not `neighbor`.
-            let nd = cost + 1 + crossing_penalty;
+            // Destination-rooted reverse search: relaxing `current → neighbor`
+            // represents the forward step `neighbor → current` toward the
+            // destination, so the cost charges `current` (the cell entered in
+            // the forward direction). `step_cost` makes a turn cost as much as a
+            // T-junction (see its docs).
+            let nd = cost + step_cost(world, Some(neighbor), current, forward, degree);
             if nd < *dist.get(&neighbor).unwrap_or(&u32::MAX) {
                 dist.insert(neighbor, nd);
                 came_from.insert(neighbor, current);
@@ -348,11 +351,59 @@ fn road_predecessors_inner(
     (came_from, dist)
 }
 
+/// Cost (in travel sub-ticks) to traverse `current`, entering from `in_cell` and
+/// leaving toward `out_cell`. Geometric, not just degree-based:
+///
+/// ```text
+///   degree ≥ 4                            → 4   4-way intersection
+///   degree = 3  OR  in ⊥ out (a 90° turn) → 2   T-junction or corner
+///   else (straight pass, in ∥ out)        → 1   straight / dead-end / arrival
+/// ```
+///
+/// A turn needs both endpoints, so `in_cell`/`out_cell` are `Option`: at a
+/// destination-root (`out_cell = None`) or the very first step from a building
+/// (`in_cell = None`) there is no turn, only the base/degree cost.
+///
+/// The single source of truth for both the P1 routing weight and the per-cell
+/// dwell the mover pays, so the route the cache prefers is a strong heuristic for
+/// the fastest one (see `docs/travel-subtick-plan.md`).
+pub(crate) fn step_cost(
+    world: &World,
+    in_cell: Option<Entity>,
+    current: Entity,
+    out_cell: Option<Entity>,
+    degree: u32,
+) -> u32 {
+    if degree >= 4 {
+        return 4;
+    }
+    let turns = match (in_cell, out_cell) {
+        (Some(i), Some(o)) => !collinear(world, i, current, o),
+        _ => false,
+    };
+    if degree == 3 || turns { 2 } else { 1 }
+}
+
+/// Whether `b` is the straight midpoint between orthogonally-adjacent road cells
+/// `a` and `c` — i.e. entering `b` from `a` and leaving to `c` is a straight pass,
+/// not a 90° turn. `false` (treated as a turn) if any position is missing.
+fn collinear(world: &World, a: Entity, b: Entity, c: Entity) -> bool {
+    let (Some(pa), Some(pb), Some(pc)) = (
+        world.positions.get(&a),
+        world.positions.get(&b),
+        world.positions.get(&c),
+    ) else {
+        return false;
+    };
+    // `a` and `c` are opposite neighbours of `b` ⇔ `b` is their midpoint.
+    pa.x + pc.x == 2 * pb.x && pa.y + pc.y == 2 * pb.y
+}
+
 /// Number of road cells in `network` that are orthogonally adjacent to
-/// `road_entity`. Used to compute the crossing penalty (> 2 → T-junction
-/// or 4-way intersection). A 2-neighbor cell is a straight segment or
-/// corner (no penalty).
-#[allow(dead_code)] // P1 standalone; test-only sanity check.
+/// `road_entity` — the cell's degree, fed to `step_cost` (3 → T-junction,
+/// ≥ 4 → 4-way). A degree-2 cell is straight *or* a corner; `step_cost`
+/// distinguishes those by direction, not by degree.
+#[allow(dead_code)] // P1 standalone; test-only sanity check (P7b wires it into the mover).
 fn road_degree_in_network(world: &World, road_entity: Entity, network: &RoadNetwork) -> u32 {
     road_connectivity::adjacent_road_entities(world, road_entity)
         .filter(|neighbor| network.roads.contains(neighbor))
@@ -531,10 +582,9 @@ mod tests {
         assert_eq!(dist.get(&r_north), Some(&0));
 
         // X is reached from the source. The reverse relaxation goes from
-        // r_north to x with edge weight `1 + penalty(current)` where
-        // current = r_north (degree 1, no penalty). So dist[x] = 0 + 1 = 1.
-        // The penalty on X is charged when LEAVING X (in reverse), which
-        // is equivalent to ENTERING X in the forward direction.
+        // r_north to x with edge weight `step_cost(current)` where current =
+        // r_north (degree 1 → cost 1). So dist[x] = 0 + 1 = 1. X's own (4-way)
+        // cost is charged when LEAVING X in reverse = ENTERING X forward.
         let dist_x = dist.get(&x).copied().expect("X must be reached");
         assert_eq!(
             dist_x, 1,
@@ -543,29 +593,62 @@ mod tests {
         );
 
         // The other R's are reached via X. The reverse relaxation goes from
-        // x to r_south with edge weight `1 + penalty(x) = 1 + 2 = 3`.
-        // So dist[r_south] = dist[x] + 3 = 1 + 3 = 4.
-        // If the penalty were 0, dist[r_south] would be 1 + 1 = 2.
+        // x to r_south with edge weight `step_cost(X) = 4` (X is a 4-way, so the
+        // geometric cost is 4 regardless of the turn). So dist[r_south] =
+        // dist[x] + 4 = 1 + 4 = 5. (Under the old `1 + crossing_penalty` model
+        // this was 1 + 3 = 4.)
         let dist_south = dist
             .get(&r_south)
             .copied()
             .expect("south R must be reached");
         assert_eq!(
-            dist_south, 4,
-            "south R should be reached with cost 4 (through X with penalty 2); \
-             if penalty were 0, cost would be 2"
+            dist_south, 5,
+            "south R should be reached with cost 5 (through the 4-way X, cost 4)"
         );
         // r_east and r_west are reached the same way (both arm cells have
         // the same cost from the source through X).
         assert_eq!(
             dist.get(&r_east).copied(),
-            Some(4),
-            "east R should also have cost 4 (symmetric arm)"
+            Some(5),
+            "east R should also have cost 5 (symmetric arm)"
         );
         assert_eq!(
             dist.get(&r_west).copied(),
-            Some(4),
-            "west R should also have cost 4 (symmetric arm)"
+            Some(5),
+            "west R should also have cost 5 (symmetric arm)"
+        );
+    }
+
+    /// P7a: a 90° turn at a degree-2 cell costs 2× (like a T-junction), while a
+    /// straight pass through a degree-2 cell costs 1×.
+    #[test]
+    fn road_predecessors_turn_costs_like_a_junction() {
+        // L-shape: A(0,0) ─ B(1,0) ─ C(1,1). At B the path turns (west↔south).
+        let mut corner = World::new(2, 2);
+        let a = place_road(&mut corner, 0, 0);
+        let b = place_road(&mut corner, 1, 0);
+        let c = place_road(&mut corner, 1, 1);
+        let corner_net = single_network(&corner);
+        let (_, dist) = road_predecessors_with_dist(&corner, &corner_net, &[c]);
+        // C→B straight-into-the-corner cost 1 (C is degree 1); B→A turns → cost 2.
+        assert_eq!(dist.get(&b), Some(&1), "B reached from C, cost 1");
+        assert_eq!(
+            dist.get(&a),
+            Some(&3),
+            "A reached through the turn at B (1 + turn 2 = 3)"
+        );
+
+        // Straight line A(0,0) ─ B(1,0) ─ C(2,0): B is a straight pass, cost 1.
+        let mut straight = World::new(3, 1);
+        let a2 = place_road(&mut straight, 0, 0);
+        let _b2 = place_road(&mut straight, 1, 0);
+        let c2 = place_road(&mut straight, 2, 0);
+        let straight_net = single_network(&straight);
+        let (_, dist2) = road_predecessors_with_dist(&straight, &straight_net, &[c2]);
+        assert_eq!(
+            dist2.get(&a2),
+            Some(&2),
+            "A reached through a straight B (1 + 1 = 2), cheaper than the turn"
         );
     }
 
