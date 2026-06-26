@@ -41,6 +41,7 @@ use crate::core::components::{
 use crate::core::entity::Entity;
 use crate::core::regions::RegionId;
 use crate::core::systems::road_connectivity::{self, RoadNetwork};
+use crate::core::systems::road_network_analysis::{road_degree_in_network, step_cost};
 use crate::core::systems::schedule::{
     ScheduleIntent, SchedulePhase, schedule_intent, schedule_phase,
 };
@@ -103,8 +104,32 @@ pub(crate) fn run(world: &mut World) {
         };
 
         let target = resolve_target(world, region, home, intent);
+
+        // P7b dwell gate: a traveller traversing the current cell stays on it for
+        // `step_cost(cell)` sub-ticks (1 straight, 2 turn/T-junction, 4 four-way)
+        // before `advance` moves it. Idle citizens and cells about to arrive/cross
+        // (`dwell_cost_for` → None) are not gated.
+        if let Some(cost) = dwell_cost_for(world, &networks, &target, state) {
+            if u32::from(state.dwell) + 1 < cost {
+                let mut waiting = state;
+                waiting.dwell += 1;
+                world.travel.insert(*id, waiting);
+                continue;
+            }
+        }
+
+        let from = state.current_cell;
         match advance(world, &networks, home, target, state) {
-            Advance::Stay(next) => {
+            Advance::Stay(mut next) => {
+                // Moved to a new road cell → record the cell just left (so the next
+                // turn is known) and reset its dwell. `travelling`/`idle` already
+                // zero `dwell`; an unchanged cell (stay-put) keeps the accumulated one.
+                if next.current_cell.is_some() && next.current_cell != from {
+                    next.prev_cell = from;
+                } else if next.current_cell == from {
+                    next.dwell = state.dwell;
+                    next.prev_cell = state.prev_cell;
+                }
                 world.travel.insert(*id, next);
             }
             Advance::Cross {
@@ -199,8 +224,20 @@ fn step_visiting(
     let next = {
         let tree = world.routes_to(dest, network);
         tree.get(&cell).copied()
-    };
-    next.map(|next| travelling(next, dest))
+    }?;
+    // P7b dwell: hold the visiting token on a crossing/turn cell for step_cost
+    // sub-ticks before advancing, exactly like a local traveller.
+    let degree = road_degree_in_network(world, cell, network);
+    let cost = step_cost(world, token.prev_cell, cell, Some(next), degree);
+    if u32::from(token.dwell) + 1 < cost {
+        let mut waiting = *token;
+        waiting.dwell += 1;
+        Some(waiting)
+    } else {
+        let mut moved = travelling(next, dest);
+        moved.prev_cell = Some(cell);
+        Some(moved)
+    }
 }
 
 /// The target a citizen is headed for. A *local* job routes to the workplace; a
@@ -237,7 +274,48 @@ fn away_state() -> TravelState {
         current_cell: None,
         destination: None,
         building: None,
+        dwell: 0,
+        prev_cell: None,
     }
+}
+
+/// P7b: the cost (in sub-ticks) to traverse the traveller's current cell toward
+/// `target`, or `None` when the move must NOT be dwell-gated — the citizen is idle,
+/// off the road graph, unreachable, or about to arrive/cross (those are handled
+/// instantly by `advance`). The turn at the cell is computed from `prev_cell` (the
+/// entry) and the route-cache forward cell (the exit).
+fn dwell_cost_for(
+    world: &World,
+    networks: &[RoadNetwork],
+    target: &Target,
+    state: TravelState,
+) -> Option<u32> {
+    let cell = state.current_cell?; // idle → not gated
+    let network = network_of_cell(networks, cell)?; // off-graph → not gated
+    let dest = match target {
+        Target::Building(building) => {
+            if is_adjacent(world, *building, cell) {
+                return None; // arriving next → advance handles it instantly
+            }
+            *building
+        }
+        Target::BorderExit { candidates, .. } => {
+            // Only gate against a still-valid committed exit; a stale destination
+            // (not in the current candidates) is left ungated so `advance` re-picks
+            // immediately rather than dwelling toward the old exit.
+            let exit = state.destination.filter(|e| candidates.contains(e))?;
+            if cell == exit {
+                return None; // crossing next → advance handles it instantly
+            }
+            exit
+        }
+    };
+    let next = {
+        let tree = world.routes_to(dest, network);
+        tree.get(&cell).copied()
+    }?; // unreachable from here → not gated (advance stays put, no dwell)
+    let degree = road_degree_in_network(world, cell, network);
+    Some(step_cost(world, state.prev_cell, cell, Some(next), degree))
 }
 
 /// Advances one citizen one tick toward `target`.
@@ -468,15 +546,22 @@ fn idle(status: TravelStatus, building: Entity) -> TravelState {
         current_cell: None,
         destination: None,
         building: Some(building),
+        dwell: 0,
+        prev_cell: None,
     }
 }
 
+/// A token stepped onto `cell`. `prev_cell`/`dwell` are reset here; the caller
+/// (run / step_visiting) patches `prev_cell` to the cell just left so the next
+/// turn is known.
 fn travelling(cell: Entity, target: Entity) -> TravelState {
     TravelState {
         status: TravelStatus::Traveling,
         current_cell: Some(cell),
         destination: Some(target),
         building: None,
+        dwell: 0,
+        prev_cell: None,
     }
 }
 
@@ -605,6 +690,38 @@ mod tests {
         let home = world.grid.get(0, 1).expect("home placed");
         let work = world.grid.get(3, 1).expect("work placed");
         (world, roads, home, work)
+    }
+
+    /// P7b: a 4-way intersection holds a traveller for 4 sub-ticks (cost 4); the
+    /// degree-1 arm cells cost 1 (one sub-tick each).
+    #[test]
+    fn dwell_holds_a_traveller_on_a_4way() {
+        // "+" intersection at X(1,1): arms N(1,0) W(0,1) E(2,1) S(1,2).
+        let mut world = World::new(3, 3);
+        for (x, y) in [(1, 0), (0, 1), (1, 1), (2, 1), (1, 2)] {
+            place_building(&mut world, x, y, BuildingKind::Road);
+        }
+        place_building(&mut world, 0, 0, BuildingKind::Residential); // touches N & W
+        place_building(&mut world, 2, 2, BuildingKind::Commercial); // touches E & S
+        let home = world.grid.get(0, 0).expect("home");
+        let work = world.grid.get(2, 2).expect("work");
+        let x_cell = world.grid.get(1, 1).expect("X");
+        let id = add_citizen(&mut world, 100, home, Some(work));
+
+        // Walk the commute and record the cell occupied each sub-tick.
+        set_hour(&mut world, 9);
+        let mut on_x = 0;
+        for _ in 0..12 {
+            run(&mut world);
+            if world.travel[&id].current_cell == Some(x_cell) {
+                on_x += 1;
+            }
+            if world.travel[&id].status == TravelStatus::AtWork {
+                break;
+            }
+        }
+        assert_eq!(on_x, 4, "the 4-way X holds the traveller for 4 sub-ticks");
+        assert_eq!(world.travel[&id].status, TravelStatus::AtWork, "arrived");
     }
 
     /// At 09:00 the citizen departs home and walks r0→r1→r2→r3, then idles AtWork.
@@ -1010,6 +1127,8 @@ mod tests {
                 current_cell: None,
                 destination: None,
                 building: None,
+                dwell: 0,
+                prev_cell: None,
             },
         );
         apply_traveler_return(
@@ -1047,6 +1166,8 @@ mod tests {
             current_cell: None,
             destination: Some(workplace),
             building: None,
+            dwell: 0,
+            prev_cell: None,
         };
         // Entry at r0, but the workplace is on the disconnected r2.
         receive_traveler(&mut world, traveler, token, r0, vec![a_return_hop()]);
@@ -1089,6 +1210,8 @@ mod tests {
             current_cell: None,
             destination: Some(workplace),
             building: None,
+            dwell: 0,
+            prev_cell: None,
         };
         receive_traveler(&mut world, traveler, token, roads[0], vec![a_return_hop()]);
 

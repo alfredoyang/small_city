@@ -1430,6 +1430,8 @@ mod tests {
                 current_cell: Some(exit),
                 destination: Some(workplace),
                 building: None,
+                dwell: 0,
+                prev_cell: None,
             },
             to_region: RegionId(2),
             exit_cell: exit,
@@ -1467,6 +1469,8 @@ mod tests {
                 current_cell: None,
                 destination: None,
                 building: None,
+                dwell: 0,
+                prev_cell: None,
             },
         );
         a.world.away_generation.insert(citizen, 1);
@@ -1509,6 +1513,8 @@ mod tests {
                 current_cell: None,
                 destination: Some(workplace),
                 building: None,
+                dwell: 0,
+                prev_cell: None,
             },
             traveler,
             to_region: RegionId(2),
@@ -1543,6 +1549,8 @@ mod tests {
                 current_cell: None,
                 destination: None,
                 building: None,
+                dwell: 0,
+                prev_cell: None,
             },
         );
         a.world.away_generation.insert(citizen, 1);

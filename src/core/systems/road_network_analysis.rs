@@ -403,8 +403,11 @@ fn collinear(world: &World, a: Entity, b: Entity, c: Entity) -> bool {
 /// `road_entity` — the cell's degree, fed to `step_cost` (3 → T-junction,
 /// ≥ 4 → 4-way). A degree-2 cell is straight *or* a corner; `step_cost`
 /// distinguishes those by direction, not by degree.
-#[allow(dead_code)] // P1 standalone; test-only sanity check (P7b wires it into the mover).
-fn road_degree_in_network(world: &World, road_entity: Entity, network: &RoadNetwork) -> u32 {
+pub(crate) fn road_degree_in_network(
+    world: &World,
+    road_entity: Entity,
+    network: &RoadNetwork,
+) -> u32 {
     road_connectivity::adjacent_road_entities(world, road_entity)
         .filter(|neighbor| network.roads.contains(neighbor))
         .count() as u32

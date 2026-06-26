@@ -407,6 +407,13 @@ pub struct TravelState {
     pub destination: Option<Entity>,
     /// The building occupied while idle (`None` while travelling).
     pub building: Option<Entity>,
+    /// P7b: sub-ticks already spent on `current_cell`. The mover advances only
+    /// when `dwell + 1 == step_cost(current_cell)`, so a crossing/turn cell holds
+    /// the traveller for 2× or 4× as long (see `docs/travel-subtick-plan.md`).
+    pub dwell: u16,
+    /// P7b: the cell stepped from last, so the turn at `current_cell` is known to
+    /// `step_cost`. `None` on the first road cell of a trip (no entry turn).
+    pub prev_cell: Option<Entity>,
 }
 
 impl Default for TravelState {
@@ -418,6 +425,8 @@ impl Default for TravelState {
             current_cell: None,
             destination: None,
             building: None,
+            dwell: 0,
+            prev_cell: None,
         }
     }
 }

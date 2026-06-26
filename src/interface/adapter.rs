@@ -1006,6 +1006,8 @@ mod tests {
                 current_cell: cell,
                 destination: None,
                 building: None,
+                dwell: 0,
+                prev_cell: None,
             },
         );
         id
@@ -1086,6 +1088,8 @@ mod tests {
                 current_cell: Some(cell),
                 destination: None,
                 building: None,
+                dwell: 0,
+                prev_cell: None,
             },
             return_path: vec![ReturnHop {
                 region: RegionId(0),

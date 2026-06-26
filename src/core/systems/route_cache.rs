@@ -6,10 +6,11 @@
 //! per citizen. The cache lives on `World` as a `#[serde(skip)]` `RefCell`
 //! (derived state — not persisted) and is recomputed lazily on miss.
 //!
-//! **Cache key.** `(destination, road_network_id)` — the crossing penalty is
-//! a compile-time const, so it doesn't enter the key. The network id matters
-//! because a destination can touch roads from more than one disconnected
-//! local road network; those trees must not collapse into one entry.
+//! **Cache key.** `(destination, road_network_id)` — the edge weight (`step_cost`:
+//! degree + turn geometry) is a pure function of the road graph, which is
+//! invalidated (cache cleared) whenever roads change, so it doesn't enter the key.
+//! The network id matters because a destination can touch roads from more than one
+//! disconnected local road network; those trees must not collapse into one entry.
 //!
 //! **Destination types.**
 //! - A non-road **building** (home, workplace, …): sources are the building's

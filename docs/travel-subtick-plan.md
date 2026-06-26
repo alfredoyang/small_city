@@ -487,3 +487,37 @@ balance is untouched.
 Re-baselined `road_predecessors_crossing_penalty_charged` (an arm reached through the
 4-way now costs 5, was 4) and added `road_predecessors_turn_costs_like_a_junction` (a
 corner costs 2 vs a straight pass 1). codex clean; gates green.
+
+---
+
+## Implemented — P7b (dwell mechanism) · `components.rs`, `systems/travel.rs`
+
+Makes crossings and turns cost **time**. `TravelState` gains `dwell: u16` (sub-ticks
+spent on the current cell) and `prev_cell: Option<Entity>` (the entry, so the turn at
+the current cell is known) — both `#[serde(skip)]` via the travel map.
+
+```text
+  travel::run, per en-route traveller (before advance):
+    cost = dwell_cost_for(target, state)   = step_cost(prev_cell, cell, came_from-next, degree)
+           └─ None when idle / off-graph / unreachable / about-to-arrive-or-cross
+              (advance handles those instantly, ungated)
+    if dwell + 1 < cost:  dwell += 1; stay on cell        // still traversing
+    else:                 advance one cell; prev_cell = cell just left; dwell = 0
+
+  straight cell (cost 1):  0+1 < 1 false → advance every tick   (unchanged)
+  4-way     (cost 4):      dwell 0,1,2,3 → advance on the 4th    (held 4 ticks)
+```
+
+`advance()`'s state machine is **unchanged** — the gate just decides *whether* to call
+it this tick. The same gate runs for visiting tokens in `step_visiting` (host side). A
+stale committed border-exit (no longer a candidate) is left ungated so `advance` re-picks
+immediately.
+
+Granularity note: `run` is still the hourly pass, so dwell is in **hours** here (a 4-way
+takes 4 hourly ticks); **P7c** rebases `run` → `resolve` (hourly) + `step_travel` (6×
+10-min sub-ticks), turning each dwell unit into 10 minutes. Display-only — `road_distances`
+(economy) is untouched, so balance is unaffected.
+
+`road_degree_in_network` is now `pub(crate)`. New test `dwell_holds_a_traveller_on_a_4way`
+(the 4-way holds for 4 sub-ticks); the 23 existing travel tests pass unchanged (their
+roads are straight, cost 1). codex clean; gates green.
