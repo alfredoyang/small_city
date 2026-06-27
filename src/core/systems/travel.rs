@@ -163,8 +163,9 @@ pub(crate) fn step_travel(world: &mut World) {
     step_visiting_tokens(world, hour, &networks);
 }
 
-/// P5: steps the tokens neighbor regions handed in, drawing them as dots until the
-/// workday ends, when each is returned home and removed.
+/// P5: steps the tokens neighbor regions handed in, drawing them as dots while
+/// moving. Once parked at work they stay off-road until the workday ends, when
+/// each is returned home and removed.
 fn step_visiting_tokens(world: &mut World, hour: u8, networks: &[RoadNetwork]) {
     let phase = schedule_phase(hour);
     let mut ids: Vec<TravelerId> = world.visiting_travel.keys().copied().collect();
@@ -198,8 +199,8 @@ fn step_visiting_tokens(world: &mut World, hour: u8, networks: &[RoadNetwork]) {
 }
 
 /// One step for a visiting token toward its workplace. `Some(token)` keeps it
-/// (walking, or holding at the workplace so the dot stays); `None` means it should
-/// be returned home — either the workday ended or the workplace is unreachable
+/// (walking, or parked at the workplace off-road); `None` means it should be
+/// returned home — either the workday ended or the workplace is unreachable
 /// (disconnected / bulldozed), which returns the traveler immediately (§5g).
 fn step_visiting(
     world: &World,
@@ -211,9 +212,18 @@ fn step_visiting(
         return None; // workday over → return home
     }
     let dest = token.destination?; // the local workplace in this host region
-    let cell = token.current_cell?;
+    let Some(cell) = token.current_cell else {
+        return Some(*token); // already parked at work; wait until workday end
+    };
     if is_adjacent(world, dest, cell) {
-        return Some(*token); // arrived: wait at the workplace, keep the dot
+        return Some(TravelState {
+            status: TravelStatus::AtWork,
+            current_cell: None,
+            destination: Some(dest),
+            building: Some(dest),
+            dwell: 0,
+            prev_cell: None,
+        });
     }
     // Step toward the workplace; if the cell is off-graph or the workplace is
     // unreachable from here, the trip can't complete → return home now (§5g).
@@ -1184,8 +1194,8 @@ mod tests {
         );
     }
 
-    /// A visiting token walks to its workplace, waits there (dot stays), and on the
-    /// workday end is returned home and removed.
+    /// A visiting token walks to its workplace, parks there (dot disappears), and
+    /// on the workday end is returned home and removed.
     #[test]
     fn visiting_token_walks_waits_then_returns_at_workday_end() {
         // Road r0..r3; commercial workplace at (3,1) touches r3.
@@ -1212,8 +1222,8 @@ mod tests {
         };
         receive_traveler(&mut world, traveler, token, roads[0], vec![a_return_hop()]);
 
-        // During work hours it walks r0 → r1 → r2 → r3 and holds at r3 (adjacent
-        // to the workplace) — the dot keeps showing.
+        // During work hours it walks r0 → r1 → r2 → r3, then parks inside the
+        // workplace — no road-cell dot remains.
         set_hour(&mut world, 9);
         for _ in 0..6 {
             step_travel(&mut world);
@@ -1223,10 +1233,11 @@ mod tests {
             .get(&traveler)
             .expect("still visiting");
         assert_eq!(
-            visiting.token.current_cell,
-            Some(roads[3]),
-            "waiting at workplace"
+            visiting.token.current_cell, None,
+            "parked token must not render a visitor dot"
         );
+        assert_eq!(visiting.token.status, TravelStatus::AtWork);
+        assert_eq!(visiting.token.building, Some(workplace));
 
         // Workday ends → the token is returned home and removed (its dot is gone).
         set_hour(&mut world, 16);
