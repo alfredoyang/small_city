@@ -267,10 +267,10 @@ impl CityDriver {
     pub fn tick(&mut self) -> CommandResult {
         match &mut self.backend {
             CityBackend::RegionalMultiRegion(game) => {
-                // P7c: one tick press = one game hour = 6 movement sub-ticks (which
-                // also runs the hourly economy on the first). `advance` keeps every
-                // region on one clock and steps movement in lockstep; the economy
-                // result (from sub-tick 0) is the selected region's status line.
+                // One tick press = one game hour = 6 movement sub-ticks (which also
+                // runs the hourly economy on the first). `advance` keeps every region
+                // on one clock and steps movement in lockstep; the economy result
+                // (from sub-tick 0) is the selected region's status line.
                 let mut economy = None;
                 for _ in 0..6 {
                     match game.advance() {
@@ -282,6 +282,20 @@ impl CityDriver {
                 economy.unwrap_or_else(|| driver_failure("no economy result this hour"))
             }
             CityBackend::Unavailable { message, .. } => driver_failure(message),
+        }
+    }
+
+    /// P7d: advance one 10-minute movement sub-tick (smooth cell-by-cell animation).
+    /// Returns `Some` only when there is a message to surface — the hourly economy
+    /// result (on the first sub-tick of each hour) or an error — and `None` on a
+    /// movement-only sub-tick, so the caller leaves the status line as-is.
+    pub fn advance(&mut self) -> Option<CommandResult> {
+        match &mut self.backend {
+            CityBackend::RegionalMultiRegion(game) => match game.advance() {
+                Ok(result) => result,
+                Err(error) => Some(command_failure(error)),
+            },
+            CityBackend::Unavailable { message, .. } => Some(driver_failure(message)),
         }
     }
 

@@ -580,3 +580,36 @@ unit tests cover movement; full suite green. codex clean (opencode skipped by re
 **P7 is complete** (P7a cost · P7b dwell · P7c sub-tick driver). A smooth per-frame
 render (calling `advance` once per animation frame instead of 6× per press) is the only
 remaining polish, deferable to a future patch.
+
+---
+
+## Implemented — P7d (smooth cell-by-cell animation, UI-only) · `ui/city_driver.rs`, `ui/tui.rs`
+
+Renders the sub-ticks instead of jumping a whole hour per frame. **No core change** —
+`RegionalGame::advance()` (P7c) is the public seam; this patch only changes *how often*
+the TUI calls it.
+
+```text
+  before (P7c): auto step → game.tick() = advance() ×6 → ONE render   (dot jumps ≤6 cells)
+  after  (P7d): auto step → game.advance() = 1 sub-tick → render      (dot steps 1 cell)
+                fired every RunSpeed::interval(): 1× 500ms · 2× 250ms · 4× 125ms
+```
+
+- **`CityDriver::advance() -> Option<CommandResult>`**: passthrough to
+  `RegionalGame::advance()`. `Some` = the hourly economy result (every 6th sub-tick) or an
+  error, to surface on the status line; `None` = a movement-only sub-tick (leave the line).
+  `CityDriver::tick()` (= `advance()` ×6 = one hour) is unchanged, so `ascii.rs` keeps its
+  one-press-one-hour behaviour.
+- **`tui.rs`**: `apply_due_auto_tick` calls `advance()` (one sub-tick); `manual_tick` (the
+  `N` key) advances **one 10-minute sub-tick** (option a). `RunSpeed::interval()` is now the
+  auto-advance cadence (`AUTO_ADVANCE_INTERVAL = 500ms` at 1×, ~2 sub-ticks/sec); the speed
+  labels/help text say "advancing every 500ms/250ms/125ms" and "Advance 10 min".
+
+**Pacing implication (by design):** at 1× the game runs ~1 hour per 3 real-seconds (6
+sub-ticks at 2/sec) — slower than the old 1 hour/sec, in exchange for watchable cell-by-cell
+motion; 2×/4× scale it. The **economy cadence is unchanged** (exactly one tick per game
+hour), so balance is unaffected — only wall-clock pacing changed.
+
+New test `auto_advance_runs_economy_once_per_six_subticks`; 5 label/interval/help tests
+updated. codex clean (opencode skipped by request). The remaining sub-cell pixel tween
+(§"Two levels of smooth", level 2) stays deferred.

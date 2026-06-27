@@ -29,7 +29,7 @@ use crate::ui::city_driver::{CityDriver, CityLaunchMode};
 use crate::ui::tui_input::{TuiAction, map_key_event};
 
 const DEFAULT_SAVE_FILE: &str = "city1";
-const AUTO_TICK_INTERVAL: Duration = Duration::from_secs(1);
+const AUTO_ADVANCE_INTERVAL: Duration = Duration::from_millis(500);
 const PAUSED_POLL_TIMEOUT: Duration = Duration::from_secs(3600);
 const MIN_TUI_WIDTH: u16 = 100;
 const MIN_TUI_HEIGHT: u16 = 30;
@@ -184,11 +184,13 @@ impl RunSpeed {
         }
     }
 
+    /// P7d: wall-clock period between auto movement sub-ticks (`advance`). At 1× the
+    /// sim advances ~2 sub-ticks/sec (one game hour ≈ 3 s); 2×/4× scale it.
     fn interval(self) -> Duration {
         match self {
-            Self::One => AUTO_TICK_INTERVAL,
-            Self::Two => Duration::from_millis(500),
-            Self::Four => Duration::from_millis(250),
+            Self::One => AUTO_ADVANCE_INTERVAL,
+            Self::Two => Duration::from_millis(250),
+            Self::Four => Duration::from_millis(125),
         }
     }
 
@@ -549,7 +551,7 @@ impl TuiState {
         self.is_running = !self.is_running;
         self.message = if self.is_running {
             format!(
-                "Simulation running at {}: auto tick every {}",
+                "Simulation running at {}: advancing every {}",
                 self.run_speed.label(),
                 speed_interval_label(self.run_speed)
             )
@@ -646,8 +648,13 @@ impl TuiRuntime {
 
     fn apply_due_auto_tick(&mut self, now: Instant) {
         if self.state.is_running && now >= self.next_auto_tick {
-            self.state.message = self.game.tick().message();
-            self.refresh_citizen_remote();
+            // P7d: each auto step is one movement sub-tick (smooth cell-by-cell). A
+            // `Some` result means the hourly economy fired (every 6th sub-tick) or an
+            // error — surface it; on a movement-only sub-tick keep the status line.
+            if let Some(result) = self.game.advance() {
+                self.state.message = result.message();
+                self.refresh_citizen_remote();
+            }
             self.next_auto_tick = now + self.state.run_speed.interval();
             self.dirty = true;
         }
@@ -1103,12 +1110,19 @@ impl TuiRuntime {
 
     fn manual_tick(&mut self) {
         if self.state.is_running {
-            self.state.message = "Pause before using manual next turn".to_string();
+            self.state.message = "Pause before stepping manually".to_string();
             return;
         }
 
-        self.state.message = self.game.tick().message();
-        self.refresh_citizen_remote();
+        // P7d: one press advances a single 10-minute movement sub-tick (option a).
+        // Show the hourly economy message when this sub-tick crossed an hour boundary
+        // (every 6th); otherwise note the fine step.
+        if let Some(result) = self.game.advance() {
+            self.state.message = result.message();
+            self.refresh_citizen_remote();
+        } else {
+            self.state.message = "Advanced 10 minutes".to_string();
+        }
     }
 }
 
@@ -2471,12 +2485,12 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  4 Industrial  5 Power Plant     6 Park"),
         Line::from(""),
         help_section("Actions"),
-        Line::from("  Space         Pause / resume automatic ticks | +/- speed"),
+        Line::from("  Space         Pause / resume auto-advance | +/- speed"),
         Line::from("  B Build · Enter zone citizens (else build) · P Paint (draw on move)"),
         Line::from("  R             Replace selected cell with selected tool"),
         Line::from("  U             Upgrade selected cell"),
         Line::from("  X             Bulldoze selected cell"),
-        Line::from("  N             Next turn        [ / ] Previous / next region"),
+        Line::from("  N             Advance 10 min   [ / ] Previous / next region"),
         Line::from(""),
         help_section("Files And UI"),
         Line::from("  S             Save city"),
@@ -2558,7 +2572,7 @@ fn simulation_status_line(state: &TuiState) -> Line<'static> {
             "RUNNING",
             Color::Green,
             format!(
-                "{} | auto tick every {}",
+                "{} | advancing every {}",
                 state.run_speed.label(),
                 speed_interval_label(state.run_speed)
             ),
@@ -2583,9 +2597,9 @@ fn simulation_status_line(state: &TuiState) -> Line<'static> {
 
 fn speed_interval_label(speed: RunSpeed) -> &'static str {
     match speed {
-        RunSpeed::One => "1 second",
-        RunSpeed::Two => "500ms",
-        RunSpeed::Four => "250ms",
+        RunSpeed::One => "500ms",
+        RunSpeed::Two => "250ms",
+        RunSpeed::Four => "125ms",
     }
 }
 
@@ -3310,7 +3324,7 @@ mod tests {
         assert!(state.is_running);
         assert_eq!(
             state.message,
-            "Simulation running at 1x: auto tick every 1 second"
+            "Simulation running at 1x: advancing every 500ms"
         );
         state.toggle_run();
         assert!(!state.is_running);
@@ -3395,13 +3409,13 @@ mod tests {
             TuiFlow::Continue
         );
         assert_eq!(runtime.state.run_speed, RunSpeed::Two);
-        assert_eq!(runtime.next_auto_tick, now + Duration::from_millis(500));
+        assert_eq!(runtime.next_auto_tick, now + Duration::from_millis(250));
         assert_eq!(
             runtime.apply_action(TuiAction::IncreaseSpeed, now),
             TuiFlow::Continue
         );
         assert_eq!(runtime.state.run_speed, RunSpeed::Four);
-        assert_eq!(runtime.next_auto_tick, now + Duration::from_millis(250));
+        assert_eq!(runtime.next_auto_tick, now + Duration::from_millis(125));
         assert_eq!(
             runtime.apply_action(TuiAction::IncreaseSpeed, now),
             TuiFlow::Continue
@@ -4015,7 +4029,7 @@ mod tests {
         );
 
         assert_eq!(runtime.game.view().status.turn, 0);
-        assert_eq!(runtime.state.message, "Pause before using manual next turn");
+        assert_eq!(runtime.state.message, "Pause before stepping manually");
         assert!(runtime.dirty);
     }
 
@@ -4484,7 +4498,7 @@ mod tests {
         runtime.apply_due_auto_tick(now);
 
         assert_eq!(runtime.game.view().status.turn, 1);
-        assert_eq!(runtime.next_auto_tick, now + AUTO_TICK_INTERVAL);
+        assert_eq!(runtime.next_auto_tick, now + AUTO_ADVANCE_INTERVAL);
         assert!(runtime.dirty);
     }
 
@@ -4500,7 +4514,31 @@ mod tests {
         runtime.apply_due_auto_tick(now);
 
         assert_eq!(runtime.game.view().status.turn, 1);
-        assert_eq!(runtime.next_auto_tick, now + Duration::from_millis(250));
+        assert_eq!(runtime.next_auto_tick, now + Duration::from_millis(125));
+    }
+
+    /// P7d: each auto step is one movement sub-tick; the hourly economy (turn) only
+    /// advances once per 6 sub-ticks.
+    #[test]
+    fn auto_advance_runs_economy_once_per_six_subticks() {
+        let mut now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.game = CityDriver::regional_with_size(10, 10).expect("regional UI driver");
+        runtime.state.is_running = true;
+        runtime.next_auto_tick = now;
+
+        for _ in 0..6 {
+            runtime.apply_due_auto_tick(now);
+            now = runtime.next_auto_tick; // jump to the next scheduled sub-tick
+        }
+        assert_eq!(
+            runtime.game.view().status.turn,
+            1,
+            "the economy ticks once across 6 movement sub-ticks"
+        );
+
+        runtime.apply_due_auto_tick(now); // 7th sub-tick begins the next hour
+        assert_eq!(runtime.game.view().status.turn, 2);
     }
 
     #[test]
@@ -4616,7 +4654,7 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            poll_timeout(false, now + AUTO_TICK_INTERVAL, now),
+            poll_timeout(false, now + AUTO_ADVANCE_INTERVAL, now),
             PAUSED_POLL_TIMEOUT
         );
     }
@@ -4637,9 +4675,9 @@ mod tests {
 
     #[test]
     fn running_next_tick_interval_follows_speed() {
-        assert_eq!(RunSpeed::One.interval(), Duration::from_secs(1));
-        assert_eq!(RunSpeed::Two.interval(), Duration::from_millis(500));
-        assert_eq!(RunSpeed::Four.interval(), Duration::from_millis(250));
+        assert_eq!(RunSpeed::One.interval(), Duration::from_millis(500));
+        assert_eq!(RunSpeed::Two.interval(), Duration::from_millis(250));
+        assert_eq!(RunSpeed::Four.interval(), Duration::from_millis(125));
     }
 
     #[test]
@@ -5045,7 +5083,7 @@ mod tests {
         let output = render_test_screen(&game, state);
 
         assert!(output.contains("Help"));
-        assert!(output.contains("Space         Pause / resume automatic ticks | +/- speed"));
+        assert!(output.contains("Space         Pause / resume auto-advance | +/- speed"));
         assert!(output.contains("O Cycle Overlay"));
         assert!(output.contains("T             Cycle tile theme"));
         assert!(output.contains("Overlay order: Normal -> Power -> Pollution"));
@@ -5064,7 +5102,7 @@ mod tests {
         let output = render_test_screen(&game, state);
 
         assert!(output.contains("Simulation: RUNNING"));
-        assert!(output.contains("1x | auto tick every 1 second"));
+        assert!(output.contains("1x | advancing every 500ms"));
     }
 
     #[test]
