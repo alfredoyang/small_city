@@ -47,32 +47,88 @@ current road graph        = the local path, recomputed each step
 
 ## 2. Proposal
 
-### One rule, both directions — a region-topology distance gradient (loop-safe)
+### One rule, both directions — a distance gradient on the ROAD-CONNECTED region graph
 
-The previous draft of this plan picked the next hop from `CrossRegionDiscovery::
-component_of` (connected-component **reachability**). That is **not loop-safe**: in
-A–B–C the B/A border network is in the same component as C, so B looking for C could
-pick the exit back toward A and ping-pong A→B→A. Reachability is not progress.
+This is the unweighted v1 of `traffic-pathfinding-plan.md` §5f's **Layer 1** ("which
+regions to cross?"). Layer 2 (the road path *within* each region) already exists —
+`road_predecessors` (P1) + `route_cache` (P2) — and we reuse it untouched.
 
-Routing instead follows a **BFS shortest-hop gradient on the region-topology graph**
-(`RegionNeighborLink { region, edge, neighbor }`, `regions/mod.rs:132`, owned by the
-directory). For a mover in region `R` heading to target region `T`:
+**Use the road-connectivity graph, not region adjacency.** Two regions can share a map
+border with **no road crossing it**, so the routing graph must be the one §5f's Layer-1
+Dijkstra uses: regions linked where a `NetworkBorderLink` pair (a road) actually crosses,
+i.e. the directory's `CrossRegionDiscovery.road_crossings` (§3). Routing on raw
+`RegionNeighborLink` *adjacency* would compute distances along roadless borders and
+dead-end (see the failure diagram).
 
 ```text
-  next hop = a neighbour N with  dist(N, T) < dist(R, T)         (strict progress)
-  exit candidates = local border cells whose link crosses to such an N
-  component_of stays only as a REACHABILITY FILTER: keep T iff the road networks are
-    actually connected R→…→T, so the citizen can physically walk the whole way.
-  ties (several N at the same shorter distance) broken deterministically (by RegionId,
-    then by exit cell position) so movement is reproducible.
+  Region adjacency (RegionNeighborLink)        Road connectivity (NetworkBorderLink pairs)
+  ─────────────────────────────────────        ───────────────────────────────────────────
+  A ── B ── C   (all share borders)            A ══ B ── C    A-B road crosses; B-C border
+                                                              has NO road
+                                               → the routing graph has edge A-B only;
+                                                 C is NOT reachable from B by road
 ```
 
-`dist_to_T[X]` = hops from `X` to `T`, computed by BFS from `T` over the **reverse**
-topology edges (`RegionNeighborLink` is directed; a mirrored layout makes forward and
-reverse coincide, but reverse-edge BFS is correct either way). The next hop is any
-outgoing edge `R → N` with `dist_to_T[N] < dist_to_T[R]`; strict monotone decrease
-guarantees termination (no loops). Outbound `T = workplace.region()`; return
-`T = traveler.citizen.region()`. Identical machinery, opposite target.
+Build a **region-level road graph** `G`: node = region; edge `R—N` iff some local
+`NetworkBorderLink` of `R` pairs with one of `N` (a road crosses that border). Then for a
+mover in region `R` heading to target region `T`:
+
+```text
+  dist_to_T[X] = BFS hops from X to T over G   (reverse-BFS seeded at T)
+  next hop     = an edge R—N in G with  dist_to_T[N] < dist_to_T[R]   (STRICT progress)
+  exit cands   = local road cells whose border link crosses to such an N
+  ties (several N at the shorter distance) → deterministic (by RegionId, then exit pos)
+```
+
+Because `G` already contains only road-connected edges, there is **no separate
+reachability filter** — connectivity is the graph. Strict monotone decrease of
+`dist_to_T` guarantees termination (no A→B→A loop). Outbound `T = workplace.region()`;
+return `T = traveler.citizen.region()`. **Same machinery, opposite target.**
+
+```text
+Distance field for target T = C  (numbers = dist_to_T over the ROAD graph G):
+
+        ┌─────┐   road   ┌─────┐   road   ┌─────┐
+        │  A  │══════════│  B  │══════════│  C  │
+        │  2  │ ───────► │  1  │ ───────► │  0  │ = T
+        └─────┘  descend └─────┘  descend └─────┘
+   every step strictly decreases dist_to_T → always reaches C, never loops.
+   Return simply re-seeds the field at T = A (so C=2, B=1, A=0) and descends the other way.
+```
+
+Why it must be the road graph, not adjacency — the dead-end:
+
+```text
+   A ── B ·· C        '··' = shared border but NO road (roadless)
+   │         │        a SEPARATE road loops A—D—C
+   D ════════┘
+  Adjacency BFS:  dist(B,C)=1 via B··C → B picks the roadless B/C border → DEAD END.
+  Road-graph BFS: B··C is not an edge; the only road path is A—D—C, so B is not even
+                  on a progressing route; A descends A(2)→D(1)→C(0) correctly.
+```
+
+### The two layers (this plan vs. §5f)
+
+```text
+  LAYER 1  "which regions to cross?"            LAYER 2  "which road cells in this region?"
+  ─────────────────────────────────            ──────────────────────────────────────────
+  graph  = road-connected region graph G       graph  = road cells (one region's World)
+  weight = 1 per hop   (THIS PLAN, v1)          weight = step_cost / crossing penalty (P7)
+         = road cost   (§5f, deferred)          algo   = Dijkstra → came_from tree
+  algo   = BFS distance field, descend          status = ALREADY EXISTS — route_cache (P2)
+  output = next-hop exit toward T               output = walk entry → exit (or → workplace)
+  runs   = worker (discovery snapshot)          runs   = each region, share-nothing
+
+        A ─Layer1─► B ─Layer1─► C          (pick the region corridor by descending dist_to_T)
+        │           │           │
+      Layer2      Layer2      Layer2        (walk the road path inside each region)
+   (home→exit) (entry→exit) (entry→work)
+
+  Neither layer ever crosses a region boundary — the token message (handoff) does.
+  THIS PLAN = §5f with Layer 1 unweighted (hop count). Swapping BFS→weighted Dijkstra
+  on the SAME graph G (border_crossing_cost) is §5f's deferred quality upgrade; nothing
+  else changes.
+```
 
 ### Multi-region flow (A → B → C, then home)
 
@@ -123,29 +179,44 @@ one-sub-tick-stale guarantee); a 2-hop trip simply takes more sub-ticks.
 
 ### `src/core/regions/worker.rs` — the gradient map (the one genuinely new piece)
 
-Add, beside `border_neighbor_map_for_region` (the direct map, `worker.rs:~860`) and
-modelled on `importable_remote_jobs_for_region` (`worker.rs:871`) for the discovery
-plumbing — but using a **BFS gradient**, not bare `component_of`:
+**Directory change first (small, required).** `CrossRegionDiscovery` today keeps only
+`components: Vec<Vec<RegionRoadNetworkId>>` (`directory.rs:38`) — `build_component_graph`
+(`directory.rs:229`) unions matched border links via `BorderLinkIndex` and then
+**discards the crossing edges**. A component `{A_net, B_net, C_net}` cannot tell whether
+A crosses *directly* to C, nor which local `BorderLinkId` reaches B vs C — so `G` is not
+derivable from `components` alone. Preserve the edges the union loop already has
+(`directory.rs:244`, where `left` is a `NetworkBorderLink` of `R` and the matched
+`topology` neighbour is `N`):
+
+```rust
+pub struct RoadCrossing { pub region: RegionId, pub link: BorderLinkId, pub neighbour: RegionId }
+// CrossRegionDiscovery gains: pub road_crossings: Vec<RoadCrossing>   (sorted, deterministic)
+// components stays as-is for existing resource reachability.
+```
+
+The travel helper then BFS-distances over the **road-connected region graph** `G` built
+from `road_crossings` (node = region; edge `R—N` for each crossing), *not* raw
+`RegionNeighborLink` adjacency (§2). This is §5f's Layer 1, unweighted.
 
 The worker has only links/topology/discovery — **no `World`/grid `Entity` cells** — so it
 returns *links*, and `RegionState` converts them to road cells (as
 `refresh_remote_exit_cells` already does):
 
 ```rust
-/// Worker side: for each destination region T reachable+road-connected from `region_id`,
-/// the local border links that cross to a STRICTLY-closer neighbour (dist_to_T[N] < dist_to_T[R]).
+/// Worker side: for each destination region T road-connected from `region_id`, the local
+/// border links crossing to a STRICTLY-closer neighbour on the ROAD graph G
+/// (dist_to_T[N] < dist_to_T[R]).
 fn travel_destination_exits_for_region(
-    topology: &[RegionNeighborLink],          // region graph → dist_to_T (BFS, §4)
-    discovery: &CrossRegionDiscovery,         // component_of → reachability filter only
+    discovery: &CrossRegionDiscovery,         // .road_crossings → road graph G (edges + dist_to_T)
     region_id: RegionId,
     border_links: &[NetworkBorderLink],
     is_owned: impl Fn(RegionId) -> bool,
 ) -> HashMap<RegionId, Vec<ExitLink>>         // T → sorted { link, to_region }
 ```
 
-Contract: deterministic (BFS over sorted edges; each `Vec<ExitLink>` sorted + deduped).
-Includes a destination only when its road networks are connected (mover can walk the
-whole way) **and** a strictly-closer owned neighbour exists.
+Contract: deterministic (BFS over sorted road-graph edges; each `Vec<ExitLink>` sorted +
+deduped). A destination appears only when a strictly-closer owned neighbour exists on `G`
+— connectivity is the graph, so there is no separate reachability filter.
 
 ### `ExitCandidate` — carry the crossing, not just a cell (`regions/mod.rs`)
 
@@ -199,6 +270,29 @@ pub struct VisitingToken { pub token: TravelState, pub purpose: VisitingPurpose 
 `TravelState.destination` is the **local** movement target while transiting (the exit
 cell); `final_workplace` keeps the true workplace for `TransitOutbound`.
 
+Token lifecycle across a 2-hop commute (A home, B transit, C work):
+
+```text
+  local citizen (A.world.travel)                 visiting token (X.world.visiting_travel)
+  ──────────────────────────────                 ─────────────────────────────────────────
+  Target::BorderExit → walk to A/B exit
+        │ Cross (mark Away, PendingHandoff::Outbound)
+        ▼ handoff to B
+                                          B: VisitingPurpose::TransitOutbound → walk to B/C exit
+                                                │ reached exit → PendingHandoff::Outbound
+                                                ▼ handoff to C
+                                          C: VisitingPurpose::Work → walk to workplace, park
+                                                │ workday ends → depart building
+                                                ▼ VisitingPurpose::TransitReturn → walk to C/B exit
+                                                │ reached exit → PendingHandoff::Return
+                                                ▼ handoff to B
+                                          B: VisitingPurpose::TransitReturn → walk to B/A exit
+                                                │ reached exit → PendingHandoff::Return
+        ┌───────────────────────────────────────┘ handoff to A
+        ▼ A is home: receive_traveler_return → walk border → home, clear Away
+  (any region, no progressing exit / stale entry → PendingHandoff::Rollback → home clears Away)
+```
+
 ### `src/core/systems/travel.rs`
 
 - `resolve_target` — keep using `remote_exit_cells[workplace.region()]`; with the map
@@ -251,8 +345,7 @@ cell); `final_workplace` keeps the true workplace for `TransitOutbound`.
 for runtime in regions {
     runtime.set_border_neighbor_map(border_neighbor_map_for_region(...)); // direct, unchanged
     let exit_links = travel_destination_exits_for_region(
-        directory.topology(),               // RegionNeighborLink edges → dist_to_T (§ below)
-        &directory.discovery_snapshot(),    // component_of → reachability filter only
+        &directory.discovery_snapshot(),    // .road_crossings → road graph G + dist_to_T (§ below)
         runtime.region_id(),
         &runtime.state().network_border_links(),
         |region| owners.owner_of(region).is_some(),
@@ -267,23 +360,22 @@ for runtime in regions {
 
 ```rust
 // Worker side, once per pass, deterministically (returns LINKS — no grid access here):
-fn progressing_exit_links(topology, region R, target T, border_links, is_owned)
+fn progressing_exit_links(discovery, region R, target T, border_links, is_owned)
     -> Vec<ExitLink>
 {
-    // dist_to_T[X] = hops from X to T. RegionNeighborLink is DIRECTED, so BFS from T over
-    // REVERSE edges (edges whose `neighbor == frontier`); a mirrored layout makes the two
-    // coincide, but reverse-edge BFS is correct regardless.
-    let dist_to_t = bfs_reverse(topology, T);
+    // Build the ROAD-connected region graph G from discovery.road_crossings (each is a real
+    // road crossing region—neighbour via a specific local link). Node = region; edge R—N
+    // for each crossing. Roadless borders aren't crossings → not edges → no dead-end.
+    let g = region_graph_from(&discovery.road_crossings);   // edges R—N
+    let dist_to_t = bfs(&g, T);                              // hops to T over G (unweighted; §5f weights later)
     let mut out = Vec::new();
-    for link in border_links.where(network.region == R) {
-        let n = neighbor_across(link);                       // an outgoing R -> N edge
-        if is_owned(n)
-           && dist_to_t.get(n).zip(dist_to_t.get(R)).is_some_and(|(dn, dr)| dn < dr) // STRICT progress
-           && road_connected(discovery, link, T) {           // reachability filter
-            out.push(ExitLink { link: link.id, to_region: n });
+    for c in discovery.road_crossings.where(region == R) {   // each gives the local link AND neighbour
+        if is_owned(c.neighbour)
+           && dist_to_t.get(c.neighbour).zip(dist_to_t.get(R)).is_some_and(|(dn, dr)| dn < dr) { // STRICT
+            out.push(ExitLink { link: c.link, to_region: c.neighbour });   // connectivity is the graph
         }
     }
-    out.sort_by_key(|e| (e.to_region.0, e.link.0));           // determinism
+    out.sort_by_key(|e| (e.to_region.0, e.link.0));   // determinism
     out.dedup();
     out
 }
@@ -427,6 +519,9 @@ to this convention.
   map for destination C does NOT include the B/A link (dist A to C is not < dist B to C),
   even though A,B,C share one road component. The regression for the old
   component-membership bug.
+- `travel_exits_skip_roadless_border` — **graph correctness**: A and B share a map border
+  with NO road crossing, but a road path A–D–C exists. A's map for C routes via D (not the
+  roadless A/B border); the gradient never dead-ends on the roadless edge.
 
 `src/core/regions/mod.rs`
 - `receive_outbound_for_remote_workplace_creates_transit_token` — B receives outbound
@@ -454,15 +549,26 @@ the existing adapter path.
 
 ## 6. Risks / non-goals
 
+- **Relation to `traffic-pathfinding-plan.md` §5f.** This plan *is* §5f's multi-hop
+  two-layer routing, with **Layer 1 unweighted** (BFS hop count) for v1; Layer 2 (the
+  per-region road walk) already exists. The §5f road-cost weighting
+  (`border_crossing_cost` / `border_route_hint`, BFS→Dijkstra on the *same* graph `G`)
+  stays the deferred quality upgrade. §5f should be reconciled: it still assumes the
+  `return_path` stack and adjacency — this plan replaces both (dynamic routing on the
+  road graph). Cross-link the two when this lands.
 - **Loop-safety is the load-bearing invariant**: next-hop must STRICTLY decrease
-  `dist(·, target)` on the topology graph. `component_of` is only the reachability
-  filter, never the routing rule. The `travel_exits_pick_only_strictly_closer_neighbour`
-  test guards this.
-- Determinism: BFS over sorted topology edges; every `Vec<ExitCandidate>` sorted +
-  deduped; deterministic tie-breaks. Cross-region remains one-sub-tick-stale, never
+  `dist_to_T` **on the road-connected graph `G`** (edges = real road crossings), so the
+  gradient can never descend a roadless border or loop. Computing distances on raw
+  `RegionNeighborLink` adjacency would dead-end; `G` makes connectivity intrinsic (no
+  separate filter). The `travel_exits_pick_only_strictly_closer_neighbour` test guards
+  the no-backward-hop case.
+- Determinism: BFS over sorted `G` edges; every `Vec<ExitCandidate>` sorted + deduped;
+  deterministic tie-breaks. Cross-region remains one-sub-tick-stale, never
   non-deterministic.
-- Do not expose `World`/topology to the UI; no new worker command; no new production
-  dependency; do not store full routes in traveller state.
+- Do not expose `World`/topology to the UI; **no new worker command/protocol**; no new
+  production dependency; do not store full routes in traveller state. (The discovery
+  snapshot gaining `road_crossings` is *data preserved from an existing computation*, not
+  a new message or command.)
 - Do not rewrite away tokens on road/topology change — dynamic routing re-plans each
   step. A token with no progressing+reachable exit emits `PendingHandoff::Rollback`,
   routed to the home region **by id** (a small worker addition: deliver to
