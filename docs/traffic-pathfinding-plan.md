@@ -29,14 +29,14 @@ explained in detail where first introduced; this is a one-page cheat sheet.
 | **`TravelStatus`** | `AtHome | AtWork | Traveling` (P3); P5 adds `Away` (token is in another region). |
 | **`TravelerId`** | `(citizen: Entity, generation: u32)` — round-trip identity for a cross-region token. `citizen.region()` IS the home region. See §5c. |
 | **`TravelerHandoff`** | The cross-region message: `TravelState` + `TravelerId` + `to_region` + `entry_link` + `return_path` + `purpose` (Outbound/Return). Routed by the worker like an export request. See §5c. |
-| **`return_path`** | `Vec<ReturnHop>` — stack of region hops for the return trip. Pushed one hop at a time on outbound, popped one hop at a time on return. See §5c, §5f. |
-| **`ReturnHop`** | `{ region: RegionId, entry_link: BorderLinkId }` — one hop in the return path. |
-| **`border_neighbor_map`** | A worker-provided hint: `HashMap<BorderLinkId, RegionId>` — "this border link faces this neighbor region." v1 direct-neighbor only; multi-hop extends to weighted Dijkstra (§5d, §5f). |
-| **`border_route_hint`** | Multi-hop extension of `border_neighbor_map`: `HashMap<BorderLinkId, HashMap<RegionId, u32>>` — weighted Dijkstra distance (road-cost-weighted) to each reachable region through each border link. See §5f. |
-| **`border_crossing_cost`** | Multi-hop worker-side table: `HashMap<(RegionId, BorderLinkId, BorderLinkId), u32>` — road-level Dijkstra cost to cross a region from one border link to another. Precomputed by the worker. See §5f. |
+| **`return_path`** | `Vec<ReturnHop>` — stack of region hops for the return trip. **⚠ Removed** by `docs/20260627-multi-region-return-home.md`: routing is dynamic per-step (no stored stack). |
+| **`ReturnHop`** | `{ region: RegionId, entry_link: BorderLinkId }` — one hop in the return path. **⚠ Removed** with `return_path`. |
+| **`border_neighbor_map`** | A worker-provided hint: `HashMap<BorderLinkId, RegionId>` — "this border link faces this neighbor region." **⚠ Revised:** retired as a *routing* source; multi-hop routing is the central `region_routes` (below). |
+| **`border_route_hint`** | Weighted Dijkstra distance to each reachable region through each border link. **⚠ Realized as** destination-keyed `region_routes` in `CrossRegionDiscovery` — see `docs/20260627-multi-region-return-home.md`. |
+| **`border_crossing_cost`** | Road-level Dijkstra cost to cross a region border→border. **⚠ Revised:** computed **per region** (`road_report()`, share-nothing) and *published* — NOT worker-side (the worker has no road graph). |
 | **`TravelPurpose`** | `Outbound | Return` — whether a handoff is going to the workplace or coming home. See §5c. |
 | **Token / movement token** | Informal name for `TravelState` (and its `visiting_travel` variant) — the thing that visibly moves on the map. The citizen entity is the *identity*; the token is the *moving representation*. |
-| **layer 1 / layer 2** | The two layers of cross-region routing. **Layer 1:** weighted Dijkstra on the cross-region component graph (region-level, worker-side). **Layer 2:** Dijkstra with crossing penalty (road-level, per-region, share-nothing). See §5f. |
+| **layer 1 / layer 2** | The two layers of cross-region routing. **Layer 1:** weighted Dijkstra on the cross-region road graph (region-level). **Layer 2:** Dijkstra with crossing penalty (road-level, per-region, share-nothing). **⚠ Revised:** Layer 1 runs in the **directory** from per-region *published* costs (not worker-side) — see `docs/20260627-multi-region-return-home.md`. |
 | **`SchedulePhase`** | `Work | Home | Leisure` — pure phase from the hour alone. See `docs/citizen-schedule-plan.md`. |
 | **`ScheduleIntent`** | `Home | Work(Entity) | Leisure` — semantic intent for a local citizen; the movement system resolves it to a target. See `docs/citizen-schedule-plan.md`. |
 | **`resolve_intent`** | Movement-side: `ScheduleIntent` → `Entity` target. `Work(remote)` → idle (P3) or border-exit (P5). See `docs/citizen-schedule-plan.md`. |
@@ -669,7 +669,21 @@ World {
 both (a visiting token's `current_cell` is a road cell in the host region, rendered the
 same way).
 
-### 5f. Multi-hop extension — two-layer routing (deferred after v1)
+### 5f. Multi-hop extension — two-layer routing
+
+> **⚠ Superseded / adopted by `docs/20260627-multi-region-return-home.md`** (no longer
+> "deferred" — it is the implemented design there). That plan keeps this section's core
+> idea (Layer 1 = weighted Dijkstra on the cross-region road graph; Layer 2 = the existing
+> per-region road Dijkstra) but **revises three things** below:
+> 1. **`border_crossing_cost` is computed per region** (`road_report()`, share-nothing) and
+>    *published* — NOT precomputed by the worker (the worker has no `World`/road graph).
+> 2. **`border_route_hint` is realized as destination-keyed `region_routes`** held in the
+>    directory's `CrossRegionDiscovery` snapshot (built in `rebuild_discovery`, read
+>    lock-free) — the central registry, not a per-worker table.
+> 3. **`return_path` is removed**: routing is dynamic per-step on `region_routes`
+>    (outbound and return are the same rule, opposite target), with a `Rollback` escape
+>    for a severed route. Read the rest of this section for the design rationale; read the
+>    other doc for the authoritative, current shape.
 
 For A→B→C (workplace in C, not a direct neighbor of A), the route is **stitched from
 per-region local searches**. There is no single pathfinding algorithm that spans
