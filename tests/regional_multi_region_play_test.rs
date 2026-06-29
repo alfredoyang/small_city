@@ -373,6 +373,64 @@ fn bridged_remote_workplace_is_not_double_counted_for_population_growth() {
     );
 }
 
+#[test]
+fn cross_region_commuter_goes_to_work_and_returns_home() {
+    let game = RegionalGame::two_region_default(4, 3).unwrap();
+    build_connected_remote_job_fixture(&game);
+
+    tick_city_for_hours(&game, 24);
+    let inspect = game.inspect_region(RegionId(1), 1, 1).unwrap();
+    let Some(InspectDetailsView::Residential {
+        job_assignments, ..
+    }) = inspect.details
+    else {
+        panic!("expected residential inspect");
+    };
+    assert!(
+        job_assignments
+            .iter()
+            .any(|assignment| assignment.cell.region == RegionId(2) && assignment.is_remote),
+        "fixture should assign a region-1 resident to a region-2 job"
+    );
+
+    tick_city_for_hours(&game, 9);
+    assert!(
+        step_until_traveler_seen(&game, RegionId(1), 8),
+        "commuter should walk from home to region-1 border"
+    );
+    assert!(
+        step_until_traveler_seen(&game, RegionId(2), 8),
+        "commuter should cross into region 2 and walk to work"
+    );
+    for _ in 0..3 {
+        game.step_travel_city().unwrap();
+    }
+
+    tick_city_for_hours(&game, 6);
+    assert!(
+        step_until_traveler_seen(&game, RegionId(2), 8),
+        "commuter should leave region-2 workplace after work"
+    );
+    assert!(
+        step_until_traveler_seen(&game, RegionId(1), 8),
+        "commuter should cross back into region 1"
+    );
+    for _ in 0..8 {
+        game.step_travel_city().unwrap();
+    }
+    assert!(
+        travelers_in_region(&game, RegionId(1)).is_empty()
+            && travelers_in_region(&game, RegionId(2)).is_empty(),
+        "after walking home, no road traveler dot should remain"
+    );
+
+    tick_city_for_hours(&game, 18);
+    assert!(
+        step_until_traveler_seen(&game, RegionId(1), 8),
+        "next workday departure proves the home-away record was cleared"
+    );
+}
+
 fn region_cell_powered(game: &RegionalGame, region: RegionId, x: usize, y: usize) -> bool {
     game.view()
         .unwrap()
@@ -387,6 +445,30 @@ fn region_cell_powered(game: &RegionalGame, region: RegionId, x: usize, y: usize
         .find(|cell| cell.x == x && cell.y == y)
         .and_then(|cell| cell.powered)
         .unwrap_or(false)
+}
+
+fn travelers_in_region(
+    game: &RegionalGame,
+    region: RegionId,
+) -> Vec<small_city::interface::view::CitizenTravelView> {
+    game.view()
+        .unwrap()
+        .regions
+        .into_iter()
+        .find(|snapshot| snapshot.region_id == region)
+        .expect("region snapshot")
+        .view
+        .travelers
+}
+
+fn step_until_traveler_seen(game: &RegionalGame, region: RegionId, max_steps: usize) -> bool {
+    for _ in 0..max_steps {
+        game.step_travel_city().unwrap();
+        if !travelers_in_region(game, region).is_empty() {
+            return true;
+        }
+    }
+    false
 }
 
 #[test]
@@ -559,6 +641,12 @@ fn build_goods_consumer_without_border_link(game: &RegionalGame, region: RegionI
 fn tick_region_for_one_day(game: &RegionalGame, region: RegionId) {
     for _ in 0..24 {
         assert!(game.tick_region(region).unwrap().success);
+    }
+}
+
+fn tick_city_for_hours(game: &RegionalGame, hours: usize) {
+    for _ in 0..hours {
+        assert!(game.tick_city().unwrap().success);
     }
 }
 
