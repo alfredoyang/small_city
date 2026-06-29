@@ -624,6 +624,153 @@ self-pairs (entry == exit) are filtered out.
 
 ## 8. P-b implementation record (Layer-1 Dijkstra)
 
+**Committed:** not yet (in the working branch `multi-region-return`).
+**What landed in the worktree:**
+
+### Types (`src/core/regions/mod.rs`)
+
+```text
+RegionRoutes { to: HashMap<RegionId, RouteField> }
+RouteField  { from: HashMap<RegionId, RouteHop> }
+RouteHop    { exits: Vec<ExitLink>, cost: u32 }
+ExitLink    { link: BorderLinkId, to_region: RegionId }
+```
+
+`RegionRoutes::exits_from(r) -> HashMap<RegionId, Vec<ExitLink>>` is the
+ergonomic accessor P-c will use; right now nothing else in the code base
+consumes `RegionRoutes` (deferred YAGNI until P-c).
+
+### `RegionDirectory` ownership wiring (`src/core/regions/directory.rs`,
+`src/core/regional_game_runner.rs`)
+
+- `RegionDirectory` gained an `owners: Arc<RegionOwnerDirectory>` field and
+  a `with_owners(topology, owners)` constructor.
+- `regional_game_runner.rs:159–162` now creates the owner directory
+  FIRST and passes it into `RegionDirectory::with_owners(...)` — same
+  `Arc`, so the worker, the directory, and the route rebuild all see the
+  same ownership state. The previous `RegionDirectory::new(topology)`
+  stored a fresh empty owner dir, which would have filtered every region
+  out of `region_routes` in production.
+- `register_region` is now `pub(crate)` in `worker.rs` so the test helper
+  in `directory.rs` can register regions for the owner filter.
+
+### `build_region_routes` (`src/core/regions/directory.rs`)
+
+```text
+build_region_routes(reports, owners) -> RegionRoutes
+  1. For every (r, n) pair joined by a published border link (a road
+     actually crosses — adjacency alone is not enough), compute the
+     intra-region border-exit cost from r and the intra-region border-
+     entry cost from n. Weight = max(1, r_cost + n_cost). Keep ALL
+     (weight, BorderLinkId) candidates per (r, n) — a multi-corridor
+     border can have several exits.
+  2. Destination-seeded Dijkstra (one per owned destination T).
+     cost_to_t[r] = shortest path from r to T in the original directed
+     graph; we relax INCOMING edges of each popped node (the reversed
+     graph), so the distance is correct for asymmetric / directed
+     edge weights. cost_to_t[T] = 0; everything else starts at u32::MAX.
+  3. Next-hop selection: for each source region r, find every neighbour
+     n with cost_to_t[n] < cost_to_t[r] (strict decrease = loop safety),
+     keep the minimum total = w(r, n) + cost_to_t[n], expand ALL
+     (weight, exit) candidates that share the minimum, sort the result
+     by (total, to_region.0, edge, offset), emit each as an ExitLink.
+     Sort+dedup on the final exits list guarantees deterministic output.
+```
+
+#### The patch (data flow)
+
+```text
+                  +-------------------------------------+
+   P-a snapshot   |  reports: Vec<RegionRoadReport>     |
+  (per region)    |   - border_links (which neighbour)  |
+                  |   - crossing_costs (entry->exit)    |
+                  +-----------------+-------------------+
+                                    |
+                                    v
+                  +-------------------------------------+
+                  |  build_region_routes(reports,       |
+                  |                     owners)         |
+                  |  1. r_to_n: HashMap<(r,n),          |
+                  |       Vec<(weight, BorderLinkId)>>  |
+                  |  2. for t in owned:                 |
+                  |       cost_to_t via reversed-Dijkstra|
+                  |  3. next-hop for each r             |
+                  +-----------------+-------------------+
+                                    |
+                                    v
+                  +-------------------------------------+
+                  |  CrossRegionDiscovery.region_routes |
+                  |  = RegionRoutes { to: HashMap<...> }|
+                  +-------------------------------------+
+                                    |
+                          (P-c reads exits_from(r))
+                          to drive remote_exit_cells
+```
+
+#### The problem the patch solves
+
+Before P-b, the cross-region routing layer could not answer "where do I go
+to reach a non-adjacent region?" — the only available structure was
+`border_neighbor_map`, which is the *direct* (1-hop) adjacency. A
+3-region commute A→B→C had no way to plan the first hop (A→B) because
+nothing in the system knew C was reachable from A at all.
+
+After P-b, `region_routes` is a complete multi-hop route map:
+`from[A].to[C].exits` lists every BorderLinkId in A that begins a
+shortest path toward C, with `to_region` set to the first hop region
+(B). The P-c stepper reads this map to populate
+`RegionState::remote_exit_cells`, replacing the direct-neighbour
+producer.
+
+### Determinism, loop-safety, and the `ponytail:` ceiling
+
+- **Loop-safety**: edge weights are forced strictly positive via
+  `max(1, r_cost + n_cost)`, so the strict-decrease next-hop rule
+  (`n_cost >= r_cost → continue`) is always meaningful. The Dijkstra
+  frontier is a `BTreeSet<(u32, RegionId)>` with lazy deletion, so
+  tie-breaking on distance is by RegionId.
+- **Tie determinism on next hops**: the next-hop selector collects
+  every minimum-total candidate, sorts by `(total, to_region.0,
+  edge, offset)`, and emits all of them. Final exit list gets a
+  `sort_by_key + dedup` for a stable snapshot.
+- **ponytail — node-graph double-counts interior regions.** The edge
+  weight is the SUM of r's "interior→border" cost and n's
+  "border→interior" cost, both measured by the producer's
+  `crossing_costs`. In a line A-B-C with B's traversal cost 10 the
+  algorithm reports `cost_to_C(A) = 20` (A→B = 10, B→C = 10) even
+  though the true A→C interior cost is 10. The next-hop direction
+  is still correct because the inflation is symmetric per-edge;
+  only the absolute `RouteHop.cost` is approximate. P-c consumes
+  `from[r].exits`, not `.cost`. The exact fix is a border-node /
+  line-graph Dijkstra keyed on `(region, border_link)`; deferred
+  until the cost is used for a budget.
+
+### Tests added (`src/core/regions/directory.rs` tests module)
+
+| Test | What it locks down |
+|---|---|
+| `region_routes_map_multihop_destination_to_first_hop` | A→B→C: A's hop for destination C is B (cost 4 = 1+1+1+1). B's hop for destination A is A (cost 2). |
+| `region_routes_pick_only_cost_decreasing_neighbour` | Edges are forced strictly positive; a leaf B's only neighbour A gets selected via strict-decrease. |
+| `region_routes_prefer_lower_cost_corridor` | A→B→C (cost 8) loses to A→D→E→C (cost 4) when the corridors differ. |
+| `region_routes_skip_roadless_border` | A and B share a map border but no road crosses; the route A→D→C skips the roadless edge entirely. |
+
+`owned(&[ids])` is a `pub(crate)` test helper that registers the given
+region ids in a fresh `RegionOwnerDirectory` and wraps it in an `Arc`
+— the routes builder filters by `owner_of(r)`, so tests must register
+the regions they use.
+
+### Known limitations (carried into P-c)
+
+- The `ponytail:` heuristic above: `RouteHop.cost` is approximate, not
+  exact. P-c reads `from[r].exits` and the `BorderLinkId` it carries,
+  not the cost.
+- Tests use a self-pair `crossing_cost(entry, exit)` data shape, which
+  the real `road_report` producer does NOT emit (it skips `entry ==
+  exit` pairs). The arithmetic is validated against the formula; the
+  real-shape producer data is exercised by integration tests (P-c).
+
+## 9. P-c implementation record (wiring)
+
 ## 9. P-c implementation record (wiring)
 
 ## Suggested patch split

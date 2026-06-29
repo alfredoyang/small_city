@@ -97,7 +97,7 @@ impl RegionOwnerDirectory {
             .copied()
     }
 
-    fn register_region(
+    pub(crate) fn register_region(
         &self,
         region_id: RegionId,
         worker_id: WorkerId,

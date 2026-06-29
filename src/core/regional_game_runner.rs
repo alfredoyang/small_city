@@ -159,8 +159,8 @@ impl RegionalGameRunner {
         let region_worker_indexes =
             validate_region_worker_indexes(regions.len(), worker_count, region_worker_indexes)?;
 
-        let directory = Arc::new(RegionDirectory::new(topology));
         let owners = Arc::new(RegionOwnerDirectory::new());
+        let directory = Arc::new(RegionDirectory::with_owners(topology, Arc::clone(&owners)));
         let mut workers = (0..worker_count)
             .map(|index| {
                 let worker_id = WorkerId(INITIAL_WORKER_ID.0 + index as u32);

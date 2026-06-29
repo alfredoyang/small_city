@@ -181,6 +181,50 @@ pub struct RegionRoadReport {
     pub crossing_costs: Vec<RegionCrossCost>,
 }
 
+/// P-?: the directory's OUTPUT for the Layer-1 router. One Dijkstra-at-T tree:
+/// every source's answer to "how do I get toward T?". Outer key = DESTINATION
+/// region; inner key = SOURCE region; value = `RouteHop` (min-cost next-hop
+/// exits + the source's total road cost to T).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegionRoutes {
+    pub to: std::collections::HashMap<RegionId, RouteField>,
+}
+
+impl RegionRoutes {
+    /// For region `r`: each reachable destination `T` → r's next-hop exits
+    /// toward T. Convenience accessor for the stepper.
+    pub fn exits_from(&self, r: RegionId) -> std::collections::HashMap<RegionId, Vec<ExitLink>> {
+        self.to
+            .iter()
+            .filter_map(|(t, field)| field.from.get(&r).map(|hop| (*t, hop.exits.clone())))
+            .collect()
+    }
+}
+
+/// P-?: one Dijkstra-at-T tree: every source's answer for T.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteField {
+    pub from: std::collections::HashMap<RegionId, RouteHop>,
+}
+
+/// P-?: r's answer for "how do I get toward T?" — the cost-sorted next-hop
+/// exits (r may have several, tied at the same cost), plus the total road
+/// cost from r to T.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteHop {
+    pub exits: Vec<ExitLink>,
+    pub cost: u32,
+}
+
+/// P-?: one region's local answer for T — leave through this border link,
+/// arriving in `to_region`. `link` is the local-side BorderLinkId; the
+/// receiving region has the matching link on its side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExitLink {
+    pub link: BorderLinkId,
+    pub to_region: RegionId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Stale-tolerant availability hint published for regional discovery.
 ///
