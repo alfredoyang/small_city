@@ -152,6 +152,35 @@ impl RegionNeighborLink {
     }
 }
 
+/// P-?: one border-edge on the region road graph: my link faces neighbour.
+/// Pairs with the neighbour's complementary link across the same map border.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegionBorderLink {
+    pub link: BorderLinkId,
+    pub neighbour: RegionId,
+}
+
+/// P-?: the cost of crossing me on the road graph: enter at `entry`, exit at `exit`,
+/// where entry and exit are two of my border links. `cost` is the Layer-2 (road-cell)
+/// Dijkstra distance between them — share-nothing, each region computes its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegionCrossCost {
+    pub entry: BorderLinkId,
+    pub exit: BorderLinkId,
+    pub cost: u32,
+}
+
+/// P-?: per-region INPUT to the directory's Layer-1 Dijkstra. The region prices
+/// its own crossings (one Layer-2 Dijkstra per border-link pair) and publishes
+/// this report alongside the existing availability hint. The directory assembles
+/// all reports and runs the small Layer-1 Dijkstra on the region road graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionRoadReport {
+    pub region: RegionId,
+    pub border_links: Vec<RegionBorderLink>,
+    pub crossing_costs: Vec<RegionCrossCost>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Stale-tolerant availability hint published for regional discovery.
 ///
@@ -479,6 +508,89 @@ impl RegionState {
         }
         links.sort();
         links
+    }
+
+    /// P-a: per-region INPUT to the directory's Layer-1 Dijkstra. The region
+    /// prices its own crossings (one Layer-2 Dijkstra per border-link pair) and
+    /// publishes this report alongside the existing availability hint. The
+    /// directory assembles all reports and runs the small Layer-1 Dijkstra on
+    /// the region road graph.
+    ///
+    /// `border_neighbours` is the worker-supplied `BorderLinkId → neighbour
+    /// RegionId` map (the direct-neighbour hint, provided by the worker from
+    /// the topology). The region's own border-road cells come from
+    /// `border_road_cells` per network; the cost from each entry to each exit
+    /// on the same network is the Layer-2 Dijkstra distance.
+    pub fn road_report(
+        &self,
+        border_neighbours: &HashMap<BorderLinkId, RegionId>,
+    ) -> RegionRoadReport {
+        let mut border_links: Vec<RegionBorderLink> = border_neighbours
+            .iter()
+            .map(|(link, neighbour)| RegionBorderLink {
+                link: *link,
+                neighbour: *neighbour,
+            })
+            .collect();
+        border_links.sort_by_key(|bl| (bl.link.edge, bl.link.offset, bl.neighbour));
+
+        // Per network: collect (cell, link) pairs that are border-road cells
+        // (i.e. the cell has at least one border link). Each border link is
+        // unique to a network (it's a map edge on that network's border).
+        let width = self.world.grid.width();
+        let height = self.world.grid.height();
+        let mut crossing_costs: Vec<RegionCrossCost> = Vec::new();
+
+        for network in road_connectivity::discover_road_networks(&self.world) {
+            let network_id = RegionRoadNetworkId {
+                region: self.id,
+                road_network: network.id,
+            };
+            // Border cells on THIS network: road cells with at least one
+            // border link.
+            let mut border_cells: Vec<(Entity, BorderLinkId)> = Vec::new();
+            for &road in &network.roads {
+                if let Some(position) = self.world.positions.get(&road) {
+                    for link in
+                        border_links_for_cell(network_id, position.x, position.y, width, height)
+                    {
+                        border_cells.push((road, link.link));
+                    }
+                }
+            }
+            // Price every entry → every exit (no self-loops; dedup by pair).
+            for &(entry_cell, entry_link) in &border_cells {
+                for &(exit_cell, exit_link) in &border_cells {
+                    if entry_link == exit_link {
+                        // A border link is a single point — staying on it is
+                        // a no-op (the mover never needs to "enter" and "exit"
+                        // through the same link). Skip the 0-cost self-pair;
+                        // it's never a useful crossing on the region graph.
+                        continue;
+                    }
+                    if let Some(cost) = self.world.road_distance_to(exit_cell, entry_cell, &network)
+                    {
+                        // `cost` is the Layer-2 road distance from exit back
+                        // to entry (= the came_from-tree hops from entry to
+                        // exit, by tree symmetry).
+                        if cost > 0 {
+                            crossing_costs.push(RegionCrossCost {
+                                entry: entry_link,
+                                exit: exit_link,
+                                cost,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        crossing_costs.sort_by_key(|c| (c.entry, c.exit));
+
+        RegionRoadReport {
+            region: self.id,
+            border_links,
+            crossing_costs,
+        }
     }
 
     /// P5b: install the worker-supplied border→neighbor hint and rebuild the
@@ -1652,5 +1764,60 @@ mod tests {
         });
         assert!(bounce.is_empty());
         assert!(!a.world.away_residents.contains(&citizen));
+    }
+
+    /// P-a: the per-region report prices entry → exit crossings on the
+    /// region's own road graph. A simple 2-road setup: two adjacent cells on
+    /// the West/East borders of a 2×2 region. The report contains symmetric
+    /// crossing costs between the two border links (adjacent → cost 1).
+    #[test]
+    fn road_report_prices_entry_to_exit() {
+        let mut a = RegionState::new(RegionId(0), 2, 2);
+        assert!(a.build(0, 0, BuildingKind::Road).success);
+        assert!(a.build(1, 0, BuildingKind::Road).success);
+
+        let mut border_neighbours = std::collections::HashMap::new();
+        border_neighbours.insert(
+            BorderLinkId {
+                edge: BorderEdge::West,
+                offset: 0,
+            },
+            RegionId(1),
+        );
+        border_neighbours.insert(
+            BorderLinkId {
+                edge: BorderEdge::East,
+                offset: 0,
+            },
+            RegionId(2),
+        );
+
+        let report = a.road_report(&border_neighbours);
+
+        assert_eq!(report.region, RegionId(0));
+
+        // The report includes the West↔East pair (adjacent cells, 1 hop on the
+        // same network). Other pairs may also exist (each border cell has
+        // multiple border links on a 2×2 grid with 4-edge borders), but
+        // West↔East at 1 hop is the load-bearing invariant.
+        let west_east = |entry_edge, exit_edge| {
+            report
+                .crossing_costs
+                .iter()
+                .find(|c| {
+                    c.entry.edge == entry_edge
+                        && c.exit.edge == exit_edge
+                        && c.entry.offset == 0
+                        && c.exit.offset == 0
+                })
+                .map(|c| c.cost)
+        };
+        assert_eq!(west_east(BorderEdge::West, BorderEdge::East), Some(1));
+        assert_eq!(west_east(BorderEdge::East, BorderEdge::West), Some(1));
+
+        // Self-pairs (entry == exit) are filtered out.
+        for c in &report.crossing_costs {
+            assert_ne!(c.entry, c.exit, "self-pair must be filtered out");
+        }
     }
 }

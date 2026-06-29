@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::regions::{
     BorderEdge, NetworkBorderLink, RegionId, RegionNeighborLink, RegionRoadNetworkId,
-    RegionalAvailabilityHint,
+    RegionRoadReport, RegionalAvailabilityHint,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -38,6 +38,12 @@ use crate::core::regions::{
 pub struct CrossRegionDiscovery {
     pub components: Vec<Vec<RegionRoadNetworkId>>,
     pub availability_hints: Vec<RegionalAvailabilityHint>,
+    /// P-a: per-region INPUT for the Layer-1 Dijkstra. Each region prices its
+    /// own crossings (one Layer-2 Dijkstra per border-link pair) and publishes
+    /// the report alongside the existing availability hint. The directory
+    /// assembles all reports and runs the small Layer-1 Dijkstra on the
+    /// region road graph (P-b).
+    pub road_reports: Vec<RegionRoadReport>,
 }
 
 impl CrossRegionDiscovery {
@@ -95,6 +101,8 @@ struct DirectoryPublishState {
     topology: Vec<RegionNeighborLink>,
     region_links: HashMap<RegionId, Vec<NetworkBorderLink>>,
     region_hints: HashMap<RegionId, Vec<RegionalAvailabilityHint>>,
+    /// P-a: per-region road reports (INPUT for the Layer-1 Dijkstra in P-b).
+    region_road_reports: HashMap<RegionId, RegionRoadReport>,
 }
 
 impl RegionDirectory {
@@ -157,12 +165,40 @@ impl RegionDirectory {
         true
     }
 
+    /// P-a: publishes one region's road report (INPUT for the Layer-1 Dijkstra
+    /// assembled in P-b). The report is computed by the region (it owns the
+    /// road graph) and pushed here. Publishing is idempotent.
+    pub fn publish_region_road_report(&self, report: RegionRoadReport) -> bool {
+        let mut state = self
+            .publish_state
+            .lock()
+            .expect("region directory publish state lock poisoned");
+        let current = state.region_road_reports.get(&report.region);
+        if current == Some(&report) {
+            return false;
+        }
+        set_or_remove_report(
+            &mut state.region_road_reports,
+            report.region,
+            report.clone(),
+        );
+        self.rebuild_discovery(&state);
+        true
+    }
+
     fn rebuild_discovery(&self, state: &DirectoryPublishState) {
         let links = flattened_region_values(&state.region_links);
         let availability_hints = flattened_region_values(&state.region_hints);
+        let mut regions: Vec<RegionId> = state.region_road_reports.keys().copied().collect();
+        regions.sort();
+        let road_reports = regions
+            .into_iter()
+            .map(|region| state.region_road_reports[&region].clone())
+            .collect();
         let discovery = CrossRegionDiscovery {
             components: build_component_graph(&links, &availability_hints, &state.topology),
             availability_hints,
+            road_reports,
         };
 
         // Build work happens before this lock. Readers hold the active-snapshot
@@ -199,6 +235,18 @@ fn set_or_remove<T>(map: &mut HashMap<RegionId, Vec<T>>, region: RegionId, value
         map.remove(&region);
     } else {
         map.insert(region, values);
+    }
+}
+
+fn set_or_remove_report(
+    map: &mut HashMap<RegionId, RegionRoadReport>,
+    region: RegionId,
+    report: RegionRoadReport,
+) {
+    if report.border_links.is_empty() && report.crossing_costs.is_empty() {
+        map.remove(&region);
+    } else {
+        map.insert(region, report);
     }
 }
 

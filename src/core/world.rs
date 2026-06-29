@@ -365,6 +365,29 @@ impl World {
         self.route_cache.borrow().contains(&(dest, network_id))
     }
 
+    /// P-a: walk the came_from tree rooted at `dest` (a road entity) and count
+    /// the hops from `dest` to `target` (also a road entity, on the same
+    /// network). Returns `None` if `target` is not reachable from `dest` (i.e.
+    /// not in the tree). Used by `RegionState::road_report` to price each
+    /// border-entry → border-exit crossing on the region's own road graph
+    /// (Layer-2 Dijkstra distance).
+    ///
+    /// **Reentrancy invariant:** does NOT touch `route_cache` (calls the pure
+    /// `road_predecessors_with_dist`, which builds a fresh tree without the
+    /// cache). Safe to call from within another route-cache compute path.
+    pub(crate) fn road_distance_to(
+        &self,
+        dest: Entity,
+        target: Entity,
+        network: &RoadNetwork,
+    ) -> Option<u32> {
+        use crate::core::systems::road_network_analysis::road_predecessors_with_dist;
+        // `dest` is a road cell, so Dijkstra seeds from it. The returned
+        // `distances` map is a fresh tree (no cache write).
+        let (_tree, distances) = road_predecessors_with_dist(self, network, &[dest]);
+        distances.get(&target).copied()
+    }
+
     /// Marks the applied derived state stale after an out-of-tick config change (DT1).
     ///
     /// `derived_dirty` is set **only** by player commands (the `RegionState`

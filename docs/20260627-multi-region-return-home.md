@@ -589,6 +589,43 @@ No UI test needed: rendering is unchanged (the token/adapter tests live in the r
 - Remove `return_path` in a small follow-up if deleting it in the same patch is noisy;
   first make behaviour stop depending on it.
 
+## 7. P-a implementation record (per-region pricing)
+
+P-a added per-region pricing. The region owns its road graph, so it computes
+its own crossing costs (one Layer-2 Dijkstra per border-link pair) and
+publishes a `RegionRoadReport` alongside the existing availability hint.
+
+### What changed
+
+- `src/core/regions/mod.rs` — new types `RegionBorderLink { link,
+  neighbour }`, `RegionCrossCost { entry, exit, cost }`, `RegionRoadReport
+  { region, border_links, crossing_costs }`. New `RegionState::road_report`
+  method (one Layer-2 Dijkstra per border cell entry, priced against every
+  other border cell exit). New `World::road_distance_to` (pure helper that
+  uses `road_predecessors_with_dist` and does NOT touch `route_cache` — so
+  it's safe to call from within another route-cache compute path).
+- `src/core/regions/directory.rs` — `CrossRegionDiscovery.road_reports`
+  field. New `RegionDirectory::publish_region_road_report` (idempotent
+  rebuild guard, same pattern as the existing `publish_region`).
+- `src/core/regions/worker.rs` — `add_region` and `process_region_events_with_mode`
+  now also publish the road report. The worker recomputes the report from
+  the **post-event** road graph (a build/bulldoze in this pass would have
+  changed the topology, so a pre-event report would be stale).
+- `src/core/regions/worker.rs` — `export_routing_reads_published_directory_without_rebuilding`
+  updated to expect 1 rebuild (the initial road report publish from
+  `add_region`).
+
+### Test
+
+`road_report_prices_entry_to_exit` — a 2×2 region with two adjacent
+border-road cells: West/0 (r0) and East/0 (r1). The road report
+contains symmetric West↔East crossing costs at 1 hop each, and
+self-pairs (entry == exit) are filtered out.
+
+## 8. P-b implementation record (Layer-1 Dijkstra)
+
+## 9. P-c implementation record (wiring)
+
 ## Suggested patch split
 
 **Prerequisite:** the token refactor (`docs/20260629-unify-travel-tokens.md`) lands first —

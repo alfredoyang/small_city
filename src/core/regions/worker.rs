@@ -8,6 +8,7 @@ use crate::core::components::TravelerHandoff;
 use crate::core::regional_types::{
     RegionCommandResponse, RegionSnapshotResponse, RegionTickResponse, UiRequestId,
 };
+use crate::core::regions::RegionRoadReport;
 pub use crate::core::regions::directory::CrossRegionDiscovery;
 use crate::core::regions::directory::RegionDirectory;
 use crate::core::regions::handle::RegionHandle;
@@ -283,8 +284,16 @@ impl RegionWorker {
         runtime.ensure_derived_state();
         let links = runtime.state().network_border_links();
         let hints = runtime.state().availability_hints();
+        let border_neighbours = border_neighbor_map_for_region(
+            &self.directory.topology(),
+            region_id,
+            &links,
+            |neighbor| self.owners.owner_of(neighbor).is_some(),
+        );
+        let road_report = runtime.state().road_report(&border_neighbours);
         self.regions.push(runtime);
         self.publish_region_summary(region_id, links, hints);
+        self.directory.publish_region_road_report(road_report);
         Ok(())
     }
 
@@ -297,6 +306,15 @@ impl RegionWorker {
 
         let runtime = self.regions.remove(position);
         self.publish_region_summary(region_id, Vec::new(), Vec::new());
+        // P-a: clear the road report for the removed region. publish_region with
+        // empty links/hints is idempotent for the availability path; the road
+        // report needs an explicit empty publish (the snapshot's
+        // `road_reports` Vec is sorted/deduped by region on rebuild).
+        self.directory.publish_region_road_report(RegionRoadReport {
+            region: region_id,
+            border_links: Vec::new(),
+            crossing_costs: Vec::new(),
+        });
         self.owners.unregister_region(region_id, self.id);
         Some(runtime)
     }
@@ -515,6 +533,9 @@ impl RegionWorker {
                 &runtime.state().network_border_links(),
                 |neighbor| owners.owner_of(neighbor).is_some(),
             );
+            // Apply the pre-event border hint so `set_border_neighbor_map`
+            // can refresh `remote_exit_cells` before the event. The post-event
+            // recompute (below) will overwrite if a road/link changed.
             runtime.set_border_neighbor_map(border_neighbor_map);
             let source_region = runtime.region_id();
             outbound.extend(
@@ -527,6 +548,21 @@ impl RegionWorker {
             // dirty; recompute the derived pass before reading the summaries it
             // feeds, so published hints reflect the latest config.
             runtime.ensure_derived_state();
+            // P-a: recompute the post-event border hint + road report from the
+            // current road graph. The pre-event `border_neighbor_map` was correct
+            // for the *previous* graph; a build/bulldoze this pass would have
+            // changed the road topology, so the report must be re-priced.
+            let owners = Arc::clone(&self.owners);
+            let post_links = runtime.state().network_border_links();
+            let post_border_neighbor_map = border_neighbor_map_for_region(
+                &self.directory.topology(),
+                runtime.region_id(),
+                &post_links,
+                |neighbor| owners.owner_of(neighbor).is_some(),
+            );
+            runtime.set_border_neighbor_map(post_border_neighbor_map.clone());
+            let road_report = runtime.state().road_report(&post_border_neighbor_map);
+            self.directory.publish_region_road_report(road_report);
             changed_summaries.push((
                 source_region,
                 runtime.state().network_border_links(),
@@ -1205,7 +1241,10 @@ mod tests {
             .route_export_request::<PowerExport>(second, RegionRoutingMode::Immediate)
             .unwrap();
 
-        assert_eq!(directory.rebuild_count(), 0);
+        // P-a: add_region now publishes a road report too, which triggers one
+        // rebuild. After that, the two route_export_request calls are
+        // idempotent (no rebuilt summaries), so the count stays at 1.
+        assert_eq!(directory.rebuild_count(), 1);
     }
 
     #[test]
