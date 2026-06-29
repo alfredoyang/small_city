@@ -95,26 +95,32 @@ fn game_time_view(time: crate::core::resources::GameTime) -> GameTimeView {
     }
 }
 
-/// P4: the map cells currently holding a moving citizen, deduped and sorted for a
-/// deterministic, presentation-agnostic render list. Only en-route citizens have a
-/// `current_cell`; idle citizens (inside a building) contribute nothing. Multiple
-/// citizens sharing a cell collapse to one marker. No entity id or path leaks out.
+/// P4 (R-a): the map cells currently holding a moving citizen, deduped and
+/// sorted for a deterministic, presentation-agnostic render list. Only
+/// `Travelling` tokens have a `current_cell`; idle `AtWork` tokens (inside a
+/// building) and absent tokens (idle at home, or away in another region) all
+/// contribute nothing. Multiple citizens sharing a cell collapse to one
+/// marker. No entity id or path leaks out.
+///
+/// The unified `world.tokens` map holds both local tokens and foreign
+/// visiting tokens (the neighbour's body is in this region — the `home.region`
+/// is elsewhere). All tokens with a road cell render a dot; idle and
+/// home-region-away tokens don't have a road cell and contribute nothing.
 fn traveler_views(world: &World) -> Vec<CitizenTravelView> {
-    // Local citizens en route (P3), filtered to live citizens so a removed-but-not-
-    // yet-pruned entry never renders a stale dot on a paused frame.
-    let local = world
-        .travel
+    let self_region = world.region_id;
+    let mut cells: Vec<(usize, usize)> = world
+        .tokens
         .iter()
-        .filter(|(id, _)| world.citizens.contains_key(id))
-        .filter_map(|(_, state)| state.current_cell);
-    // P5: tokens visiting from neighbor regions render the same way.
-    let visiting = world
-        .visiting_travel
-        .values()
-        .filter_map(|visiting| visiting.token.current_cell);
-
-    let mut cells: Vec<(usize, usize)> = local
-        .chain(visiting)
+        .filter(|(id, token)| {
+            // A local token: the citizen must still be alive (the stepper
+            // prunes stale entries at the end of each sub-tick, but a paused
+            // frame may see a not-yet-pruned entry).
+            world.citizens.contains_key(id)
+                // A foreign token: the home is elsewhere, the citizen is not
+                // in this region's `world.citizens`. Always include.
+                || token.home.region != self_region
+        })
+        .filter_map(|(_, token)| token.state.current_cell)
         .filter_map(|cell| world.positions.get(&cell))
         .map(|position| (position.x, position.y))
         .collect();
@@ -974,14 +980,16 @@ fn digit_symbol(value: i32) -> char {
 #[cfg(test)]
 mod tests {
     use super::{calculate_demand, traveler_views, view_world};
-    use crate::core::components::{Citizen, Morale, TravelState, TravelStatus};
+    use crate::core::components::{
+        Citizen, Morale, PlaceRef, TravelState, TravelStatus, TravelToken,
+    };
     use crate::core::entity::Entity;
     use crate::core::systems::placement::place_building;
     use crate::core::world::World;
     use crate::interface::input::BuildingKind;
     use crate::interface::view::{CitizenTravelView, CityDemand, DemandLevel};
 
-    /// Inserts a citizen and its travel state. `cell = None` ⇒ idle.
+    /// Inserts a citizen and its travel state. `cell = None` ⇒ idle (no token).
     fn add_citizen(world: &mut World, local: u32, cell: Option<Entity>) -> Entity {
         let id = Entity::new(world.region_id, local);
         world.citizens.insert(
@@ -995,21 +1003,27 @@ mod tests {
                 money: 0,
             },
         );
-        world.travel.insert(
-            id,
-            TravelState {
-                status: if cell.is_some() {
-                    TravelStatus::Traveling
-                } else {
-                    TravelStatus::AtHome
+        if let Some(cell) = cell {
+            world.tokens.insert(
+                id,
+                TravelToken {
+                    state: TravelState {
+                        status: TravelStatus::Traveling,
+                        current_cell: Some(cell),
+                        destination: None,
+                        building: None,
+                        dwell: 0,
+                        prev_cell: None,
+                    },
+                    home: PlaceRef {
+                        region: world.region_id,
+                        building: id,
+                    },
+                    work: None,
+                    trip_gen: 0,
                 },
-                current_cell: cell,
-                destination: None,
-                building: None,
-                dwell: 0,
-                prev_cell: None,
-            },
-        );
+            );
+        }
         id
     }
 
@@ -1047,8 +1061,10 @@ mod tests {
         );
     }
 
-    /// A travel entry whose citizen was removed (not yet pruned) is skipped, so a
-    /// paused frame never shows a stale dot.
+    /// A token whose citizen was removed (not yet pruned) is skipped, so a
+    /// paused frame never shows a stale dot. The `world.tokens.retain` in the
+    /// stepper prunes this, but the adapter is more conservative and filters
+    /// directly.
     #[test]
     fn traveler_views_excludes_removed_citizen() {
         let mut world = World::new(2, 1);
@@ -1057,21 +1073,21 @@ mod tests {
         let id = add_citizen(&mut world, 1, Some(r0));
         assert_eq!(traveler_views(&world).len(), 1);
 
-        // Remove the citizen but leave the (not-yet-pruned) travel entry.
+        // Remove the citizen but leave the (not-yet-pruned) token.
         world.citizens.remove(&id);
-        assert!(world.travel.contains_key(&id));
+        assert!(world.tokens.contains_key(&id));
         assert!(
             traveler_views(&world).is_empty(),
             "stale dot must not render"
         );
     }
 
-    /// P5: visiting tokens (handed in by neighbor regions) render dots too, and
-    /// dedupe against a local traveller sharing the same cell.
+    /// Foreign tokens (visiting from a neighbour) render dots too, and dedupe
+    /// against a local traveller sharing the same cell. The unified `world.tokens`
+    /// map holds both.
     #[test]
     fn traveler_views_includes_visiting_tokens() {
-        use crate::core::components::{ReturnHop, TravelState, TravelerId, VisitingToken};
-        use crate::core::regions::{BorderEdge, BorderLinkId, RegionId};
+        use crate::core::regions::RegionId;
 
         let mut world = World::new(2, 1);
         place_building(&mut world, 0, 0, BuildingKind::Road);
@@ -1079,11 +1095,11 @@ mod tests {
         let r0 = world.grid.get(0, 0).expect("r0");
         let r1 = world.grid.get(1, 0).expect("r1");
 
-        // A local traveller on r0 and a visiting token on r0 collapse to one marker;
-        // a second visiting token on r1 adds another.
+        // A local traveller on r0 and a foreign token on r0 collapse to one
+        // marker; a second foreign token on r1 adds another.
         add_citizen(&mut world, 1, Some(r0));
-        let visiting_on = |cell| VisitingToken {
-            token: TravelState {
+        let foreign_on = |cell| TravelToken {
+            state: TravelState {
                 status: TravelStatus::Traveling,
                 current_cell: Some(cell),
                 destination: None,
@@ -1091,28 +1107,16 @@ mod tests {
                 dwell: 0,
                 prev_cell: None,
             },
-            return_path: vec![ReturnHop {
-                region: RegionId(0),
-                entry_link: BorderLinkId {
-                    edge: BorderEdge::East,
-                    offset: 0,
-                },
-            }],
+            home: PlaceRef {
+                region: RegionId(3),
+                building: Entity::new(RegionId(3), 0),
+            },
+            work: None,
+            trip_gen: 1,
         };
-        world.visiting_travel.insert(
-            TravelerId {
-                citizen: Entity::new(RegionId(3), 1),
-                generation: 1,
-            },
-            visiting_on(r0),
-        );
-        world.visiting_travel.insert(
-            TravelerId {
-                citizen: Entity::new(RegionId(3), 2),
-                generation: 1,
-            },
-            visiting_on(r1),
-        );
+        let _ = add_citizen(&mut world, 2, Some(r0)); // local on r0 too
+        let _ = add_foreign_token(&mut world, Entity::new(RegionId(3), 1), foreign_on(r0));
+        let _ = add_foreign_token(&mut world, Entity::new(RegionId(3), 2), foreign_on(r1));
 
         assert_eq!(
             traveler_views(&world),
@@ -1121,6 +1125,15 @@ mod tests {
                 CitizenTravelView { x: 1, y: 0 },
             ]
         );
+    }
+
+    fn add_foreign_token(world: &mut World, _citizen: Entity, token: TravelToken) -> Entity {
+        // Use a unique key. For a foreign token, the citizen key in
+        // `world.tokens` doesn't have to be a real citizen in this region —
+        // it's just the unique map key.
+        let key = Entity::new(world.region_id, 90);
+        world.tokens.insert(key, token);
+        key
     }
 
     /// The marker list reaches the public `view_world` render model.

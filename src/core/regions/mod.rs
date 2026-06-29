@@ -29,7 +29,7 @@ use std::collections::HashMap;
 
 use crate::core::city_refs::CityCellRef;
 use crate::core::components::{
-    PendingHandoff, Position, PowerSource, ReturnHop, TravelPurpose, TravelState, TravelerHandoff,
+    HandoffKind, PendingHandoff, Position, PowerSource, TravelState, TravelToken, TravelerHandoff,
     WorkplaceAssignment,
 };
 use crate::core::entity::Entity;
@@ -312,7 +312,7 @@ impl RegionState {
     /// Buffers any cross-region crossings into `outgoing_handoffs` for the regions
     /// layer to drain (`drain_traveler_handoffs`).
     pub(crate) fn step_travel(&mut self) {
-        travel::step_travel(&mut self.world);
+        travel::step_tokens(&mut self.world);
     }
 
     /// Applies one player build command through the core systems.
@@ -507,14 +507,16 @@ impl RegionState {
     }
 
     /// P5b: drain this tick's buffered crossings into routed handoffs, resolving
-    /// each border link from the topology. An outbound whose exit cell no longer
-    /// maps to a link toward its region is rolled back home (never strands `Away`).
+    /// each border link from the topology. A `Move` whose exit cell no longer maps
+    /// to a link toward its region is rolled back home (never strands the citizen).
+    /// `Rollback` handoffs are emitted by a neighbour that could not place an
+    /// inbound token — we route them back to the home region.
     pub(crate) fn drain_traveler_handoffs(&mut self) -> Vec<TravelerHandoff> {
         let pending = std::mem::take(&mut self.world.outgoing_handoffs);
         let mut handoffs = Vec::new();
         for handoff in pending {
             match handoff {
-                PendingHandoff::Outbound {
+                PendingHandoff::Move {
                     traveler,
                     token,
                     to_region,
@@ -524,48 +526,89 @@ impl RegionState {
                         token,
                         traveler,
                         to_region,
-                        entry_link,
-                        return_path: vec![ReturnHop {
-                            region: self.id,
-                            entry_link,
-                        }],
-                        purpose: TravelPurpose::Outbound,
+                        entry_link: Some(entry_link),
+                        kind: HandoffKind::Move,
                     }),
-                    None => travel::apply_traveler_return(&mut self.world, traveler),
-                },
-                PendingHandoff::Return {
-                    traveler,
-                    mut return_path,
-                } => {
-                    // Pop the last hop: it names the region to return to and the link.
-                    if let Some(hop) = return_path.pop() {
-                        handoffs.push(TravelerHandoff {
-                            token: TravelState::default(), // unused on Return
-                            traveler,
-                            to_region: hop.region,
-                            entry_link: hop.entry_link,
-                            return_path,
-                            purpose: TravelPurpose::Return,
-                        });
+                    None => {
+                        // The exit cell no longer faces `to_region` — the outbound
+                        // can't route. Two cases:
+                        //   - Home-side: the home just lost its border link (or
+                        //     the link map went stale). Apply `apply_traveler_return`
+                        //     locally — it clears `away_residents` (the citizen
+                        //     wasn't really away).
+                        //   - Host-side: a foreign visitor's exit became
+                        //     unroutable. B has no home record, so a local
+                        //     `apply_traveler_return` would no-op. Emit a `Rollback`
+                        //     to the home region so it can clear `away_residents`
+                        //     there.
+                        if token.home.region == self.id {
+                            travel::apply_traveler_return(&mut self.world, traveler);
+                        } else {
+                            handoffs.push(TravelerHandoff {
+                                token: token.clone(),
+                                traveler,
+                                to_region: token.home.region,
+                                entry_link: None,
+                                kind: HandoffKind::Rollback,
+                            });
+                        }
                     }
+                },
+                PendingHandoff::Rollback {
+                    traveler,
+                    to_region,
+                } => {
+                    // The home's own entry vanished (self-bounce) or a neighbour
+                    // bounced a foreign citizen home. Pass it through to the home
+                    // region; no `entry_link` is needed (the home applies
+                    // `apply_traveler_return` directly).
+                    handoffs.push(TravelerHandoff {
+                        token: TravelToken {
+                            state: TravelState::default(),
+                            home: crate::core::components::PlaceRef {
+                                region: to_region,
+                                building: crate::core::entity::Entity::default(),
+                            },
+                            work: None,
+                            trip_gen: traveler.generation,
+                        },
+                        traveler,
+                        to_region,
+                        entry_link: None,
+                        kind: HandoffKind::Rollback,
+                    });
                 }
             }
         }
         handoffs
     }
 
-    /// P5b: apply an inbound crossing. Outbound → place the token at the local
-    /// entry cell (mapped from the sender's exit link) so it walks to the
-    /// workplace; if the link can't be placed (topology drift), bounce a `Return`
-    /// so the home citizen is never stranded. Return → clear the `Away` mark.
-    /// Returns any handoffs the worker must route onward (the bounce).
+    /// P5b: apply an inbound crossing. `Move` at a host (foreign home) → place
+    /// the token at the entry cell; `Move` completing at home or `Rollback` →
+    /// apply the home guard. Returns any bounce handoffs (entry-cell vanished
+    /// or self-bounce) for the worker to route onward.
     pub(crate) fn receive_traveler_handoff(
         &mut self,
         handoff: TravelerHandoff,
     ) -> Vec<TravelerHandoff> {
-        match handoff.purpose {
-            TravelPurpose::Outbound => {
-                let local_link = handoff.entry_link.matching_neighbor_link();
+        match handoff.kind {
+            HandoffKind::Move => {
+                // If this is the home region, gate on the four-part guard.
+                if handoff.token.home.region == self.id
+                    && !travel::home_accepts(
+                        &self.world,
+                        handoff.traveler.citizen,
+                        handoff.traveler.generation,
+                    )
+                {
+                    // Stale or duplicate — drop silently.
+                    return Vec::new();
+                }
+                let Some(entry_link) = handoff.entry_link else {
+                    // A Move with no entry_link is malformed; bounce home.
+                    return self.bounce_to_home(&handoff);
+                };
+                let local_link = entry_link.matching_neighbor_link();
                 match self.cell_at_border_link(local_link) {
                     Some(entry_cell) => {
                         travel::receive_traveler(
@@ -573,33 +616,37 @@ impl RegionState {
                             handoff.traveler,
                             handoff.token,
                             entry_cell,
-                            handoff.return_path,
                         );
                         Vec::new()
                     }
                     None => {
-                        // Can't place — bounce a Return along the path it came in on.
-                        let mut return_path = handoff.return_path;
-                        return_path
-                            .pop()
-                            .map(|hop| TravelerHandoff {
-                                token: TravelState::default(),
-                                traveler: handoff.traveler,
-                                to_region: hop.region,
-                                entry_link: hop.entry_link,
-                                return_path,
-                                purpose: TravelPurpose::Return,
-                            })
-                            .into_iter()
-                            .collect()
+                        // Entry road gone (topology drift) — bounce a Rollback
+                        // home. If THIS is the home region (its own entry vanished),
+                        // it self-bounces: next sub-tick `apply_traveler_return`
+                        // clears `away_residents`, so the abandoned trip is
+                        // re-departable. (Never drop the traveller.)
+                        self.bounce_to_home(&handoff)
                     }
                 }
             }
-            TravelPurpose::Return => {
+            HandoffKind::Rollback => {
                 travel::apply_traveler_return(&mut self.world, handoff.traveler);
                 Vec::new()
             }
         }
+    }
+
+    /// Build a `PendingHandoff::Rollback` handoff to push to `outgoing_handoffs`
+    /// (the worker's drain routes it back to the home).
+    fn bounce_to_home(&self, handoff: &TravelerHandoff) -> Vec<TravelerHandoff> {
+        let to_region = handoff.token.home.region;
+        vec![TravelerHandoff {
+            token: handoff.token.clone(),
+            traveler: handoff.traveler,
+            to_region,
+            entry_link: None,
+            kind: HandoffKind::Rollback,
+        }]
     }
 
     /// `(cell, border link)` for every border road cell, in deterministic order.
@@ -1214,6 +1261,7 @@ fn border_links_for_cell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::components::{Citizen, Morale};
     use crate::core::systems::citizens;
     use crate::interface::input::BuildingKind;
 
@@ -1394,7 +1442,7 @@ mod tests {
 
     // ---- P5b: cross-region token handoff (regions wiring) ----
 
-    use crate::core::components::{PendingHandoff, TravelStatus, TravelerId};
+    use crate::core::components::{PendingHandoff, TravelerId};
 
     /// An East-edge road in region A; the worker hint says East faces region B.
     /// `set_border_neighbor_map` must record that cell as an exit toward B.
@@ -1414,9 +1462,9 @@ mod tests {
         );
     }
 
-    /// Draining an outbound resolves the facing border link and seeds the return path.
+    /// Draining a Move resolves the facing border link and emits a `TravelerHandoff`.
     #[test]
-    fn drain_outbound_resolves_border_link() {
+    fn drain_move_resolves_border_link() {
         let mut a = RegionState::new(RegionId(1), 2, 1);
         assert!(a.build(1, 0, BuildingKind::Road).success);
         let exit = a.world.grid.get(1, 0).expect("road");
@@ -1430,17 +1478,30 @@ mod tests {
             citizen: Entity::new(RegionId(1), 5),
             generation: 1,
         };
+        let home = Entity::new(RegionId(1), 0);
         let workplace = Entity::new(RegionId(2), 9);
-        a.world.outgoing_handoffs.push(PendingHandoff::Outbound {
-            traveler,
-            token: TravelState {
-                status: TravelStatus::Traveling,
+        let token = TravelToken {
+            state: TravelState {
+                status: crate::core::components::TravelStatus::Traveling,
                 current_cell: Some(exit),
                 destination: Some(workplace),
                 building: None,
                 dwell: 0,
                 prev_cell: None,
             },
+            home: crate::core::components::PlaceRef {
+                region: RegionId(1),
+                building: home,
+            },
+            work: Some(crate::core::components::PlaceRef {
+                region: RegionId(2),
+                building: workplace,
+            }),
+            trip_gen: 1,
+        };
+        a.world.outgoing_handoffs.push(PendingHandoff::Move {
+            traveler,
+            token,
             to_region: RegionId(2),
             exit_cell: exit,
         });
@@ -1449,61 +1510,70 @@ mod tests {
         assert_eq!(handoffs.len(), 1);
         let handoff = &handoffs[0];
         assert_eq!(handoff.to_region, RegionId(2));
-        assert_eq!(handoff.entry_link, link);
-        assert_eq!(handoff.purpose, TravelPurpose::Outbound);
-        assert_eq!(
-            handoff.return_path,
-            vec![ReturnHop {
-                region: RegionId(1),
-                entry_link: link
-            }]
-        );
+        assert_eq!(handoff.entry_link, Some(link));
+        assert_eq!(handoff.kind, HandoffKind::Move);
         assert!(a.world.outgoing_handoffs.is_empty(), "buffer drained");
     }
 
-    /// An unroutable outbound (no facing link) rolls the away citizen back home
+    /// An unroutable Move (no facing link) rolls the away citizen back home
     /// rather than stranding it.
     #[test]
-    fn drain_outbound_rolls_back_when_unroutable() {
+    fn drain_move_rolls_back_when_unroutable() {
         let mut a = RegionState::new(RegionId(1), 2, 1);
         assert!(a.build(1, 0, BuildingKind::Road).success);
         let exit = a.world.grid.get(1, 0).expect("road");
         // No border_neighbor_map entry → the exit faces nothing.
         let citizen = Entity::new(RegionId(1), 5);
-        a.world.travel.insert(
+        // The guard `home_accepts` requires the citizen to be in
+        // `world.citizens`; the test pre-registers it so the rollback fires.
+        a.world.citizens.insert(
             citizen,
-            TravelState {
-                status: TravelStatus::Away,
-                current_cell: None,
-                destination: None,
-                building: None,
-                dwell: 0,
-                prev_cell: None,
+            Citizen {
+                id: citizen,
+                age: 1,
+                home: Entity::new(RegionId(1), 0),
+                workplace_assignment: None,
+                morale: Morale::default(),
+                money: 0,
             },
         );
+        a.world.away_residents.insert(citizen);
         a.world.away_generation.insert(citizen, 1);
-        a.world.outgoing_handoffs.push(PendingHandoff::Outbound {
+        let home = Entity::new(RegionId(1), 0);
+        let workplace = Entity::new(RegionId(2), 9);
+        let token = TravelToken {
+            state: TravelState::default(),
+            home: crate::core::components::PlaceRef {
+                region: RegionId(1),
+                building: home,
+            },
+            work: Some(crate::core::components::PlaceRef {
+                region: RegionId(2),
+                building: workplace,
+            }),
+            trip_gen: 1,
+        };
+        a.world.outgoing_handoffs.push(PendingHandoff::Move {
             traveler: TravelerId {
                 citizen,
                 generation: 1,
             },
-            token: TravelState::default(),
+            token,
             to_region: RegionId(2),
             exit_cell: exit,
         });
 
         let handoffs = a.drain_traveler_handoffs();
         assert!(handoffs.is_empty(), "nothing routed");
-        assert_eq!(
-            a.world.travel[&citizen].status,
-            TravelStatus::AtHome,
+        assert!(
+            !a.world.away_residents.contains(&citizen),
             "rolled back home"
         );
     }
 
-    /// Receiving an outbound places the token at the matching local entry cell.
+    /// Receiving a Move at a host (foreign home) places the token at the entry cell.
     #[test]
-    fn receive_outbound_places_token_at_entry_cell() {
+    fn receive_move_at_host_places_token() {
         // Region B with a West-edge road at (0,0).
         let mut b = RegionState::new(RegionId(2), 2, 1);
         assert!(b.build(0, 0, BuildingKind::Road).success);
@@ -1513,71 +1583,74 @@ mod tests {
             citizen: Entity::new(RegionId(1), 5),
             generation: 1,
         };
+        let home = Entity::new(RegionId(1), 0);
         let workplace = Entity::new(RegionId(2), 9);
-        // Sender's exit link was East/offset 0; B maps it via matching_neighbor_link.
         let handoff = TravelerHandoff {
-            token: TravelState {
-                status: TravelStatus::Traveling,
-                current_cell: None,
-                destination: Some(workplace),
-                building: None,
-                dwell: 0,
-                prev_cell: None,
+            token: TravelToken {
+                state: TravelState::default(),
+                home: crate::core::components::PlaceRef {
+                    region: RegionId(1),
+                    building: home,
+                },
+                work: Some(crate::core::components::PlaceRef {
+                    region: RegionId(2),
+                    building: workplace,
+                }),
+                trip_gen: 1,
             },
             traveler,
             to_region: RegionId(2),
-            entry_link: BorderLinkId {
+            entry_link: Some(BorderLinkId {
                 edge: BorderEdge::East,
                 offset: 0,
-            },
-            return_path: vec![ReturnHop {
-                region: RegionId(1),
-                entry_link: BorderLinkId {
-                    edge: BorderEdge::East,
-                    offset: 0,
-                },
-            }],
-            purpose: TravelPurpose::Outbound,
+            }),
+            kind: HandoffKind::Move,
         };
         let bounce = b.receive_traveler_handoff(handoff);
         assert!(bounce.is_empty(), "placed, no bounce");
-        let visiting = b.world.visiting_travel.get(&traveler).expect("visiting");
-        assert_eq!(visiting.token.current_cell, Some(entry));
+        let token = b.world.tokens.get(&traveler.citizen).expect("token placed");
+        assert_eq!(token.state.current_cell, Some(entry));
     }
 
-    /// Receiving a Return clears the home citizen's Away mark.
+    /// Receiving a Rollback clears the home citizen's `away_residents` record.
     #[test]
-    fn receive_return_clears_away() {
+    fn receive_rollback_clears_away() {
         let mut a = RegionState::new(RegionId(1), 1, 1);
         let citizen = Entity::new(RegionId(1), 5);
-        a.world.travel.insert(
+        // `home_accepts` requires the citizen to be in `world.citizens`.
+        a.world.citizens.insert(
             citizen,
-            TravelState {
-                status: TravelStatus::Away,
-                current_cell: None,
-                destination: None,
-                building: None,
-                dwell: 0,
-                prev_cell: None,
+            Citizen {
+                id: citizen,
+                age: 1,
+                home: Entity::new(RegionId(1), 0),
+                workplace_assignment: None,
+                morale: Morale::default(),
+                money: 0,
             },
         );
+        a.world.away_residents.insert(citizen);
         a.world.away_generation.insert(citizen, 1);
 
         let bounce = a.receive_traveler_handoff(TravelerHandoff {
-            token: TravelState::default(),
+            token: TravelToken {
+                state: TravelState::default(),
+                home: crate::core::components::PlaceRef {
+                    region: RegionId(1),
+                    building: Entity::new(RegionId(1), 0),
+                },
+                work: None,
+                trip_gen: 1,
+            },
             traveler: TravelerId {
                 citizen,
                 generation: 1,
             },
             to_region: RegionId(1),
-            entry_link: BorderLinkId {
-                edge: BorderEdge::East,
-                offset: 0,
-            },
-            return_path: Vec::new(),
-            purpose: TravelPurpose::Return,
+            entry_link: None,
+            kind: HandoffKind::Rollback,
         });
         assert!(bounce.is_empty());
-        assert_eq!(a.world.travel[&citizen].status, TravelStatus::AtHome);
+        assert!(!a.world.away_residents.contains(&citizen));
     }
 }

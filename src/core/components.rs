@@ -289,117 +289,77 @@ pub struct HappinessEffect {
 }
 
 /// P3 movement: where a citizen is in its daily commute. Lives only in the
-/// `#[serde(skip)]` `World::travel` map (transient display/derived state — it is
+/// `#[serde(skip)]` `World::tokens` map (transient display/derived state — it is
 /// rebuilt from the schedule each tick and never saved), so it carries no serde.
 ///
-/// `AtHome`/`AtWork` are the idle endpoints (citizen inside a building, off the
+/// `AtWork` is the idle-at-workplace endpoint (citizen inside a building, off the
 /// road graph); `Traveling` means the citizen is on a road cell stepping toward
-/// its destination. `Away` (P5) means the citizen's token is out in a neighbor
-/// region — the home side neither steps nor draws it until a `Return` clears the
-/// mark.
+/// its destination. A token does NOT exist when the citizen is idle-at-home or
+/// away in another region — absence of a token IS the "idle at home" state, and
+/// `world.away_residents` IS the "away" state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TravelStatus {
-    AtHome,
     AtWork,
     Traveling,
-    Away,
 }
 
 /// P5 cross-region travel: round-trip identity for a traveler whose token is out
 /// in a neighbor region. `citizen.region()` is the home region; the neighbor
-/// echoes the whole id back on `Return` and never dereferences the `Entity` as an
-/// ECS key (the same opaque-id trust boundary as `JobExportGrant.workplace`).
-/// `generation` disambiguates successive trips so a stale `Return` is ignored.
+/// echoes the whole id back on the return handoff and never dereferences the
+/// `Entity` as an ECS key (the same opaque-id trust boundary as
+/// `JobExportGrant.workplace`). `generation` is the active trip stamp — bumped
+/// on each cross-out, never cleared, so a stale older trip can never match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TravelerId {
     pub citizen: Entity,
     pub generation: u32,
 }
 
-/// P5: one hop on the outbound path, pushed on the way out and popped on the way
-/// back so a `Return` retraces the exact crossing chain. v1 is direct-neighbor
-/// only (the stack holds one hop), but the shape supports the deferred multi-hop
-/// extension (§5f). The regions layer (P5b) fills `entry_link` from topology.
+/// A building address — what region the building lives in (a city-wide `Entity`
+/// already packs its birth region, but the `region` field is kept explicit so a
+/// foreign PlaceRef can be compared without re-decoding the entity).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReturnHop {
+pub struct PlaceRef {
     pub region: RegionId,
-    pub entry_link: BorderLinkId,
+    pub building: Entity,
 }
 
-/// P5: a token visiting this region (the host) on behalf of a neighbor's citizen.
-/// `token` is stepped and drawn like any local traveller; `return_path` is the
-/// crossing chain to route the `Return` back home when the workday ends.
+/// The unified travel token — one per citizen *while away from home* (in the
+/// region where the body physically is; idle-at-home = no token). Carries the
+/// citizen's two endpoints (home, work) so the symmetric stepper can re-target
+/// without consulting `Citizen` mid-step; the home region bumps `gen` on each
+/// cross-out so a stale older return handoff can never match.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VisitingToken {
-    pub token: TravelState,
-    pub return_path: Vec<ReturnHop>,
-}
-
-/// P5: which way a [`TravelerHandoff`] is going. `Outbound` walks the token to the
-/// workplace in the host region; `Return` tells the home region the trip is done.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TravelPurpose {
-    Outbound,
-    Return,
-}
-
-/// P5b: the crossing message routed over the region border topology (the same
-/// `RegionNeighborLink` flow that carries power/job/goods exports). Built by the
-/// regions layer from a [`PendingHandoff`] — it adds the `BorderLinkId` routing the
-/// core left out. The *only* thing that crosses a border; the citizen entity never
-/// migrates and the receiver treats `traveler.citizen` as opaque id data.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TravelerHandoff {
-    /// The token itself (its `destination` is the workplace, on `Outbound`).
-    pub token: TravelState,
-    /// Round-trip identity (home-region entity + trip generation).
-    pub traveler: TravelerId,
-    /// Routed to this region by the worker (like an export request).
-    pub to_region: RegionId,
-    /// The sender's exit link; the receiver maps it via `matching_neighbor_link`.
-    pub entry_link: BorderLinkId,
-    /// Outbound: the hops walked so far (push on the way out). Return: what remains
-    /// to retrace (pop on the way back).
-    pub return_path: Vec<ReturnHop>,
-    pub purpose: TravelPurpose,
-}
-
-/// P5: a crossing the core has decided on this tick, buffered for the regions
-/// layer (P5b) to route. The core never touches border-link topology, so an
-/// `Outbound` carries the local `exit_cell` (P5b maps it to a `BorderLinkId`) and
-/// a `Return` carries the `return_path` it was handed on the way in.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PendingHandoff {
-    /// A local commuter reached its border-exit cell and wants to cross.
-    Outbound {
-        traveler: TravelerId,
-        /// The token on the exit cell; its `destination` is the remote workplace.
-        token: TravelState,
-        to_region: RegionId,
-        exit_cell: Entity,
-    },
-    /// A visiting token's workday ended; tell the home region the trip is done.
-    Return {
-        traveler: TravelerId,
-        return_path: Vec<ReturnHop>,
-    },
+pub struct TravelToken {
+    /// P3 movement payload — the cell/building the body is on, the dwell gate, the
+    /// turn memory. The adapter already renders this; reuse it verbatim.
+    pub state: TravelState,
+    /// The citizen's home (a building in the home region).
+    pub home: PlaceRef,
+    /// The citizen's workplace (`None` for jobless — always targets home).
+    pub work: Option<PlaceRef>,
+    /// The active-trip stamp. The home region sets it (= bumped `away_generation`)
+    /// on departure; hosts carry it unchanged. `TravelerId` on the wire is
+    /// `{citizen, generation}`.
+    pub trip_gen: u32,
 }
 
 /// P3 movement: one citizen's per-tick trip state.
 ///
 /// ```text
-///   idle:      current_cell = None,       building = Some(b)   (inside building b)
-///   en route:  current_cell = Some(road), building = None      (on that road cell)
-///   destination = Some(b) while travelling toward b; None when idle.
+///   AtWork:    current_cell = None,       building = Some(work)   (parked at workplace)
+///   Travelling:current_cell = Some(road), building = None         (on that road cell)
 /// ```
 ///
-/// `building` records the building the citizen actually occupies while idle, so
-/// the departure origin is read from movement state — **not** re-inferred from
-/// the (mutable) workplace assignment. Re-inferring would teleport a citizen
-/// whose assignment changed while idle, or strand one whose assignment cleared.
+/// `building` records the building the citizen actually occupies while idle at
+/// work, so the departure origin on the Home phase is read from movement state —
+/// **not** re-inferred from the (mutable) workplace assignment. Re-inferring
+/// would teleport a citizen whose assignment changed while parked, or strand
+/// one whose assignment cleared.
 ///
-/// No stored path: the citizen re-reads the region route cache (`came_from`)
-/// each tick and steps one cell, so this stays tiny and `Copy`.
+/// `destination` is set while travelling toward a building (home or work); `None`
+/// when idle. No stored path: the citizen re-reads the region route cache
+/// (`came_from`) each tick and steps one cell, so this stays tiny and `Copy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TravelState {
     pub status: TravelStatus,
@@ -418,10 +378,11 @@ pub struct TravelState {
 
 impl Default for TravelState {
     fn default() -> Self {
-        // A citizen with no recorded trip is assumed home and idle; the movement
-        // system fills `building` with the citizen's home on the first tick.
+        // A freshly-created token is idle (no cell, no building). The movement
+        // system fills `building` with the token's `work.building` on the
+        // first work-phase step, or removes the token on first home-arrival.
         Self {
-            status: TravelStatus::AtHome,
+            status: TravelStatus::AtWork,
             current_cell: None,
             destination: None,
             building: None,
@@ -429,6 +390,64 @@ impl Default for TravelState {
             prev_cell: None,
         }
     }
+}
+
+/// P5: a crossing the core has decided on this tick, buffered for the regions
+/// layer to route. The core never touches border-link topology, so the `Move`
+/// variant carries the local `exit_cell` (the regions layer maps it to a
+/// `BorderLinkId`); the `Rollback` variant is emitted by a neighbour that
+/// could not place an inbound token and is routed back to the home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingHandoff {
+    /// A local commuter reached its border-exit cell and wants to cross.
+    Move {
+        traveler: TravelerId,
+        /// The moved `TravelToken`. On the wire, the home region strips the
+        /// `state` and rebuilds it on receive; only `home`/`work`/`gen` carry
+        /// meaning across the border.
+        token: TravelToken,
+        to_region: RegionId,
+        exit_cell: Entity,
+    },
+    /// A neighbour bounced this citizen home (its outbound could not place) —
+    /// `apply_traveler_return` at the home region clears `away_residents`.
+    Rollback {
+        traveler: TravelerId,
+        to_region: RegionId,
+    },
+}
+
+/// P5b: the crossing message routed over the region border topology (the same
+/// `RegionNeighborLink` flow that carries power/job/goods exports). Built by the
+/// regions layer from a [`PendingHandoff`] — it adds the `BorderLinkId` routing
+/// the core left out. The *only* thing that crosses a border; the citizen
+/// entity never migrates and the receiver treats `traveler.citizen` as opaque
+/// id data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TravelerHandoff {
+    /// The moved `TravelToken` (its `state` is rebuilt on receive; only
+    /// `home`/`work`/`gen` carry meaning across the border).
+    pub token: TravelToken,
+    /// Round-trip identity (home-region entity + trip generation).
+    pub traveler: TravelerId,
+    /// Routed to this region by the worker (like an export request).
+    pub to_region: RegionId,
+    /// The sender's exit link; the receiver maps it via `matching_neighbor_link`.
+    /// `None` on a Rollback (the home's own entry vanished, self-bounce).
+    pub entry_link: Option<BorderLinkId>,
+    /// `Move` = a normal crossing; `Rollback` = today's bounce-home fallback
+    /// (a neighbour could not place an inbound token → it sends the citizen
+    /// home). Replaces the `Outbound`/`Return` purpose enum.
+    pub kind: HandoffKind,
+}
+
+/// P5b: which way a [`TravelerHandoff`] is going. `Move` walks the token to the
+/// workplace in the host region; `Rollback` tells the home region the trip is
+/// done (or that the outbound could not place, self-bounce).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffKind {
+    Move,
+    Rollback,
 }
 
 #[cfg(test)]

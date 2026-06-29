@@ -354,3 +354,206 @@ the walk primitives are **reused unchanged**. Only the token *type/map/stepper* 
   adapter reads `world.tokens`; golden + unified tests.
 - **R-b:** delete `world.visiting_travel` / `VisitingToken` / `return_path` / `ReturnHop` /
   `TravelPurpose{Outbound,Return}` and their construction sites once nothing references them.
+
+---
+
+## 7. R-a implementation record
+
+R-a was implemented in commit `[r-a]`. The patch collapses `world.travel` and
+`world.visiting_travel` into one `world.tokens: HashMap<Entity, TravelToken>`,
+backed by `away_residents: HashSet<Entity>` (the home region's active-away
+record) and `away_generation: HashMap<Entity, u32>` (the monotonic trip
+stamp). The two maps + two steppers + one type conversion at every border are
+gone; the new model is one map + one stepper + one move at the border.
+
+### 7a. The new types (in `components.rs`)
+
+```text
+  TravelState { AtWork, Travelling }             // no Away, no AtHome
+  TravelToken { state, home: PlaceRef, work: Option<PlaceRef>, trip_gen: u32 }
+  PlaceRef { region: RegionId, building: Entity }
+  TravelerId { citizen: Entity, generation: u32 }    // still the handoff identity
+  PendingHandoff::{ Move { traveler, token, to_region, exit_cell },
+                    Rollback { traveler, to_region } }
+  TravelerHandoff { token, traveler, to_region, entry_link: Option<BorderLinkId>,
+                    kind: HandoffKind::{ Move, Rollback } }
+  HandoffKind::{ Move, Rollback }                  // replaces TravelPurpose
+```
+
+Removed: `world.travel`, `world.visiting_travel`, `VisitingToken`, `return_path`/
+`ReturnHop`, `TravelPurpose{Outbound,Return}`, `TravelStatus::{Away, AtHome}`.
+`TravelState` is reused (its `building` field still records the at-work
+location). `TravelerId` is reused. `HandoffKind` replaces `TravelPurpose`.
+
+### 7b. The two-pass stepper (in `systems/travel.rs`)
+
+```text
+  step_tokens(world):
+    // ── DEPART pass: every resident in this region with no token here AND not
+    //    in away_residents whose phase target is elsewhere → first-step toward
+    //    target. Token created ONLY if a route exists (no route ⇒ no token).
+    for (id, citizen) in world.citizens:
+        if world.tokens.contains_key(id) || away_residents.contains(id): continue
+        if target == home: continue
+        let Some(state) = depart_toward(world, &networks, citizen.home, target) else continue
+        world.tokens.insert(id, TravelToken { state, home, work, trip_gen: 0 })
+        just_departed.insert(id)
+
+    // ── MOVE pass: every present token (except the just-departed).
+    //    dwell gate is checked INSIDE advance_*_building / advance_to_exit
+    //    BEFORE advancing — remote trips get the same dwell as local ones.
+    for (citizen, token) in world.tokens (sorted by citizen.0):
+        if just_departed.contains(citizen): continue
+        refresh_endpoints_from(&mut token, world.citizens.get(&citizen))  // None for foreign
+        let target = if phase == Work { token.work.unwrap_or(token.home) } else { token.home }
+        match target.region == self_region {
+            true => apply advance_to_building,
+            false => apply advance_to_exit,
+        }
+
+    // Cleanup: remove arrived-home, update others, drain handoffs.
+    for c in removes: world.tokens.remove(c); if arrived_home: away_residents.remove(c)
+    for h in handoffs: world.outgoing_handoffs.push(h)
+    world.tokens.retain(|id, t| world.citizens.contains_key(id) || t.home.region != self_region)
+    away_residents.retain(|c| world.citizens.contains_key(c))  // dead-while-away cleanup
+```
+
+The depart pass collects `fresh_tokens` first and writes them at the end (to
+avoid borrow conflicts on `world.tokens` mid-iteration); the move pass similarly
+collects `updates` / `removes` / `handoffs` and applies them after the loop.
+
+### 7c. The `home_accepts` guard (used by `apply_traveler_return` and the receive side)
+
+```rust
+fn home_accepts(c, gen) -> bool {
+    world.citizens.contains(c)     // not dead-while-away
+        && !world.tokens.contains(c)  // not already walking home
+        && away_residents.contains(c) // on an active trip (not post-completion)
+        && away_generation.get(&c) == Some(&gen)  // current trip, not stale older
+}
+```
+
+The paired `retain` after the move pass keeps `away_residents` and
+`world.tokens` consistent with `world.citizens`. A resident that dies WHILE
+away is dropped from both, and a late `Move`/`Rollback` for it is dropped by
+`home_accepts` (no ghost).
+
+### 7d. Cross-region: one move, no conversion
+
+```text
+  A: token reaches exit_cell → emit PendingHandoff::Move { traveler, token, ... }
+  Worker: route_traveler_handoff → emit TravelerHandoff { kind: Move, ... } (or Rollback)
+  B: receive_traveler_handoff (kind == Move) → place token at entry cell → stepper continues
+  B: receive_traveler_handoff (kind == Rollback) → apply_traveler_return → home_accepts → if true, clear away_residents
+```
+
+The `Rollback` kind handles two cases: the home's own entry vanished (self-bounce,
+clear `away_residents` locally) and a neighbour's exit became unroutable
+(emit a `Rollback` handoff to the home, which clears `away_residents` there).
+
+### 7e. The animated return (the one intentional change)
+
+Today (P5a), a visiting token in B at workday end emits an instant `Return`
+handoff (the token disappears from B's `visiting_travel`, the home applies
+`apply_traveler_return`). In R-a, the visitor walks workplace → border home
+sub-tick by sub-tick: B's `step_tokens` calls `advance_to_exit` on the
+foreign token with `target = token.home`, which walks the token toward a
+border-exit cell; on the border cell, a `Move` handoff is emitted to A; A
+places the token at its entry cell and walks it home in subsequent sub-ticks.
+The home-phase stepper in A walks the token from border → home. All `dwell`
+gating applies (a 4-way on the return path holds for 4 sub-ticks).
+
+### 7f. Tests added (276 total, 14 new for R-a)
+
+- `local_commute_unchanged` — home→work walks exact r0..r3, arrives AtWork.
+- `dwell_holds_a_traveller_on_a_4way` — local 4-way holds 4 sub-ticks.
+- `remote_dwell_holds_a_visitor_on_a_4way` — foreign 4-way holds 3 sub-ticks (cost-1; the placement sub-tick isn't counted because the test pre-places the token).
+- `phase_flip_retargets_home` — Home phase re-targets the token (the P3 behaviour is preserved).
+- `crossed_out_token_removed_from_home` — cross-out removes the local token (no Away stub).
+- `stale_older_trip_dropped_by_monotonic_generation` — stale older trip is dropped.
+- `post_completion_duplicate_dropped_by_away_residents` — post-completion duplicate is dropped (generation alone would match; `away_residents` rejects).
+- `jobless_goes_home_in_work_phase` — jobless → home in Work phase.
+- `mid_day_job_reassign_reroutes` — reassigned workplace routes from the OLD workplace (not teleport to new).
+- `depart_creates_token_only_if_route` — no token for an unreachable workplace; away resident NOT re-spawned.
+- `arrive_home_removes_token_and_away_residents` — ArrivedHome removes token + `away_residents`.
+- `no_exit_stays_put_not_teleport` — disconnected road network → no token, no handoff.
+- `dead_while_away_prunes_away_residents` — `away_residents` pruned for dead citizens.
+- `host_walks_visitor_home_animation` — foreign visitor walks workplace → border at off-work.
+- `return_now_animates` — home-side walk after a Move is received.
+- `idle_at_work_remembers_location` — reassigned worker departs from OLD workplace, not new.
+- Adapter: `traveler_views_includes_visiting_tokens`, `traveler_views_excludes_removed_citizen`.
+- Regions: `drain_move_resolves_border_link`, `drain_move_rolls_back_when_unroutable`, `receive_move_at_host_places_token`, `receive_rollback_clears_away`, `traveler_handoff_routes_to_destination_inbox`, `border_neighbor_map_maps_edge_to_neighbor`.
+
+### 7g. Diagrams
+
+**Before (P5a, two maps + two steppers + type conversion at every border):**
+
+```text
+  A (home):  world.travel[citizen] = TravelState  (idle/Away/Travelling)
+            step_travel()  →  schedule_intent + walk + cross
+            on cross: insert TravelState{Away, ...} into world.travel
+                       push PendingHandoff::Outbound { ..., return_path = [] }
+
+  Wire:     TravelerHandoff { token: TravelState, return_path: Vec<ReturnHop>,
+                             purpose: TravelPurpose::Outbound }
+
+  B (host): visiting_travel[TravelerId] = VisitingToken { token, return_path }
+            step_visiting()  →  walk to workplace
+            on workday end: push PendingHandoff::Return { return_path }
+                            remove from visiting_travel  (instant!)
+            on receive Return: apply_traveler_return (Away + gen check, clear)
+```
+
+**After (R-a, one map + one stepper + one move at the border):**
+
+```text
+  A (home):  world.tokens[citizen] = TravelToken { state, home, work, trip_gen }
+            (present iff away-from-home; idle-at-home = no token)
+            away_residents[citizen] = true iff on an active cross-region trip
+            away_generation[citizen] = monotonic trip stamp
+            step_tokens()  →
+                DEPART pass: resident without token & not in away_residents
+                             whose phase target ≠ home → depart (or no-op)
+                MOVE pass:   every present token → walk to target (one cell)
+                             dwell gate (cost = step_cost) before advancing
+                on ArrivedHome: remove token, remove from away_residents
+                on Reached(exit): emit PendingHandoff::Move { ..., trip_gen =
+                                bumped away_generation, away_residents inserted }
+
+  Wire:     TravelerHandoff { token: TravelToken, traveler, to_region,
+                             entry_link: Option<...>, kind: HandoffKind::Move }
+
+  B (host): world.tokens[citizen] = same TravelToken (placed at entry cell)
+            step_tokens()  →
+                MOVE pass:   token with home.region != self
+                             → advance_to_exit (target = token.home)
+                             → walk to border-exit, then Reached(exit) → Move
+            on receive Move: home_accepts (false for post-completion dup)
+                or place at entry cell (host case)
+
+  Animated return (one intentional change):
+    B: visitor's target = token.home; B's stepper walks the visitor
+       workplace → border (sub-tick by sub-tick, with dwell gating).
+    B: at the border cell → Reached(exit) → emit Move to A.
+    A: receive_traveler_handoff (Move) → home_accepts check → place at entry.
+    A: phase = Home → MOVE pass walks border → home.
+    A: at home → ArrivedHome → remove token, remove from away_residents.
+```
+
+**The stale-return guard (home_accepts, four-part check):**
+
+```text
+  home_accepts(c, gen) =
+      c ∈ world.citizens                          (not dead-while-away)
+   && c ∉ world.tokens.keys()                    (not already placed/walking home)
+   && c ∈ away_residents                          (on an ACTIVE trip)
+   && away_generation[c] == Some(gen)             (the CURRENT trip, not stale older)
+```
+
+- Dead-while-away: c removed from `world.citizens` → guard rejects.
+- Stale older trip: gen doesn't match the current `away_generation` → guard rejects.
+- Post-completion duplicate: c removed from `away_residents` on home-arrival → guard rejects.
+- Already-walking-home: c in `world.tokens` (a Move just placed it) → guard rejects.
+
+Paired `retain` after each `step_tokens` keeps `away_residents` and
+`world.tokens` consistent with `world.citizens`.

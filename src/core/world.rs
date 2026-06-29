@@ -68,20 +68,23 @@ pub(crate) struct World {
     // an empty cache and the first access recomputes.
     #[serde(skip, default)]
     route_cache: RefCell<RouteCache>,
-    // P3: per-citizen movement state, keyed by the citizen entity. `#[serde(skip)]`
-    // because it is transient display/derived state — `travel::run` rebuilds it
-    // from the daily schedule each tick, so a freshly-loaded world starts empty
-    // and re-derives placement on the next tick.
+    // P3 + P5 (R-a): one `TravelToken` per citizen *while away from home* (in the
+    // region where the body physically is; idle-at-home = no token). Keyed by the
+    // citizen entity (globally unique across regions). `#[serde(skip)]` because
+    // it is transient display/derived state — `step_tokens` rebuilds it from the
+    // daily schedule each tick, so a freshly-loaded world starts empty and
+    // re-derives placement on the next tick.
     #[serde(skip, default)]
-    pub(crate) travel: HashMap<Entity, crate::core::components::TravelState>,
-    // P5: tokens handed in by neighbor regions, stepping toward a local workplace
-    // and drawn as dots here while their home-region citizen is `Away`. Keyed by
-    // the round-trip `TravelerId`. `#[serde(skip)]` like `travel`.
+    pub(crate) tokens: HashMap<Entity, crate::core::components::TravelToken>,
+    // R-a: the home region's record of residents currently away across a region
+    // boundary. Inserted on cross-out (the token is placed in the neighbour),
+    // removed on home-arrival (the token is back, idle-at-home, no token
+    // needed). Together with `away_generation` it disambiguates a cross-region
+    // away resident from an idle/new one. `#[serde(skip)]` like `tokens`.
     #[serde(skip, default)]
-    pub(crate) visiting_travel:
-        HashMap<crate::core::components::TravelerId, crate::core::components::VisitingToken>,
-    // P5: crossings this region decided on this tick (outbound exits and returns),
-    // drained by the regions layer (P5b), which adds border-link routing and sends
+    pub(crate) away_residents: std::collections::HashSet<Entity>,
+    // P5: crossings this region decided on this tick (moves and rollbacks),
+    // drained by the regions layer, which adds border-link routing and sends
     // them. The core only produces them; it never routes.
     #[serde(skip, default)]
     pub(crate) outgoing_handoffs: Vec<crate::core::components::PendingHandoff>,
@@ -155,8 +158,8 @@ impl World {
             importable_remote_jobs: 0,
             cross_region_goods_routes: CrossRegionGoodsRoutes::default(),
             route_cache: RefCell::default(),
-            travel: HashMap::new(),
-            visiting_travel: HashMap::new(),
+            tokens: HashMap::new(),
+            away_residents: std::collections::HashSet::new(),
             outgoing_handoffs: Vec::new(),
             remote_exit_cells: HashMap::new(),
             border_neighbor_map: HashMap::new(),

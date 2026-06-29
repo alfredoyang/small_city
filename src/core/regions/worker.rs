@@ -1339,7 +1339,7 @@ mod tests {
     /// destination region's inbox.
     #[test]
     fn traveler_handoff_routes_to_destination_inbox() {
-        use crate::core::components::{TravelState, TravelerId};
+        use crate::core::components::{HandoffKind, TravelState, TravelToken, TravelerId};
         use crate::core::entity::Entity;
 
         let mut worker = RegionWorker::new(WorkerId(7));
@@ -1351,18 +1351,25 @@ mod tests {
             .unwrap();
 
         let handoff = TravelerHandoff {
-            token: TravelState::default(),
+            token: TravelToken {
+                state: TravelState::default(),
+                home: crate::core::components::PlaceRef {
+                    region: RegionId(1),
+                    building: Entity::new(RegionId(1), 0),
+                },
+                work: None,
+                trip_gen: 1,
+            },
             traveler: TravelerId {
                 citizen: Entity::new(RegionId(1), 5),
                 generation: 1,
             },
             to_region: RegionId(2),
-            entry_link: BorderLinkId {
+            entry_link: Some(BorderLinkId {
                 edge: BorderEdge::East,
                 offset: 0,
-            },
-            return_path: Vec::new(),
-            purpose: crate::core::components::TravelPurpose::Outbound,
+            }),
+            kind: HandoffKind::Move,
         };
         worker
             .route_outbound(
