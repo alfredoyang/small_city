@@ -1,7 +1,15 @@
-# 20260627 Multi-region commuting — dynamic both-way routing (incl. return home)
+# 20260627 Multi-region commuting — the Layer-1 routing registry
 
-Status: **plan** (not implemented). Builds on P5 cross-region tokens + P7 sub-tick
-movement. Pairs with `docs/travel-subtick-plan.md`.
+Status: **plan** (not implemented). Builds on P5 cross-region tokens + P7 sub-tick movement.
+
+> **Scope (after the token refactor was split out).** This plan now covers **only the
+> multi-hop routing layer** — the central L1 registry that makes `remote_exit_cells`
+> multi-hop, and the per-region Dijkstra pricing that feeds it. The **token model, the one
+> stepper, the move-not-convert handoff, and `Rollback`** moved to
+> `docs/20260629-unify-travel-tokens.md` (the behaviour-preserving refactor) — a
+> **prerequisite** that lands first. This plan assumes a single `TravelToken` whose stepper
+> routes to a remote endpoint via `remote_exit_cells`; here we only change *what that map
+> contains* (direct-neighbour → cost-routed multi-hop `RouteExit`s).
 
 ## 1. Introduction / Problem
 
@@ -32,102 +40,142 @@ long-term source of truth: if roads, border links, or topology change while a ci
 is away, every stored path can go stale, and rewriting every away/visiting token is
 brittle.
 
-**Goal.** One symmetric, **loop-safe, dynamic** routing rule for both directions,
-reusing the existing structures (`remote_exit_cells`, `advance_to_exit`,
-`Target::BorderExit`, `PendingHandoff`/`TravelerHandoff`, `VisitingToken`, the
-`StepTravel` barrier). Remove/deprecate `return_path`. Stable facts the token already
-carries:
+**Goal.** One symmetric, **loop-safe, dynamic** routing rule for both directions, on a
+**single `TravelToken`** (local citizens and visitors unified — see the refactor) carried region-to-region
+by the existing `PendingHandoff`/`TravelerHandoff` + `StepTravel` barrier. Remove
+`return_path` / the two-token split. Stable facts the token already carries:
 
 ```text
 traveler.citizen.region() = home region  (the return target)
 token.destination         = final workplace (the outbound target)
-current region topology   = the routing graph, recomputed each step
-current road graph        = the local path, recomputed each step
+directory region_routes   = the Layer-1 next-hop map (central snapshot, read each step)
+current road graph        = the Layer-2 local path (per-region route cache)
 ```
+
+### Scope — first remove the adjacency-only ROUTING, keep the crossing TRANSPORT
+
+The current cross-region travel splits cleanly into two parts; this plan **replaces the
+routing** and **keeps the transport**. Audit and excise the direct-neighbour-only routing
+*before* layering on multi-hop, so there is one routing path, not two.
+
+```text
+  REMOVE (direct-neighbour-only ROUTING — "adjacency")     KEEP (token crossing TRANSPORT)
+  ────────────────────────────────────────────────────     ─────────────────────────────────
+  refresh_remote_exit_cells: remote_exit_cells keyed by     RegionEvent::ReceiveTraveler / StepTravel
+    the DIRECT border_neighbor_map only (regions/mod.rs)     step_travel_city barrier (FIFO, 1-subtick stale)
+  resolve_target: Target::BorderExit.to_region =            PendingHandoff / TravelerHandoff carriers
+    workplace.region() (assumes direct neighbour)             (shape changes: drop return_path, add
+  return_path / ReturnHop stack + drain/receive popping       exit_link / Rollback — flow unchanged)
+    it (the stale stored route — components.rs, mod.rs)      drain_traveler_handoffs flow + OutboundMessage::
+  border_neighbor_map as a ROUTING source (its only            TravelerHandedOff / drained_*_messages
+    consumer was the direct exit map)                        cell_at_border_link / exit_link_for /
+                                                               matching_neighbor_link / border_road_links
+                                                             apply_traveler_return (clears the Away marker)
+                                                             world.{outgoing_handoffs}, the Away marker
+                                                               (token state now unified — §3)
+```
+
+So `remote_exit_cells` survives **as the field**, but its *meaning* and *producer*
+change: from "direct neighbour → its border cells" (direct map) to "destination region →
+cost-routed `RouteExit`s" (from `region_routes`). The token crossing event and all the
+border-link plumbing are untouched — only *which region is next* is now answered by the
+Layer-1 registry instead of the adjacency map / stored stack.
 
 ## 2. Proposal
 
-### One rule, both directions — a distance gradient on the ROAD-CONNECTED region graph
+### Two-layer routing — weighted Dijkstra on the road-cost region graph (full §5f)
 
-This is the unweighted v1 of `traffic-pathfinding-plan.md` §5f's **Layer 1** ("which
-regions to cross?"). Layer 2 (the road path *within* each region) already exists —
-`road_predecessors` (P1) + `route_cache` (P2) — and we reuse it untouched.
+This implements `traffic-pathfinding-plan.md` §5f **in full**: **Layer 1** = Dijkstra on a
+**road-cost-weighted region graph** ("which regions to cross, by lowest road cost?");
+**Layer 2** = the per-region road Dijkstra that already exists (`road_predecessors` P1 +
+`route_cache` P2). Neither layer ever crosses a region boundary — the token handoff does.
+
+```text
+  LAYER 1  "which regions to cross?"            LAYER 2  "which road cells in this region?"
+  ─────────────────────────────────            ──────────────────────────────────────────
+  graph  = road-cost region graph               graph  = road cells (one region's World)
+  weight = per-region road-crossing cost        weight = step_cost / crossing penalty (P7)
+           (each region's own Dijkstra)         algo   = Dijkstra → came_from tree
+  algo   = Dijkstra (cost to each region T)     status = ALREADY EXISTS — route_cache (P2)
+  output = next-hop exit toward T (min cost)    output = walk entry → exit (or → workplace)
+  runs   = directory (from PUBLISHED costs)     runs   = each region, share-nothing
+
+        A ─Layer1─► B ─Layer1─► C          (pick the region corridor by lowest road cost)
+        │           │           │
+      Layer2      Layer2      Layer2        (Dijkstra the road path inside each region)
+   (home→exit) (entry→exit) (entry→work)
+```
+
+**The cost comes from the regions, not the worker (share-nothing).** Each region owns its
+roads; only it can price a crossing. So:
+
+1. **Each region runs its own road Dijkstra** (reusing `route_cache`/`road_predecessors`)
+   to price every *border-entry → border-exit* traversal of itself (its `crossing_costs`),
+   and knows which neighbour each border link faces (its `border_links`).
+2. **Each region publishes** that `RegionRoadReport` up to `CrossRegionDiscovery`, exactly
+   as it already publishes `availability_hints` (spare resources).
+3. **The directory runs Layer-1 Dijkstra** over the assembled weighted region road graph
+   (intra-region edges = published `crossing_costs`; inter-region edges = matched
+   `border_links` crossings) → `region_routes`. **Destination-keyed**: one Dijkstra seeded
+   at each destination `T` fills a whole `RouteField` — every region's min-cost next-hop
+   exit toward `T` — in a single run (`region_routes.to[T].from[R]`).
+4. **A transiting token in region `R` reads `region_routes.to[T].from[R]`** for its next
+   hop toward its destination `T`, runs **Layer-2 Dijkstra** locally to that exit cell, then
+   crosses via the existing token handoff event.
+
+> This corrects §5f, which had the *worker* precompute the crossing cost — but the worker
+> has no `World`/road graph. Pricing is a per-region (share-nothing) job; the directory
+> only assembles the published `RegionRoadReport`s.
 
 **Use the road-connectivity graph, not region adjacency.** Two regions can share a map
-border with **no road crossing it**, so the routing graph must be the one §5f's Layer-1
-Dijkstra uses: regions linked where a `NetworkBorderLink` pair (a road) actually crosses,
-i.e. the directory's `CrossRegionDiscovery.road_crossings` (§3). Routing on raw
-`RegionNeighborLink` *adjacency* would compute distances along roadless borders and
-dead-end (see the failure diagram).
+border with **no road crossing it**, so its edges are the regions' published
+`border_links` (a road actually crosses), never raw `RegionNeighborLink` adjacency:
 
 ```text
   Region adjacency (RegionNeighborLink)        Road connectivity (NetworkBorderLink pairs)
   ─────────────────────────────────────        ───────────────────────────────────────────
   A ── B ── C   (all share borders)            A ══ B ── C    A-B road crosses; B-C border
                                                               has NO road
-                                               → the routing graph has edge A-B only;
-                                                 C is NOT reachable from B by road
+                                               → the graph has edge A-B only; C is NOT reachable
+                                                 from B by road
 ```
 
-Build a **region-level road graph** `G`: node = region; edge `R—N` iff some local
-`NetworkBorderLink` of `R` pairs with one of `N` (a road crosses that border). Then for a
-mover in region `R` heading to target region `T`:
+**Layer-1 is a cost-distance gradient** — for a mover in region `R` heading to target `T`,
+`cost_to_T[X]` = min road cost from `X` to `T` over the region road graph (Dijkstra seeded at `T`); the next
+hop is an edge `R—N` with `cost_to_T[N] < cost_to_T[R]`. Strict decrease of a Dijkstra
+distance guarantees termination (**no A→B→A loop**), and it being road-connected means a
+roadless border is never an edge (**no dead-end**). Outbound `T = workplace.region()`,
+return `T = traveler.citizen.region()` — **same machinery, opposite target.**
 
 ```text
-  dist_to_T[X] = BFS hops from X to T over G   (reverse-BFS seeded at T)
-  next hop     = an edge R—N in G with  dist_to_T[N] < dist_to_T[R]   (STRICT progress)
-  exit cands   = local road cells whose border link crosses to such an N
-  ties (several N at the shorter distance) → deterministic (by RegionId, then exit pos)
+Cost field for target T = C  (numbers = cost_to_T over the region road graph; edge labels = road-crossing cost):
+
+   ┌─────┐  cost 4  ┌─────┐  cost 3  ┌─────┐
+   │  A  │══════════│  B  │══════════│  C  │
+   │  7  │ ───────► │  3  │ ───────► │  0  │ = T
+   └─────┘  descend └─────┘  descend └─────┘
+  every step strictly decreases cost_to_T → always reaches C, never loops.
+  Return re-seeds the field at T = A and descends the other way.
 ```
 
-Because `G` already contains only road-connected edges, there is **no separate
-reachability filter** — connectivity is the graph. Strict monotone decrease of
-`dist_to_T` guarantees termination (no A→B→A loop). Outbound `T = workplace.region()`;
-return `T = traveler.citizen.region()`. **Same machinery, opposite target.**
+Lowest road COST, not fewest hops — a fast 3-hop corridor can beat a slow 2-hop one:
 
 ```text
-Distance field for target T = C  (numbers = dist_to_T over the ROAD graph G):
-
-        ┌─────┐   road   ┌─────┐   road   ┌─────┐
-        │  A  │══════════│  B  │══════════│  C  │
-        │  2  │ ───────► │  1  │ ───────► │  0  │ = T
-        └─────┘  descend └─────┘  descend └─────┘
-   every step strictly decreases dist_to_T → always reaches C, never loops.
-   Return simply re-seeds the field at T = A (so C=2, B=1, A=0) and descends the other way.
+   A ══ B ══ C     2 hops, but B is a congested grid: crossing cost 15 → total 18
+   ║         ║
+   D ══ E ══ ╝     3 hops on motorways: 4 + 5 + 4 = 13  → Dijkstra picks A-D-E-C
+  (Layer-1 edge weights ARE Layer-2 Dijkstra distances, so the two share one cost model.)
 ```
 
-Why it must be the road graph, not adjacency — the dead-end:
+And why it must be the road graph — the roadless dead-end:
 
 ```text
    A ── B ·· C        '··' = shared border but NO road (roadless)
    │         │        a SEPARATE road loops A—D—C
    D ════════┘
-  Adjacency BFS:  dist(B,C)=1 via B··C → B picks the roadless B/C border → DEAD END.
-  Road-graph BFS: B··C is not an edge; the only road path is A—D—C, so B is not even
-                  on a progressing route; A descends A(2)→D(1)→C(0) correctly.
-```
-
-### The two layers (this plan vs. §5f)
-
-```text
-  LAYER 1  "which regions to cross?"            LAYER 2  "which road cells in this region?"
-  ─────────────────────────────────            ──────────────────────────────────────────
-  graph  = road-connected region graph G       graph  = road cells (one region's World)
-  weight = 1 per hop   (THIS PLAN, v1)          weight = step_cost / crossing penalty (P7)
-         = road cost   (§5f, deferred)          algo   = Dijkstra → came_from tree
-  algo   = BFS distance field, descend          status = ALREADY EXISTS — route_cache (P2)
-  output = next-hop exit toward T               output = walk entry → exit (or → workplace)
-  runs   = worker (discovery snapshot)          runs   = each region, share-nothing
-
-        A ─Layer1─► B ─Layer1─► C          (pick the region corridor by descending dist_to_T)
-        │           │           │
-      Layer2      Layer2      Layer2        (walk the road path inside each region)
-   (home→exit) (entry→exit) (entry→work)
-
-  Neither layer ever crosses a region boundary — the token message (handoff) does.
-  THIS PLAN = §5f with Layer 1 unweighted (hop count). Swapping BFS→weighted Dijkstra
-  on the SAME graph G (border_crossing_cost) is §5f's deferred quality upgrade; nothing
-  else changes.
+  Adjacency:   B··C looks like a 1-hop edge → B picks the roadless B/C border → DEAD END.
+  Road graph:  B··C is not an edge; the only road path is A—D—C, so A descends its
+               cost field A→D→C correctly and B is simply not on a progressing route.
 ```
 
 ### Multi-region flow (A → B → C, then home)
@@ -135,16 +183,16 @@ Why it must be the road graph, not adjacency — the dead-end:
 ```text
 Home A                   Transit B                  Work C
 ------                   ---------                  ------
-T=C; next hop=B (dist B<dist A)
+phase=Work → target=C; next hop=B
 walk A→A/B exit
-Outbound ──────────────> T=C; next hop=C
+MOVE token ────────────> target=C; next hop=C
                          walk B/A → B/C exit
-                         Outbound ───────────────> T=C reached: walk to workplace
-                                                    workday ends → T=A
-                         Return <───────────────── next hop=B (dist B<dist C)
-                         T=A; next hop=A
+                         MOVE token ─────────────> target=C reached: walk to workplace, idle
+                                                    phase flips → Home: target=A
+                         MOVE token <───────────── next hop=B (the SAME stepper, opposite endpoint)
+                         target=A; next hop=A
                          walk B/C → B/A exit
-Return <──────────────── final home region: walk border → home
+MOVE token <──────────── home region: walk border → home, idle
 ```
 
 ### Road / topology change behaviour
@@ -152,11 +200,12 @@ Return <──────────────── final home region: walk
 ```text
 Stored return_path:  fixed C→B→A; a link change strands the token unless every token
                      is rewritten.
-Gradient (this plan): each ReceiveTraveler/StepTravel recomputes dist(·,T) and the
-                     reachable exits from the CURRENT snapshot. Road removed → the
-                     local exit re-pick (advance_to_exit) chooses another reachable
-                     exit toward a still-closer neighbour; topology changed → the
-                     gradient points elsewhere. If no progressing+reachable exit
+Gradient (this plan): the directory precomputes region_routes once per change
+                     (rebuild_discovery); each ReceiveTraveler/StepTravel READS the
+                     current snapshot's next-hop (no per-step recompute). Road removed →
+                     directory rebuilds the routes AND the local exit re-pick
+                     (advance_to_exit) chooses another reachable exit; topology changed →
+                     the snapshot's gradient points elsewhere. If no progressing exit
                      exists, emit PendingHandoff::Rollback → routed directly to the home
                      region by id → apply_traveler_return clears Away (never strand,
                      cosmetic teleport only when the road route home is severed).
@@ -177,160 +226,200 @@ one-sub-tick-stale guarantee); a 2-hop trip simply takes more sub-ticks.
 
 ## 3. Important functions and structures
 
-### `src/core/regions/worker.rs` — the gradient map (the one genuinely new piece)
+### `src/core/regions/directory.rs` — the central Layer-1 routing registry
 
-**Directory change first (small, required).** `CrossRegionDiscovery` today keeps only
-`components: Vec<Vec<RegionRoadNetworkId>>` (`directory.rs:38`) — `build_component_graph`
-(`directory.rs:229`) unions matched border links via `BorderLinkIndex` and then
-**discards the crossing edges**. A component `{A_net, B_net, C_net}` cannot tell whether
-A crosses *directly* to C, nor which local `BorderLinkId` reaches B vs C — so `G` is not
-derivable from `components` alone. Preserve the edges the union loop already has
-(`directory.rs:244`, where `left` is a `NetworkBorderLink` of `R` and the matched
-`topology` neighbour is `N`):
+The region routing map is **cross-region state**, so it lives where the other
+cross-region collectors live: the coordinator-owned `CrossRegionDiscovery` snapshot
+(`directory.rs:38`), built once per change in `rebuild_discovery` (`directory.rs:160`)
+and read lock-free via `discovery_snapshot()`. This is the **cross-region sibling of
+`resource_registry.rs`** — `resource_registry` is region-*local* (per-`World`); the
+directory snapshot is the central one (it already holds `components` for resource
+reachability + `availability_hints` for every region's spare capacity). Layer-1 routing
+belongs in the same place, built at the same chokepoint, snapshotted to all readers —
+the build-once-cache-until-change pattern, lifted to the cross-region layer. Workers/
+regions **read** it; nobody recomputes a region graph per pass.
 
-```rust
-pub struct RoadCrossing { pub region: RegionId, pub link: BorderLinkId, pub neighbour: RegionId }
-// CrossRegionDiscovery gains: pub road_crossings: Vec<RoadCrossing>   (sorted, deterministic)
-// components stays as-is for existing resource reachability.
-```
-
-The travel helper then BFS-distances over the **road-connected region graph** `G` built
-from `road_crossings` (node = region; edge `R—N` for each crossing), *not* raw
-`RegionNeighborLink` adjacency (§2). This is §5f's Layer 1, unweighted.
-
-The worker has only links/topology/discovery — **no `World`/grid `Entity` cells** — so it
-returns *links*, and `RegionState` converts them to road cells (as
-`refresh_remote_exit_cells` already does):
-
-```rust
-/// Worker side: for each destination region T road-connected from `region_id`, the local
-/// border links crossing to a STRICTLY-closer neighbour on the ROAD graph G
-/// (dist_to_T[N] < dist_to_T[R]).
-fn travel_destination_exits_for_region(
-    discovery: &CrossRegionDiscovery,         // .road_crossings → road graph G (edges + dist_to_T)
-    region_id: RegionId,
-    border_links: &[NetworkBorderLink],
-    is_owned: impl Fn(RegionId) -> bool,
-) -> HashMap<RegionId, Vec<ExitLink>>         // T → sorted { link, to_region }
-```
-
-Contract: deterministic (BFS over sorted road-graph edges; each `Vec<ExitLink>` sorted +
-deduped). A destination appears only when a strictly-closer owned neighbour exists on `G`
-— connectivity is the graph, so there is no separate reachability filter.
-
-### `ExitCandidate` — carry the crossing, not just a cell (`regions/mod.rs`)
-
-`remote_exit_cells: HashMap<RegionId, Vec<Entity>>` (bare road cells) is **not enough**:
-`drain_traveler_handoffs` must know the immediate next-hop neighbour and link, and a
-border/corner road cell can carry multiple links. `RegionState::refresh_remote_exit_cells`
-converts the worker's `ExitLink`s to:
-
-```rust
-pub struct ExitLink      { pub link: BorderLinkId, pub to_region: RegionId }   // worker output
-pub struct ExitCandidate { pub cell: Entity, pub link: BorderLinkId, pub to_region: RegionId }
-// world.remote_exit_cells: HashMap<RegionId, Vec<ExitCandidate>>   // keyed by destination T
-```
-
-`resolve_target`/`advance_to_exit` walk to `candidate.cell`; `drain` reads
-`candidate.link`/`candidate.to_region` directly (no `exit_link_for(cell, region)`
-re-derivation, which is ambiguous on multi-link cells).
-
-### `src/core/components.rs`
-
-- `ReturnHop`, `return_path` — **remove** (first stop depending on them, delete in a
-  small follow-up to keep the diff readable). They encode stale route state.
-- `TravelerHandoff` — keep as the crossing carrier; drop `return_path`. Make
-  `entry_link: Option<BorderLinkId>`. For `Outbound`/`Return` it is `Some(sender-side
-  link)` (the immediate crossing); for the new `Rollback` purpose it is `None`. `to_region`
-  is the immediate next-hop neighbour (or, for `Rollback`, the home region directly).
-- `TravelPurpose` — add a third variant `Rollback` (alongside `Outbound`/`Return`), the
-  by-id un-strand delivered to home; the receiver handles it before any border placement.
-- `PendingHandoff::Outbound` — keep; carries `{ traveler, token, to_region, exit_link }`
-  (the immediate next-hop neighbour and its crossing link, from the chosen
-  `ExitCandidate` — not a bare `exit_cell`, which is ambiguous on a multi-link road).
-  Final workplace stays in `token.destination`.
-- `PendingHandoff::Return` — replace the `return_path` field with `{ traveler, to_region,
-  exit_link }` (the same immediate-crossing shape as Outbound).
-- `PendingHandoff::Rollback { traveler }` — NEW, the never-strand escape hatch. When a
-  transit/work region finds **no progressing+reachable exit toward home**, it emits this;
-  the worker routes it **directly to `traveler.citizen.region()` by id** (not by border
-  topology), and the home region calls `apply_traveler_return` to clear `Away` (a cosmetic
-  teleport home — only happens when the road route home is severed mid-trip).
-- `VisitingToken` — keep the container; add a small purpose tag (no new token type):
-
-```rust
-pub enum VisitingPurpose {
-    Work,                                                   // at the final workplace region
-    TransitOutbound { final_workplace: Entity, to_region: RegionId, exit_link: BorderLinkId },
-    TransitReturn  { to_region: RegionId, exit_link: BorderLinkId },   // toward home
-}
-pub struct VisitingToken { pub token: TravelState, pub purpose: VisitingPurpose }
-```
-
-`TravelState.destination` is the **local** movement target while transiting (the exit
-cell); `final_workplace` keeps the true workplace for `TransitOutbound`.
-
-Token lifecycle across a 2-hop commute (A home, B transit, C work):
+Exactly two kinds of structure, with one direction of flow — **INPUT** each region
+publishes, and **OUTPUT** the directory computes from all inputs and stores in the
+snapshot. Nothing is shared both ways; the only overlap value (a region id) is named for
+its role on each side.
 
 ```text
-  local citizen (A.world.travel)                 visiting token (X.world.visiting_travel)
-  ──────────────────────────────                 ─────────────────────────────────────────
-  Target::BorderExit → walk to A/B exit
-        │ Cross (mark Away, PendingHandoff::Outbound)
-        ▼ handoff to B
-                                          B: VisitingPurpose::TransitOutbound → walk to B/C exit
-                                                │ reached exit → PendingHandoff::Outbound
-                                                ▼ handoff to C
-                                          C: VisitingPurpose::Work → walk to workplace, park
-                                                │ workday ends → depart building
-                                                ▼ VisitingPurpose::TransitReturn → walk to C/B exit
-                                                │ reached exit → PendingHandoff::Return
-                                                ▼ handoff to B
-                                          B: VisitingPurpose::TransitReturn → walk to B/A exit
-                                                │ reached exit → PendingHandoff::Return
-        ┌───────────────────────────────────────┘ handoff to A
-        ▼ A is home: receive_traveler_return → walk border → home, clear Away
-  (any region, no progressing exit / stale entry → PendingHandoff::Rollback → home clears Away)
+  per region (share-nothing)            CrossRegionDiscovery (central snapshot)
+  ────────────────────────────          ───────────────────────────────────────────────
+  RegionRoadReport            ──publish──►  reports: Vec<RegionRoadReport>   (INPUT, raw)
+   ├ border_links: Vec<BorderLink>           │
+   │   {link, neighbour}                      │ build_region_routes (in rebuild_discovery):
+   └ crossing_costs: Vec<CrossCost>           │   1. assemble the region road graph from every report's
+       {entry, exit, cost}                    │      border_links (edges) + crossing_costs (weights)
+                                              │   2. Dijkstra per destination T
+                                              ▼
+                                         region_routes: RegionRoutes        (OUTPUT, answer)
+                                           to[T]: RouteField
+                                             from[R]: RouteHop { exits, cost }
+
+  token in R heading to T ──read──► region_routes.to[T].from[R].exits   (one lookup)
 ```
 
-### `src/core/systems/travel.rs`
+**INPUT — what a region knows about itself** (computed in its own `World`, published on
+the existing `availability_hints` path):
 
-- `resolve_target` — keep using `remote_exit_cells[workplace.region()]`; with the map
-  now multi-hop, local-citizen outbound needs no new logic beyond reading
-  `ExitCandidate.cell`. **Fix `Target::BorderExit.to_region`**: today it is
-  `workplace.region()` (the FINAL region); it must become the chosen
-  `candidate.to_region` (immediate next hop) — otherwise multi-hop crossings route to
-  the wrong region.
-- `advance_to_exit` (`travel.rs:340`) — reuse; it already re-picks reachable candidates
-  when they change.
-- `depart_to_cell` (`travel.rs:516`, `(world, networks, origin, dest_cell) -> Option<Entity>`
-  returning the entry road cell) / `advance_to_building` (`travel.rs:416`) — reuse for the
-  **workday-end departure**: a final-region work visitor is parked off-road
-  (`current_cell = None`) at the workplace, so the return must first depart the building
-  to a reachable exit using the existing building→road departure (wrapping the returned
-  entry cell into a `TravelState`), not a shortcut.
-- `step_visiting_tokens` / `step_visiting` — extend by `VisitingPurpose`: Work (current
-  behaviour) · TransitOutbound (walk to exit → `PendingHandoff::Outbound`) · TransitReturn
-  (walk to exit → `PendingHandoff::Return`). Keep the P7b dwell gate (already applied to
-  visiting tokens).
-- `receive_traveler_return` — keep for the final home-region leg.
-- `apply_traveler_return` — clears the `Away` mark **in the home region only** (it mutates
-  the home `world.travel` entry; it is a no-op in a transit/work region, which has no
-  local entry for that citizen). So it is the fallback *at home*, not everywhere — see the
-  `Rollback` path below for the non-home failure case.
+```rust
+pub struct RegionRoadReport {                  // one per region, published each change
+    pub region: RegionId,
+    pub border_links: Vec<BorderLink>,         // an edge of the region road graph: my border link → the neighbour it reaches
+    pub crossing_costs: Vec<CrossCost>,        // an edge weight: my own Dijkstra, border entry → border exit
+}
+pub struct BorderLink { pub link: BorderLinkId, pub neighbour: RegionId }
+pub struct CrossCost  { pub entry: BorderLinkId, pub exit: BorderLinkId, pub cost: u32 }
+```
 
-### `src/core/regions/mod.rs`
+**OUTPUT — what the directory computes** (one Layer-1 Dijkstra per destination):
 
-- `receive_traveler_handoff` — branch by whether `self.id` is the final target:
-  - Outbound, `self == workplace.region()` → create a Work visitor.
-  - Outbound, transit → create a `TransitOutbound` token toward the current
-    gradient exit.
-  - Return, `self == home region` → `receive_traveler_return`.
-  - Return, transit → create a `TransitReturn` token toward the current gradient exit.
-- `drain_traveler_handoffs` — stop reading/writing `return_path`; for both kinds, take
-  `ExitCandidate.link`/`to_region` and emit the immediate `TravelerHandoff`.
-- `cell_at_border_link`, `exit_link_for`, `border_road_links`, `refresh_remote_exit_cells`
-  — reuse (the last now stores `ExitCandidate`s).
+```rust
+pub struct CrossRegionDiscovery {
+    pub components: Vec<Vec<RegionRoadNetworkId>>,         // existing — resource reachability
+    pub availability_hints: Vec<RegionalAvailabilityHint>,// existing — spare resources
+    pub region_routes: RegionRoutes,                      // NEW — the Layer-1 route table
+}
+
+pub struct RegionRoutes {                      // outer key = DESTINATION region
+    to: HashMap<RegionId /*T*/, RouteField>,   // region_routes.to[T] = the field toward T
+}
+pub struct RouteField {                        // one Dijkstra-at-T tree: every source's answer
+    from: HashMap<RegionId /*R*/, RouteHop>,   // region_routes.to[T].from[R]
+}
+pub struct RouteHop {                          // R's answer for "how do I get toward T?"
+    pub exits: Vec<ExitLink>,                  // min-cost next-hop crossing link(s), sorted
+    pub cost: u32,                             // R's total road cost to T
+}
+pub struct ExitLink { pub link: BorderLinkId, pub to_region: RegionId }  // the next crossing
+
+impl RegionRoutes {
+    // for region R: each reachable destination T → R's next-hop exits toward T.
+    fn exits_from(&self, r: RegionId) -> HashMap<RegionId, Vec<ExitLink>> {
+        self.to.iter()
+            .filter_map(|(t, field)| field.from.get(&r).map(|hop| (*t, hop.exits.clone())))
+            .collect()
+    }
+}
+```
+
+The edges of the region road graph come from the regions' `border_links` (not from `components`, which
+`build_component_graph` builds by unioning and then *discarding* the edges). `RegionRoadReport`
+is the travel analogue of `RegionalAvailabilityHint` (per-region published input);
+`RegionRoutes` is the travel analogue of `components` (directory-computed output) and is the
+destination-keyed form of §5f's `border_route_hint`. Determinism: Dijkstra over sorted
+`border_links` with cost tie-breaks (cost, then `RegionId`, then `BorderLinkId`); every
+`Vec<ExitLink>` sorted + deduped. Connectivity is intrinsic to the graph — no reachability filter.
+
+### `src/core/regions/worker.rs` / `RegionState` — publish costs, read routes
+
+- **Publish (step 1–2):** `RegionState::road_report()` builds its `RegionRoadReport` (the
+  per-region Dijkstra, §4) and the worker forwards it to the directory alongside the
+  existing availability publish — *the worker carries the report, the region computes it*
+  (the worker has no `World`/road graph).
+- **Read (step 3):** the worker reads `discovery.region_routes.exits_from(R)` (a lookup, no
+  graph search) and hands `RegionState` the `ExitLink`s;
+  `RegionState::refresh_remote_exit_cells` resolves each `ExitLink` → road cell(s) as today.
+
+```rust
+let exit_links: HashMap<RegionId, Vec<ExitLink>> =
+    discovery.region_routes.exits_from(R);          // destination T → R's cost-sorted exits toward T
+runtime.set_travel_destination_exits(exit_links);   // RegionState resolves links → cells
+```
+
+### Build, caching & locking (how `region_routes` is published)
+
+`region_routes` is built and published exactly like the directory's existing central state
+(`components`, `availability_hints`) — see the decision record
+`docs/20260628-l1-map-build-locking.md` for the full analysis. In short:
+
+```text
+  publish_state (Mutex)   — held across update + WHOLE-map rebuild   (the build)
+  active_snapshot (Mutex) — held only to STORE the new Arc           (the swap, brief)
+                          — routing reads take it only to Arc::clone (brief, never blocks the build)
+```
+
+- The worker whose region's `RegionRoadReport` changed calls `publish_region`, which
+  **rebuilds the whole `region_routes`** (a full Dijkstra-per-destination recompute from
+  all reports — not an incremental patch), under `publish_state`. Same flow as
+  `build_component_graph` today; idempotent (`directory.rs:150`): an unchanged report → no
+  rebuild.
+- It then swaps the new `Arc<CrossRegionDiscovery>` into `active_snapshot` (a brief write).
+  Routing reads (`discovery_snapshot()`, every sub-tick) just `Arc::clone` it — **never
+  blocked by the rebuild**.
+- The **heavy** road-cell Dijkstra is the per-region `road_report()` (each region's own
+  `World`, **off the directory lock**, share-nothing). The directory runs only the **small
+  region-level** Dijkstra (nodes = `(region, border-link)`), so the rebuild is bounded by
+  region count and only happens on a road-graph change.
+
+> **v1: keep the build under `publish_state`** (correct + simplest; small + rare). It holds
+> the write lock only against other *publishers*, never readers. **Do not** shrink to a
+> naive lock-only-swap — it loses a concurrent publisher's update. If profiling later shows
+> publisher contention, move the rebuild to a single owner / a generation-CAS swap (the two
+> escape hatches in the decision record).
+
+### `RouteExit` — "to reach region T, leave HERE through this exit" (`regions/mod.rs`)
+
+A **`RouteExit`** is one region's local answer to *"a token wants to reach final region T —
+where does it leave me, and what's the next region?"* It is the cell-resolved form of a
+Layer-1 next-hop: **walk to `cell`, which crosses via `link` into next-hop `to_region`.**
+Every region on the route except the final one holds one (or a few, cost-ordered) per
+destination; the token follows a *chain* of them, one per region.
+
+```text
+  Token's final destination = C.   Each region looks up ITS OWN RouteExit toward C:
+
+   Region A                     Region B                     Region C
+   ┌───────────────┐            ┌───────────────┐            ┌───────────────┐
+   │ remote_exit_  │            │ remote_exit_  │            │  (final — no   │
+   │  cells[C] =    │            │  cells[C] =    │            │   RouteExit;   │
+   │  RouteExit{    │  AB_link   │  RouteExit{    │  BC_link   │   walk to the  │
+   │   cell ───────────┐         │   cell ───────────┐         │   workplace)   │
+   │   link: AB_link│  │ cross   │   link: BC_link│  │ cross   │                │
+   │   to_region: B │  ▼ to B    │   to_region: C │  ▼ to C    │                │
+   └───────────────┘            └───────────────┘            └───────────────┘
+        │ Layer-2 walk to cell        │ Layer-2 walk to cell
+        └──── handoff ────────────────┘──── handoff ───────────►
+
+   keyed by FINAL destination (C) · `to_region` is the IMMEDIATE next hop (A→B, B→C)
+```
+
+It exists because the bare `HashMap<RegionId, Vec<Entity>>` (cells only) is **not enough**:
+`drain_traveler_handoffs` needs the immediate next-hop neighbour *and* link, and a
+border/corner road cell can carry multiple links — so `exit_link_for(cell, region)` would
+be ambiguous. `RouteExit` keeps the `link` and `to_region` the Layer-1 router already chose,
+so nothing is re-derived. `RegionState::refresh_remote_exit_cells` resolves the directory's
+link-level `ExitLink`s into cell-level `RouteExit`s:
+
+```rust
+pub struct ExitLink  { pub link: BorderLinkId, pub to_region: RegionId }            // directory output (link-level)
+pub struct RouteExit { pub cell: Entity, pub link: BorderLinkId, pub to_region: RegionId } // region-local (cell-resolved)
+// world.remote_exit_cells: HashMap<RegionId /*final destination T*/, Vec<RouteExit>>
+```
+
+`resolve_target`/`advance_to_exit` walk to `route_exit.cell`; `drain` reads
+`route_exit.link`/`route_exit.to_region` directly (no ambiguous `exit_link_for`).
+
+### Token model & movement — see the refactor (prerequisite)
+
+The single `TravelToken`, the one stepper, the move-not-convert handoff (`kind: {Move,
+Rollback}`), the home-region front-end, and `Rollback` all live in
+**`docs/20260629-unify-travel-tokens.md`** and land first. This plan assumes that stepper:
+it routes a token toward a *remote* endpoint by walking to `remote_exit_cells[target.region]`
+and emitting `PendingHandoff::Move`. **The only thing this plan changes is what
+`remote_exit_cells` contains** — direct-neighbour cells become cost-routed multi-hop
+`RouteExit`s, and `RouteExit.to_region` is the immediate *next hop* (not the final region).
+
+### `src/core/regions/mod.rs` (routing wiring only)
+
+- `refresh_remote_exit_cells` — instead of the direct `border_neighbor_map`, resolve the
+  worker's `region_routes.exits_from(self.id)` (`ExitLink`s) into cell-level `RouteExit`s via
+  `cell_at_border_link` / `border_road_links` (sorted). The stepper and handoff are unchanged.
+- `drain_traveler_handoffs` — a `Move` already carries `RouteExit.{link, to_region}` from the
+  stepper, so drain emits the `TravelerHandoff` directly (no `exit_link_for(cell, region)`
+  re-derivation, which is ambiguous on a multi-link cell). Unchanged otherwise.
 
 ### `src/core/regions/runtime/mod.rs`, `src/core/regional_game_runner.rs`
 
@@ -339,251 +428,182 @@ Token lifecycle across a 2-hop commute (A home, B transit, C work):
 
 ## 4. Pseudocode / integration
 
-### Worker builds the gradient destination-exit map
+### Step 1 — each region prices its own crossings (Layer-2 Dijkstra, share-nothing)
 
 ```rust
-for runtime in regions {
-    runtime.set_border_neighbor_map(border_neighbor_map_for_region(...)); // direct, unchanged
-    let exit_links = travel_destination_exits_for_region(
-        &directory.discovery_snapshot(),    // .road_crossings → road graph G + dist_to_T (§ below)
-        runtime.region_id(),
-        &runtime.state().network_border_links(),
-        |region| owners.owner_of(region).is_some(),
-    );                                       // T → Vec<ExitLink { link, to_region }>
-    runtime.set_travel_destination_exits(exit_links);  // RegionState resolves links → cells
+// RegionState — reuses route_cache / road_predecessors (the SAME Dijkstra Layer 2 uses).
+fn road_report(&self) -> RegionRoadReport {
+    let links: Vec<BorderLinkId> = self.border_road_links();           // my border links (sorted)
+    let mut crossing_costs = Vec::new();
+    for entry in &links {
+        let tree = self.world.routes_from(self.cell_at_border_link(*entry));  // one Dijkstra
+        for exit in &links {
+            if exit == entry { continue }
+            if let Some(cost) = tree.cost_to(self.cell_at_border_link(*exit)) {
+                crossing_costs.push(CrossCost { entry: *entry, exit: *exit, cost }); // cross me entry→exit
+            }
+        }
+    }
+    RegionRoadReport {
+        region: self.id,
+        border_links: self.border_link_neighbours(),   // Vec<BorderLink { link, neighbour }>
+        crossing_costs,                                 // Vec<CrossCost>, sorted, deterministic
+    }
 }
-// For A-B-C: A maps C → A/B links (next hop B, dist B<dist A); B maps C → B/C links;
-//            C maps A → C/B links; B maps A → B/A links. Never the backward link.
+// O(border_links) single-source Dijkstra runs — fine for small border counts. Recomputed
+// when this region's roads change (same dirty signal as availability), then published.
 ```
 
-### Next-hop selection (the gradient, shared by outbound and return)
+### Step 3 — directory assembles the region road graph and runs Layer-1 Dijkstra (in `rebuild_discovery`)
 
 ```rust
-// Worker side, once per pass, deterministically (returns LINKS — no grid access here):
-fn progressing_exit_links(discovery, region R, target T, border_links, is_owned)
-    -> Vec<ExitLink>
+// directory.rs rebuild_discovery — the single chokepoint, alongside build_component_graph.
+fn build_region_routes(reports: &[RegionRoadReport], is_owned: impl Fn(RegionId)->bool)
+    -> RegionRoutes
 {
-    // Build the ROAD-connected region graph G from discovery.road_crossings (each is a real
-    // road crossing region—neighbour via a specific local link). Node = region; edge R—N
-    // for each crossing. Roadless borders aren't crossings → not edges → no dead-end.
-    let g = region_graph_from(&discovery.road_crossings);   // edges R—N
-    let dist_to_t = bfs(&g, T);                              // hops to T over G (unweighted; §5f weights later)
-    let mut out = Vec::new();
-    for c in discovery.road_crossings.where(region == R) {   // each gives the local link AND neighbour
-        if is_owned(c.neighbour)
-           && dist_to_t.get(c.neighbour).zip(dist_to_t.get(R)).is_some_and(|(dn, dr)| dn < dr) { // STRICT
-            out.push(ExitLink { link: c.link, to_region: c.neighbour });   // connectivity is the graph
+    // Region road graph: node = (region, border_link). Intra-region edge entry→exit =
+    // the report's crossing_costs; inter-region edge = matched border_links pair (cost 0).
+    // Only owned, road-connected edges are added.
+    let g = weighted_region_graph(reports, &is_owned);
+    let mut to = HashMap::new();
+    for t in g.target_regions() {                       // ONE Dijkstra per DESTINATION T
+        let cost_to_t = dijkstra(&g, t);                // min road cost from every node to T
+        let mut from: HashMap<RegionId, RouteHop> = HashMap::new();
+        for report in reports {
+            for bl in &report.border_links {            // candidate crossing R=report.region → bl.neighbour
+                if is_owned(bl.neighbour) && progresses(&cost_to_t, report.region, bl) {  // strictly lower
+                    let hop = from.entry(report.region).or_default();
+                    hop.exits.push(ExitLink { link: bl.link, to_region: bl.neighbour });
+                    hop.cost = cost_to_t[&node(report.region)];   // R's cost to T
+                }
+            }
         }
-    }
-    out.sort_by_key(|e| (e.to_region.0, e.link.0));   // determinism
-    out.dedup();
-    out
-}
-// RegionState::refresh_remote_exit_cells then maps each ExitLink → ExitCandidate by
-// resolving link → road cell(s) via cell_at_border_link / border_road_links (sorted).
-```
-
-### Outbound local citizen (unchanged shape, multi-hop via the map)
-
-```rust
-ScheduleIntent::Work(workplace) if workplace.as_local(region).is_none() => {
-    match world.remote_exit_cells.get(&workplace.region()) {     // now multi-hop
-        Some(exits) if !exits.is_empty() => Target::BorderExit {
-            candidates: exits,        // ExitCandidate { cell, link, to_region }
-            workplace,                // final workplace (stays in token.destination)
-            // to_region is the chosen candidate.to_region (immediate next hop),
-            // NOT workplace.region().
-        },
-        _ => Target::Building(home),  // truly unreachable → idle (unchanged)
-    }
-}
-```
-
-### Receive (outbound or return) — same branch shape
-
-```rust
-fn receive_traveler_handoff(h) -> Vec<TravelerHandoff> {
-    // Rollback arrives at home by id — clear Away before any border work, never strand.
-    if h.purpose == Rollback { travel::apply_traveler_return(world, h.traveler); return Vec::new(); }
-
-    let target = match h.purpose {
-        Outbound => h.token.destination?.region(),       // final workplace region
-        Return   => h.traveler.citizen.region(),         // home region
-        Rollback => unreachable!(),                       // handled by the top guard
-    };
-    // Place at the local entry cell (sender-side link → local). If the entry road
-    // vanished since the sender emitted (one-sub-tick stale), DO NOT drop — roll home.
-    let Some(entry_cell) = h.entry_link.and_then(|l| cell_at_border_link(l.matching_neighbor_link())) else {
-        return rollback_or_clear(self.id, target, h.traveler);   // home → apply_traveler_return; else Rollback
-    };
-    if self.id == target {
-        match h.purpose {
-            Outbound => travel::receive_traveler_work(world, h.traveler, entry_cell, h.token.destination?),
-            Return   => travel::receive_traveler_return(world, h.traveler, entry_cell),
+        for hop in from.values_mut() {                  // cost-ordered, deterministic
+            hop.exits.sort_by_key(|x| (cost_at(&cost_to_t, x), x.to_region.0, x.link.0));
+            hop.exits.dedup();
         }
-        return Vec::new();
+        to.insert(t, RouteField { from });              // the whole field toward T, one run
     }
-    // transit: pick the current gradient exit toward `target`, create a transit token
-    let Some(cand) = current_gradient_exit_toward(target, entry_cell) else {
-        // no progressing+reachable exit → never strand: roll the citizen home by id.
-        world.outgoing_handoffs.push(PendingHandoff::Rollback { traveler: h.traveler });
-        return Vec::new();
-    };
-    travel::receive_transit_traveler(world, h.traveler, entry_cell, cand.cell, match h.purpose {
-        Rollback => unreachable!(),   // handled at the top
-        Outbound => VisitingPurpose::TransitOutbound { final_workplace: h.token.destination?,
-                                                       to_region: cand.to_region, exit_link: cand.link },
-        Return   => VisitingPurpose::TransitReturn  { to_region: cand.to_region, exit_link: cand.link },
-    });
-    Vec::new()
+    RegionRoutes { to }
 }
-
-// Never-strand helper: at home clear Away locally; elsewhere route a Rollback to home by id.
-fn rollback_or_clear(self_id, target, traveler) -> Vec<TravelerHandoff> {
-    if self_id == traveler.citizen.region() { travel::apply_traveler_return(world, traveler); }
-    else { world.outgoing_handoffs.push(PendingHandoff::Rollback { traveler }); }
-    Vec::new()
-}
+// For destination C: to[C].from[A] → A/B link (min-cost corridor); to[C].from[B] → B/C.
+// For destination A: to[A].from[C] → C/B; to[A].from[B] → B/A. A congested region is
+// skipped for a cheaper detour (the motorway example in §2).
 ```
 
-### Transit token reaches its border exit (step_visiting)
+### Worker reads the registry (a lookup, no graph search)
 
 ```rust
-if token.current_cell == token.destination {                 // arrived at the exit cell
-    let pending = match purpose {
-        TransitOutbound { final_workplace, to_region, exit_link } => PendingHandoff::Outbound {
-            traveler, token: travelling(token.current_cell, final_workplace), to_region, exit_link },
-        TransitReturn { to_region, exit_link } => PendingHandoff::Return { traveler, to_region, exit_link },
-    };
-    world.outgoing_handoffs.push(pending);
-    remove visiting token;
+let discovery = directory.discovery_snapshot();          // Arc<CrossRegionDiscovery>
+for runtime in regions {
+    runtime.set_travel_destination_exits(                // destination T → Vec<ExitLink>, precomputed
+        discovery.region_routes.exits_from(runtime.region_id()),
+    );                                                   // replaces the old direct border_neighbor_map map
 }
+// RegionState::refresh_remote_exit_cells maps each ExitLink → RouteExit via
+// cell_at_border_link / border_road_links (sorted) — unchanged.
 ```
 
-### Workday end in the final region (parked departure reused)
+### Movement (stepper / receive / drain) — in the refactor
 
-```rust
-if purpose == Work && schedule_phase(hour) != Work {
-    let target = traveler.citizen.region();                   // home
-    let Some(cand) = current_gradient_exit_toward(target, work_building_cell) else {
-        world.outgoing_handoffs.push(PendingHandoff::Rollback { traveler });  // no road home
-        remove visiting token; return;
-    };
-    // depart the parked off-road visitor via the existing building→road path; the entry
-    // road may itself be unreachable now → roll home rather than strand:
-    let Some(entry) = depart_to_cell(world, networks, work_building, cand.cell) else {
-        world.outgoing_handoffs.push(PendingHandoff::Rollback { traveler });
-        remove visiting token; return;
-    };
-    visiting.token = travelling(entry, cand.cell);   // walk entry → exit cell
-    visiting.purpose = VisitingPurpose::TransitReturn { to_region: cand.to_region, exit_link: cand.link };
-}
-```
-
-### Drain handoffs (no return_path)
-
-```rust
-match pending {
-    Outbound { traveler, token, to_region, exit_link }
-        => TravelerHandoff { token, traveler, to_region, entry_link: Some(exit_link), purpose: Outbound },
-    Return  { traveler, to_region, exit_link }
-        => TravelerHandoff { token: TravelState::default(), traveler, to_region,
-                             entry_link: Some(exit_link), purpose: Return },
-    Rollback { traveler }                 // route to home BY ID; clears Away on arrival
-        => TravelerHandoff { token: TravelState::default(), traveler,
-                             to_region: traveler.citizen.region(), entry_link: None,
-                             purpose: Rollback },
-}
-// Outbound/Return entry_link is Some(sender-side link), carried straight from the
-// ExitCandidate — no ambiguous exit_link_for(cell, region) re-derivation on a multi-link
-// road cell. Rollback's to_region is the home region directly (worker routes it by id);
-// its receive handles apply_traveler_return before any border placement.
-```
-
-### entry_link convention (unified, sender-side)
-
-Today Outbound receive uses `entry_link.matching_neighbor_link()` (sender-side → local)
-while Return receive uses `handoff.entry_link` directly (home-side, because
-`return_path` stored a home-side link). Removing `return_path` makes `entry_link`
-**`Some(sender-side link)` for both `Outbound` and `Return`** (both receivers call
-`matching_neighbor_link()`), and **`None` only for `Rollback`** (which clears `Away` at
-home without any border placement). The existing direct-return tests must be re-baselined
-to this convention.
+The stepper, the place-and-continue receive, the `Move`/`Rollback` drain, and the
+`entry_link` convention are specified in `docs/20260629-unify-travel-tokens.md`. The only
+seam this plan adds is **what `refresh_remote_exit_cells` reads** — the worker's
+`region_routes` (above) instead of the direct `border_neighbor_map` — producing multi-hop
+`RouteExit`s that the unchanged stepper walks to and the unchanged drain hands off.
 
 ## 5. Tests
 
-`src/core/regions/worker.rs`
-- `travel_exits_map_multihop_destination_to_first_hop` — topology A→B→C: A maps C to its
-  A/B links (next hop B); B maps A to its B/A links.
-- `travel_exits_pick_only_strictly_closer_neighbour` — **loop-safety**: in A–B–C, B's
-  map for destination C does NOT include the B/A link (dist A to C is not < dist B to C),
-  even though A,B,C share one road component. The regression for the old
-  component-membership bug.
-- `travel_exits_skip_roadless_border` — **graph correctness**: A and B share a map border
-  with NO road crossing, but a road path A–D–C exists. A's map for C routes via D (not the
-  roadless A/B border); the gradient never dead-ends on the roadless edge.
+`src/core/regions/directory.rs` (the central `region_routes` Dijkstra build)
+- `region_routes_map_multihop_destination_to_first_hop` — A–B–C road graph: `to[C].from[A]`
+  → A/B link (next hop B); `to[A].from[B]` → B/A link.
+- `region_routes_pick_only_cost_decreasing_neighbour` — **loop-safety**: `to[C].from[B]`
+  does NOT include the B/A link (`cost_to_C(A)` is not < `cost_to_C(B)`), even though A,B,C
+  share one road component. Regression for the old component-membership bug.
+- `region_routes_prefer_lower_cost_corridor` — **weighting**: A→B→C (2 hops, B crossing
+  cost 15) vs A→D→E→C (3 hops, cost 4+5+4); `to[C].from[A]` routes via D — lowest road cost,
+  not fewest hops. Drives the per-region `crossing_costs` end to end.
+- `region_routes_skip_roadless_border` — **graph correctness**: A and B share a map border
+  with NO road crossing, but a road path A–D–C exists; `to[C].from[A]` routes via D, never
+  the roadless edge.
+- `road_report_prices_entry_to_exit` (`regions/mod.rs`) — a region's `road_report` reports
+  the Layer-2 Dijkstra `crossing_costs` between its border links (a longer/congested
+  internal path costs more than a short one).
+- `discovery_assembles_region_routes_from_published_costs` — `rebuild_discovery` builds
+  `region_routes` from the published `RegionRoadReport`s; a road change reprices and
+  rebuilds.
 
-`src/core/regions/mod.rs`
-- `receive_outbound_for_remote_workplace_creates_transit_token` — B receives outbound
-  for a C workplace → a `TransitOutbound` token toward a B/C exit.
-- `transit_outbound_forwards_without_return_path` — B transit reaches its B/C exit →
-  drain emits `TravelerHandoff::Outbound` to C; assert no `return_path`.
-- `workday_end_creates_dynamic_return_to_home_region` — parked Work visitor in C, work
-  phase ends → C departs the building and creates a `TransitReturn` toward A.
-- `transit_return_routes_by_current_topology` — B receives Return from C for home A →
-  picks the current B/A exit and forwards Return to A.
-- `return_replans_after_exit_road_removed` — B has two progressing exits toward A; remove
-  the preferred road → return takes the remaining reachable one.
-- `severed_route_home_rolls_back_not_strands` — a transit/work region with NO progressing
-  exit toward home emits `PendingHandoff::Rollback`; the home region clears `Away` via
-  `apply_traveler_return` (citizen ends home, never stuck `Away`).
-- `receive_return_starts_homebound_walk` — keep the existing final-leg test (border→home
-  still animates).
+`src/core/regions/mod.rs` (routing wiring — the token/movement tests are in the refactor doc)
+- `remote_exit_cells_routes_multihop_via_region_routes` — with an A–B–C registry,
+  `A.remote_exit_cells[C]` resolves to a `RouteExit` crossing toward B (next hop), and
+  `B.remote_exit_cells[C]` toward C — replacing the direct `border_neighbor_map` map.
+- `multihop_handoff_uses_route_exit_link_not_re_derivation` — a `Move` at a multi-link border
+  cell hands off via the carried `RouteExit.link`, not an ambiguous `exit_link_for`.
 
 `src/core/regional_game_runner.rs` / `runtime/mod.rs`
-- `multi_region_return_handoff_arrives_next_subtick` — the StepTravel barrier still gives
+- `multi_region_handoff_arrives_next_subtick` — the StepTravel barrier still gives
   one-sub-tick staleness across a 2-hop trip.
 
-No UI test needed: transit tokens stay in `world.visiting_travel`, so dots render through
-the existing adapter path.
+No UI test needed: rendering is unchanged (the token/adapter tests live in the refactor doc).
 
 ## 6. Risks / non-goals
 
+- **Layer 1 is a central registry fed by per-region prices.** Each region prices its own
+  crossings (Layer-2 Dijkstra over its `route_cache`, share-nothing) and publishes a
+  `RegionRoadReport`; the coordinator-owned `CrossRegionDiscovery` snapshot
+  (`directory.rs`) assembles them and runs **Layer-1 Dijkstra** in `rebuild_discovery`,
+  read lock-free via `discovery_snapshot()`. It is the **cross-region sibling of
+  `resource_registry.rs`** (region-local): build-once-cache-until-change; workers/regions
+  read `region_routes`, never recompute a graph per pass.
 - **Relation to `traffic-pathfinding-plan.md` §5f.** This plan *is* §5f's multi-hop
-  two-layer routing, with **Layer 1 unweighted** (BFS hop count) for v1; Layer 2 (the
-  per-region road walk) already exists. The §5f road-cost weighting
-  (`border_crossing_cost` / `border_route_hint`, BFS→Dijkstra on the *same* graph `G`)
-  stays the deferred quality upgrade. §5f should be reconciled: it still assumes the
-  `return_path` stack and adjacency — this plan replaces both (dynamic routing on the
-  road graph). Cross-link the two when this lands.
+  two-layer routing **in full** — Layer 1 = weighted Dijkstra on the road-cost region graph,
+  Layer 2 = the existing per-region road Dijkstra. `region_routes` is the destination-keyed
+  form of §5f's `border_route_hint`, and the published `crossing_costs` = §5f's
+  `border_crossing_cost`. It also **corrects** §5f:
+  §5f had the *worker* compute `border_crossing_cost`, but the worker has no road graph —
+  pricing must be per-region (share-nothing), which is steps 1–2 here. §5f still assumes the
+  `return_path` stack and adjacency; this plan replaces both. Reconcile/cross-link §5f when
+  this lands.
 - **Loop-safety is the load-bearing invariant**: next-hop must STRICTLY decrease
-  `dist_to_T` **on the road-connected graph `G`** (edges = real road crossings), so the
-  gradient can never descend a roadless border or loop. Computing distances on raw
-  `RegionNeighborLink` adjacency would dead-end; `G` makes connectivity intrinsic (no
-  separate filter). The `travel_exits_pick_only_strictly_closer_neighbour` test guards
+  `cost_to_T` (a Dijkstra distance) **on the road-connected region road graph** (edges = real road
+  crossings), so it can never descend a roadless border or loop. Computing on raw
+  `RegionNeighborLink` adjacency would dead-end; the graph makes connectivity intrinsic (no
+  separate filter). The `region_routes_pick_only_cost_decreasing_neighbour` test guards
   the no-backward-hop case.
-- Determinism: BFS over sorted `G` edges; every `Vec<ExitCandidate>` sorted + deduped;
-  deterministic tie-breaks. Cross-region remains one-sub-tick-stale, never
-  non-deterministic.
+- Determinism: Dijkstra over sorted region-road-graph edges with deterministic cost tie-breaks (cost,
+  then `RegionId`, then `BorderLinkId`); every `Vec<ExitLink>` sorted + deduped. Cross-region
+  remains one-sub-tick-stale, never non-deterministic.
 - Do not expose `World`/topology to the UI; **no new worker command/protocol**; no new
-  production dependency; do not store full routes in traveller state. (The discovery
-  snapshot gaining `road_crossings` is *data preserved from an existing computation*, not
-  a new message or command.)
+  production dependency; do not store full routes in traveller state. (Each region's
+  `RegionRoadReport` rides the **existing availability publish path**, and the snapshot
+  is assembled in the existing `rebuild_discovery` chokepoint — no new message or command.)
 - Do not rewrite away tokens on road/topology change — dynamic routing re-plans each
   step. A token with no progressing+reachable exit emits `PendingHandoff::Rollback`,
-  routed to the home region **by id** (a small worker addition: deliver to
-  `owners.owner_of(home)` directly, not via border topology), where
-  `apply_traveler_return` clears `Away`. `apply_traveler_return` is home-region-only and
-  must never be relied on to un-strand from a transit/work region.
+  routed to the home region **by id** — this needs **no new worker capability**:
+  `route_traveler_handoff` (`worker.rs:642`) already routes any handoff by
+  `handoff.to_region` via `owners.owner_of(target_region)`, regardless of adjacency, so a
+  `Rollback` just sets `to_region = traveler.citizen.region()` and reuses that path. The
+  home region's receive handles `Rollback` → `apply_traveler_return` before any border
+  placement. `apply_traveler_return` is home-region-only and must never be relied on to
+  un-strand from a transit/work region.
 - Remove `return_path` in a small follow-up if deleting it in the same patch is noisy;
   first make behaviour stop depending on it.
 
 ## Suggested patch split
 
-- **P-a (core map):** `ExitCandidate` + `travel_destination_exits_for_region` (BFS
-  gradient) + `refresh_remote_exit_cells` storing candidates + worker wiring +
-  worker tests (incl. the loop-safety regression). No movement change yet.
-- **P-b (movement):** `VisitingPurpose`, transit branches in `receive_traveler_handoff` /
-  `step_visiting` / drain, `Target::BorderExit.to_region` fix, parked-departure reuse,
-  `entry_link` unification; re-baseline direct-return tests + the multi-hop tests.
-- **P-c (cleanup):** delete `return_path` / `ReturnHop` and their construction sites.
+**Prerequisite:** the token refactor (`docs/20260629-unify-travel-tokens.md`) lands first —
+one `TravelToken`, one stepper, `Move`/`Rollback` handoff, `RouteExit` shape. This plan then
+only swaps what feeds the stepper's `remote_exit_cells`:
+
+- **P-a (per-region pricing):** `road_report` (Layer-2 Dijkstra over `route_cache` →
+  `border_links` + `crossing_costs`) published via the availability path; `RegionRoadReport`
+  (input) on `CrossRegionDiscovery`. Region tests (`road_report_prices_entry_to_exit`).
+- **P-b (the L1 registry):** `RegionRoutes` (output) + `build_region_routes` (Layer-1
+  Dijkstra) in `rebuild_discovery`; build-under-`publish_state`, swap the snapshot
+  (`docs/20260628-l1-map-build-locking.md`). Directory tests (multihop, cost-corridor,
+  loop-safety, roadless-border).
+- **P-c (wire it in):** **repoint `refresh_remote_exit_cells`** from the direct
+  `border_neighbor_map` producer to `region_routes` (→ multi-hop `RouteExit`s), retiring
+  `border_neighbor_map`'s routing use; worker reads `region_routes`. Region tests
+  (`remote_exit_cells_routes_multihop_via_region_routes`). Direct neighbours keep working —
+  they're the 1-hop case of the new map; the stepper/handoff are unchanged from the refactor.
