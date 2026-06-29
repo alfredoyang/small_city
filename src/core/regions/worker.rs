@@ -563,6 +563,12 @@ impl RegionWorker {
             runtime.set_border_neighbor_map(post_border_neighbor_map.clone());
             let road_report = runtime.state().road_report(&post_border_neighbor_map);
             self.directory.publish_region_road_report(road_report);
+            // P-c: refresh the multi-hop `remote_exit_cells` from the routes
+            // snapshot. The publish above rebuilt the directory's discovery,
+            // so a routes field for THIS region is now available.
+            if let Some(exits) = self.directory.exits_from(source_region) {
+                runtime.set_region_routes(&exits);
+            }
             changed_summaries.push((
                 source_region,
                 runtime.state().network_border_links(),

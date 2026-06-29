@@ -159,6 +159,20 @@ impl RegionDirectory {
             .clone()
     }
 
+    /// P-c: the current snapshot's `region_routes.exits_from(region)` —
+    /// for every reachable target T, the first-hop exits `region` should
+    /// use to head toward T. None if the snapshot hasn't been rebuilt
+    /// yet (no reports published).
+    pub fn exits_from(&self, region: RegionId) -> Option<HashMap<RegionId, Vec<ExitLink>>> {
+        let snapshot = self
+            .active_snapshot
+            .lock()
+            .expect("region directory active-snapshot lock poisoned")
+            .clone();
+        let map = snapshot.region_routes.exits_from(region);
+        if map.is_empty() { None } else { Some(map) }
+    }
+
     pub fn set_topology(&self, topology: Vec<RegionNeighborLink>) {
         let mut state = self
             .publish_state

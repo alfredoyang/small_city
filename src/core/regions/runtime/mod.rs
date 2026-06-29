@@ -89,9 +89,9 @@ use crate::core::regional_types::{
 };
 use crate::core::regions::handle::{RegionEventReceiver, RegionHandle, mailbox};
 use crate::core::regions::{
-    GoodsExportGrant, JobExportGrant, PendingGoodsDemand, PendingJobDemand, PendingPowerDemand,
-    PowerExportGrant, RegionId, RegionRoadNetworkId, RegionState, RegionalTickGoodsPhase,
-    RegionalTickJobPhase, RegionalTickPowerPhase,
+    ExitLink, GoodsExportGrant, JobExportGrant, PendingGoodsDemand, PendingJobDemand,
+    PendingPowerDemand, PowerExportGrant, RegionId, RegionRoadNetworkId, RegionState,
+    RegionalTickGoodsPhase, RegionalTickJobPhase, RegionalTickPowerPhase,
 };
 use crate::core::world::CrossRegionGoodsRoutes;
 use crate::interface::input::MapOverlayInput;
@@ -582,6 +582,17 @@ impl RegionRuntime {
         map: std::collections::HashMap<crate::core::regions::BorderLinkId, RegionId>,
     ) {
         self.state.set_border_neighbor_map(map);
+    }
+
+    /// P-c: install this region's slice of the directory's `region_routes`
+    /// (its `exits_from(self.id)` map — for every reachable target T, the
+    /// first-hop exits r should use) and rebuild the multi-hop
+    /// `remote_exit_cells` from it.
+    pub(crate) fn set_region_routes(
+        &mut self,
+        exits_from: &std::collections::HashMap<RegionId, Vec<ExitLink>>,
+    ) {
+        self.state.set_region_routes(exits_from);
     }
 
     pub(crate) fn set_cross_region_goods_routes(&mut self, routes: CrossRegionGoodsRoutes) {

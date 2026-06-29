@@ -771,8 +771,177 @@ the regions they use.
 
 ## 9. P-c implementation record (wiring)
 
-## 9. P-c implementation record (wiring)
+**Committed:** not yet (in the working branch `multi-region-return`).
+**What landed in the worktree:**
 
+### `RegionDirectory::exits_from` (`src/core/regions/directory.rs`)
+
+A reader-side accessor over the active snapshot:
+
+```text
+exits_from(&self, region: RegionId) -> Option<HashMap<RegionId, Vec<ExitLink>>>
+    None  - snapshot has no report yet for this region, or the region has
+            no reachable targets.
+    Some  - for every reachable target T, the first-hop ExitLinks
+            `region` should use to head toward T.
+```
+
+`None` on empty: callers (the worker) use this to decide whether to
+call `RegionState::set_region_routes` at all on this pass.
+
+### `RegionState::set_region_routes` (`src/core/regions/mod.rs`)
+
+```text
+set_region_routes(&mut self,
+                  exits_from: &HashMap<RegionId, Vec<ExitLink>>)
+    1. Build a BorderLinkId -> local-cell index from `border_road_links()`.
+    2. For every (target, exit) in `exits_from`, push the local cells
+       matching `exit.link` into `map[target]`. (Multi-hop and direct
+       neighbours are handled uniformly — both are recorded under the
+       FINAL target region.)
+    3. Gap-fill: for every direct neighbour in `border_neighbor_map`
+       that is NOT mentioned in `exits_from`, push its border cells.
+       (A direct neighbour absent from routes has no published report
+       yet, so the direct cell is the only exit available.)
+    4. sort + dedup the exit cell lists; assign to remote_exit_cells.
+```
+
+The gap-fill is **gap-fill only** — it does NOT inject a direct cell
+when routes mention a target but resolve to no local cell. The
+distinction matters because a route's first hop may pick a non-direct
+border (a cheaper detour) and a direct-cell injection would defeat
+that choice for the consumer's `depart_toward` step (which picks the
+first reachable candidate, not the cheapest).
+
+### `RegionRuntime::set_region_routes` (`src/core/regions/runtime/mod.rs`)
+
+Thin wrapper: `runtime.state.set_region_routes(exits_from)`. The
+`pub(crate)` API is the same shape as `set_border_neighbor_map` and
+`set_importable_remote_jobs` — runtime owns the write path, state
+holds the data.
+
+### Worker wiring (`src/core/regions/worker.rs`)
+
+After `publish_region_road_report` rebuilds the directory's discovery
+(so the snapshot is fresh), the worker:
+
+```rust
+if let Some(exits) = self.directory.exits_from(source_region) {
+    runtime.set_region_routes(&exits);
+}
+```
+
+Ordering is synchronous: `publish_region_road_report` swaps the active
+snapshot before returning (`directory.rs:255–258`), so the
+subsequent `exits_from` read sees the latest state. Cross-pass
+staleness against *other* regions' reports is the accepted one-tick-
+stale barrier model (relaxed across regions, strict within).
+
+If `exits_from` returns `None` (no report published yet for THIS
+region), `set_region_routes` is skipped and `remote_exit_cells`
+retains the direct build from the earlier `set_border_neighbor_map`
+call — preserving the old behaviour for the moment between the two
+calls.
+
+#### The patch (data flow)
+
+```text
+   (per region, after the route report is published)
+                  +-------------------------------------+
+                  |  publish_region_road_report(report) |
+                  +-----------------+-------------------+
+                                    |
+                                    v
+                  +-------------------------------------+
+                  |  directory.rebuild_discovery:       |
+                  |    build_region_routes              |
+                  |    -> RegionRoutes { to: ... }      |
+                  |    (active_snapshot = Arc::swap)    |
+                  +-----------------+-------------------+
+                                    |
+                                    v
+                  +-------------------------------------+
+                  |  directory.exits_from(source_region)|
+                  |    -> HashMap<T, Vec<ExitLink>>     |
+                  |       (T = final target,            |
+                  |        ExitLink = first hop)        |
+                  +-----------------+-------------------+
+                                    |
+                                    v
+                  +-------------------------------------+
+                  |  RegionState::set_region_routes     |
+                  |    -> remote_exit_cells             |
+                  |       (target T -> local cells,     |
+                  |        with gap-fill from direct)   |
+                  +-----------------+-------------------+
+                                    |
+                                    v
+                  +-------------------------------------+
+                  |  travel::resolve_target reads       |
+                  |  remote_exit_cells[target.region]   |
+                  |  and departs to a local cell.       |
+                  +-------------------------------------+
+```
+
+#### The problem the patch solves
+
+Before P-c, the only producer of `remote_exit_cells` was
+`border_neighbor_map` — a direct (1-hop) neighbour map. A 3-region
+commute A→B→C had no entry for C in `remote_exit_cells[A]` because
+A does not border C, so the stepper saw `None`, fell through to
+`Target::Building(home)`, and the citizen idled at home forever.
+
+After P-c, `remote_exit_cells` is sourced from the multi-hop
+`region_routes` map (P-b output). For every reachable final target
+T, the first-hop border cells are recorded. A→B→C works because
+`region_routes[A].to[C].from[A].exits[0] = (A's_B-border_link, B)`
+and the local cells matching that link end up in
+`remote_exit_cells[A][C]`. The stepper departs to one of those
+cells, the existing move-not-convert handoff crosses into B, and
+B's analogous map drives the second hop.
+
+### Determinism, gap-fill correctness, and stale-barrier notes
+
+- **Determinism**: `remote_exit_cells` values are `sort()`+`dedup()`;
+  map keys are target regions, value content is a set-union over
+  route exits + direct cells. HashMap iteration order is irrelevant.
+- **Gap-fill correctness**: keyed on `exits_from.contains_key(&neighbor)`,
+  not `map.contains_key(&neighbor)`. A target the routes mention but
+  whose BorderLinkId has no local cell still has its key absent from
+  `map`; the route's choice must be respected anyway.
+- **One-tick staleness**: the worker publishes THIS region's road
+  report, the directory rebuilds, then `exits_from` reads the new
+  snapshot. Other regions' road reports from prior passes may be
+  visible — that is the cross-region relaxed-barrier contract, and
+  P-c's correctness does not require fresh reports from neighbours.
+- **No-routes path**: `exits_from` returns `None` on empty →
+  `set_region_routes` skipped → `remote_exit_cells` keeps the
+  direct build from `set_border_neighbor_map`. The two state
+  producers compose without conflict.
+
+### Tests added (`src/core/regions/mod.rs` tests module)
+
+| Test | What it locks down |
+|---|---|
+| `set_region_routes_populates_remote_exit_cells` | The 1-hop happy path: routes mention region 2 with the East exit, the local East-edge cell ends up in `remote_exit_cells[2]`. |
+| `set_region_routes_falls_back_to_border_neighbor_map` | Empty `exits_from`: only the direct neighbour in `border_neighbor_map` contributes; the gap-fill works. |
+| `set_region_routes_does_not_inject_direct_when_routes_cover` | Routes cover region 2 via a non-East detour link (no local cell resolves); the East cell from `border_neighbor_map` is NOT injected — the fallback is gap-fill only, never re-injection. |
+
+### Known limitations (carried forward)
+
+- A multi-hop commute that requires the first hop to use a non-direct
+  border will work as long as the route's first hop's BorderLinkId has
+  a local road cell. If a region's report picks a border exit that has
+  no local road (e.g. a brand-new detour), `map[target]` ends up
+  empty and the consumer falls through to "stay put". This is
+  acceptable because the report comes from the region's own road
+  graph — the border cell exists by construction.
+- The cross-region one-tick staleness contract still applies: a
+  region A's `remote_exit_cells[T]` reflects the routes snapshot at
+  the end of A's pass, which may include a neighbour's report from
+  a prior pass. The P-b producer re-prices reports after every
+  build/bulldoze (`worker.rs:550–565`), so the staleness is bounded
+  to one regional pass.
 ## Suggested patch split
 
 **Prerequisite:** the token refactor (`docs/20260629-unify-travel-tokens.md`) lands first —
