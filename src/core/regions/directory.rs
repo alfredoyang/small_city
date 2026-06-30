@@ -149,8 +149,8 @@ impl RegionDirectory {
         }
     }
 
-    /// P5b: the current region topology (read by the worker to build the
-    /// per-region border-neighbor hint for travel routing).
+    /// P5b/P-a: the current region topology (read by the worker to build
+    /// direct border-neighbour facts for road-report pricing).
     pub fn topology(&self) -> Vec<RegionNeighborLink> {
         self.publish_state
             .lock()
@@ -339,7 +339,9 @@ fn flattened_region_values<T: Clone>(map: &HashMap<RegionId, Vec<T>>) -> Vec<T> 
 /// `(link.edge, link.offset, to_region)`; region-routes lookups are by
 /// `HashMap`. One Dijkstra per destination T.
 ///
-/// Mental model for one region report:
+/// Mental model for one region report. A report is local pricing only: "where
+/// can I leave this region, and what does it cost to drive between my border
+/// openings?"
 ///
 /// ```text
 /// Region A
@@ -357,9 +359,44 @@ fn flattened_region_values<T: Clone>(map: &HashMap<RegionId, Vec<T>>) -> Vec<T> 
 ///   { entry: West/0, exit: East/0, cost: 7 }
 /// ```
 ///
-/// Layer-1 Dijkstra assembles these local reports into region-to-region
-/// weights: leave A through its chosen border, enter B through the matching
-/// border, then pay B's internal `RegionCrossCost` to reach B's next exit.
+/// The directory first turns matching reports into a weighted region graph:
+///
+/// ```text
+/// Published border links:
+///   A East/0 faces B West/0
+///   B East/0 faces C West/0
+///
+/// Region graph:
+///   A --w(A,B)--> B --w(B,C)--> C
+///
+/// w(A,B) = A cost to reach East/0 + B cost from West/0
+/// ```
+///
+/// Then it runs one destination-rooted Dijkstra per target region T. For T=C:
+///
+/// ```text
+/// Distance field:
+///
+///   A ----> B ----> C
+///   17      8       0
+///
+/// A's valid next hop is B because 8 < 17.
+/// B's valid next hop is C because 0 < 8.
+/// B->A is rejected because 17 is not < 8, so loops cannot form.
+/// ```
+///
+/// Output shape:
+///
+/// ```text
+/// RegionRoutes.to[C].from[A] =
+///   RouteHop {
+///     exits: [ExitLink { link: East/0, to_region: B }],
+///     cost: 17,
+///   }
+/// ```
+///
+/// `RegionRoutes::exits_from(A)` flips this into the stepper-friendly answer:
+/// "for final destination C, leave A through East/0 toward B."
 fn build_region_routes(
     reports: &[RegionRoadReport],
     owners: &RegionOwnerDirectory,
@@ -428,8 +465,10 @@ fn build_region_routes(
                     .map(|c| c.cost)
                     .min()
                     .unwrap_or(0);
-                // Owned-region check: only r→n edges to owned regions
-                // are useful (you can't cross into an unowned region).
+                // Live-inbox check, not an existence check. Regions are expected to
+                // persist, but a route is only useful if the worker layer currently
+                // knows who owns the destination inbox. Reassignment updates this
+                // directory; delivery still re-checks ownership before sending.
                 if owners.owner_of(n_id).is_some() {
                     // Edge weights must be strictly positive so the
                     // strict-decrease next-hop rule fires even when both

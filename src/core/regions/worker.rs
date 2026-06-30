@@ -526,20 +526,12 @@ impl RegionWorker {
                 &runtime.state().network_border_links(),
             );
             runtime.set_importable_remote_jobs(importable_remote_jobs);
-            // P5b: refresh the travel border-neighbor hint from the topology, like
-            // the import hint above. Owned-region check excludes stale neighbors.
-            let owners = Arc::clone(&self.owners);
-            let border_neighbor_map = border_neighbor_map_for_region(
-                &self.directory.topology(),
-                runtime.region_id(),
-                &runtime.state().network_border_links(),
-                |neighbor| owners.owner_of(neighbor).is_some(),
-            );
-            // Apply the pre-event border hint so `set_border_neighbor_map`
-            // can refresh `remote_exit_cells` before the event. The post-event
-            // recompute (below) will overwrite if a road/link changed.
-            runtime.set_border_neighbor_map(border_neighbor_map);
             let source_region = runtime.region_id();
+            // P-c: install the current Layer-1 route exits before processing events,
+            // so `StepTravel` uses the latest published route snapshot. A post-event
+            // refresh below picks up any road changes this pass.
+            let exits = self.directory.exits_from(source_region).unwrap_or_default();
+            runtime.set_region_routes(&exits);
             outbound.extend(
                 runtime
                     .process_some_events(max_events_per_region)
@@ -550,10 +542,9 @@ impl RegionWorker {
             // dirty; recompute the derived pass before reading the summaries it
             // feeds, so published hints reflect the latest config.
             runtime.ensure_derived_state();
-            // P-a: recompute the post-event border hint + road report from the
-            // current road graph. The pre-event `border_neighbor_map` was correct
-            // for the *previous* graph; a build/bulldoze this pass would have
-            // changed the road topology, so the report must be re-priced.
+            // P-a: recompute the post-event border-neighbour facts + road report
+            // from the current road graph. These facts feed pricing only; travel
+            // exits come from the Layer-1 `region_routes` snapshot below.
             let owners = Arc::clone(&self.owners);
             let post_links = runtime.state().network_border_links();
             let post_border_neighbor_map = border_neighbor_map_for_region(
@@ -562,15 +553,13 @@ impl RegionWorker {
                 &post_links,
                 |neighbor| owners.owner_of(neighbor).is_some(),
             );
-            runtime.set_border_neighbor_map(post_border_neighbor_map.clone());
             let road_report = runtime.state().road_report(&post_border_neighbor_map);
             self.directory.publish_region_road_report(road_report);
             // P-c: refresh the multi-hop `remote_exit_cells` from the routes
             // snapshot. The publish above rebuilt the directory's discovery,
             // so a routes field for THIS region is now available.
-            if let Some(exits) = self.directory.exits_from(source_region) {
-                runtime.set_region_routes(&exits);
-            }
+            let exits = self.directory.exits_from(source_region).unwrap_or_default();
+            runtime.set_region_routes(&exits);
             changed_summaries.push((
                 source_region,
                 runtime.state().network_border_links(),
@@ -880,9 +869,9 @@ impl RegionWorker {
     }
 }
 
-/// P5b: builds the `BorderLinkId → neighbor RegionId` hint for one region from the
-/// region topology — "this border link faces this neighbor." Each region edge
-/// (north/south/west/east) faces at most one neighbor in the v1 grid layout.
+/// P-a: builds the `BorderLinkId → neighbor RegionId` facts for one region's
+/// road report — "this border link faces this neighbor." Travel routing reads the
+/// Layer-1 `RegionRoutes`; this helper only prices/publishes the local road graph.
 fn border_neighbor_map_for_region(
     topology: &[RegionNeighborLink],
     region_id: RegionId,

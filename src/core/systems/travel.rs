@@ -36,7 +36,7 @@ use std::collections::HashSet;
 
 use crate::core::components::{PendingHandoff, PlaceRef, TravelState, TravelToken, TravelerId};
 use crate::core::entity::Entity;
-use crate::core::regions::RegionId;
+use crate::core::regions::RouteExit;
 use crate::core::systems::road_connectivity::{self, RoadNetwork};
 use crate::core::systems::road_network_analysis::{road_degree_in_network, step_cost};
 use crate::core::systems::schedule::schedule_phase;
@@ -64,11 +64,7 @@ enum RemoteStep {
     /// region for the host. On the home side, the move pass also bumps
     /// `away_generation` and inserts into `away_residents`; on a host, the gen is
     /// just carried.
-    CrossOut {
-        to_region: RegionId,
-        exit_cell: Entity,
-        token: TravelToken,
-    },
+    CrossOut { exit: RouteExit, token: TravelToken },
     /// No reachable border exit from the current cell → stay put (§4b no-teleport).
     Stay,
 }
@@ -176,11 +172,7 @@ pub(crate) fn step_tokens(world: &mut World) {
                 }
             } else {
                 match advance_to_exit(world, &networks, &token, target) {
-                    RemoteStep::CrossOut {
-                        to_region,
-                        exit_cell,
-                        token: moved,
-                    } => {
+                    RemoteStep::CrossOut { exit, token: moved } => {
                         let trip_gen = if token.home.region == self_region {
                             // Home: bump + record. (We mutate `away_residents` and
                             // `away_generation` directly; the `world` borrow is on
@@ -202,8 +194,9 @@ pub(crate) fn step_tokens(world: &mut World) {
                                 generation: trip_gen,
                             },
                             token: moved,
-                            to_region,
-                            exit_cell,
+                            to_region: exit.to_region,
+                            exit_cell: exit.cell,
+                            exit_link: exit.link,
                         });
                         removes.push((citizen, false));
                     }
@@ -361,9 +354,9 @@ fn depart_toward(
     } else {
         // Remote target — pick the first reachable border-exit candidate.
         let candidates = world.remote_exit_cells.get(&target.region)?;
-        for &exit_cell in candidates {
-            if let Some(entry) = depart_to_cell(world, networks, origin, exit_cell) {
-                return Some(travelling(entry, exit_cell));
+        for exit in candidates {
+            if let Some(entry) = depart_to_cell(world, networks, origin, exit.cell) {
+                return Some(travelling(entry, exit.cell));
             }
         }
         None
@@ -501,12 +494,11 @@ fn advance_to_exit(
     token: &TravelToken,
     target: PlaceRef,
 ) -> RemoteStep {
-    let target_region = target.region;
-    let Some(candidates) = world.remote_exit_cells.get(&target_region) else {
+    let Some(candidates) = world.remote_exit_cells.get(&target.region) else {
         return RemoteStep::Stay;
     };
     let state = &token.state;
-    let exit_cell = match state.current_cell {
+    let exit = match state.current_cell {
         None => {
             // Idle in a building — depart onto the first reachable entry road.
             let origin = state
@@ -514,8 +506,8 @@ fn advance_to_exit(
                 .filter(|b| world.buildings.contains_key(b))
                 .unwrap_or(token.home.building);
             let mut chosen = None;
-            for &exit in candidates {
-                if depart_to_cell(world, networks, origin, exit).is_some() {
+            for exit in candidates {
+                if depart_to_cell(world, networks, origin, exit.cell).is_some() {
                     chosen = Some(exit);
                     break;
                 }
@@ -526,27 +518,27 @@ fn advance_to_exit(
             // En route — the committed exit is `state.destination` (a road cell
             // in the candidates list). If it's missing/invalid, re-pick a
             // candidate reachable from the current cell.
-            let committed = state.destination.filter(|e| candidates.contains(e));
+            let committed = state
+                .destination
+                .and_then(|e| candidates.iter().find(|exit| exit.cell == e));
             committed.or_else(|| {
-                candidates.iter().copied().find(|&exit| {
-                    cell == exit || step_toward_cell(world, networks, cell, exit).is_some()
+                candidates.iter().find(|exit| {
+                    cell == exit.cell
+                        || step_toward_cell(world, networks, cell, exit.cell).is_some()
                 })
             })
         }
     };
-    let Some(exit_cell) = exit_cell else {
+    let Some(exit) = exit.copied() else {
         return RemoteStep::Stay;
     };
+    let exit_cell = exit.cell;
     if let Some(current) = state.current_cell {
         if current == exit_cell {
             // On the exit cell → cross.
             let mut moved = token.clone();
             moved.state = travelling(exit_cell, target.building);
-            return RemoteStep::CrossOut {
-                to_region: target_region,
-                exit_cell,
-                token: moved,
-            };
+            return RemoteStep::CrossOut { exit, token: moved };
         }
         // Step one cell toward the exit.
         let network = match network_of_cell(networks, current) {
@@ -673,7 +665,7 @@ mod tests {
         Citizen, Morale, TravelState, TravelStatus, TravelToken, WorkplaceAssignment,
     };
     use crate::core::entity::Entity;
-    use crate::core::regions::RegionId;
+    use crate::core::regions::{BorderEdge, BorderLinkId, RegionId, RouteExit};
 
     use crate::core::systems::placement::place_building;
     use crate::core::world::World;
@@ -709,6 +701,17 @@ mod tests {
             },
         );
         id
+    }
+
+    fn route_exit(cell: Entity, to_region: RegionId) -> RouteExit {
+        RouteExit {
+            cell,
+            link: BorderLinkId {
+                edge: BorderEdge::East,
+                offset: 0,
+            },
+            to_region,
+        }
     }
 
     fn commute_world() -> (World, [Entity; 4], Entity, Entity) {
@@ -1105,7 +1108,9 @@ mod tests {
         let workplace = Entity::new(RegionId(7), 99);
         // The exit candidate is r3 (which is on the disconnected network).
         let r3 = world.grid.get(3, 0).expect("r3");
-        world.remote_exit_cells.insert(RegionId(7), vec![r3]);
+        world
+            .remote_exit_cells
+            .insert(RegionId(7), vec![route_exit(r3, RegionId(7))]);
         let id = add_citizen(&mut world, 100, home, Some(workplace));
         set_hour(&mut world, 9);
         // 5 sub-ticks: the citizen never departs (no reachable exit), no token
@@ -1237,7 +1242,9 @@ mod tests {
         world.tokens.insert(key, token);
 
         // Set remote_exit_cells for region 7: the only exit is r0.
-        world.remote_exit_cells.insert(RegionId(7), vec![roads[0]]);
+        world
+            .remote_exit_cells
+            .insert(RegionId(7), vec![route_exit(roads[0], RegionId(7))]);
 
         // Home phase in B → the token departs from work and walks toward r0
         // (the border-exit cell), one cell per sub-tick.
@@ -1302,7 +1309,9 @@ mod tests {
         let key = Entity::new(world.region_id, 77);
         world.tokens.insert(key, token);
         // The remote target is in region 8; provide r0 as the border exit.
-        world.remote_exit_cells.insert(RegionId(8), vec![r0]);
+        world
+            .remote_exit_cells
+            .insert(RegionId(8), vec![route_exit(r0, RegionId(8))]);
 
         set_hour(&mut world, 9);
         let mut on_x = 0;

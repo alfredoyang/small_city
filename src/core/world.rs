@@ -21,7 +21,7 @@ use crate::core::components::{
 };
 use crate::core::entity::Entity;
 use crate::core::grid::Grid;
-use crate::core::regions::RegionId;
+use crate::core::regions::{RegionId, RouteExit};
 use crate::core::resource_registry::{
     JobCounts, JobResolution, PowerResolution, ResourceRegistryCache,
 };
@@ -88,20 +88,11 @@ pub(crate) struct World {
     // them. The core only produces them; it never routes.
     #[serde(skip, default)]
     pub(crate) outgoing_handoffs: Vec<crate::core::components::PendingHandoff>,
-    // P5 input: "to reach neighbor region R, a local commuter can exit via one of
-    // these border road cells" (sorted candidates, possibly on different home road
-    // networks). The mover picks the first candidate reachable from its position, so
-    // two disconnected home networks touching the same neighbor each work. Populated
-    // by the regions layer (P5b) from the border-neighbor hint + `network_border_links`;
-    // empty here means no remote commuting (P1–P4 behaviour: remote workers idle home).
+    // P5/P-c input: "to reach final target region R, walk to one of these local
+    // route exits." Each candidate carries its road cell, border link, and immediate
+    // next-hop region from the Layer-1 route map. Empty means no remote commuting.
     #[serde(skip, default)]
-    pub(crate) remote_exit_cells: HashMap<RegionId, Vec<Entity>>,
-    // P5b input from the worker: "this border link faces this neighbor region"
-    // (built from the RegionNeighborLink topology). RegionState derives both
-    // `remote_exit_cells` (for the mover) and the exit/entry link resolution from
-    // it. Empty here means no cross-region travel.
-    #[serde(skip, default)]
-    pub(crate) border_neighbor_map: HashMap<crate::core::regions::BorderLinkId, RegionId>,
+    pub(crate) remote_exit_cells: HashMap<RegionId, Vec<RouteExit>>,
     // P5: per-citizen generation of the trip currently out of region, so a stale
     // `Return` (generation mismatch) is ignored. Bumped on each outbound emit.
     #[serde(skip, default)]
@@ -162,7 +153,6 @@ impl World {
             away_residents: std::collections::HashSet::new(),
             outgoing_handoffs: Vec::new(),
             remote_exit_cells: HashMap::new(),
-            border_neighbor_map: HashMap::new(),
             away_generation: HashMap::new(),
             derived_dirty: Cell::new(false),
             building_rules: crate::core::building_rules::BuildingRules::default(),

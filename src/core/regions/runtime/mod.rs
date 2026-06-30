@@ -575,15 +575,6 @@ impl RegionRuntime {
         self.state.set_importable_remote_jobs(jobs);
     }
 
-    /// P5b: install the worker-built border→neighbor hint (rebuilds the mover's
-    /// `remote_exit_cells`).
-    pub(crate) fn set_border_neighbor_map(
-        &mut self,
-        map: std::collections::HashMap<crate::core::regions::BorderLinkId, RegionId>,
-    ) {
-        self.state.set_border_neighbor_map(map);
-    }
-
     /// P-c: install this region's slice of the directory's `region_routes`
     /// (its `exits_from(self.id)` map — for every reachable target T, the
     /// first-hop exits r should use) and rebuild the multi-hop

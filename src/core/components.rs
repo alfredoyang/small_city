@@ -393,10 +393,10 @@ impl Default for TravelState {
 }
 
 /// P5: a crossing the core has decided on this tick, buffered for the regions
-/// layer to route. The core never touches border-link topology, so the `Move`
-/// variant carries the local `exit_cell` (the regions layer maps it to a
-/// `BorderLinkId`); the `Rollback` variant is emitted by a neighbour that
-/// could not place an inbound token and is routed back to the home.
+/// layer to route. The `Move` variant carries the exact Layer-1 first-hop
+/// `exit_link`, so the regions layer does not need the old direct-neighbour map
+/// to re-derive routing at the border. The `Rollback` variant is emitted by a
+/// neighbour that could not place an inbound token and is routed back to the home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingHandoff {
     /// A local commuter reached its border-exit cell and wants to cross.
@@ -408,6 +408,7 @@ pub enum PendingHandoff {
         token: TravelToken,
         to_region: RegionId,
         exit_cell: Entity,
+        exit_link: BorderLinkId,
     },
     /// A neighbour bounced this citizen home (its outbound could not place) —
     /// `apply_traveler_return` at the home region clears `away_residents`.

@@ -225,6 +225,17 @@ pub struct ExitLink {
     pub to_region: RegionId,
 }
 
+/// One concrete local road-cell exit for a final remote target. `cell` is the
+/// road cell the token walks to; `link` and `to_region` are the Layer-1 first hop
+/// carried through to the handoff, so the old direct-neighbour hint is not needed
+/// to re-derive routing at the border.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RouteExit {
+    pub cell: Entity,
+    pub link: BorderLinkId,
+    pub to_region: RegionId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Stale-tolerant availability hint published for regional discovery.
 ///
@@ -561,10 +572,11 @@ impl RegionState {
     /// the region road graph.
     ///
     /// `border_neighbours` is the worker-supplied `BorderLinkId → neighbour
-    /// RegionId` map (the direct-neighbour hint, provided by the worker from
-    /// the topology). The region's own border-road cells come from
-    /// `border_road_cells` per network; the cost from each entry to each exit
-    /// on the same network is the Layer-2 Dijkstra distance.
+    /// RegionId` map used only to label this region's border openings for the
+    /// report. It is not a travel-routing source; travel exits come from
+    /// `RegionRoutes`. The region prices its own road graph by measuring the
+    /// Layer-2 distance from each border entry to each border exit on the same
+    /// local network.
     pub fn road_report(
         &self,
         border_neighbours: &HashMap<BorderLinkId, RegionId>,
@@ -637,43 +649,12 @@ impl RegionState {
         }
     }
 
-    /// P5b: install the worker-supplied border→neighbor hint and rebuild the
-    /// per-mover exit-cell map from it. Called before each region's processing
-    /// slice (like `set_importable_remote_jobs`).
-    pub(crate) fn set_border_neighbor_map(&mut self, map: HashMap<BorderLinkId, RegionId>) {
-        self.world.border_neighbor_map = map;
-        self.refresh_remote_exit_cells();
-    }
-
-    /// Rebuilds `remote_exit_cells` (neighbor region → local exit road cells) from
-    /// the current border-neighbor hint. Every border road cell whose link faces a
-    /// neighbor is an exit toward that neighbor.
-    fn refresh_remote_exit_cells(&mut self) {
-        let mut map: HashMap<RegionId, Vec<Entity>> = HashMap::new();
-        for (cell, link) in self.border_road_links() {
-            if let Some(&neighbor) = self.world.border_neighbor_map.get(&link) {
-                map.entry(neighbor).or_default().push(cell);
-            }
-        }
-        for cells in map.values_mut() {
-            cells.sort();
-            cells.dedup();
-        }
-        self.world.remote_exit_cells = map;
-    }
-
-    /// P-c: rebuild `remote_exit_cells` (FINAL target region → local exit
-    /// road cells) from a `region_routes.exits_from(self.id)` map. The
-    /// map's key is the FINAL target T; the value is the list of
-    /// `ExitLink`s — local border `BorderLinkId`s r should use to begin
-    /// a shortest path toward T. The route may be 1 hop (direct
-    /// neighbour) or N hops (multi-hop); either way the first hop
-    /// always starts at a local border, so we resolve each `BorderLinkId`
-    /// to its local cells.
-    ///
-    /// `border_neighbor_map` is consulted as a fallback so a target with
-    /// no published route (e.g. a brand-new neighbour whose road report
-    /// hasn't landed yet) still gets the direct exit.
+    /// P-c: rebuild `remote_exit_cells` (FINAL target region → local route
+    /// exits) from `RegionRoutes::exits_from(self.id)`. The map key is final
+    /// target T; each `ExitLink` says which local border link to use and which
+    /// neighbour receives the token. The route may be 1 hop or N hops; either
+    /// way the first hop starts at a local border, so we resolve each
+    /// `BorderLinkId` to concrete local road cells.
     pub(crate) fn set_region_routes(
         &mut self,
         exits_from: &std::collections::HashMap<RegionId, Vec<ExitLink>>,
@@ -683,42 +664,30 @@ impl RegionState {
         for (cell, link) in self.border_road_links() {
             cells_by_link.entry(link).or_default().push(cell);
         }
-        let mut map: HashMap<RegionId, Vec<Entity>> = HashMap::new();
-        // Track every target the routes MENTIONED, even if no local cell
-        // resolved (e.g. a multi-hop first hop whose BorderLinkId has no
-        // local road yet). The fallback must skip these so the route's
-        // choice (possibly a non-direct first hop) is not defeated.
+        let mut map: HashMap<RegionId, Vec<RouteExit>> = HashMap::new();
         for (target, exits) in exits_from {
             for exit in exits {
                 if let Some(cells) = cells_by_link.get(&exit.link) {
                     map.entry(*target)
                         .or_default()
-                        .extend(cells.iter().copied());
+                        .extend(cells.iter().copied().map(|cell| RouteExit {
+                            cell,
+                            link: exit.link,
+                            to_region: exit.to_region,
+                        }));
                 }
             }
         }
-        // Fallback: a direct neighbour with NO entry in `exits_from` (no
-        // route published yet) keeps the direct border exit so the mover
-        // can still reach it.
-        for (link, cells) in &cells_by_link {
-            if let Some(&neighbor) = self.world.border_neighbor_map.get(link) {
-                if !exits_from.contains_key(&neighbor) {
-                    map.entry(neighbor)
-                        .or_default()
-                        .extend(cells.iter().copied());
-                }
-            }
-        }
-        for cells in map.values_mut() {
-            cells.sort();
-            cells.dedup();
+        for exits in map.values_mut() {
+            exits.sort();
+            exits.dedup();
         }
         self.world.remote_exit_cells = map;
     }
 
-    /// P5b: drain this tick's buffered crossings into routed handoffs, resolving
-    /// each border link from the topology. A `Move` whose exit cell no longer maps
-    /// to a link toward its region is rolled back home (never strands the citizen).
+    /// P5b: drain this tick's buffered crossings into routed handoffs. A `Move`
+    /// whose carried exit link no longer resolves to its exit cell is rolled back
+    /// home (never strands the citizen).
     /// `Rollback` handoffs are emitted by a neighbour that could not place an
     /// inbound token — we route them back to the home region.
     pub(crate) fn drain_traveler_handoffs(&mut self) -> Vec<TravelerHandoff> {
@@ -731,19 +700,21 @@ impl RegionState {
                     token,
                     to_region,
                     exit_cell,
-                } => match self.exit_link_for(exit_cell, to_region) {
-                    Some(entry_link) => handoffs.push(TravelerHandoff {
-                        token,
-                        traveler,
-                        to_region,
-                        entry_link: Some(entry_link),
-                        kind: HandoffKind::Move,
-                    }),
-                    None => {
-                        // The exit cell no longer faces `to_region` — the outbound
-                        // can't route. Two cases:
+                    exit_link,
+                } => {
+                    if self.cell_at_border_link(exit_link) == Some(exit_cell) {
+                        handoffs.push(TravelerHandoff {
+                            token,
+                            traveler,
+                            to_region,
+                            entry_link: Some(exit_link),
+                            kind: HandoffKind::Move,
+                        });
+                    } else {
+                        // The selected exit link no longer resolves to this cell —
+                        // the outbound can't route. Two cases:
                         //   - Home-side: the home just lost its border link (or
-                        //     the link map went stale). Apply `apply_traveler_return`
+                        //     the route went stale). Apply `apply_traveler_return`
                         //     locally — it clears `away_residents` (the citizen
                         //     wasn't really away).
                         //   - Host-side: a foreign visitor's exit became
@@ -763,7 +734,7 @@ impl RegionState {
                             });
                         }
                     }
-                },
+                }
                 PendingHandoff::Rollback {
                     traveler,
                     to_region,
@@ -830,7 +801,7 @@ impl RegionState {
                         Vec::new()
                     }
                     None => {
-                        // Entry road gone (topology drift) — bounce a Rollback
+                        // Entry road gone (stale route snapshot) — bounce a Rollback
                         // home. If THIS is the home region (its own entry vanished),
                         // it self-bounces: next sub-tick `apply_traveler_return`
                         // clears `away_residents`, so the abandoned trip is
@@ -878,21 +849,6 @@ impl RegionState {
             }
         }
         out
-    }
-
-    /// The border link from `exit_cell` that faces `to_region`, if any.
-    fn exit_link_for(&self, exit_cell: Entity, to_region: RegionId) -> Option<BorderLinkId> {
-        let position = self.world.positions.get(&exit_cell)?;
-        let width = self.world.grid.width();
-        let height = self.world.grid.height();
-        let network = RegionRoadNetworkId {
-            region: self.id,
-            road_network: 0,
-        };
-        border_links_for_cell(network, position.x, position.y, width, height)
-            .into_iter()
-            .map(|link| link.link)
-            .find(|link| self.world.border_neighbor_map.get(link) == Some(&to_region))
     }
 
     /// The local road cell sitting on `link`, if it exists and is a road.
@@ -1654,24 +1610,6 @@ mod tests {
 
     use crate::core::components::{PendingHandoff, TravelerId};
 
-    /// An East-edge road in region A; the worker hint says East faces region B.
-    /// `set_border_neighbor_map` must record that cell as an exit toward B.
-    #[test]
-    fn border_hint_populates_remote_exit_cells() {
-        let mut a = RegionState::new(RegionId(1), 2, 1);
-        assert!(a.build(1, 0, BuildingKind::Road).success); // East edge (x = width-1)
-        let exit = a.world.grid.get(1, 0).expect("road");
-        let link = BorderLinkId {
-            edge: BorderEdge::East,
-            offset: 0,
-        };
-        a.set_border_neighbor_map(HashMap::from([(link, RegionId(2))]));
-        assert_eq!(
-            a.world.remote_exit_cells.get(&RegionId(2)),
-            Some(&vec![exit])
-        );
-    }
-
     /// P-c: a multi-hop `exits_from(r)` map populates `remote_exit_cells`
     /// for a final target T. The test region is built with one East-edge
     /// road; the exits_from map says A's first hop toward T (region 2) is
@@ -1701,72 +1639,35 @@ mod tests {
         // contains the local East-edge cell.
         assert_eq!(
             a.world.remote_exit_cells.get(&RegionId(2)),
-            Some(&vec![exit])
+            Some(&vec![RouteExit {
+                cell: exit,
+                link,
+                to_region: RegionId(2)
+            }])
         );
     }
 
-    /// P-c fallback: when the routes field is empty (no report published
-    /// yet for any neighbour), `set_region_routes` falls back to the
-    /// direct `border_neighbor_map` so a fresh build still works.
+    /// P-c: an empty route field means no remote exits. Direct-neighbour
+    /// routing also comes through `RegionRoutes`; there is no separate
+    /// border-neighbour fallback.
     #[test]
-    fn set_region_routes_falls_back_to_border_neighbor_map() {
+    fn set_region_routes_empty_routes_clear_remote_exit_cells() {
         let mut a = RegionState::new(RegionId(1), 2, 1);
         assert!(a.build(1, 0, BuildingKind::Road).success); // East edge
-        let exit = a.world.grid.get(1, 0).expect("road");
         let link = BorderLinkId {
             edge: BorderEdge::East,
             offset: 0,
         };
-        a.set_border_neighbor_map(HashMap::from([(link, RegionId(2))]));
-        // Empty routes field: only the fallback path contributes.
-        a.set_region_routes(&HashMap::new());
-        assert_eq!(
-            a.world.remote_exit_cells.get(&RegionId(2)),
-            Some(&vec![exit])
-        );
-    }
-
-    /// P-c routes take priority: when routes already cover a direct
-    /// neighbour, the fallback does NOT inject the direct border cell
-    /// (which would defeat the route's cheaper-corridor choice). The
-    /// fallback is gap-fill only.
-    #[test]
-    fn set_region_routes_does_not_inject_direct_when_routes_cover() {
-        use crate::core::regions::ExitLink;
-        let mut a = RegionState::new(RegionId(1), 2, 1);
-        assert!(a.build(1, 0, BuildingKind::Road).success); // East edge
-        let direct = a.world.grid.get(1, 0).expect("road");
-        // A south-edge road at a hypothetical detour exit (we'll fake its
-        // BorderLinkId for the route even though the geometry wouldn't
-        // actually produce one — the point is the route picks a non-East
-        // cell and the fallback must respect that).
-        let direct_link = BorderLinkId {
-            edge: BorderEdge::East,
-            offset: 0,
-        };
-        let detour_link = BorderLinkId {
-            edge: BorderEdge::South,
-            offset: 0,
-        };
-        a.set_border_neighbor_map(HashMap::from([(direct_link, RegionId(2))]));
-        // Routes pick a detour (South) toward target region 2.
-        let exits_from: HashMap<RegionId, Vec<ExitLink>> = HashMap::from([(
+        a.set_region_routes(&HashMap::from([(
             RegionId(2),
             vec![ExitLink {
-                link: detour_link,
+                link,
                 to_region: RegionId(2),
             }],
-        )]);
-        a.set_region_routes(&exits_from);
-        // Routes set target=2 → empty (the detour_link has no local cell).
-        // The fallback MUST NOT then append the direct East cell. If it
-        // did, the mover would take the direct (cost-suboptimal) route.
-        let cells = a.world.remote_exit_cells.get(&RegionId(2));
-        let has_direct = cells.is_some_and(|v| v.contains(&direct));
-        assert!(
-            !has_direct,
-            "fallback must not inject the direct cell when routes cover the target"
-        );
+        )]));
+        assert!(a.world.remote_exit_cells.contains_key(&RegionId(2)));
+        a.set_region_routes(&HashMap::new());
+        assert!(a.world.remote_exit_cells.is_empty());
     }
 
     /// Draining a Move resolves the facing border link and emits a `TravelerHandoff`.
@@ -1779,8 +1680,6 @@ mod tests {
             edge: BorderEdge::East,
             offset: 0,
         };
-        a.set_border_neighbor_map(HashMap::from([(link, RegionId(2))]));
-
         let traveler = TravelerId {
             citizen: Entity::new(RegionId(1), 5),
             generation: 1,
@@ -1811,6 +1710,7 @@ mod tests {
             token,
             to_region: RegionId(2),
             exit_cell: exit,
+            exit_link: link,
         });
 
         let handoffs = a.drain_traveler_handoffs();
@@ -1829,7 +1729,7 @@ mod tests {
         let mut a = RegionState::new(RegionId(1), 2, 1);
         assert!(a.build(1, 0, BuildingKind::Road).success);
         let exit = a.world.grid.get(1, 0).expect("road");
-        // No border_neighbor_map entry → the exit faces nothing.
+        // The handoff carries a stale link that no longer resolves to the exit.
         let citizen = Entity::new(RegionId(1), 5);
         // The guard `home_accepts` requires the citizen to be in
         // `world.citizens`; the test pre-registers it so the rollback fires.
@@ -1868,6 +1768,10 @@ mod tests {
             token,
             to_region: RegionId(2),
             exit_cell: exit,
+            exit_link: BorderLinkId {
+                edge: BorderEdge::West,
+                offset: 0,
+            },
         });
 
         let handoffs = a.drain_traveler_handoffs();
