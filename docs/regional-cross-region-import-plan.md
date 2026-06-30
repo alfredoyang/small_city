@@ -14,7 +14,7 @@ The active direction is **producer-authoritative imports**:
 - the consumer applies imported derived state only after a grant.
 
 For vocabulary (`World`, `RegionState`, `RegionRuntime`, `RegionWorker`, directory,
-snapshot, hints, export grants) see [regional-terminology.md](regional-terminology.md).
+snapshot, hints, export grants) see [regional-terminology.md](architecture/regional-terminology.md).
 For M workers running N regions, see
 [regional-multi-worker-plan.md](regional-multi-worker-plan.md).
 

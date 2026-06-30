@@ -6,7 +6,7 @@ Status: implemented — G1 + G2. Follow-ups: exact route distance on
 This mission lets a road-connected industrial in one region supply goods to a
 shop in a neighboring region, instead of both falling back to the abstract edge
 market. It mirrors the cross-region **jobs** patch; read
-[regional-terminology.md](regional-terminology.md) §4/§4b first — the vocabulary
+[regional-terminology.md](architecture/regional-terminology.md) §4/§4b first — the vocabulary
 and the registry → discovery → producer-owned export-grant model are reused
 verbatim.
 

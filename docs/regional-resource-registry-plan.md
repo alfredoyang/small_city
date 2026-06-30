@@ -21,7 +21,7 @@ symptom that motivated this foundation.
 
 For definitions of the types and terms used below (import vs export convention,
 topology, components, export allocations, generations), see
-[regional-terminology.md](regional-terminology.md).
+[regional-terminology.md](architecture/regional-terminology.md).
 
 ## Motivation (current state)
 

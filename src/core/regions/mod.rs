@@ -655,6 +655,33 @@ impl RegionState {
     /// neighbour receives the token. The route may be 1 hop or N hops; either
     /// way the first hop starts at a local border, so we resolve each
     /// `BorderLinkId` to concrete local road cells.
+    ///
+    /// ```text
+    /// Layer-1 route answer for source A:
+    ///
+    ///   final target C -> ExitLink { link: East/0, to_region: B }
+    ///
+    /// Local road graph in A:
+    ///
+    ///   BorderLinkId East/0 -> [road cell r42]
+    ///
+    /// Stored mover answer:
+    ///
+    ///   remote_exit_cells[C] = [
+    ///     RouteExit { cell: r42, link: East/0, to_region: B }
+    ///   ]
+    /// ```
+    ///
+    /// `RouteExit` deliberately carries all three pieces:
+    ///
+    /// ```text
+    /// cell      = Layer-2 local movement target ("walk to this road cell")
+    /// link      = sender-side border link carried in the handoff
+    /// to_region = immediate next-hop region for worker routing
+    /// ```
+    ///
+    /// This keeps Layer-1's chosen route intact through crossing; the drain path
+    /// no longer re-derives a neighbour from a separate direct-border map.
     pub(crate) fn set_region_routes(
         &mut self,
         exits_from: &std::collections::HashMap<RegionId, Vec<ExitLink>>,

@@ -9,7 +9,7 @@ uses directories and snapshots, but only as stale-tolerant routing hints. Cross-
 power/jobs remain producer-authoritative request/grant flows.
 
 For vocabulary (`World`, `RegionState`, `RegionRuntime`, `RegionWorker`, directory,
-snapshot, hints, export grants) see [regional-terminology.md](regional-terminology.md).
+snapshot, hints, export grants) see [regional-terminology.md](architecture/regional-terminology.md).
 
 ## Current State
 
