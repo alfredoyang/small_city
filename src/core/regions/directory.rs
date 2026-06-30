@@ -574,11 +574,13 @@ fn build_region_routes(
             if r_cost == u32::MAX {
                 continue; // unreachable
             }
-            // Collect every candidate next hop with the minimum total cost,
-            // then sort by (total, to_region, edge, offset) for determinism.
-            // Ties are emitted as multiple ExitLinks so a region with several
-            // equally-good first hops keeps all of them.
-            let mut candidates: Vec<(u32, RegionId, BorderLinkId)> = Vec::new();
+            // Pick the cheapest next-hop region(s), then keep every local exit
+            // toward those next-hop regions. A region can have disconnected local
+            // road networks that both cross to the same neighbour; keeping only
+            // the single cheapest border link can strand a token that entered on
+            // the other local network. Layer 1 chooses the neighbour; Layer 2
+            // still chooses a reachable border cell inside this region.
+            let mut best_next_regions: Vec<RegionId> = Vec::new();
             let mut best_total: u32 = u32::MAX;
             for (rn, exits) in &r_to_n {
                 if rn.0 != *r {
@@ -594,26 +596,41 @@ fn build_region_routes(
                 if n_cost >= r_cost {
                     continue;
                 }
-                // Expand every (weight, exit) candidate for this (r, n) edge.
-                for (w, edge) in exits {
-                    let total = w.saturating_add(n_cost);
-                    if total < best_total {
-                        best_total = total;
-                        candidates.clear();
-                        candidates.push((total, n, *edge));
-                    } else if total == best_total {
-                        candidates.push((total, n, *edge));
+                let Some(min_w) = exits.iter().map(|(w, _)| *w).min() else {
+                    continue;
+                };
+                let total = min_w.saturating_add(n_cost);
+                if total < best_total {
+                    best_total = total;
+                    best_next_regions.clear();
+                    best_next_regions.push(n);
+                } else if total == best_total {
+                    best_next_regions.push(n);
+                }
+            }
+            best_next_regions.sort();
+            best_next_regions.dedup();
+
+            let mut candidates: Vec<(u32, RegionId, BorderLinkId)> = Vec::new();
+            for n in &best_next_regions {
+                let n_cost = cost_to_t.get(n).copied().unwrap_or(u32::MAX);
+                if n_cost == u32::MAX || n_cost >= r_cost {
+                    continue;
+                }
+                if let Some(exits) = r_to_n.get(&(*r, *n)) {
+                    for (w, edge) in exits {
+                        let total = w.saturating_add(n_cost);
+                        candidates.push((total, *n, *edge));
                     }
                 }
             }
             if !candidates.is_empty() {
                 candidates.sort_by_key(|(t, n, e)| (*t, n.0, e.edge, e.offset));
-                let total_cost = candidates[0].0;
                 let entry = from.entry(*r).or_insert(RouteHop {
                     exits: Vec::new(),
                     cost: u32::MAX,
                 });
-                entry.cost = total_cost;
+                entry.cost = best_total;
                 for (_, next_region, edge) in &candidates {
                     entry.exits.push(ExitLink {
                         link: *edge,
@@ -970,6 +987,103 @@ mod tests {
         let to_a_from_b = &routes.to[&RegionId(1)].from[&RegionId(2)];
         assert_eq!(to_a_from_b.cost, 2);
         assert_eq!(to_a_from_b.exits[0].to_region, RegionId(1));
+    }
+
+    /// P-c regression: Layer 1 chooses the next-hop region, not a single local
+    /// border cell. If A has two disconnected roads that both cross to B, keeping
+    /// only the cheapest A→B border can strand a token that entered on the other
+    /// road. Preserve all exits toward the chosen next-hop region; Layer 2 filters
+    /// by local reachability.
+    #[test]
+    fn region_routes_preserve_all_exits_to_best_next_region() {
+        use crate::core::regions::{
+            BorderLinkId, RegionBorderLink, RegionCrossCost, RegionRoadReport,
+        };
+        let owners = owned(&[1, 2]);
+        let a_east_0 = BorderLinkId {
+            edge: BorderEdge::East,
+            offset: 0,
+        };
+        let a_east_1 = BorderLinkId {
+            edge: BorderEdge::East,
+            offset: 1,
+        };
+        let b_west_0 = BorderLinkId {
+            edge: BorderEdge::West,
+            offset: 0,
+        };
+        let b_west_1 = BorderLinkId {
+            edge: BorderEdge::West,
+            offset: 1,
+        };
+        let reports = vec![
+            RegionRoadReport {
+                region: RegionId(1),
+                border_links: vec![
+                    RegionBorderLink {
+                        link: a_east_0,
+                        neighbour: RegionId(2),
+                    },
+                    RegionBorderLink {
+                        link: a_east_1,
+                        neighbour: RegionId(2),
+                    },
+                ],
+                crossing_costs: vec![
+                    RegionCrossCost {
+                        entry: a_east_0,
+                        exit: a_east_0,
+                        cost: 1,
+                    },
+                    RegionCrossCost {
+                        entry: a_east_1,
+                        exit: a_east_1,
+                        cost: 9,
+                    },
+                ],
+            },
+            RegionRoadReport {
+                region: RegionId(2),
+                border_links: vec![
+                    RegionBorderLink {
+                        link: b_west_0,
+                        neighbour: RegionId(1),
+                    },
+                    RegionBorderLink {
+                        link: b_west_1,
+                        neighbour: RegionId(1),
+                    },
+                ],
+                crossing_costs: vec![
+                    RegionCrossCost {
+                        entry: b_west_0,
+                        exit: b_west_0,
+                        cost: 0,
+                    },
+                    RegionCrossCost {
+                        entry: b_west_1,
+                        exit: b_west_1,
+                        cost: 0,
+                    },
+                ],
+            },
+        ];
+
+        let routes = build_region_routes(&reports, &owners);
+        let exits = &routes.to[&RegionId(2)].from[&RegionId(1)].exits;
+        assert_eq!(
+            exits,
+            &vec![
+                ExitLink {
+                    link: a_east_0,
+                    to_region: RegionId(2),
+                },
+                ExitLink {
+                    link: a_east_1,
+                    to_region: RegionId(2),
+                },
+            ]
+        );
     }
 
     /// P-b: **strict-decrease.** Inter-region edges are forced strictly

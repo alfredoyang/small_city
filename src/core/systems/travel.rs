@@ -1269,6 +1269,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transit_token_walks_from_entry_to_onward_exit() {
+        let mut world = World::new(20, 15);
+        for y in 0..=14 {
+            place_building(&mut world, 8, y, BuildingKind::Road);
+        }
+        let entry = world.grid.get(8, 0).expect("entry");
+        let exit = world.grid.get(8, 14).expect("exit");
+        let key = Entity::new(RegionId(1), 42);
+        world.tokens.insert(
+            key,
+            TravelToken {
+                state: TravelState {
+                    status: TravelStatus::Traveling,
+                    current_cell: Some(entry),
+                    destination: None,
+                    building: None,
+                    dwell: 0,
+                    prev_cell: None,
+                },
+                home: PlaceRef {
+                    region: RegionId(1),
+                    building: Entity::new(RegionId(1), 1),
+                },
+                work: Some(PlaceRef {
+                    region: RegionId(7),
+                    building: Entity::new(RegionId(7), 2),
+                }),
+                trip_gen: 1,
+            },
+        );
+        world
+            .remote_exit_cells
+            .insert(RegionId(7), vec![route_exit(exit, RegionId(7))]);
+
+        set_hour(&mut world, 9);
+        step_tokens(&mut world);
+
+        assert_eq!(
+            world.tokens[&key].state.current_cell,
+            Some(world.grid.get(8, 1).expect("next")),
+            "transit token should walk toward the onward exit"
+        );
+    }
+
     /// A remote visitor on a 4-way intersection holds for 4 sub-ticks
     /// (cost 4) — the remote dwell gate is checked before advancing.
     /// Regression for the "remote trips still bypass P7b dwell" fix.
