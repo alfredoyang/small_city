@@ -67,7 +67,7 @@ fn busy_region_cannot_starve_another_region_when_event_limit_is_set() {
 
 #[test]
 fn add_region_rejects_duplicate_region_id() {
-    let mut worker = RegionWorker::new(WorkerId(5));
+    let mut worker = test_worker(WorkerId(5));
 
     assert!(
         worker
@@ -322,7 +322,7 @@ fn stale_spare_power_hint_routes_to_producer_but_denies_cleanly() {
         BorderEdge::East,
         81,
     )]));
-    let mut worker = RegionWorker::with_directory(WorkerId(52), Arc::clone(&directory));
+    let mut worker = test_worker_with_directory(WorkerId(52), Arc::clone(&directory));
     worker
         .add_region(RegionRuntime::new(power_export_consumer_region(caller)))
         .unwrap();
@@ -1210,7 +1210,7 @@ fn two_worker_barrier_matches_single_worker_for_power_and_jobs_script() {
 }
 
 fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
-    let mut worker = RegionWorker::new(id);
+    let mut worker = test_worker(id);
     for region_id in regions {
         worker
             .add_region(RegionRuntime::new(RegionState::new(*region_id, 2, 2)))
@@ -1473,11 +1473,24 @@ fn cell_powered(worker: &RegionWorker, region_id: RegionId, x: usize, y: usize) 
 }
 
 fn worker_with_region_states(id: WorkerId, regions: Vec<RegionState>) -> RegionWorker {
-    let mut worker = RegionWorker::new(id);
+    let mut worker = test_worker(id);
     for region in regions {
         worker.add_region(RegionRuntime::new(region)).unwrap();
     }
     worker
+}
+
+fn test_worker(id: WorkerId) -> RegionWorker {
+    let owners = Arc::new(RegionOwnerDirectory::new());
+    let directory = Arc::new(RegionDirectory::with_owners(
+        Vec::new(),
+        Arc::clone(&owners),
+    ));
+    RegionWorker::with_directory_and_owners(id, directory, owners)
+}
+
+fn test_worker_with_directory(id: WorkerId, directory: Arc<RegionDirectory>) -> RegionWorker {
+    RegionWorker::with_directory_and_owners(id, directory, Arc::new(RegionOwnerDirectory::new()))
 }
 
 fn assert_component(

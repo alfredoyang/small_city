@@ -238,10 +238,12 @@ pub struct RegionWorker {
 }
 
 impl RegionWorker {
+    #[cfg(test)]
     pub fn new(id: WorkerId) -> Self {
         Self::with_directory(id, Arc::new(RegionDirectory::default()))
     }
 
+    #[cfg(test)]
     pub fn with_directory(id: WorkerId, directory: Arc<RegionDirectory>) -> Self {
         Self::with_directory_and_owners(id, directory, Arc::new(RegionOwnerDirectory::default()))
     }

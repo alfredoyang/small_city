@@ -338,6 +338,28 @@ fn flattened_region_values<T: Clone>(map: &HashMap<RegionId, Vec<T>>) -> Vec<T> 
 /// Determinism: every `Vec<ExitLink>` is sorted + deduped by
 /// `(link.edge, link.offset, to_region)`; region-routes lookups are by
 /// `HashMap`. One Dijkstra per destination T.
+///
+/// Mental model for one region report:
+///
+/// ```text
+/// Region A
+/// +-------------------+
+/// | West link         |        East link
+/// | to X              |        to B
+/// |     <--- road ----+-------->
+/// +-------------------+
+///
+/// RegionBorderLink = "this border opening crosses to that region"
+///   { link: West/0, neighbour: X }
+///   { link: East/0, neighbour: B }
+///
+/// RegionCrossCost  = "inside this region, entry border -> exit border costs N"
+///   { entry: West/0, exit: East/0, cost: 7 }
+/// ```
+///
+/// Layer-1 Dijkstra assembles these local reports into region-to-region
+/// weights: leave A through its chosen border, enter B through the matching
+/// border, then pay B's internal `RegionCrossCost` to reach B's next exit.
 fn build_region_routes(
     reports: &[RegionRoadReport],
     owners: &RegionOwnerDirectory,

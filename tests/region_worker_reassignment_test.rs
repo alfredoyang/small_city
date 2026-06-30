@@ -1,15 +1,17 @@
 //! Integration tests for moving region runtimes between workers at safe points.
 
 use small_city::core::regional_game::UiRequestId;
+use small_city::core::regions::directory::RegionDirectory;
 use small_city::core::regions::runtime::{RegionEvent, RegionRuntime};
-use small_city::core::regions::worker::{RegionWorker, WorkerId};
+use small_city::core::regions::worker::{RegionOwnerDirectory, RegionWorker, WorkerId};
 use small_city::core::regions::{RegionId, RegionState};
+use std::sync::Arc;
 
 #[test]
 fn runtime_can_be_removed_from_one_worker_and_added_to_another() {
     let region_id = RegionId(1);
     let mut source_worker = worker_with_regions(WorkerId(1), &[region_id]);
-    let mut target_worker = RegionWorker::new(WorkerId(2));
+    let mut target_worker = test_worker(WorkerId(2));
 
     let runtime = source_worker
         .remove_region(region_id)
@@ -24,7 +26,7 @@ fn runtime_can_be_removed_from_one_worker_and_added_to_another() {
 fn only_new_owner_processes_moved_runtime_events() {
     let region_id = RegionId(2);
     let mut source_worker = worker_with_regions(WorkerId(3), &[region_id]);
-    let mut target_worker = RegionWorker::new(WorkerId(4));
+    let mut target_worker = test_worker(WorkerId(4));
 
     source_worker
         .push_event(region_id, tick(1))
@@ -48,7 +50,7 @@ fn only_new_owner_processes_moved_runtime_events() {
 fn existing_send_handle_still_delivers_to_moved_runtime() {
     let region_id = RegionId(3);
     let mut source_worker = worker_with_regions(WorkerId(5), &[region_id]);
-    let mut target_worker = RegionWorker::new(WorkerId(6));
+    let mut target_worker = test_worker(WorkerId(6));
     let handle = source_worker
         .handle_for(region_id)
         .expect("handle should exist before move");
@@ -95,13 +97,22 @@ fn failed_reassignment_returns_runtime_with_queued_events() {
 }
 
 fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
-    let mut worker = RegionWorker::new(id);
+    let mut worker = test_worker(id);
     for region_id in regions {
         worker
             .add_region(RegionRuntime::new(RegionState::new(*region_id, 2, 2)))
             .unwrap();
     }
     worker
+}
+
+fn test_worker(id: WorkerId) -> RegionWorker {
+    let owners = Arc::new(RegionOwnerDirectory::new());
+    let directory = Arc::new(RegionDirectory::with_owners(
+        Vec::new(),
+        Arc::clone(&owners),
+    ));
+    RegionWorker::with_directory_and_owners(id, directory, owners)
 }
 
 fn tick(request_id: u64) -> RegionEvent {

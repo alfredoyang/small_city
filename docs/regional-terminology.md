@@ -45,11 +45,14 @@ These describe *where* regions and roads are, and which roads may share power.
   one region. This is the granularity sharing follows — *not* the region as a
   whole. "Sharing follows roads" means it follows `RegionRoadNetworkId`s.
 - **`BorderEdge`** — `North | South | East | West`: which map edge a road touches.
-- **`BorderLinkId { edge, offset }`** — a specific spot on a border edge where a
-  road meets the region boundary. `offset` is the cell coordinate along that edge
-  (x for N/S, y for W/E).
+- **`BorderLinkId { edge, offset }`** — where on this region's border. It names
+  the edge and offset only; it does not name the region on the other side.
+  `offset` is x for N/S, y for W/E.
 - **`NetworkBorderLink { network, link }`** — "this road network reaches the
   boundary at this border link." Produced by `RegionState::network_border_links()`.
+- **`RegionBorderLink { link, neighbour }`** — where on this border plus which
+  neighboring region it reaches. In short: `BorderLinkId` + `RegionId`. Used in
+  `RegionRoadReport` for Layer-1 travel routing.
 - **`RegionNeighborLink { region, edge, neighbor }`** — declared adjacency: "this
   region's `edge` borders that `neighbor` region." This is the **topology** that
   gates which border links may match. Without a declared neighbor link, two

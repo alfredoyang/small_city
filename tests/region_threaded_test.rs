@@ -1,10 +1,12 @@
 //! Integration tests for the optional threaded region worker runner.
 
 use small_city::core::regional_game::UiRequestId;
+use small_city::core::regions::directory::RegionDirectory;
 use small_city::core::regions::runtime::{RegionEvent, RegionRuntime};
 use small_city::core::regions::threaded::{ThreadedRegionWorker, ThreadedWorkerShutdown};
-use small_city::core::regions::worker::{RegionWorker, WorkerId};
+use small_city::core::regions::worker::{RegionOwnerDirectory, RegionWorker, WorkerId};
 use small_city::core::regions::{RegionId, RegionState};
+use std::sync::Arc;
 
 #[test]
 fn threaded_worker_processes_tick_request_and_returns_summary() {
@@ -90,13 +92,22 @@ fn shutdown_can_drain_one_bounded_pass_deterministically() {
 }
 
 fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
-    let mut worker = RegionWorker::new(id);
+    let mut worker = test_worker(id);
     for region_id in regions {
         worker
             .add_region(RegionRuntime::new(RegionState::new(*region_id, 2, 2)))
             .unwrap();
     }
     worker
+}
+
+fn test_worker(id: WorkerId) -> RegionWorker {
+    let owners = Arc::new(RegionOwnerDirectory::new());
+    let directory = Arc::new(RegionDirectory::with_owners(
+        Vec::new(),
+        Arc::clone(&owners),
+    ));
+    RegionWorker::with_directory_and_owners(id, directory, owners)
 }
 
 fn tick(request_id: u64) -> RegionEvent {
