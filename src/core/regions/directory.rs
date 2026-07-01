@@ -395,8 +395,7 @@ fn flattened_region_values<T: Clone>(map: &HashMap<RegionId, Vec<T>>) -> Vec<T> 
 /// ```text
 /// RegionRoutes.to[C].from[A] =
 ///   RouteHop {
-///     exits: [ExitLink { link: East/0, to_region: B }],
-///     cost: 9,
+///     exits: [ExitLink { link: East/0, to_region: B, cost: 9 }],
 ///   }
 /// ```
 ///
@@ -594,14 +593,8 @@ fn build_region_routes(
         //    lower dist. Those are valid first hops; keep all
         //    minimum-cost ties.
         let mut from: std::collections::HashMap<RegionId, RouteHop> = HashMap::new();
-        // Destination T: no hop, cost 0.
-        from.insert(
-            *t,
-            RouteHop {
-                exits: Vec::new(),
-                cost: 0,
-            },
-        );
+        // Destination T: no hop.
+        from.insert(*t, RouteHop { exits: Vec::new() });
         for r in &owned_regions {
             if r == t {
                 continue;
@@ -692,13 +685,7 @@ fn build_region_routes(
             // observable in tests.
             all_exits.sort_by_key(|e| (e.cost, e.to_region.0, e.link.edge, e.link.offset));
             let exits: Vec<ExitLink> = dedup_exits(all_exits);
-            from.insert(
-                *r,
-                RouteHop {
-                    exits,
-                    cost: best_next_total,
-                },
-            );
+            from.insert(*r, RouteHop { exits });
         }
         to_map.insert(*t, RouteField { from });
     }
@@ -1058,14 +1045,12 @@ mod tests {
         // n_dist=2 < r_dist=3 (strict decrease), so A hops to B with
         // cost = 1 + 2 = 3.
         let to_c_from_a = &routes.to[&RegionId(3)].from[&RegionId(1)];
-        assert_eq!(to_c_from_a.cost, 3);
         assert_eq!(to_c_from_a.exits[0].to_region, RegionId(2));
         // For destination A (1): dist[(A, East/0)] = 0, dist[(B, West/0)] = 1,
         // dist[(B, East/0)] = 2, dist[(C, West/0)] = 3. B's (West/0) crossing
         // to A has n_dist=0 < r_dist=1; B's (East/0) crossing to C has
         // n_dist=3 > r_dist=2 (rejected). B hops to A with cost = 1 + 0 = 1.
         let to_a_from_b = &routes.to[&RegionId(1)].from[&RegionId(2)];
-        assert_eq!(to_a_from_b.cost, 1);
         assert_eq!(to_a_from_b.exits[0].to_region, RegionId(1));
     }
 
@@ -1229,7 +1214,6 @@ mod tests {
         // destination (no hop). Node 2's only neighbour is A with w=1 and
         // cost_to_1(A)=0; strict-decrease 0 < 1 fires, so B hops to A.
         let to_a_from_b = &routes.to[&RegionId(1)].from[&RegionId(2)];
-        assert_eq!(to_a_from_b.cost, 1);
         assert_eq!(to_a_from_b.exits[0].to_region, RegionId(1));
     }
 
@@ -1481,7 +1465,6 @@ mod tests {
         //             + E->C (cross 1) = 5
         // A should hop to D (the cheaper corridor). A's cost to C is 5.
         let to_c_from_a = &routes.to[&RegionId(3)].from[&RegionId(1)];
-        assert_eq!(to_c_from_a.cost, 5);
         assert_eq!(to_c_from_a.exits[0].to_region, RegionId(4));
     }
 
@@ -1678,7 +1661,6 @@ mod tests {
         // A's cost to C = cross A->B (1) + B's interior West->East (10)
         // + cross B->C (1) = 12. NOT 20.
         let to_c_from_a = &routes.to[&RegionId(3)].from[&RegionId(1)];
-        assert_eq!(to_c_from_a.cost, 12);
         assert_eq!(to_c_from_a.exits[0].to_region, RegionId(2));
     }
 
@@ -1917,7 +1899,6 @@ mod tests {
         //   A.e0 cost = 1 + dist[(B, b_west_0)] = 1 + 2 = 3
         //   A.e1 cost = 1 + dist[(B, b_west_1)] = 1 + 6 = 7
         let to_c_from_a = &routes.to[&RegionId(3)].from[&RegionId(1)];
-        assert_eq!(to_c_from_a.cost, 3);
         assert_eq!(to_c_from_a.exits.len(), 2);
         // Sorted by (cost, to_region, edge, offset): cheaper East/0 first.
         assert_eq!(to_c_from_a.exits[0].link, a_east_0);
@@ -2048,7 +2029,6 @@ mod tests {
         // The chosen next-hop region is B (only). Both A borders are
         // emitted, with their distinct per-exit costs.
         let to_c_from_a = &routes.to[&RegionId(3)].from[&RegionId(1)];
-        assert_eq!(to_c_from_a.cost, 10);
         assert_eq!(to_c_from_a.exits.len(), 2);
         // Sorted by (cost, to_region, edge, offset).
         assert_eq!(to_c_from_a.exits[0].cost, 10);
@@ -2125,7 +2105,6 @@ mod tests {
         let routes = build_region_routes(&reports, &owners);
         // A -> C: cross A->B (1) + B's (West, East, 5) + cross B->C (1) = 7.
         let to_c_from_a = &routes.to[&RegionId(3)].from[&RegionId(1)];
-        assert_eq!(to_c_from_a.cost, 7);
         assert_eq!(to_c_from_a.exits[0].to_region, RegionId(2));
     }
 

@@ -183,8 +183,7 @@ pub struct RegionRoadReport {
 
 /// P-?: the directory's OUTPUT for the Layer-1 router. One Dijkstra-at-T tree:
 /// every source's answer to "how do I get toward T?". Outer key = DESTINATION
-/// region; inner key = SOURCE region; value = `RouteHop` (min-cost next-hop
-/// exits + the source's total road cost to T).
+/// region; inner key = SOURCE region; value = `RouteHop` (next-hop exits).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegionRoutes {
     pub to: std::collections::HashMap<RegionId, RouteField>,
@@ -208,20 +207,26 @@ pub struct RouteField {
 }
 
 /// P-?: r's answer for "how do I get toward T?" — the cost-sorted next-hop
-/// exits (r may have several, with different per-exit costs), plus the best
-/// road cost from r to T.
+/// exits. Each [`ExitLink`] carries its own remaining route cost; there is no
+/// separate summary cost to keep in sync.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RouteHop {
     pub exits: Vec<ExitLink>,
-    pub cost: u32,
 }
 
-/// P-?: one region's local answer for T — leave through this border link,
-/// arriving in `to_region`. `link` is the local-side BorderLinkId; the
-/// receiving region has the matching link on its side. `cost` is the
-/// remaining Layer-1 distance from this exit onward to the final target
-/// (crossing cost + border-node distance to the destination's nearest
-/// border); the stepper adds its local distance to `cell` to rank exits.
+/// Layer-1 routing answer: "leave this region through `link`, then the worker
+/// sends the token to `to_region`." This is border-only; it does not know which
+/// local road cell the token can stand on.
+///
+/// ```text
+/// ExitLink = which border to use + next region + remaining route cost
+/// ```
+///
+/// `link` is the local-side BorderLinkId; the receiving region has the matching
+/// link on its side. `cost` is the remaining Layer-1 distance from this exit
+/// onward to the final target (crossing cost + border-node distance to the
+/// destination's nearest border); the stepper adds its local distance to the
+/// concrete road cell when ranking exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExitLink {
     pub link: BorderLinkId,
@@ -229,11 +234,17 @@ pub struct ExitLink {
     pub cost: u32,
 }
 
-/// One concrete local road-cell exit for a final remote target. `cell` is the
-/// road cell the token walks to; `link` and `to_region` are the Layer-1 first hop
-/// carried through to the handoff, so the old direct-neighbour hint is not needed
-/// to re-derive routing at the border. `cost` mirrors `ExitLink.cost` and is
-/// the per-exit Layer-1 distance to the final target.
+/// Layer-2 movement-ready exit: the Layer-1 [`ExitLink`] plus the concrete local
+/// road `cell` the token walks to.
+///
+/// ```text
+/// RouteExit = ExitLink + the concrete local road cell to walk to
+/// ```
+///
+/// `link` and `to_region` are carried through to the handoff, so the old
+/// direct-neighbour hint is not needed to re-derive routing at the border.
+/// `cost` mirrors `ExitLink.cost` and is the per-exit Layer-1 distance to the
+/// final target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RouteExit {
     pub cell: Entity,

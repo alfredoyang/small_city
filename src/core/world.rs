@@ -37,6 +37,9 @@ fn default_region_id() -> RegionId {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+// TODO: consider renaming this type to `RegionWorld`. `World` follows ECS
+// convention, but in multi-region mode it means one region's ECS store, not the
+// whole city.
 pub(crate) struct World {
     // The region that owns this world. Not serialized (region identity is owned by
     // `RegionState`); stamped at the region load/construction boundary via

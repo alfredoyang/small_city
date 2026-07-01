@@ -133,6 +133,23 @@ RouteExit
    and what remains after that crossing?"
 ```
 
+Short version:
+
+```text
+ExitLink  = which border to use + next region + remaining route cost
+RouteExit = ExitLink + the concrete local road cell to walk to
+```
+
+```text
+RegionDirectory / L1
+  ExitLink { link: East/0, to_region: B, cost: 10 }
+        |
+        | RegionState::set_region_routes maps East/0 to road cell r42
+        v
+World.remote_exit_cells / L2
+  RouteExit { cell: r42, link: East/0, to_region: B, cost: 10 }
+```
+
 ### L2: Local Pricing Inside One Region
 
 For one region, L2 is just normal road routing over local road cells.
@@ -233,18 +250,15 @@ So A chooses D, not B:
 Route field for final target C:
 
   from A -> RouteHop {
-              exits: [ExitLink { link: South/0, to_region: D, cost: 7 }],
-              cost: 7
+              exits: [ExitLink { link: South/0, to_region: D, cost: 7 }]
             }
   from D -> RouteHop {
-              exits: [ExitLink { link: East/0, to_region: C, cost: 2 }],
-              cost: 2
+              exits: [ExitLink { link: East/0, to_region: C, cost: 2 }]
             }
   from B -> RouteHop {
-              exits: [ExitLink { link: East/0, to_region: C, cost: 2 }],
-              cost: 2
+              exits: [ExitLink { link: East/0, to_region: C, cost: 2 }]
             }
-  from C -> no exit, cost 0
+  from C -> no exit
 ```
 
 This is also the loop-safety rule: every hop must strictly decrease the Dijkstra
@@ -304,6 +318,20 @@ cell      = local L2 walking target
 link      = sender-side border link for handoff placement
 to_region = immediate next-hop region for worker routing
 cost      = remaining L1 cost after using this exit
+```
+
+```text
+RegionDirectory / L1
+  ExitLink { link, to_region, cost }
+        |
+        | RegionState::set_region_routes maps border link -> local road cell
+        v
+World.remote_exit_cells / L2
+  RouteExit { cell, link, to_region, cost }
+        |
+        | travel walks token to cell
+        v
+PendingHandoff::Move { exit_cell: cell, exit_link: link, to_region }
 ```
 
 That prevents the old duplicate routing path. The border crossing uses the same
@@ -448,7 +476,7 @@ for destination in owned_regions {
         emit every strict-decrease exit to those chosen next-hop region(s)
             as ExitLink { link, to_region, cost: 1 + dist[(to_region, entry)] };
 
-        routes.to[destination].from[source] = RouteHop { exits, cost };
+        routes.to[destination].from[source] = RouteHop { exits };
     }
 }
 ```

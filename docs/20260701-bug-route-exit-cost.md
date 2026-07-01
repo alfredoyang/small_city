@@ -21,8 +21,8 @@ pub struct RouteExit {
 }
 ```
 
-`RouteHop.cost` is only the best total cost for the source region. It is not
-attached to each exit. `travel::advance_to_exit(...)` then picks the first
+The route summary used to keep only the best total cost for the source region,
+not a cost attached to each exit. `travel::advance_to_exit(...)` then picks the first
 reachable `RouteExit`, not the cheapest reachable one.
 
 Bug example:
@@ -101,7 +101,8 @@ ExitLink {
 }
 ```
 
-- Keep `RouteHop.cost = min(exit.cost)` for summary/debug use.
+- Do not keep a separate `RouteHop.cost`; each `ExitLink.cost` is the value the
+  mover needs.
 
 `src/core/systems/travel.rs`
 - `advance_to_exit(...)` currently picks first reachable candidate.
@@ -145,7 +146,6 @@ all_exits = valid_crossings
 
 RouteHop {
     exits: all_exits,
-    cost: best_next_total,
 }
 ```
 
@@ -330,8 +330,8 @@ Path 2:
   ExitLink.cost from A East/1 = 1 + (16 + 1) = 18
 ```
 
-`RouteHop.cost` remains the best summary cost for the source region. The mover
-does not use it for choosing a local exit; it uses each `ExitLink.cost`.
+`RouteHop` stays as just the list of exits. The mover chooses from the
+per-exit `ExitLink.cost` values, so there is no summary cost to keep in sync.
 
 `src/core/regions/mod.rs`
 
