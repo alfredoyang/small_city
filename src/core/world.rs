@@ -108,6 +108,11 @@ pub(crate) struct World {
     // recompute it. A `Cell` so the `&self` invalidation chokepoints can set it.
     #[serde(skip, default)]
     derived_dirty: Cell<bool>,
+    // L1 routing: local road graph or border links may be stale for road-report
+    // pricing. TODO: `derived_dirty` and `road_topology_dirty` are coarse
+    // command-side invalidation flags; split by subsystem if config mutation grows.
+    #[serde(skip, default)]
+    road_topology_dirty: Cell<bool>,
     // Tunable footprint/building rules. `#[serde(skip)]` so they are not duplicated per region in
     // the save; the regional layer injects the save-stamped rules into each world (until then every
     // world deterministically gets the embedded default).
@@ -158,6 +163,7 @@ impl World {
             remote_exit_cells: HashMap::new(),
             away_generation: HashMap::new(),
             derived_dirty: Cell::new(false),
+            road_topology_dirty: Cell::new(false),
             building_rules: crate::core::building_rules::BuildingRules::default(),
             positions: HashMap::new(),
             buildings: HashMap::new(),
@@ -402,6 +408,19 @@ impl World {
     /// Marks the applied derived state current after the derived pass has run.
     pub(crate) fn clear_derived_dirty(&self) {
         self.derived_dirty.set(false);
+    }
+
+    /// Marks the local road graph / border-link report stale for Layer-1 pricing.
+    pub(crate) fn mark_road_topology_dirty(&self) {
+        self.road_topology_dirty.set(true);
+    }
+
+    pub(crate) fn is_road_topology_dirty(&self) -> bool {
+        self.road_topology_dirty.get()
+    }
+
+    pub(crate) fn clear_road_topology_dirty(&self) {
+        self.road_topology_dirty.set(false);
     }
 
     /// Return cached local power resolution, recomputing lazily when dirty.

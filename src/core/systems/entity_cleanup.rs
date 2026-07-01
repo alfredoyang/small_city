@@ -37,7 +37,10 @@ pub(crate) fn remove_entity(world: &mut World, entity: Entity, x: usize, y: usiz
         // P2: still dispatch the route cache invalidation based on the
         // pre-removal kind (the legacy fallback path may not have a record).
         match removed_kind {
-            Some(BuildingKind::Road) => world.clear_route_cache(),
+            Some(BuildingKind::Road) => {
+                world.clear_route_cache();
+                world.mark_road_topology_dirty();
+            }
             Some(_) => world.evict_route_cache(entity),
             None => {}
         }
@@ -75,7 +78,10 @@ pub(crate) fn remove_entity(world: &mut World, entity: Entity, x: usize, y: usiz
     // previously-connected areas (coarse clear). A removed building means
     // this destination's entry cells no longer exist (per-destination evict).
     match removed_kind {
-        Some(BuildingKind::Road) => world.clear_route_cache(),
+        Some(BuildingKind::Road) => {
+            world.clear_route_cache();
+            world.mark_road_topology_dirty();
+        }
         Some(_) => world.evict_route_cache(entity),
         None => {}
     }

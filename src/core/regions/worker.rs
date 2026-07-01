@@ -296,6 +296,11 @@ impl RegionWorker {
         self.regions.push(runtime);
         self.publish_region_summary(region_id, links, hints);
         self.directory.publish_region_road_report(road_report);
+        self.regions
+            .last()
+            .expect("just pushed runtime")
+            .state()
+            .clear_road_topology_dirty();
         Ok(())
     }
 
@@ -542,24 +547,26 @@ impl RegionWorker {
             // dirty; recompute the derived pass before reading the summaries it
             // feeds, so published hints reflect the latest config.
             runtime.ensure_derived_state();
-            // P-a: recompute the post-event border-neighbour facts + road report
-            // from the current road graph. These facts feed pricing only; travel
-            // exits come from the Layer-1 `region_routes` snapshot below.
-            let owners = Arc::clone(&self.owners);
-            let post_links = runtime.state().network_border_links();
-            let post_border_neighbor_map = border_neighbor_map_for_region(
-                &self.directory.topology(),
-                runtime.region_id(),
-                &post_links,
-                |neighbor| owners.owner_of(neighbor).is_some(),
-            );
-            let road_report = runtime.state().road_report(&post_border_neighbor_map);
-            self.directory.publish_region_road_report(road_report);
-            // P-c: refresh the multi-hop `remote_exit_cells` from the routes
-            // snapshot. The publish above rebuilt the directory's discovery,
-            // so a routes field for THIS region is now available.
-            let exits = self.directory.exits_from(source_region).unwrap_or_default();
-            runtime.set_region_routes(&exits);
+            if runtime.state().is_road_topology_dirty() {
+                // L1 repricing gate: only recompute the road report when local
+                // road topology changed. `publish_region_road_report` remains
+                // idempotent as the safety net for false positives.
+                let owners = Arc::clone(&self.owners);
+                let post_links = runtime.state().network_border_links();
+                let post_border_neighbor_map = border_neighbor_map_for_region(
+                    &self.directory.topology(),
+                    runtime.region_id(),
+                    &post_links,
+                    |neighbor| owners.owner_of(neighbor).is_some(),
+                );
+                let road_report = runtime.state().road_report(&post_border_neighbor_map);
+                self.directory.publish_region_road_report(road_report);
+                // P-c: refresh the multi-hop `remote_exit_cells` from the routes
+                // snapshot rebuilt by the publish above.
+                let exits = self.directory.exits_from(source_region).unwrap_or_default();
+                runtime.set_region_routes(&exits);
+                runtime.state().clear_road_topology_dirty();
+            }
             changed_summaries.push((
                 source_region,
                 runtime.state().network_border_links(),
@@ -1418,6 +1425,156 @@ mod tests {
             worker.region(RegionId(2)).unwrap().pending_event_count(),
             1,
             "destination received a ReceiveTraveler event"
+        );
+    }
+
+    #[test]
+    fn step_travel_does_not_republish_road_report() {
+        let directory = Arc::new(RegionDirectory::new(Vec::new()));
+        let mut worker = RegionWorker::with_directory(WorkerId(8), Arc::clone(&directory));
+        worker
+            .add_region(RegionRuntime::new(RegionState::new(RegionId(1), 2, 2)))
+            .unwrap();
+        let before = directory.rebuild_count();
+
+        worker
+            .push_event(RegionId(1), RegionEvent::StepTravel)
+            .expect("event routed");
+        let summary = worker.process_region_events_for_barrier(usize::MAX);
+
+        assert!(summary.routing_errors.is_empty());
+        assert_eq!(
+            directory.rebuild_count(),
+            before,
+            "movement-only events should not republish unchanged road reports"
+        );
+    }
+
+    #[test]
+    fn build_road_republishes_road_report() {
+        let directory = Arc::new(RegionDirectory::new(Vec::new()));
+        let mut worker = RegionWorker::with_directory(WorkerId(9), Arc::clone(&directory));
+        worker
+            .add_region(RegionRuntime::new(RegionState::new(RegionId(1), 2, 2)))
+            .unwrap();
+        let before = directory.rebuild_count();
+
+        worker
+            .push_event(
+                RegionId(1),
+                RegionEvent::RunCommand {
+                    request_id: UiRequestId(1),
+                    command: crate::core::regional_types::RegionCommand::Build {
+                        x: 1,
+                        y: 0,
+                        kind: crate::interface::input::BuildingKind::Road,
+                    },
+                },
+            )
+            .expect("event routed");
+        let summary = worker.process_region_events(usize::MAX);
+
+        assert!(summary.routing_errors.is_empty());
+        assert!(
+            directory.rebuild_count() > before,
+            "road build changes the road report and should rebuild routes"
+        );
+    }
+
+    #[test]
+    fn build_house_does_not_republish_road_report() {
+        let directory = Arc::new(RegionDirectory::new(Vec::new()));
+        let mut worker = RegionWorker::with_directory(WorkerId(10), Arc::clone(&directory));
+        worker
+            .add_region(RegionRuntime::new(RegionState::new(RegionId(1), 2, 2)))
+            .unwrap();
+        let before = directory.rebuild_count();
+
+        worker
+            .push_event(
+                RegionId(1),
+                RegionEvent::RunCommand {
+                    request_id: UiRequestId(1),
+                    command: crate::core::regional_types::RegionCommand::Build {
+                        x: 0,
+                        y: 0,
+                        kind: crate::interface::input::BuildingKind::Residential,
+                    },
+                },
+            )
+            .expect("event routed");
+        let summary = worker.process_region_events(usize::MAX);
+
+        assert!(summary.routing_errors.is_empty());
+        assert_eq!(
+            directory.rebuild_count(),
+            before,
+            "non-road build should not recompute road reports"
+        );
+    }
+
+    #[test]
+    fn preview_build_does_not_republish_road_report() {
+        let directory = Arc::new(RegionDirectory::new(Vec::new()));
+        let mut worker = RegionWorker::with_directory(WorkerId(12), Arc::clone(&directory));
+        worker
+            .add_region(RegionRuntime::new(RegionState::new(RegionId(1), 2, 2)))
+            .unwrap();
+        let before = directory.rebuild_count();
+
+        worker
+            .push_event(
+                RegionId(1),
+                RegionEvent::RunCommand {
+                    request_id: UiRequestId(1),
+                    command: crate::core::regional_types::RegionCommand::PreviewBuild {
+                        x: 0,
+                        y: 0,
+                        kind: crate::interface::input::BuildingKind::Road,
+                    },
+                },
+            )
+            .expect("event routed");
+        let summary = worker.process_region_events(usize::MAX);
+
+        assert!(summary.routing_errors.is_empty());
+        assert_eq!(
+            directory.rebuild_count(),
+            before,
+            "preview should not mutate road topology or republish road reports"
+        );
+    }
+
+    #[test]
+    fn bulldoze_road_republishes_road_report() {
+        let directory = Arc::new(RegionDirectory::new(Vec::new()));
+        let mut worker = RegionWorker::with_directory(WorkerId(11), Arc::clone(&directory));
+        let mut region = RegionState::new(RegionId(1), 2, 2);
+        assert!(
+            region
+                .build(1, 0, crate::interface::input::BuildingKind::Road)
+                .success
+        );
+        worker
+            .add_region(RegionRuntime::new(region))
+            .expect("region added");
+        let before = directory.rebuild_count();
+
+        worker
+            .push_event(
+                RegionId(1),
+                RegionEvent::RunCommand {
+                    request_id: UiRequestId(1),
+                    command: crate::core::regional_types::RegionCommand::Bulldoze { x: 1, y: 0 },
+                },
+            )
+            .expect("event routed");
+        let summary = worker.process_region_events(usize::MAX);
+
+        assert!(summary.routing_errors.is_empty());
+        assert!(
+            directory.rebuild_count() > before,
+            "road bulldoze changes the road report and should rebuild routes"
         );
     }
 }

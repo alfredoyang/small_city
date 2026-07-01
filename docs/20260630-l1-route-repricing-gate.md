@@ -1,40 +1,162 @@
 # 20260630 L1 Route Repricing Gate
 
-## 1. Introduction / Problem
+## 1. Introduction / Current State
 
-`RegionWorker::process_region_events_with_mode` currently recomputes a region's
-post-event border links, `border_neighbor_map`, `RegionRoadReport`, and Layer-1
-route snapshot after every processed region event batch.
+This document tracks the Layer-1 route repricing gate idea against the **current
+implementation**.
 
-The directory publish is idempotent, so unchanged reports do not always rebuild
-Layer-1:
-
-```text
-process event
-  -> road_report(...)
-  -> publish_region_road_report(...)
-      -> returns early if unchanged
-```
-
-But the expensive part before publish still runs for pure runtime events:
+Current code has a `road_topology_dirty` flag. After every processed region event
+batch, `RegionWorker::process_region_events_with_mode(...)` always installs the
+current Layer-1 exits before events, but it recomputes and republishes the road
+report **only when local road topology changed**:
 
 ```text
-StepTravel / ReceiveTraveler / export grants
-  -> ensure_derived_state()
-  -> network_border_links()
-  -> road_report()
-  -> publish no-op
+RegionWorker::process_region_events_with_mode
+  |
+  +-- install current directory.exits_from(region)
+  |
+  +-- runtime.process_some_events(...)
+  |
+  +-- runtime.ensure_derived_state()
+  |
+  +-- if runtime.state().is_road_topology_dirty()
+        |
+        +-- runtime.state().network_border_links()
+        +-- border_neighbor_map_for_region(...)
+        +-- runtime.state().road_report(...)
+        +-- directory.publish_region_road_report(...)
+        |
+        +-- directory.exits_from(region)
+        +-- runtime.set_region_routes(...)
+        +-- runtime.state().clear_road_topology_dirty()
 ```
 
-That is wasted work. Layer-1 road prices only need recompute when local road
-topology may have changed.
+`RegionDirectory::publish_region_road_report(...)` is idempotent:
 
-## 2. Proposal
+```text
+same report as last snapshot -> return false, no rebuild
+changed report              -> rebuild discovery + RegionRoutes
+```
 
-Keep the current idempotent directory publish as the safety net, but gate the
-post-event road-report work with a `World` dirty flag.
+So the directory still avoids rebuilding when the report is unchanged, and the
+worker now also skips the pre-publish work when the local road graph is clean:
 
-Add `road_topology_dirty` beside `derived_dirty`:
+```text
+network_border_links()
+border_neighbor_map_for_region(...)
+road_report(...)
+```
+
+That means pure movement events (`StepTravel`, handoff receive, grants) keep the
+installed route exits and do not reprice local roads.
+
+## 2. Current Routing Data Flow
+
+The current Layer-1/Layer-2 routing shape is:
+
+```text
+RegionState::road_report
+  -> RegionRoadReport {
+       border_links,
+       crossing_costs,
+     }
+
+RegionDirectory::publish_region_road_report
+  -> build_region_routes(...)
+  -> RegionRoutes
+
+RegionDirectory::exits_from(A)
+  -> HashMap<final_target_region, Vec<ExitLink>>
+
+RegionState::set_region_routes
+  -> World.remote_exit_cells:
+       HashMap<final_target_region, Vec<RouteExit>>
+```
+
+Important distinction:
+
+```text
+ExitLink  = which border to use + next region + remaining route cost
+RouteExit = ExitLink + concrete local road cell to walk to
+```
+
+Diagram:
+
+```text
+Directory / L1
+  ExitLink { link: East/0, to_region: B, cost: 10 }
+        |
+        | RegionState::set_region_routes maps East/0 to local road cell r42
+        v
+World.remote_exit_cells / L2
+  RouteExit { cell: r42, link: East/0, to_region: B, cost: 10 }
+        |
+        | travel picks by local weighted distance + RouteExit.cost
+        v
+PendingHandoff::Move { exit_cell: r42, exit_link: East/0, to_region: B }
+```
+
+`RouteHop` now contains only `exits: Vec<ExitLink>`. There is no separate
+`RouteHop.cost`; each `ExitLink.cost` is the value the mover uses.
+
+## 3. Important Functions And Structures
+
+`src/core/regions/worker.rs`
+
+- `RegionWorker::process_region_events_with_mode(...)`
+  - Installs `directory.exits_from(source_region)` both before and after event
+    processing when roads changed.
+  - Gates the post-event `RegionRoadReport` publish behind
+    `runtime.state().is_road_topology_dirty()`.
+
+`src/core/regions/mod.rs`
+
+- `RegionState::road_report(...)`
+  - Builds `RegionRoadReport` from current local road graph and border neighbour
+    facts.
+- `RegionState::set_region_routes(...)`
+  - Converts `ExitLink` values from the directory into local `RouteExit` cells.
+- `RegionState::{is,clear}_road_topology_dirty()`
+  - Thin wrappers used by the worker gate.
+- `ExitLink`
+  - L1 route answer: border link, immediate next region, remaining route cost.
+- `RouteExit`
+  - L2 movement answer: `ExitLink` plus local road cell.
+
+`src/core/regions/directory.rs`
+
+- `RegionDirectory::publish_region_road_report(...)`
+  - Idempotent publish.
+  - Rebuilds discovery/routes only when the report changed.
+- `build_region_routes(...)`
+  - Builds the border-node graph and emits per-exit `ExitLink.cost`.
+
+`src/core/world.rs`
+
+- `derived_dirty: Cell<bool>`
+  - Exists today.
+  - Tracks applied derived state after config changes.
+- `road_topology_dirty`
+  - Exists today.
+  - Set by road placement/removal, cleared after the worker successfully
+    republishes and reinstalls routes.
+
+`src/core/systems/placement.rs`
+
+- `place_building(...)`
+  - If `kind == BuildingKind::Road`, clears route cache and marks
+    `road_topology_dirty`.
+
+`src/core/systems/entity_cleanup.rs`
+
+- `remove_entity(...)`
+  - If the removed entity was a road, clears route cache and marks
+    `road_topology_dirty`.
+
+## 4. Implemented Gate
+
+The implementation adds a road-topology flag next to `derived_dirty` and gates
+only the road-report publish path.
 
 ```text
 World
@@ -48,77 +170,43 @@ affected subsystem.
 Mark `road_topology_dirty` at the same chokepoints that already invalidate the
 route cache:
 
-- placing a road
-- removing a road
-- replacing a road or replacing something with a road
-- road-affecting upgrade only if one is introduced later
-
-Current flow:
-
 ```text
-Worker
-  for each runtime with pending events
-    process_some_events(...)
-    ensure_derived_state()
-    always recompute border links + road_report
-    publish report (maybe no-op)
+place road
+remove road
+replace road <-> non-road
+future road-affecting upgrade, if one appears
 ```
 
-Proposed flow:
+Before the gate:
 
 ```text
-Worker
-  for each runtime with pending events
-    process_some_events(...)
-    ensure_derived_state()
-    if runtime.state().is_road_topology_dirty():
-      recompute border links + road_report
-      publish report
-      refresh region_routes exits
-      runtime.state().clear_road_topology_dirty()
-    else:
-      keep current multi-hop exit map
+event batch
+  -> ensure_derived_state()
+  -> always recompute road_report()
+  -> publish_region_road_report()
+  -> set_region_routes()
 ```
 
-This avoids worker-side guessing. The region's ECS mutation code already knows
-whether the road graph changed.
+Current gated flow:
 
-## 3. Important Functions And Structures
+```text
+event batch
+  -> ensure_derived_state()
+  -> if road_topology_dirty:
+       recompute road_report()
+       publish_region_road_report()
+       set_region_routes(directory.exits_from(region))
+       clear road_topology_dirty
+     else:
+       keep installed route exits
+```
 
-`src/core/regions/worker.rs`
-- `RegionWorker::process_region_events_with_mode(...)` — extend. It should decide
-  whether to recompute road reports by reading the region state's
-  `road_topology_dirty` flag after processing events.
-- `RegionWorker::publish_region_summary(...)` — unchanged.
+`publish_region_road_report(...)` remains idempotent. It is the safety net for
+false positives.
 
-`src/core/regions/runtime/mod.rs`
-- `RegionRuntime::process_some_events(...)` — unchanged.
+## 5. Pseudocode / Integration
 
-`src/core/world.rs`
-- `World::road_topology_dirty: Cell<bool>` — new sibling of `derived_dirty`.
-- `World::{mark,is,clear}_road_topology_dirty()` — new tiny accessors.
-- Add a TODO near `derived_dirty` / `road_topology_dirty`: both flags are coarse
-  and should be split by subsystem if config mutation grows.
-
-`src/core/regions/mod.rs`
-- `RegionState::{is,clear}_road_topology_dirty()` — new thin wrappers for the
-  worker. No UI exposure.
-
-`src/core/systems/placement.rs`
-- `place_building(...)` — already clears route cache when `kind == Road`; also
-  call `world.mark_road_topology_dirty()` there.
-
-`src/core/systems/entity_cleanup.rs`
-- `remove_entity(...)` — already clears route cache when the removed kind is
-  `Road`; also call `world.mark_road_topology_dirty()` there.
-
-`src/core/regions/directory.rs`
-- `RegionDirectory::publish_region_road_report(...)` — unchanged idempotent guard.
-  It remains the last line of defense against unnecessary Layer-1 rebuilds.
-
-## 4. Pseudocode / Integration
-
-Add the flag in `World`:
+Flag in `World`:
 
 ```rust
 pub(crate) struct World {
@@ -130,82 +218,70 @@ pub(crate) struct World {
 // invalidation flags. Split by affected subsystem if config mutation grows.
 ```
 
-Mark it at road mutation chokepoints:
+Marked at road mutation chokepoints:
 
 ```rust
-// placement.rs
-if kind == BuildingKind::Road {
+if a road was placed/removed/replaced {
     world.clear_route_cache();
     world.mark_road_topology_dirty();
 }
-
-// entity_cleanup.rs
-match removed_kind {
-    Some(BuildingKind::Road) => {
-        world.clear_route_cache();
-        world.mark_road_topology_dirty();
-    }
-    Some(_) => world.evict_route_cache(entity),
-    None => {}
-}
 ```
 
-Then in `process_region_events_with_mode`:
+Worker publish path:
 
 ```rust
 outbound.extend(runtime.process_some_events(max_events_per_region));
 runtime.ensure_derived_state();
 
 if runtime.state().is_road_topology_dirty() {
-    let post_links = runtime.state().network_border_links();
-    let post_border_neighbor_map = border_neighbor_map_for_region(..., &post_links, ...);
-    runtime.set_border_neighbor_map(post_border_neighbor_map.clone());
-    let road_report = runtime.state().road_report(&post_border_neighbor_map);
-    self.directory.publish_region_road_report(road_report);
-    if let Some(exits) = self.directory.exits_from(source_region) {
-        runtime.set_region_routes(&exits);
-    }
+    let links = runtime.state().network_border_links();
+    let neighbours = border_neighbor_map_for_region(..., &links, ...);
+    let report = runtime.state().road_report(&neighbours);
+
+    self.directory.publish_region_road_report(report);
+
+    let exits = self.directory.exits_from(source_region).unwrap_or_default();
+    runtime.set_region_routes(&exits);
+
     runtime.state().clear_road_topology_dirty();
 }
 ```
 
-Do not clear the flag before a successful publish. If publish stays idempotent
-and returns `false`, clearing is still fine because the report matched the
-snapshot.
+The worker clears the flag after publishing and reinstalling `region_routes`.
 
-## 5. Tests
+## 6. Tests
 
-Add focused worker/directory tests:
+Focused tests:
 
 - `step_travel_does_not_republish_road_report`
   - enqueue `RegionEvent::StepTravel`
   - process one barrier pass
-  - assert `directory.rebuild_count()` does not increase from road-report publish
+  - assert directory route rebuild count does not increase
 
 - `build_road_republishes_road_report`
-  - enqueue `RegionCommand::Build { kind: Road, .. }`
+  - build a road
   - process one pass
   - assert road report publish/rebuild happens
 
 - `build_house_does_not_republish_road_report`
-  - enqueue `RegionCommand::Build { kind: Residential, .. }`
+  - build a non-road building
   - assert no road-report rebuild
 
 - `preview_build_does_not_republish_road_report`
-  - enqueue `RegionCommand::PreviewBuild`
+  - preview only
   - assert no road-report rebuild
 
 - `bulldoze_road_republishes_road_report`
   - create and then bulldoze a road
   - assert road report publish/rebuild happens
 
-No UI tests: no UI/view contract changes.
+No UI tests: this is worker/core routing maintenance only.
 
-## 6. Risks / Non-goals
+## 7. Risks / Non-goals
 
-- The flag only tracks road topology. If a future non-road building changes
-  border route pricing, that mutation must mark `road_topology_dirty` too.
-- This does not change Layer-1 route semantics, only when reports are recomputed.
-- Do not expose `World` or ECS state to the UI.
-- Keep `publish_region_road_report` idempotent; it protects against false
-  positives and stale assumptions.
+- This does not change Layer-1 route semantics.
+- This does not change `ExitLink`, `RouteExit`, or handoff routing.
+- The flag must be marked at every road-topology mutation; missing one can leave
+  stale route prices installed.
+- Keep the idempotent directory publish. It protects against false positives and
+  stale assumptions.

@@ -29,6 +29,7 @@ pub(crate) fn place_building(world: &mut World, x: usize, y: usize, kind: Buildi
     // is a cache miss on first access, not a stale entry — no invalidation.
     if kind == BuildingKind::Road {
         world.clear_route_cache();
+        world.mark_road_topology_dirty();
     }
 }
 

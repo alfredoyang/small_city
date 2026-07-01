@@ -473,6 +473,14 @@ impl RegionState {
         ensure_derived_state(&mut self.world, self.id);
     }
 
+    pub(crate) fn is_road_topology_dirty(&self) -> bool {
+        self.world.is_road_topology_dirty()
+    }
+
+    pub(crate) fn clear_road_topology_dirty(&self) {
+        self.world.clear_road_topology_dirty();
+    }
+
     /// Returns a UI-safe snapshot without exposing this region's ECS world.
     ///
     /// This is a pure read of already-applied derived state. Because regions are
