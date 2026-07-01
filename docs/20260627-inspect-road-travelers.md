@@ -1,437 +1,399 @@
-# Inspect road travelers — who is on this road cell
+# Inspect road travelers — how many citizens are on this road cell
 
-Status: **plan** (not implemented). UI/interface feature on top of the committed
-travel work (P3 dots, P5 cross-region tokens, P7 sub-tick movement). Pairs with
-`docs/travel-subtick-plan.md`.
+Status: **plan** (not implemented). UI/interface feature on top of the current
+travel-token implementation: `world.tokens: HashMap<Entity, TravelToken>` with
+one token in the region where the body physically is.
 
 ---
 
 ## 1. Introduction — the problem
 
 Today the inspect panel shows a per-**building** roster (`InspectView.roster`,
-`view.rs:234`): residents of a home, or local workers of a workplace
-(`adapter.rs:195 citizen_roster`). A **road** cell, however, inspects to
-`InspectDetailsView::Road` (`view.rs` variant) with **no information about the
-travellers standing on it** — the P4/P7 dots show *that* someone is commuting, but
-not *who*, *where they're going*, or *where they came from*.
+`src/interface/view.rs:221`): residents of a home, or local workers of a workplace
+(`citizen_roster`, `src/interface/adapter.rs`). A **road** cell inspects to
+`InspectDetailsView::Road` with no information about how many travelers are
+standing on it. The map dot says *someone* is moving, but not how crowded that
+road cell is.
 
-The data already exists in the ECS: `world.travel: HashMap<Entity, TravelState>`
-(local commuters) and `world.visiting_travel: HashMap<TravelerId, VisitingToken>`
-(cross-region tokens), each with a `current_cell`. The inspect adapter just doesn't
-surface it.
+The data already exists locally:
 
-**Goal — two tiers, split by cost.** The cheap summary is always on screen; the
-expensive cross-region detail is fetched only on demand:
+```text
+World
+ └─ tokens: HashMap<Entity, TravelToken>
+      key   = citizen Entity (home-region identity, globally unique)
+      value = body token currently in THIS region
+              state.current_cell = road cell, when travelling
+              home/work          = final endpoints
+              trip_gen           = stale-handoff guard
+```
 
-1. **Hover (cursor on the road)** — the inspect side panel lists every citizen on the
-   cell using **only local data, no cross-region query**: each row shows where it is
-   commuting **from**, its **destination**, and the destination building's **type**
-   (Residential / Commercial / Industrial, queried locally). For a visiting token the
-   local-only facts are: its destination workplace (here) + type, and its **home region
-   id** — *not* its name/age/etc. (those live in the neighbour's `World`).
+`world.tokens` now covers both local moving residents and foreign bodies visiting
+or transiting through this region. There is no `world.travel`,
+`world.visiting_travel`, `VisitingToken`, or `return_path` in the current model.
 
-2. **Enter** — opens a **detail popup list**, exactly like pressing `Enter` on a
-   building roster. Local citizens' full `CitizenDetailView` (age, happiness, money,
-   where they work/live) is read locally; **if there is a visiting token on the road,
-   its detail is fetched cross-region by querying `remote_workers_at` on its destination
-   workplace** (`regional_game.rs:489`) — the same fan-out the building roster already
-   uses for remote staff; the visitor's home region is among those that answer.
+**Goal — two tiers, split by cost.**
 
-So hovering never crosses a region boundary; only `Enter` does, and only when a visitor
-is present. Read-only, deterministic, no simulation/economy change.
+1. **Hover / inspect** shows only a **count** of tokens on the road using this
+   region's local `World`.
+2. **Enter** opens the existing citizen-panel popup with full details. Local
+   details come from this region. Visitor details reuse the existing
+   remote-worker lookup only when the visitor's final workplace is local to this
+   region; transit visitors remain count-only in v1 unless we add a precise
+   by-citizen remote query.
+
+Read-only, deterministic, no simulation or economy change.
 
 ---
 
 ## 2. Proposal
 
-Two pieces: a **local-only inline list** (`InspectView.travelers`) shown on hover, and an
-**Enter detail popup** that reuses the building roster's panel and its cross-region fetch.
+Add a local-only road-traveler count to `InspectView`, then let the TUI render
+only that count in the inspect panel. Reuse the existing citizen panel for
+`Enter`.
 
-### Tier 1 — hover: local-only inline list
-
-```text
-  cursor on a ROAD cell  →  inspect panel shows, with NO cross-region query:
-  ┌─ Travellers (3) ──────────────────────────────┐
-  │  from Home (0,1)   →  (3,1) [Commercial]       │   ◄─ local citizen → local workplace
-  │  from Home (2,0)   →  Region 2                  │   ◄─ local citizen → remote (region only)
-  │  from Region 2     →  (3,1) [Commercial]        │   ◄─ visiting token: dest+type exact,
-  └───────────────────────────────────────────────┘       origin = home region id only
-```
-
-Every field here comes from the inspected region's own `World` (`world.travel`,
-`world.visiting_travel`, `world.buildings`, `world.positions`) — **no neighbour query**.
-
-### Tier 2 — Enter: detail popup, fetching the visitor cross-region
+### Tier 1 — hover: local-only count
 
 ```text
-  cursor on a ROAD cell with travellers
-     │  Enter (TuiAction::EnterCell, tui.rs:939) — cell_has_roster → cell_has_panel
-     ▼
-  open the citizen panel (render_citizen_panel, tui.rs:1400) — SAME popup as a building
-     │
-     ├─ local citizens  → CitizenDetailView read locally (cheap)
-     │
-     └─ IF a visiting token is present → fetch detail via remote_workers_at on the
-        visitor's DESTINATION WORKPLACE W (its home region is among those that answer):
-
-        Host region (worker A)               every region with commuters to W
-        ────────────────────────            ─────────────────────────────────
-        Enter → remote_workers_at(W)  ──"your residents who work at W?"──►
-              (per distinct visitor dest)            RegionState::remote_workers_for
-                                                     → its residents commuting to W
-              popup ◄────reply: Vec<CitizenDetailView>──◄  (incl. this visitor; maybe more)
-        synchronous round-trip, exactly like `remote_workers_at` on a workplace cell.
-        (v1 ceiling: a SUPERSET — all commuters to W, not strictly those on this road.)
+cursor on a ROAD cell
+  |
+  v
+inspect_world(...)
+  |
+  +-- citizen_roster(...)       existing building roster
+  |
+  +-- road_traveler_count(...)  NEW, local-only
+        |
+        +-- scan world.tokens
+        +-- keep tokens whose state.current_cell == inspected road cell
 ```
 
-Today `Enter` on a road falls through to *Build* (test `enter_does_not_open_roster_on_a_road`,
-`tui.rs:4081`); the change opens the panel when `travelers` is non-empty, in a new
-`PanelMode::Travellers`. The building roster's own behaviour is **unchanged**.
-
-### Data flow — reuses the existing inspect path, no new event
+Example inspect text:
 
 ```text
-  TUI cursor on (x,y)
-     │  CityDriver::inspect (city_driver.rs:193)
-     ▼
-  RegionalGame::inspect_selected_region (regional_game.rs:478)
-     │  → RegionalGame::inspect_region (regional_game.rs:467)
-     │  ── runner ── RegionalGameRunner::inspect_region (regional_game_runner.rs:291)
-     ▼
-  RegionState::inspect (regions/mod.rs:402)
-     │
-     ▼
-  interface::adapter::inspect_world (adapter.rs:164)   ◄── the ONLY ECS→view boundary
-     ├─ existing: roster = citizen_roster(world, x, y)          (building roster)
-     └─ NEW:      travelers = road_travelers(world, x, y)       (road traveller list)
-                  │ reads world.travel + world.visiting_travel filtered to this cell
-                  │ resolves origin + destination + queried type from TravelState
-                  ▼
-              InspectView { …, roster, travelers }  → TUI renders both
+Road
+Travellers: 3
 ```
 
-This is the **same synchronous inspect path** the roster already uses. It *does* cross
-to the worker thread (`ThreadedRegionWorker::inspect_region`, `threaded.rs:128` sends an
-inspect command and blocks for the reply) — but it adds **no new `RegionEvent` and no
-barrier pass**. The data is read from the inspected region's own `World`, so there is no
-cross-region staleness to reason about for the gathering itself.
+The count comes from the inspected region's own `World.tokens`. No neighbour
+query, no endpoint resolution, and no citizen detail rows on hover.
 
-### The cross-region wrinkle (share-nothing)
-
-Two kinds of traveller can stand on a local road:
+### Tier 2 — Enter: existing citizen panel
 
 ```text
-  world.travel[citizen]            world.visiting_travel[TravelerId]
-  ───────────────────────          ────────────────────────────────────────
-  a LOCAL citizen                  a NEIGHBOUR's citizen, here as a token (P5)
-  full Citizen data available      NO Citizen data locally (share-nothing — it lives
-   → home, workplace + TravelState   in the home region's World)
-   → inline row from state.destination → inline row from only TravelerId.citizen.region()
-     (local dest exact; remote region    (home region id) + token.destination (local
-      best-effort), origin inferred       workplace) → dest+type exact, origin = region id
-   → Enter detail read LOCALLY        → Enter detail FETCHED via remote_workers_at on the
-                                          destination workplace (P5 worker-boundary fan-out)
+Enter on road with travelers
+  |
+  v
+open render_citizen_panel(...)      existing popup/table
+  |
+  +-- local traveler details         NEW local facade call, same inspect-style chain
+  |
+  +-- visitor details, v1            only when a token's work is local to this region:
+        remote_workers_at(workplace)
 ```
 
-Both kinds appear in the inline list from **local data only**. The difference is the
-`Enter` detail: a local citizen's `CitizenDetailView` is read from this `World`; a
-visiting token's is **fetched via a destination-workplace remote-worker lookup**
-(`remote_workers_at(W)`, the one cross-region step, only on `Enter`). That asymmetry is
-inherent to share-nothing, handled honestly.
+Current TUI touchpoints:
 
-### Per-traveller resolution (local citizen)
+- `TuiAction::EnterCell` is handled around `src/ui/tui.rs:939`.
+- `cell_has_roster` is currently building-only at `src/ui/tui.rs:1365`.
+- `render_citizen_panel` is the reusable popup at `src/ui/tui.rs:1400`.
+- `fetch_citizen_remote` at `src/ui/tui.rs:761` is workplace-only; road travelers
+  should call `remote_workers_at` directly only for local workplace destinations
+  discovered by the Enter-only facade call.
+- The state is still `citizen_panel: bool`; a small `PanelMode` enum is optional,
+  not required for P-a.
 
-The **destination is read from `TravelState.destination`** — the building/cell the
-citizen is *actually* walking toward this trip — **not** re-derived from
-`schedule_intent` (with P7 sub-ticks a commuter can still be mid-route when the hour
-flips, so the live intent can disagree; `destination` is the truth). Three things come
-off it — the destination endpoint, the **queried destination type**, and the inferred
-origin:
+Visitor-detail ceiling:
 
 ```text
-  dest = state.destination?                             // None → skip (a traveller always has one)
-  classify dest BY ITS OWN NATURE (robust to a mid-trip assignment change):
-     ├─ dest is a border-exit road cell → destination = RemoteRegion(workplace.region())
-     │                                     or Unknown  (region best-effort), kind = None (remote)
-     └─ else (a local building cell)    → destination = its coords (Unknown if bulldozed),
-                                           kind = world.buildings[dest].kind  (the queried type)
-  origin = if dest == citizen.home { workplace endpoint } else { home endpoint }   // best-effort
+Region 4 road token:
+  home = Region 1
+  work = Region 7
+
+remote_workers_at(...) can answer "who works at this local workplace cell?"
+It cannot answer "give me Entity(Region1, n) from its home region" today.
 ```
 
-- **`destination_kind`** is the queried building type (`Residential` / `Commercial` /
-  `Industrial`) — `None` for a remote destination (the workplace is in another region —
-  share-nothing) or an unresolvable cell. This is the type the user wants on each row;
-  it also tells home (Residential) from work (Commercial/Industrial) without a separate
-  activity field.
-- **`origin`** is the inferred complementary endpoint — `dest == home` ⇒ from the
-  workplace, otherwise ⇒ from home. Best-effort (no stored trip origin; see §3 ceiling).
+So, with the current protocol:
 
-The inline row carries **no citizen detail** — that is fetched only on `Enter` (Tier 2).
-An entry with no `destination` is **skipped**, not shown blank.
+- Visitor already in its workplace region: `remote_workers_at(workplace)` can return
+  a useful, possibly superset, detail list.
+- Visitor transiting through a middle region: hover shows only the count; full
+  detail needs a new direct by-citizen/home-region query. Do not fake it.
+
+### Existing inspect data flow
+
+```text
+CityDriver::inspect                         src/ui/city_driver.rs:193
+  -> RegionalGame::inspect_selected_region  src/core/regional_game.rs:478
+  -> RegionalGame::inspect_region           src/core/regional_game.rs:467
+  -> RegionalGameRunner::inspect_region     src/core/regional_game_runner.rs:291
+  -> ThreadedRegionWorker::inspect_region   src/core/regions/threaded.rs:128
+  -> RegionRuntime::inspect                 src/core/regions/runtime/mod.rs:595
+  -> RegionState::inspect                   src/core/regions/mod.rs:486
+  -> adapter::inspect_world                 src/interface/adapter.rs:170
+```
+
+`adapter::inspect_world` is still the ECS-to-view boundary. The UI must not read
+`World`, `Entity`, or `TravelToken` directly.
 
 ---
 
 ## 3. Important structures / functions
 
-### `RoadTravelerView` (NEW, `interface/view.rs`)
+### Existing travel data
+
+`src/core/components.rs`
+
+- `TravelToken { state, home, work, trip_gen }`
+  - Reused. This is the single source for road bodies.
+- `PlaceRef { region, building }`
+  - Reused for final home/work endpoints.
+- `TravelState { status, current_cell, destination, building, dwell, prev_cell }`
+  - Reused only for current road cell and current local leg state.
+- `TravelStatus::{AtWork, Traveling}`
+  - No `AtHome`, no `Away`.
+
+`src/core/world.rs`
+
+- `tokens: HashMap<Entity, TravelToken>`
+  - Reused. Scan this for road travelers.
+- `away_residents`, `away_generation`
+  - Not used by inspect.
+
+### New view models
+
+`src/interface/view.rs`
 
 ```rust
-pub struct RoadTravelerView {              // the INLINE row only — local-only, no detail
-    pub origin: TripEndpointView,             // where they're commuting from
-    pub destination: TripEndpointView,        // where they're going
-    pub destination_kind: Option<BuildingKind>, // queried type; None if remote/unresolvable
-    pub is_visitor: bool,                     // a cross-region token → Enter fetches its detail
-}
-pub enum TripEndpointView {
-    Local { x: usize, y: usize },      // a building cell in this region
-    RemoteRegion(RegionId),            // a neighbour region (no local coords)
-    Unknown,                           // position unresolvable (e.g. bulldozed mid-trip)
+pub struct InspectView {
+    ...
+    pub road_traveler_count: usize,
 }
 ```
 
-UI-safe (coords + tags + the existing `BuildingKind` view type, no `Entity`, no detail).
-Lives in the **interface** layer beside `CitizenDetailView`. `Copy`, `Eq` like the other
-small view models. `is_visitor` tells the TUI whether `Enter` needs a cross-region fetch
-(Tier 2); the detail itself is **not** carried inline.
+Keep hover inspect intentionally small: a count only, no citizen list and no
+endpoint rows.
 
-### `road_travelers(world, x, y) -> Vec<RoadTravelerView>` (NEW, `interface/adapter.rs`)
+For Enter, use a separate UI-safe seed instead of storing details in
+`InspectView`:
 
-The sole ECS→view builder for the list. Contract: returns `[]` unless `(x,y)` is a
-road cell; otherwise one entry per local citizen *and* per visiting token whose
-`current_cell == grid.get(x,y)`, **deterministically ordered** (locals by
-`entity.0`, then visiting by `(citizen.0, generation)`). It reads `TravelState`
-(`current_cell`, `destination`), `citizen.home`, and `workplace_assignment`; resolves
-coordinates via `world.positions`; and **queries the destination type** via
-`world.buildings[dest].kind`. **All local** — no `Citizen` detail, no schedule/hour, no
-cross-region read. Reuses `road_connectivity::is_road_entity` (`road_connectivity.rs:120`).
+```rust
+pub struct RoadTravelerPanelSeedView {
+    pub local_details: Vec<CitizenDetailView>,
+    pub local_visitor_workplaces: Vec<CityCellRef>,
+}
+```
 
-> **Ponytail ceiling — what's exact vs. best-effort.**
-> - **Local destinations are exact.** When `TravelState.destination` is a local building,
->   it is the committed target and resolves to its real coordinates (or `Unknown` if the
->   building was bulldozed mid-trip).
-> - **A remote destination's *region* is best-effort.** Before crossing, `TravelState.
->   destination` is only the *border-exit road cell*, not the remote workplace — so the
->   shown `RemoteRegion(r)` is read from the *current* `workplace_assignment` and can be
->   wrong (or `Unknown`) if that assignment changed/cleared mid-trip. Upgrade path:
->   derive the region from `remote_exit_cells`/the border hint, or carry the remote
->   workplace in the token.
-> - **`origin` is best-effort.** It is **inferred** as the complementary home↔work
->   endpoint — `TravelState` stores no trip origin (`building` is `None` while
->   travelling, `prev_cell` is the last *road* cell). It assumes v1's home↔work commute.
->   Upgrade path: store the departed-from building in `TravelState` and read it here.
+`local_visitor_workplaces` is coarse on purpose. The TUI can call the existing
+`remote_workers_at(workplace)` for those local workplace cells. Transit visitors
+have no local workplace in this region, so they do not get detail rows in v1.
 
-> **Visiting tokens in the inline list.** A `VisitingToken` carries no `Citizen`, so its
-> inline row is built from local facts only: `destination` + `destination_kind` are
-> **exact** (`token.destination` is a local workplace here → coords + `Commercial`/
-> `Industrial`); `origin` is `RemoteRegion(traveler.citizen.region())` (home region id,
-> no coords); `is_visitor = true`. Its full detail is fetched on `Enter` (next).
+### New adapter helpers
 
-### Enter-time detail fetch (the one cross-region step)
+`src/interface/adapter.rs`
 
-The popup detail has two halves. The UI cannot build either from the inline
-`RoadTravelerView` (no `Entity`, no ECS access), so **both come through facade calls**:
+- `road_traveler_count(world, x, y) -> usize`
+  - New local-only ECS-to-view builder.
+  - Returns `0` unless `(x,y)` is a road.
+  - Scans `world.tokens`, filters `state.current_cell == cell`.
+  - Skips stale local tokens whose citizen no longer exists, matching traveler
+    dot rendering.
+- `road_traveler_panel_seed(world, x, y) -> RoadTravelerPanelSeedView`
+  - Enter-only detail builder.
+  - Local citizens: returns `CitizenDetailView` rows.
+  - Visitors whose `token.work.region == world.region_id`: returns that local
+    workplace cell in `local_visitor_workplaces` so the UI can call
+    `remote_workers_at`.
+  - Transit visitors: no detail in v1.
+  - Same residential perspective as `citizen_roster`: local citizen detail, no
+    direct ECS leak.
 
-- **Local citizens** → a NEW ECS→view builder, `road_traveler_details(world, x, y) ->
-  Vec<CitizenDetailView>` (`interface/adapter.rs`), building each local citizen on the
-  cell with the residential `citizen_relation` perspective (`WorksAt`/`Unemployed`,
-  `adapter.rs:235`). Local and synchronous — but, like `inspect`, the UI cannot call the
-  adapter directly; it **threads the whole `inspect` facade/worker chain** (the cost of
-  not crossing the ECS boundary from the UI):
+Target rule for the Enter-only seed:
 
-  ```text
-  CityDriver::road_traveler_details → RegionalGame::road_traveler_details_selected_region
-    → RegionalGameRunner (ThreadedRegionWorkerCommand::RoadTravelerDetails) → worker thread
-    → RegionRuntime → RegionState::road_traveler_details → adapter::road_traveler_details
-  ```
-  Mechanical, mirrors the existing `inspect`/`remote_workers_at` plumbing exactly.
-- **Visiting tokens** → `RegionalGame::remote_workers_at` (`regional_game.rs:489`) on the
-  visitor's **destination workplace W**, which fans out to every region's
-  `RegionState::remote_workers_for` (`regions/mod.rs:413`); the region that owns the
-  visitor (its home) returns its `CitizenDetailView`. Synchronous, like the building
-  roster's remote staff. (`fetch_citizen_remote` `tui.rs:767` is workplace-only, so the
-  `Travellers` mode calls `remote_workers_at(W)` directly.)
+```text
+target = if schedule_phase(hour) == Work {
+    token.work.unwrap_or(token.home)
+} else {
+    token.home
+}
 
-The TUI concatenates the two into the popup. (A single combined facade
-`road_traveler_details_at(x,y)` returning local + remote is the obvious convenience, but
-keeping the local builder and the existing `remote_workers_at` separate reuses more.)
+is_visitor = token.home.region != world.region_id
 
-> **Ponytail ceiling — visitor fetch granularity.** v1 keys the fetch by the visitor's
-> **destination workplace** (reusing `remote_workers_at` verbatim — zero new cross-region
-> protocol), so it returns every remote commuter to that workplace, which can be a
-> *superset* of the visitors on this one road cell. Upgrade path: a precise per-`TravelerId`
-> query (route by `traveler.citizen.region()` + entity) when exactness matters. Decide
-> P-b vs. this reuse at implementation time (see split).
+if token.home.region == world.region_id:
+  local_details.push(citizen_relation(...))
 
-### `InspectView.travelers: Vec<RoadTravelerView>` (CHANGED, `view.rs:221`)
+if is_visitor && token.work == Some(local workplace):
+  local_visitor_workplaces.push(workplace coords)
+```
 
-New field beside `roster`. Empty for every non-road cell (and for roads with no
-travellers). All existing `InspectView { … }` constructors gain `travelers`.
+This mirrors the current stepper in `src/core/systems/travel.rs`: tokens retarget by
+`schedule_phase(hour)` and their stored `home/work` endpoints.
 
-### TUI (CHANGED, `ui/tui.rs`)
+### Facade for Enter details
 
-- **Hover** renders `inspect.travelers` as a small inline list in the inspect panel
-  (`from {origin} → {destination} [{kind}]`) — no panel, no fetch.
-- **`Enter`** on a road with travellers opens the existing **citizen panel popup**
-  (`render_citizen_panel`, `tui.rs:1400`) — the same control a building uses — populated
-  with `CitizenDetailView`s: local citizens read locally, plus a **cross-region fetch for
-  any visitors** via `remote_workers_at` on each visitor destination (cached on open and
-  refreshed on tick like the building roster). `cell_has_roster` → `cell_has_panel`
-  so the panel opens on a road too. No new widget — `citizen_selected` /
-  `handle_citizen_panel_key` / `render_citizen_panel` are reused; the road path calls
-  `remote_workers_at` directly rather than `fetch_citizen_remote` (which is workplace-only).
+Add the same narrow chain used by inspect:
+
+```text
+CityDriver::road_traveler_panel_seed
+  -> RegionalGame::road_traveler_panel_seed_selected_region
+  -> RegionalGameRunner / ThreadedRegionWorkerCommand
+  -> RegionRuntime
+  -> RegionState::road_traveler_panel_seed
+  -> adapter::road_traveler_panel_seed
+```
+
+Visitor detail fetch reuses existing calls only when possible:
+
+- `RegionalGame::remote_workers_at` (`src/core/regional_game.rs:489`)
+- `RegionState::remote_workers_for` (current worker-side remote staff path)
+
+No new cross-region protocol is required for P-a/P-b. Precise transit visitor detail is
+deferred.
 
 ---
 
-## 4. Pseudocode + interaction with current code
+## 4. Pseudocode / integration
 
-### Adapter (the new builder + the wiring)
+### Adapter
 
 ```rust
-// interface/adapter.rs — NEW, mirrors citizen_roster's shape
-fn road_travelers(world: &World, x: usize, y: usize) -> Vec<RoadTravelerView> {
-    let Some(cell) = world.grid.get(x, y) else { return Vec::new() };
-    if !road_connectivity::is_road_entity(world, cell) { return Vec::new() }   // reuse
-    let mut out = Vec::new();
+fn road_traveler_count(world: &World, x: usize, y: usize) -> usize {
+    let Some(cell) = world.grid.get(x, y) else { return 0 };
+    if !road_connectivity::is_road_entity(world, cell) {
+        return 0;
+    }
 
-    // Local citizens standing on this cell (sorted by entity.0).
-    let mut locals: Vec<(&Entity, &TravelState)> = world.travel.iter()
-        .filter(|(_, s)| s.current_cell == Some(cell)).collect();
-    locals.sort_by_key(|(id, _)| id.0);
-    for (id, state) in locals {
-        let Some(citizen) = world.citizens.get(id) else { continue };          // skip pruned
-        if let Some(v) = local_traveler_view(world, citizen, state) {          // §2 resolution
-            out.push(v);                                                       // skip if no dest
+    world.tokens.iter()
+        .filter(|(_, t)| t.state.current_cell == Some(cell))
+        .filter(|(citizen, token)| {
+            token.home.region != world.region_id || world.citizens.contains_key(citizen)
+        })
+        .count()
+}
+```
+
+```rust
+fn road_traveler_panel_seed(world: &World, x: usize, y: usize) -> RoadTravelerPanelSeedView {
+    let Some(cell) = road_cell(world, x, y) else { return default_seed() };
+    let phase = schedule_phase(world.resources.time.hour_of_day());
+    let mut seed = RoadTravelerPanelSeedView::default();
+
+    let mut tokens: Vec<_> = world.tokens.iter()
+        .filter(|(_, t)| t.state.current_cell == Some(cell))
+        .collect();
+    tokens.sort_by_key(|(citizen, _)| citizen.0);
+
+    for (citizen, token) in tokens {
+        if token.home.region == world.region_id {
+            if let Some(detail) = citizen_relation(world, *citizen) {
+                seed.local_details.push(detail);
+            }
+            continue;
+        }
+
+        // Visitor details can be fetched with existing remote_workers_at only
+        // when the visitor's workplace is local to this region.
+        if phase == SchedulePhase::Work {
+            if let Some(work) = token.work.filter(|w| w.region == world.region_id) {
+                if let Some(pos) = world.positions.get(&work.building) {
+                    seed.local_visitor_workplaces.push(CityCellRef { x: pos.x, y: pos.y });
+                }
+            }
         }
     }
 
-    // Cross-region tokens standing on this cell (sorted by (citizen.0, generation)).
-    let mut visiting: Vec<(&TravelerId, &VisitingToken)> = world.visiting_travel.iter()
-        .filter(|(_, v)| v.token.current_cell == Some(cell)).collect();
-    visiting.sort_by_key(|(t, _)| (t.citizen.0, t.generation));
-    for (traveler, v) in visiting {
-        let dest = v.token.destination;                                        // local workplace
-        out.push(RoadTravelerView {
-            origin: TripEndpointView::RemoteRegion(traveler.citizen.region()),  // home region only
-            destination: endpoint_for(world, dest),                            // local cell, exact
-            destination_kind: kind_of(world, dest),                            // Commercial/Industrial
-            is_visitor: true,                                                  // Enter fetches detail
-        });
-    }
-    out
+    seed.local_visitor_workplaces.sort();
+    seed.local_visitor_workplaces.dedup();
+    seed
 }
-
-// destination + queried type + inferred origin, from the committed destination — not
-// the live schedule intent (which can disagree mid-route after an hour flip). Returns
-// None (skip) for the impossible no-destination case rather than a blank row.
-fn local_traveler_view(world, citizen, state: &TravelState) -> Option<RoadTravelerView> {
-    let dest = state.destination?;                  // None → skip (a traveller has one)
-    let workplace = citizen.workplace_assignment.map(|a| a.workplace);
-    // origin ≈ the OTHER endpoint: leaving home ⇒ came from work, else came from home.
-    let origin = if dest == citizen.home {
-        workplace_endpoint(world, workplace)
-    } else {
-        endpoint_for(world, Some(citizen.home))
-    };
-    let (destination, destination_kind) = if road_connectivity::is_road_entity(world, dest) {
-        // border-exit road cell → remote commute, pre-cross: name the region (best-effort),
-        // type unknown (the workplace is in another region — share-nothing).
-        (workplace.map_or(Unknown, |w| RemoteRegion(w.region())), None)
-    } else {
-        // a local building cell (home or workplace); coords + its queried type, or
-        // Unknown if bulldozed mid-trip (a missing local building, NOT remote).
-        (endpoint_for(world, Some(dest)), kind_of(world, Some(dest)))
-    };
-    Some(RoadTravelerView { origin, destination, destination_kind, is_visitor: false })
-}
-// endpoint_for(world, Option<Entity>): positions.get → Local{x,y}, else Unknown.
-// workplace_endpoint(world, Option<Entity>): Local{x,y} if local & resolvable,
-//   RemoteRegion(region) if remote, else Unknown.
-// kind_of(world, Option<Entity>): world.buildings[e].kind → view BuildingKind, else None.
 ```
 
-Interaction: `road_travelers` is added to `inspect_world` (`adapter.rs:164`) next to
-the existing `roster: citizen_roster(world, x, y)` call — `InspectView` gains the
-field, every constructor updates. No core/systems change; `is_road_entity`,
-`positions`, `buildings`, and `citizen_relation` are reused verbatim (no schedule/hour
-read). The fallback inspect (`city_driver.rs` `fallback_inspect`) sets `travelers: Vec::new()`.
-
-### TUI — inline list on hover, popup (with fetch) on Enter
+### Inspect wiring
 
 ```rust
-// ui/tui.rs
-
-// Tier 1 — hover: render inspect.travelers inline in the inspect panel, no fetch:
-//   "from Home (0,1)   →  (3,1) [Commercial]"
-//   "from Region 2     →  (3,1) [Commercial]"     (is_visitor = true)
-
-// Tier 2 — Enter: open the SAME citizen panel popup a building uses, and fetch visitors.
-fn cell_has_panel(inspect: &InspectView) -> bool {            // was cell_has_roster
-    cell_has_roster(inspect) || !inspect.travelers.is_empty()
+InspectView {
+    ...
+    roster: citizen_roster(world, x, y),
+    road_traveler_count: road_traveler_count(world, x, y),
 }
-// EnterCell (tui.rs:939): on a road with travellers, open citizen_panel in PanelMode::
-// Travellers (a NEW small enum replacing the citizen_panel: bool flag) and populate the
-// detail rows like a building roster — BOTH halves via the facade (the UI has no ECS):
-let local = self.game.road_traveler_details(x, y)?;     // NEW local builder (§3) — like inspect
-let visitors = if inspect.travelers.iter().any(|t| t.is_visitor) {
-    self.game.remote_workers_at(W)?    // per distinct visitor destination W — like the roster
-} else { Vec::new() };
-self.state.panel_mode = Some(PanelMode::Travellers);   // replaces citizen_panel: bool;
-                                       // reuse render_citizen_panel + citizen_selected, rows = local ++ visitors
-// Flips the test `enter_does_not_open_roster_on_a_road` → opens iff travellers present.
 ```
 
-Interaction: hover renders from the view model only (UI never reads ECS). `Enter` reuses
-the `citizen_panel` machinery (`citizen_selected`, `handle_citizen_panel_key`,
-`render_citizen_panel`) and calls `RegionalGame::remote_workers_at` for the visitor
-detail (the road path calls it directly rather than `fetch_citizen_remote`, which is
-workplace-only) — the same cross-region round-trip, keyed by the road's visitor
-destinations (see the §3 granularity ceiling).
+Every existing `InspectView` constructor in tests/fallback UI gets
+`road_traveler_count: 0`.
+
+### TUI
+
+Smallest useful implementation:
+
+```rust
+fn cell_has_panel(inspect: &InspectView) -> bool {
+    cell_has_roster(inspect) || inspect.road_traveler_count > 0
+}
+
+match action {
+    TuiAction::EnterCell if inspect.road_traveler_count > 0 => {
+        let seed = self.game.road_traveler_panel_seed(x, y);
+        self.state.citizen_panel = true;
+        self.state.citizen_selected = 0;
+        self.state.citizen_roster = seed.local_details;
+        self.state.citizen_remote = self.fetch_road_traveler_remote(seed.local_visitor_workplaces);
+        self.state.message = "Travelers (↑/↓ select · Esc close)".to_string();
+    }
+    ...
+}
+```
+
+`fetch_road_traveler_remote`:
+
+```text
+for each workplace cell from road_traveler_panel_seed:
+    call remote_workers_at(workplace)
+dedupe/append results
+
+for transit visitor with no local workplace:
+    no detail fetch in v1
+```
+
+This is deliberately boring. Add `PanelMode` only if the bool starts making the code
+awkward.
 
 ---
 
-## Decisions locked
+## 5. Tests
 
-- **Two tiers split by cost.** Hover → a **local-only** inline list (`InspectView.travelers`);
-  `Enter` → the existing citizen-panel popup with full detail, fetching visitors
-  cross-region. Hovering never crosses a region boundary.
-- **Inline row = origin + destination + queried `destination_kind`** (the building type)
-  + `is_visitor`. No "activity" field — the type (Residential⇒home, Commercial/Industrial⇒
-  work) carries it. Local destinations + types are exact; a remote trip's region is
-  best-effort pre-cross, its type `None` (share-nothing). **No `detail` carried inline.**
-- **`Enter` reuses the building roster's panel *and* its remote fetch.** Both halves come
-  through the facade (the UI has no ECS): local citizens via a NEW `road_traveler_details`
-  builder, visitors via `remote_workers_at(W)` on the destination workplace (superset; see
-  ceiling). A new `PanelMode::Travellers` enum replaces the `citizen_panel: bool` flag.
-- **Origin = the inferred complementary endpoint** (best-effort, not stored).
-- **Deterministic order**: locals by `entity.0`, then visiting by
-  `(citizen.0, generation)`. Read-only; no economy/balance change.
+P-a interface/adapter:
 
-## Risks / notes
+- road with no tokens -> `InspectView.road_traveler_count == 0`.
+- road with local + visitor tokens -> count equals visible tokens.
+- removed local citizen token is skipped; foreign token is counted, matching
+  `traveler_views`.
+- `road_traveler_panel_seed` returns local `CitizenDetailView` rows for local
+  travelers.
+- visitor in workplace region adds that local workplace to
+  `local_visitor_workplaces`.
+- transit visitor does not add a fake detail row or remote workplace.
 
-- The `origin` inference is tied to v1's commute-only schedule; revisit when richer
-  schedules land (store the real origin then).
-- The visitor `Enter` fetch is **the only cross-region step** and reuses the existing
-  synchronous remote-worker round-trip (same one-tick-staleness profile as the building
-  roster's remote staff — it reads the neighbour's last published state). v1's
-  destination-keyed fetch can show a superset of the road's visitors (§3 ceiling).
-- The panel gains a `Travellers` mode beside `Roster`; keep the branch obvious and
-  re-baseline the panel tests (`enter_does_not_open_roster_on_a_road` flips).
-- Perf: `road_travelers` scans `world.travel` + `world.visiting_travel` per inspect (on
-  cursor move, not per frame); the visitor fetch happens only on `Enter`. Fine at v1
-  sizes; ponytail upgrade is a cell→travellers index if a huge map makes it show.
+P-b UI:
 
-## Suggested patch split
+- inspect panel renders only `Travellers: N` for a road.
+- `Enter` on road with travelers opens the existing citizen panel.
+- `Enter` on road without travelers still builds.
+- local traveler details come through the facade, not direct ECS access.
+- visitor in workplace region triggers `remote_workers_at`; transit visitor does not.
 
-- **P-a (interface):** `RoadTravelerView` (`origin` / `destination` / `destination_kind`
-  / `is_visitor`) + `TripEndpointView` + `road_travelers` + `InspectView.travelers`, plus
-  the `road_traveler_details(world, x, y) -> Vec<CitizenDetailView>` local builder exposed
-  via `RegionState`/`RegionalGame` (like `inspect`) + adapter tests (local→local-work with
-  kind; resident going home; remote-workplace destination → region + `kind None`; a
-  visiting token → exact dest+kind, `is_visitor`; the local-detail builder; empty for
-  non-road / road-with-no-travellers). **Local-only, no cross-region code.**
-- **P-b (ui/tui):** Tier-1 inline render of `inspect.travelers`; Tier-2 `Enter` →
-  `cell_has_panel` opens the popup in `PanelMode::Travellers`, rows = `road_traveler_details`
-  (local) ++ `remote_workers_at(W)` per visitor destination (the superset fetch); flip
-  `enter_does_not_open_roster_on_a_road` + open/render/fetch tests. (If precise
-  per-`TravelerId` fetch is wanted, that core query is a separate P-b′ before this.)
-- **P-c (optional, ui/ascii):** the same in the ASCII frontend.
+P-c optional:
+
+- ASCII inspect renders the same count.
+
+---
+
+## 6. Risks / non-goals
+
+- Full detail for a transit visitor is **not** solved by existing
+  `remote_workers_at`; it needs a new by-home-region/by-citizen query. Do not hide
+  that with a fake row.
+- Hover deliberately does **not** show origin/destination/detail rows. Press Enter
+  for details.
+- `road_traveler_count` is an O(tokens) scan on inspect/cursor movement. Fine for
+  now. Add a cell index only if this shows up in profiling.
+- No core movement, routing, worker barrier, or economy behavior changes.
