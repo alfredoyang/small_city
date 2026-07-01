@@ -416,16 +416,16 @@ fn build_region_routes(
     //                                          clamped to >= 1 (strict-decrease)
     //          2) border-crossing: (R, link) -> (N, link.matching_neighbor_link())
     //                                 weight = 1
-    //                                 payload = ExitLink { link, to_region: N }
+    //                                 payload = ExitLink { link, to_region: N, cost }
     //
     // For each owned destination T, run a destination-rooted Dijkstra over
     // the reversed graph: dist[(R, link)] = shortest path from (R, link)
     // to any (T, _) border node. Then a source region R's first hop is
     // any local border (R, link) whose crossing edge leads to a
     // (N, matching) node with strictly lower distance. The route cost
-    // is the minimum over R's borders of (1 + best n_dist), and ALL
-    // exits at that minimum are emitted so a token on a different local
-    // network is never stranded.
+    // is the minimum over chosen next-hop regions, and ALL
+    // strict-decrease exits to those chosen regions are emitted so a
+    // token on a different local network is never stranded.
 
     let reports_by_region: HashMap<RegionId, &RegionRoadReport> =
         reports.iter().map(|r| (r.region, r)).collect();
@@ -438,7 +438,10 @@ fn build_region_routes(
     // below after the forward pass).
     type RouteNode = (RegionId, BorderLinkId);
     type InsideEdges = Vec<(RouteNode, u32)>;
-    type CrossingEdges = Vec<(RouteNode, ExitLink)>;
+    /// P-e: the per-crossing tuple carries the border link and the
+    /// neighbour RegionId (no ExitLink yet — the per-exit `cost` is
+    /// filled in the candidate phase from `dist[(N, matching)]`).
+    type CrossingEdges = Vec<(RouteNode, BorderLinkId, RegionId, u32)>;
     let mut graph: HashMap<RouteNode, (InsideEdges, CrossingEdges)> = HashMap::new();
     // Reverse index of crossing edges: for each target (N, matching_link),
     // the list of predecessor (source_node, weight) pairs. Built once.
@@ -495,13 +498,7 @@ fn build_region_routes(
                 .entry((report.region, bl.link))
                 .or_insert_with(|| (Vec::new(), Vec::new()))
                 .1
-                .push((
-                    target,
-                    ExitLink {
-                        link: bl.link,
-                        to_region: n,
-                    },
-                ));
+                .push((target, bl.link, n, 1));
             crossing_rev
                 .entry(target)
                 .or_default()
@@ -624,7 +621,10 @@ fn build_region_routes(
             let mut n_dist_for_n: std::collections::HashMap<RegionId, u32> =
                 std::collections::HashMap::new();
             // Every valid (R, link) -> N crossing, by (link, N, exit).
-            let mut valid_crossings: Vec<(BorderLinkId, RegionId, ExitLink)> = Vec::new();
+            // P-e: every (R.link, n, target, n_dist) is a valid
+            // strict-decrease crossing. The ExitLink is built in the
+            // emission step with cost = 1 + n_dist.
+            let mut valid_crossings: Vec<(BorderLinkId, RegionId, RouteNode, u32)> = Vec::new();
             for bl in &r_report.border_links {
                 let r_node = (*r, bl.link);
                 let r_dist = dist.get(&r_node).copied().unwrap_or(u32::MAX);
@@ -634,7 +634,7 @@ fn build_region_routes(
                 let Some((_, crossings)) = graph.get(&r_node) else {
                     continue;
                 };
-                for (target, exit) in crossings {
+                for (target, _link, n_region, _weight) in crossings {
                     let n_dist = dist.get(target).copied().unwrap_or(u32::MAX);
                     if n_dist == u32::MAX {
                         continue;
@@ -643,9 +643,8 @@ fn build_region_routes(
                     if n_dist >= r_dist {
                         continue;
                     }
-                    valid_crossings.push((bl.link, exit.to_region, *exit));
-                    let n = exit.to_region;
-                    let entry = n_dist_for_n.entry(n).or_insert(u32::MAX);
+                    valid_crossings.push((bl.link, *n_region, *target, n_dist));
+                    let entry = n_dist_for_n.entry(*n_region).or_insert(u32::MAX);
                     if n_dist < *entry {
                         *entry = n_dist;
                     }
@@ -673,17 +672,25 @@ fn build_region_routes(
                     }
                 })
                 .collect();
-            let mut all_exits: Vec<ExitLink> = valid_crossings
-                .into_iter()
-                .filter_map(|(_link, n, exit)| {
-                    if chosen_regions.contains(&n) {
-                        Some(exit)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            all_exits.sort_by_key(|e| (e.to_region.0, e.link.edge, e.link.offset));
+            // Build per-exit ExitLinks for every valid crossing to a
+            // chosen next-hop region. cost = 1 (cross) + dist[(N, matching)]
+            // = border-node distance from THIS exit onward to T.
+            let mut all_exits: Vec<ExitLink> = Vec::new();
+            for (link, n, _target, n_dist) in valid_crossings {
+                if !chosen_regions.contains(&n) {
+                    continue;
+                }
+                let cost = 1u32.saturating_add(n_dist);
+                all_exits.push(ExitLink {
+                    link,
+                    to_region: n,
+                    cost,
+                });
+            }
+            // Stable sort by (cost, to_region, edge, offset) so the
+            // emitted list is deterministic and per-exit costs are
+            // observable in tests.
+            all_exits.sort_by_key(|e| (e.cost, e.to_region.0, e.link.edge, e.link.offset));
             let exits: Vec<ExitLink> = dedup_exits(all_exits);
             from.insert(
                 *r,
@@ -1150,10 +1157,12 @@ mod tests {
                 ExitLink {
                     link: a_east_0,
                     to_region: RegionId(2),
+                    cost: 1,
                 },
                 ExitLink {
                     link: a_east_1,
                     to_region: RegionId(2),
+                    cost: 1,
                 },
             ]
         );
@@ -1756,21 +1765,23 @@ mod tests {
         let routes = build_region_routes(&reports, &owners);
         // A's exits to T=B: both East borders are valid (each crosses to
         // the matching West of B at cost 1). Both are emitted; sorted by
-        // (to_region, edge, offset) -> East/0 before East/1.
+        // (cost, to_region, edge, offset) -> East/0 then East/1 (same cost).
         let to_b_from_a = &routes.to[&RegionId(2)].from[&RegionId(1)];
         assert_eq!(to_b_from_a.exits.len(), 2);
         assert_eq!(
             to_b_from_a.exits[0],
             ExitLink {
                 link: east_0,
-                to_region: RegionId(2)
+                to_region: RegionId(2),
+                cost: 1,
             }
         );
         assert_eq!(
             to_b_from_a.exits[1],
             ExitLink {
                 link: east_1,
-                to_region: RegionId(2)
+                to_region: RegionId(2),
+                cost: 1,
             }
         );
     }
@@ -1898,15 +1909,151 @@ mod tests {
         ];
         let routes = build_region_routes(&reports, &owners);
         // A's RouteHop to T=C: dist[(B, b_west_0)] = 2 (cross C->B
-        // 1 + B w0->east 1). n_dist_for_B = min(2, 6) = 2.
+        // 1 + B w0->east 1). dist[(B, b_west_1)] = 6 (cross C->B 1
+        // + B w1->east 5). n_dist_for_B = min(2, 6) = 2.
         // best_next_total = 1 + 2 = 3. Both A.e0 and A.e1 are valid
         // strict-decrease exits to B (the only chosen next-hop region).
-        // Both must be emitted.
+        // Both must be emitted. P-e: per-exit costs differ:
+        //   A.e0 cost = 1 + dist[(B, b_west_0)] = 1 + 2 = 3
+        //   A.e1 cost = 1 + dist[(B, b_west_1)] = 1 + 6 = 7
         let to_c_from_a = &routes.to[&RegionId(3)].from[&RegionId(1)];
         assert_eq!(to_c_from_a.cost, 3);
         assert_eq!(to_c_from_a.exits.len(), 2);
-        // Sorted by (to_region, edge, offset): both to B, East/0 before East/1.
+        // Sorted by (cost, to_region, edge, offset): cheaper East/0 first.
         assert_eq!(to_c_from_a.exits[0].link, a_east_0);
+        assert_eq!(to_c_from_a.exits[0].cost, 3);
+        assert_eq!(to_c_from_a.exits[1].link, a_east_1);
+        assert_eq!(to_c_from_a.exits[1].cost, 7);
+    }
+
+    /// P-e: **per-exit cost on emitted ExitLinks.** A has two exits to
+    /// the same next-hop region B. B's interior to the final target
+    /// differs by which entry border the token uses (B entry 1 reaches
+    /// C cheaply, entry 2 reaches C at twice the cost). Both exits
+    /// are emitted, and the per-exit `cost` carries the border-node
+    /// distance from THAT exit onward to T.
+    #[test]
+    fn region_routes_exit_links_carry_per_exit_cost() {
+        use crate::core::regions::{
+            BorderLinkId, RegionBorderLink, RegionCrossCost, RegionRoadReport,
+        };
+        let owners = owned(&[1, 2, 3]);
+        let a_east_0 = BorderLinkId {
+            edge: BorderEdge::East,
+            offset: 0,
+        };
+        let a_east_1 = BorderLinkId {
+            edge: BorderEdge::East,
+            offset: 1,
+        };
+        let b_west_0 = BorderLinkId {
+            edge: BorderEdge::West,
+            offset: 0,
+        };
+        let b_west_1 = BorderLinkId {
+            edge: BorderEdge::West,
+            offset: 1,
+        };
+        let b_east = BorderLinkId {
+            edge: BorderEdge::East,
+            offset: 0,
+        };
+        let reports = vec![
+            // A: two borders both crossing to B.
+            RegionRoadReport {
+                region: RegionId(1),
+                border_links: vec![
+                    RegionBorderLink {
+                        link: a_east_0,
+                        neighbour: RegionId(2),
+                    },
+                    RegionBorderLink {
+                        link: a_east_1,
+                        neighbour: RegionId(2),
+                    },
+                ],
+                crossing_costs: vec![
+                    RegionCrossCost {
+                        entry: a_east_0,
+                        exit: a_east_0,
+                        cost: 0,
+                    },
+                    RegionCrossCost {
+                        entry: a_east_1,
+                        exit: a_east_1,
+                        cost: 0,
+                    },
+                ],
+            },
+            // B: West/0 -> East (cost 8). West/1 -> East (cost 16).
+            // C is reachable only via East/0.
+            RegionRoadReport {
+                region: RegionId(2),
+                border_links: vec![
+                    RegionBorderLink {
+                        link: b_west_0,
+                        neighbour: RegionId(1),
+                    },
+                    RegionBorderLink {
+                        link: b_west_1,
+                        neighbour: RegionId(1),
+                    },
+                    RegionBorderLink {
+                        link: b_east,
+                        neighbour: RegionId(3),
+                    },
+                ],
+                crossing_costs: vec![
+                    RegionCrossCost {
+                        entry: b_west_0,
+                        exit: b_east,
+                        cost: 8,
+                    },
+                    RegionCrossCost {
+                        entry: b_west_1,
+                        exit: b_east,
+                        cost: 16,
+                    },
+                ],
+            },
+            // C: West connects to B's East/0.
+            RegionRoadReport {
+                region: RegionId(3),
+                border_links: vec![RegionBorderLink {
+                    link: BorderLinkId {
+                        edge: BorderEdge::West,
+                        offset: 0,
+                    },
+                    neighbour: RegionId(2),
+                }],
+                crossing_costs: vec![RegionCrossCost {
+                    entry: BorderLinkId {
+                        edge: BorderEdge::West,
+                        offset: 0,
+                    },
+                    exit: BorderLinkId {
+                        edge: BorderEdge::West,
+                        offset: 0,
+                    },
+                    cost: 0,
+                }],
+            },
+        ];
+        let routes = build_region_routes(&reports, &owners);
+        // dist[(B, b_west_0)] = 1 (cross C->B) + 8 = 9.
+        // dist[(B, b_west_1)] = 1 (cross C->B) + 16 = 17.
+        // dist[(B, b_east)] = 1 (cross C->B).
+        // A.e0 -> (B, b_west_0): n_dist 9. cost = 1 + 9 = 10.
+        // A.e1 -> (B, b_west_1): n_dist 17. cost = 1 + 17 = 18.
+        // The chosen next-hop region is B (only). Both A borders are
+        // emitted, with their distinct per-exit costs.
+        let to_c_from_a = &routes.to[&RegionId(3)].from[&RegionId(1)];
+        assert_eq!(to_c_from_a.cost, 10);
+        assert_eq!(to_c_from_a.exits.len(), 2);
+        // Sorted by (cost, to_region, edge, offset).
+        assert_eq!(to_c_from_a.exits[0].cost, 10);
+        assert_eq!(to_c_from_a.exits[0].link, a_east_0);
+        assert_eq!(to_c_from_a.exits[1].cost, 18);
         assert_eq!(to_c_from_a.exits[1].link, a_east_1);
     }
 

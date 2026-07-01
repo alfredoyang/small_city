@@ -208,8 +208,8 @@ pub struct RouteField {
 }
 
 /// P-?: r's answer for "how do I get toward T?" — the cost-sorted next-hop
-/// exits (r may have several, tied at the same cost), plus the total road
-/// cost from r to T.
+/// exits (r may have several, with different per-exit costs), plus the best
+/// road cost from r to T.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RouteHop {
     pub exits: Vec<ExitLink>,
@@ -218,22 +218,28 @@ pub struct RouteHop {
 
 /// P-?: one region's local answer for T — leave through this border link,
 /// arriving in `to_region`. `link` is the local-side BorderLinkId; the
-/// receiving region has the matching link on its side.
+/// receiving region has the matching link on its side. `cost` is the
+/// remaining Layer-1 distance from this exit onward to the final target
+/// (crossing cost + border-node distance to the destination's nearest
+/// border); the stepper adds its local distance to `cell` to rank exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExitLink {
     pub link: BorderLinkId,
     pub to_region: RegionId,
+    pub cost: u32,
 }
 
 /// One concrete local road-cell exit for a final remote target. `cell` is the
 /// road cell the token walks to; `link` and `to_region` are the Layer-1 first hop
 /// carried through to the handoff, so the old direct-neighbour hint is not needed
-/// to re-derive routing at the border.
+/// to re-derive routing at the border. `cost` mirrors `ExitLink.cost` and is
+/// the per-exit Layer-1 distance to the final target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RouteExit {
     pub cell: Entity,
     pub link: BorderLinkId,
     pub to_region: RegionId,
+    pub cost: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -701,6 +707,7 @@ impl RegionState {
                             cell,
                             link: exit.link,
                             to_region: exit.to_region,
+                            cost: exit.cost,
                         }));
                 }
             }
@@ -1653,23 +1660,26 @@ mod tests {
             edge: BorderEdge::East,
             offset: 0,
         };
-        // A's exits toward T=region 2: first hop is region 2 via East.
+        // A's exits toward T=region 2: first hop is region 2 via East,
+        // remaining Layer-1 cost = 1 (the cross; B is the destination).
         let exits_from: HashMap<RegionId, Vec<ExitLink>> = HashMap::from([(
             RegionId(2),
             vec![ExitLink {
                 link,
                 to_region: RegionId(2),
+                cost: 1,
             }],
         )]);
         a.set_region_routes(&exits_from);
         // The mover's `remote_exit_cells[target_region]` (FINAL target 2)
-        // contains the local East-edge cell.
+        // contains the local East-edge cell, with the same per-exit cost.
         assert_eq!(
             a.world.remote_exit_cells.get(&RegionId(2)),
             Some(&vec![RouteExit {
                 cell: exit,
                 link,
-                to_region: RegionId(2)
+                to_region: RegionId(2),
+                cost: 1,
             }])
         );
     }
@@ -1690,6 +1700,7 @@ mod tests {
             vec![ExitLink {
                 link,
                 to_region: RegionId(2),
+                cost: 1,
             }],
         )]));
         assert!(a.world.remote_exit_cells.contains_key(&RegionId(2)));

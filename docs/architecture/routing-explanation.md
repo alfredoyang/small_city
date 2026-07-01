@@ -26,10 +26,10 @@ Layer 2 inside A:
 The code keeps those responsibilities separate:
 
 ```text
-RegionState::road_report        prices local border-to-border roads  (L2 data)
-RegionDirectory::build_routes   assembles region graph + Dijkstra     (L1 map)
-RegionState::set_region_routes  converts L1 border links to road cells
-travel::advance_to_exit         walks the token to the chosen road cell
+RegionState::road_report         prices local border-to-border roads  (L2 data)
+build_region_routes              assembles border-node graph + Dijkstra (L1 map)
+RegionState::set_region_routes   converts L1 border links to road cells
+travel::advance_to_exit          walks the token to the chosen road cell
 ```
 
 ## 2. Proposal / Mental Model
@@ -54,15 +54,15 @@ This document is the readable map of the current implementation.
                     RegionDirectory snapshot
                     ------------------------
                     build_region_routes(...)
-                    - assemble weighted region graph
-                    - run Dijkstra per destination
+                    - assemble weighted border-node graph
+                    - run reversed Dijkstra per destination
                     - produce RegionRoutes
                                 |
                                 v
                     RegionWorker, for each region
                     -----------------------------
                     exits_from(A)
-                      C -> [ExitLink { link: East/0, to_region: B }]
+                      C -> [ExitLink { link: East/0, to_region: B, cost: 7 }]
                                 |
                                 v
                     RegionState::set_region_routes(...)
@@ -77,6 +77,7 @@ This document is the readable map of the current implementation.
                         cell: r42,
                         link: East/0,
                         to_region: B,
+                        cost: 7,
                       }
                     ]
 ```
@@ -94,7 +95,8 @@ Citizen token in A wants final workplace in C
           |
           | reads world.remote_exit_cells[C]
           v
-  chooses RouteExit { cell: r42, link: East/0, to_region: B }
+  chooses cheapest RouteExit by:
+    weighted local road cost to cell + RouteExit.cost
           |
           | Layer 2 local walking
           v
@@ -123,10 +125,12 @@ RegionRoadReport
   "what roads/border prices does this region publish?"
 
 RegionRoutes / ExitLink
-  "for final target C, which border link leaves A on the best next hop?"
+  "for final target C, which border link leaves A on the best next hop,
+   and what does that exit cost after crossing?"
 
 RouteExit
-  "which local road cell should the token walk to, and where does it cross?"
+  "which local road cell should the token walk to, where does it cross,
+   and what remains after that crossing?"
 ```
 
 ### L2: Local Pricing Inside One Region
@@ -159,9 +163,10 @@ RegionCrossCost:
 `World::road_distance_to(...)`, which calls `road_predecessors_with_dist(...)`;
 it does **not** use `World::routes_to(...)` or the route cache.
 
-### L1: Region Dijkstra
+### L1: Border-Node Dijkstra
 
-The directory turns local reports into a weighted region graph.
+The directory turns local reports into a weighted graph whose nodes are
+`(region, border_link)`, not just `region`.
 
 ```text
 Published border matches:
@@ -171,47 +176,55 @@ Published border matches:
   A South/0 <->  D North/0
   D East/0  <->  C South/0
 
-Region graph:
+Border-node graph:
 
-       B
-      / \
-     /   \
-    A     C
-     \   /
-      \ /
-       D
+  (A, East/0)  --cross 1--> (B, West/0)  --inside B--> (B, East/0)  --cross 1--> (C, West/0)
+
+  (A, South/0) --cross 1--> (D, North/0) --inside D--> (D, East/0) --cross 1--> (C, South/0)
 ```
 
-Each region edge gets a cost from the two reports:
+There are only two edge types:
 
 ```text
-w(A,B) = A cost to reach East/0 + B cost from West/0
-w(B,C) = B cost to reach East/0 + C cost from West/0
-w(A,D) = A cost to reach South/0 + D cost from North/0
-w(D,C) = D cost to reach East/0 + C cost from South/0
+inside-region:
+  (R, entry_link) -> (R, exit_link)
+  weight = RegionCrossCost { entry, exit, cost }.cost.max(1)
+
+border-crossing:
+  (R, local_link) -> (N, local_link.matching_neighbor_link())
+  weight = 1
+  payload = ExitLink { link: local_link, to_region: N, cost: 1 + dist[(N, matching)] }
 ```
 
 Example weights:
 
 ```text
-         B
-      4 / \ 8
-       /   \
-      A     C
-       \   /
-     2  \ / 5
-         D
+Goal: reach C
+
+  via B:
+    A East/0 --1--> B West/0 --8--> B East/0 --1--> C West/0
+    total = 10
+
+  via D:
+    A South/0 --1--> D North/0 --5--> D East/0 --1--> C South/0
+    total = 7
 ```
 
-For destination `C`, Dijkstra computes:
+For destination `C`, Dijkstra seeds every C border node at `0`, then walks the
+reversed graph:
 
 ```text
-cost_to_C[C] = 0
-cost_to_C[B] = 8
-cost_to_C[D] = 5
-cost_to_C[A] = min(A->B->C, A->D->C)
-             = min(4 + 8, 2 + 5)
-             = 7
+dist[(C, West/0)]  = 0
+dist[(C, South/0)] = 0
+
+dist[(B, East/0)]  = 1
+dist[(B, West/0)]  = 9
+
+dist[(D, East/0)]  = 1
+dist[(D, North/0)] = 6
+
+dist[(A, East/0)]  = 10
+dist[(A, South/0)] = 7
 ```
 
 So A chooses D, not B:
@@ -219,18 +232,49 @@ So A chooses D, not B:
 ```text
 Route field for final target C:
 
-  from A -> ExitLink { link: South/0, to_region: D }, cost 7
-  from D -> ExitLink { link: East/0,  to_region: C }, cost 5
-  from B -> ExitLink { link: East/0,  to_region: C }, cost 8
+  from A -> RouteHop {
+              exits: [ExitLink { link: South/0, to_region: D, cost: 7 }],
+              cost: 7
+            }
+  from D -> RouteHop {
+              exits: [ExitLink { link: East/0, to_region: C, cost: 2 }],
+              cost: 2
+            }
+  from B -> RouteHop {
+              exits: [ExitLink { link: East/0, to_region: C, cost: 2 }],
+              cost: 2
+            }
   from C -> no exit, cost 0
 ```
 
 This is also the loop-safety rule: every hop must strictly decrease the Dijkstra
-distance.
+distance at the border node.
 
 ```text
-A(7) -> D(5) -> C(0)     valid: 7 > 5 > 0
-D(5) -> A(7)             rejected: 7 is not lower than 5
+(A, South/0)(7) -> (D, North/0)(6)   valid: 6 < 7
+(D, East/0)(1)  -> (C, South/0)(0)   valid: 0 < 1
+(D, North/0)(6) -> (A, South/0)(7)   rejected: 7 is not lower than 6
+```
+
+The selector chooses next-hop region(s) by the best region distance, then emits
+every strict-decrease exit to those chosen region(s). This matters when one
+region has disconnected local roads:
+
+```text
+Goal: A -> C, chosen next-hop region is B
+
+  A East/0 -> B West/0 -> C   cheap
+  A East/1 -> B West/1 -> C   valid but more expensive
+
+Both A exits are published:
+  remote_exit_cells[C] includes East/0 and East/1
+
+Layer 2 then picks the cheapest reachable exit for the token:
+
+  weighted local road cost to RouteExit.cell + RouteExit.cost
+
+The local cost uses the same `step_cost` weighting as movement (turn/T-junction
+= 2, four-way = 4), not raw hop count.
 ```
 
 ### L1 To L2 Adapter: `set_region_routes`
@@ -240,7 +284,7 @@ L1 returns border links. Local movement needs road cells.
 ```text
 L1 answer for source A:
 
-  final target C -> ExitLink { link: South/0, to_region: D }
+  final target C -> ExitLink { link: South/0, to_region: D, cost: 7 }
 
 Local border roads in A:
 
@@ -249,7 +293,7 @@ Local border roads in A:
 Stored movement answer:
 
   remote_exit_cells[C] = [
-    RouteExit { cell: r42, link: South/0, to_region: D }
+    RouteExit { cell: r42, link: South/0, to_region: D, cost: 7 }
   ]
 ```
 
@@ -259,6 +303,7 @@ Stored movement answer:
 cell      = local L2 walking target
 link      = sender-side border link for handoff placement
 to_region = immediate next-hop region for worker routing
+cost      = remaining L1 cost after using this exit
 ```
 
 That prevents the old duplicate routing path. The border crossing uses the same
@@ -272,15 +317,17 @@ Goal: citizen in A works in C
 
 Weights:
 
-  A -> B = 4
-  B -> C = 8
+  A East/0  -> B West/0  = 1 crossing
+  B West/0  -> B East/0  = 8 inside B
+  B East/0  -> C West/0  = 1 crossing
 
-  A -> D = 2
-  D -> C = 5
+  A South/0 -> D North/0 = 1 crossing
+  D North/0 -> D East/0  = 5 inside D
+  D East/0  -> C South/0 = 1 crossing
 
 Totals:
 
-  A -> B -> C = 12
+  A -> B -> C = 10
   A -> D -> C = 7
 
 Chosen:
@@ -292,11 +339,11 @@ Flow:
 
 ```text
 Directory route:
-  to[C].from[A].exits = [ExitLink { link: South/0, to_region: D }]
+  to[C].from[A].exits = [ExitLink { link: South/0, to_region: D, cost: 7 }]
 
 Region A install:
   South/0 resolves to road cell r42
-  remote_exit_cells[C] = [RouteExit { cell: r42, link: South/0, to_region: D }]
+  remote_exit_cells[C] = [RouteExit { cell: r42, link: South/0, to_region: D, cost: 7 }]
 
 Travel step:
   token walks home -> ... -> r42
@@ -319,7 +366,7 @@ Then D repeats the same mechanism:
 
 ```text
 Region D has:
-  remote_exit_cells[C] = [RouteExit { cell: d_exit, link: East/0, to_region: C }]
+  remote_exit_cells[C] = [RouteExit { cell: d_exit, link: East/0, to_region: C, cost: 2 }]
 
 Token in D walks to d_exit and crosses to C.
 ```
@@ -331,7 +378,7 @@ Token in D walks to d_exit and crosses to C.
 - `RegionCrossCost` — L2 cost from one local border link to another.
 - `RegionRoadReport` — one region's published L2 border pricing.
 - `RegionRoutes` / `RouteField` / `RouteHop` / `ExitLink` — L1 output.
-- `RouteExit` — local movement-ready exit: `{ cell, link, to_region }`.
+- `RouteExit` — local movement-ready exit: `{ cell, link, to_region, cost }`.
 - `RegionState::road_report(...)` — builds the per-region L2 report.
 - `RegionState::set_region_routes(...)` — converts L1 `ExitLink`s into local
   `RouteExit`s.
@@ -339,8 +386,8 @@ Token in D walks to d_exit and crosses to C.
 `src/core/regions/directory.rs`
 - `RegionDirectory::publish_region_road_report(...)` — stores one region report
   and rebuilds the snapshot when it changes.
-- `build_region_routes(...)` — assembles the weighted region graph and runs one
-  destination-rooted Dijkstra per target region.
+- `build_region_routes(...)` — assembles the weighted border-node graph and runs
+  one destination-rooted reversed Dijkstra per target region.
 - `RegionDirectory::exits_from(region)` — returns this region's
   `HashMap<target_region, Vec<ExitLink>>`.
 
@@ -355,10 +402,12 @@ Token in D walks to d_exit and crosses to C.
 
 `src/core/systems/travel.rs`
 - `depart_toward(...)` — for remote targets, picks a reachable
-  `remote_exit_cells[target.region]` candidate.
+  `remote_exit_cells[target.region]` candidate by
+  `weighted local road distance + exit.cost`.
 - `advance_to_exit(...)` — walks toward the selected `RouteExit.cell`; on the
   border cell, emits a `PendingHandoff::Move` carrying `exit.link` and
-  `exit.to_region`.
+  `exit.to_region`. A committed exit is kept while reachable to avoid
+  mid-route oscillation.
 
 `src/core/components.rs`
 - `PendingHandoff::Move { exit_cell, exit_link, to_region, ... }` — buffered
@@ -381,17 +430,23 @@ L1 route assembly:
 
 ```rust
 // RegionDirectory snapshot rebuild
-for report in reports {
-    collect RegionBorderLink and RegionCrossCost;
-}
+node = (RegionId, BorderLinkId);
+
+inside edge:
+    (R, entry) -> (R, exit), weight = RegionCrossCost.cost.max(1)
+
+crossing edge:
+    (R, link) -> (N, link.matching_neighbor_link()), weight = 1
 
 for destination in owned_regions {
-    cost_to_destination = dijkstra(destination, region_graph);
+    seed every (destination, border_link) at 0;
+    dist = dijkstra_over_reversed_border_node_graph();
 
     for source in owned_regions {
-        choose neighbour where:
-            cost_to_destination[neighbour] < cost_to_destination[source]
-            and total edge cost is minimal;
+        enumerate every strict-decrease crossing from source borders;
+        choose next-hop region(s) with minimum 1 + min_dist_for_region;
+        emit every strict-decrease exit to those chosen next-hop region(s)
+            as ExitLink { link, to_region, cost: 1 + dist[(to_region, entry)] };
 
         routes.to[destination].from[source] = RouteHop { exits, cost };
     }
@@ -414,6 +469,7 @@ for (target, exit_links) in exits_from_a {
                 cell,
                 link: exit.link,
                 to_region: exit.to_region,
+                cost: exit.cost,
             });
         }
     }
@@ -424,7 +480,11 @@ Move a token:
 
 ```rust
 let candidates = world.remote_exit_cells[target.region];
-let exit = first candidate reachable by local L2 roads;
+let exit = cheapest reachable candidate by:
+    World::road_distance_to(exit.cell, current_or_depart_entry, network) + exit.cost;
+
+if already walking to a still-reachable committed exit:
+    keep it; // avoids oscillation when route costs change mid-trip
 
 walk toward exit.cell;
 
@@ -465,23 +525,23 @@ Existing tests that anchor this routing model:
 - `region_routes_pick_only_cost_decreasing_neighbour`
 - `region_routes_prefer_lower_cost_corridor`
 - `region_routes_skip_roadless_border`
+- `region_routes_cost_counts_middle_region_once`
+- `region_routes_emit_all_exits_to_chosen_next_hop_regardless_of_border_cost`
+- `region_routes_asymmetric_inside_cost`
+- `region_routes_exit_links_carry_per_exit_cost`
+- `remote_exit_choice_prefers_cheapest_reachable_exit`
+- `remote_exit_choice_uses_weighted_local_distance`
+- `remote_exit_keeps_committed_exit_when_still_valid`
 - `set_region_routes_populates_remote_exit_cells`
 - `set_region_routes_empty_routes_clear_remote_exit_cells`
 - `drain_move_resolves_border_link`
 - `cross_region_commuter_goes_to_work_and_returns_home`
 
-Useful future test if the sample above is not already covered end-to-end:
-
-- `multi_hop_commute_prefers_cheaper_a_d_c_over_a_b_c`
-  - Build A/B/C/D reports where A-B-C is valid but costlier than A-D-C.
-  - Assert `RegionRoutes::exits_from(A)[C]` points to D.
-  - Then step a token and assert the first handoff routes to D.
-
 ## 6. Risks / Non-goals
 
-- L1 edge weights are region-level approximations. The current model is good for
-  choosing a next hop; exact border-to-border global cost would require a
-  border-node graph keyed by `(region, border_link)`.
+- L1 costs are exact for the published border-node graph, not for every possible
+  future traffic model. Congestion or time-varying costs would need new report
+  fields.
 - The direct border-neighbour facts still exist for report pricing. They are not
   a travel-routing source.
 - Cross-region route snapshots are stale-tolerant. If a road disappears after a
