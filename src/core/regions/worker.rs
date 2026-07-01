@@ -286,22 +286,28 @@ impl RegionWorker {
         runtime.ensure_derived_state();
         let links = runtime.state().network_border_links();
         let hints = runtime.state().availability_hints();
-        let border_neighbours = border_neighbor_map_for_region(
-            &self.directory.topology(),
-            region_id,
-            &links,
-            |neighbor| self.owners.owner_of(neighbor).is_some(),
-        );
-        let road_report = runtime.state().road_report(&border_neighbours);
         self.regions.push(runtime);
         self.publish_region_summary(region_id, links, hints);
-        self.directory.publish_region_road_report(road_report);
-        self.regions
-            .last()
-            .expect("just pushed runtime")
-            .state()
-            .clear_road_topology_dirty();
+        // Adding a region changes the live-owner set. Earlier regions may have
+        // skipped border links to this neighbour while it was still unowned, so
+        // republish all reports once the new owner is registered.
+        self.publish_current_road_reports();
         Ok(())
+    }
+
+    fn publish_current_road_reports(&self) {
+        let topology = self.directory.topology();
+        for runtime in &self.regions {
+            let links = runtime.state().network_border_links();
+            let region_id = runtime.region_id();
+            let border_neighbours =
+                border_neighbor_map_for_region(&topology, region_id, &links, |neighbor| {
+                    self.owners.owner_of(neighbor).is_some()
+                });
+            let road_report = runtime.state().road_report(&border_neighbours);
+            self.directory.publish_region_road_report(road_report);
+            runtime.state().clear_road_topology_dirty();
+        }
     }
 
     /// Removes one owned runtime so a caller can move it at a safe point.

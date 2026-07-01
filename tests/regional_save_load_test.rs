@@ -274,6 +274,42 @@ fn save_load_rebuilds_cross_region_remote_jobs_after_daily_tick() {
 }
 
 #[test]
+fn save_load_rebuilds_cross_region_travel_routes() {
+    let path = save_path("regional-remote-travel-routes");
+    let game = RegionalGame::two_region_default(6, 3).unwrap();
+    build_cross_region_remote_job_fixture(&game);
+    run_regional_days(&game, 10);
+
+    game.save_to_file(&path).unwrap();
+    let loaded = RegionalGame::load_from_file(&path).unwrap();
+    run_regional_days(&loaded, 1);
+
+    let loaded_view = loaded.view().unwrap();
+    let assignment = region_view(&loaded_view.regions, RegionId(1))
+        .map
+        .cells
+        .iter()
+        .find(|cell| cell.x == 0 && cell.y == 0)
+        .and_then(|cell| cell.job_assignments.first().copied())
+        .expect("loaded remote assignment");
+    assert!(assignment.is_remote);
+
+    let mut saw_traveler = false;
+    for _ in 0..(9 * 6 + 1) {
+        loaded.advance().unwrap();
+        let view = loaded.view().unwrap();
+        saw_traveler |= !region_view(&view.regions, RegionId(1)).travelers.is_empty();
+        saw_traveler |= !region_view(&view.regions, RegionId(2)).travelers.is_empty();
+    }
+
+    assert!(
+        saw_traveler,
+        "loaded region should animate a remote commuter after route reports rebuild"
+    );
+    remove_save_file(path);
+}
+
+#[test]
 fn save_load_rebuilds_local_job_assignment_visibility_immediately() {
     let path = save_path("regional-local-job-visibility-rebuild");
     let game = RegionalGame::single_region(4, 3).unwrap();
