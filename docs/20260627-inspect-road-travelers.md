@@ -100,7 +100,7 @@ Current TUI touchpoints:
   should call `remote_workers_at` directly only for local workplace destinations
   discovered by the Enter-only facade call.
 - The state is still `citizen_panel: bool`; a small `PanelMode` enum is optional,
-  not required for P-a.
+  not required for P-b.
 
 Visitor-detail ceiling:
 
@@ -116,7 +116,9 @@ It cannot answer "give me Entity(Region1, n) from its home region" today.
 So, with the current protocol:
 
 - Visitor already in its workplace region: `remote_workers_at(workplace)` can return
-  a useful, possibly superset, detail list.
+  a useful detail list, but it is a **workplace roster superset**, not exactly
+  "the visitors standing on this road cell." It may include foreign commuters
+  assigned to that workplace who are parked at work or walking on another road.
 - Visitor transiting through a middle region: hover shows only the count; full
   detail needs a new direct by-citizen/home-region query. Do not fake it.
 
@@ -220,7 +222,12 @@ target = if schedule_phase(hour) == Work {
 is_visitor = token.home.region != world.region_id
 
 if token.home.region == world.region_id:
-  local_details.push(citizen_relation(...))
+  local_details.push(CitizenDetailView {
+      age,
+      happiness,
+      money,
+      relation: citizen_relation(world, BuildingKind::Residential, citizen),
+  })
 
 if is_visitor && token.work == Some(local workplace):
   local_visitor_workplaces.push(workplace coords)
@@ -247,7 +254,7 @@ Visitor detail fetch reuses existing calls only when possible:
 - `RegionalGame::remote_workers_at` (`src/core/regional_game.rs:489`)
 - `RegionState::remote_workers_for` (current worker-side remote staff path)
 
-No new cross-region protocol is required for P-a/P-b. Precise transit visitor detail is
+No new cross-region protocol is required for P-a2/P-b. Precise transit visitor detail is
 deferred.
 
 ---
@@ -285,8 +292,16 @@ fn road_traveler_panel_seed(world: &World, x: usize, y: usize) -> RoadTravelerPa
 
     for (citizen, token) in tokens {
         if token.home.region == world.region_id {
-            if let Some(detail) = citizen_relation(world, *citizen) {
-                seed.local_details.push(detail);
+            if let Some(citizen) = world.citizens.get(citizen) {
+                seed.local_details.push(CitizenDetailView {
+                    age: citizen.age,
+                    happiness: citizen.morale.actual,
+                    money: citizen.money,
+                    // Same perspective as a residential roster: "where does this
+                    // resident work?" `citizen_relation` returns only the relation,
+                    // not a full detail row.
+                    relation: citizen_relation(world, BuildingKind::Residential, citizen),
+                });
             }
             continue;
         }
@@ -337,7 +352,7 @@ match action {
         self.state.citizen_selected = 0;
         self.state.citizen_roster = seed.local_details;
         self.state.citizen_remote = self.fetch_road_traveler_remote(seed.local_visitor_workplaces);
-        self.state.message = "Travelers (↑/↓ select · Esc close)".to_string();
+        self.state.message = "Traveler details (may include workplace roster · Esc close)".to_string();
     }
     ...
 }
@@ -350,6 +365,8 @@ for each workplace cell from road_traveler_panel_seed:
     call remote_workers_at(workplace)
 dedupe/append results
 
+These remote rows are workplace-scoped, not exact road-cell rows.
+
 for transit visitor with no local workplace:
     no detail fetch in v1
 ```
@@ -359,14 +376,45 @@ awkward.
 
 ---
 
-## 5. Tests
+## 5. Suggested patch split
 
-P-a interface/adapter:
+Keep the count separate from the Enter facade; they have very different costs.
+
+```text
+P-a1 count only
+  InspectView.road_traveler_count
+  adapter::road_traveler_count
+  inspect rendering/tests
+
+P-a2 Enter seed facade
+  RoadTravelerPanelSeedView
+  CityDriver -> RegionalGame -> runner/thread/runtime -> RegionState -> adapter
+  local CitizenDetailView rows + local visitor workplace seeds
+
+P-b TUI
+  Enter opens existing citizen panel
+  road panel label says remote rows may be workplace roster rows
+
+P-c ASCII
+  render the same road-traveler count
+```
+
+P-a1 is small and useful by itself. P-a2 is the expensive cross-thread plumbing
+patch; do not hide it inside the count change.
+
+---
+
+## 6. Tests
+
+P-a1 interface/adapter count only:
 
 - road with no tokens -> `InspectView.road_traveler_count == 0`.
 - road with local + visitor tokens -> count equals visible tokens.
 - removed local citizen token is skipped; foreign token is counted, matching
   `traveler_views`.
+
+P-a2 Enter seed facade:
+
 - `road_traveler_panel_seed` returns local `CitizenDetailView` rows for local
   travelers.
 - visitor in workplace region adds that local workplace to
@@ -387,7 +435,7 @@ P-c optional:
 
 ---
 
-## 6. Risks / non-goals
+## 7. Risks / non-goals
 
 - Full detail for a transit visitor is **not** solved by existing
   `remote_workers_at`; it needs a new by-home-region/by-citizen query. Do not hide
