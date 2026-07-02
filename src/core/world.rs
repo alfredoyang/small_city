@@ -109,8 +109,10 @@ pub(crate) struct World {
     #[serde(skip, default)]
     derived_dirty: Cell<bool>,
     // L1 routing: local road graph or border links may be stale for road-report
-    // pricing. TODO: `derived_dirty` and `road_topology_dirty` are coarse
-    // command-side invalidation flags; split by subsystem if config mutation grows.
+    // pricing. Road cost currently depends only on road presence/connectivity, not
+    // road level; if level affects pricing later, road upgrades must mark this too.
+    // TODO: `derived_dirty` and `road_topology_dirty` are coarse command-side
+    // invalidation flags; split by subsystem if config mutation grows.
     #[serde(skip, default)]
     road_topology_dirty: Cell<bool>,
     // Tunable footprint/building rules. `#[serde(skip)]` so they are not duplicated per region in

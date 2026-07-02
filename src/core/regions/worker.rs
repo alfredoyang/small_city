@@ -291,6 +291,8 @@ impl RegionWorker {
         // Adding a region changes the live-owner set. Earlier regions may have
         // skipped border links to this neighbour while it was still unowned, so
         // republish all reports once the new owner is registered.
+        // ponytail: O(N^2) over startup adds; narrow to neighbours if region
+        // counts grow enough for setup time to matter.
         self.publish_current_road_reports();
         Ok(())
     }
@@ -1484,6 +1486,87 @@ mod tests {
         assert!(
             directory.rebuild_count() > before,
             "road build changes the road report and should rebuild routes"
+        );
+    }
+
+    #[test]
+    fn clean_region_refreshes_routes_after_neighbour_road_change() {
+        let topology = vec![
+            RegionNeighborLink::new(RegionId(1), BorderEdge::East, RegionId(2)),
+            RegionNeighborLink::new(RegionId(2), BorderEdge::West, RegionId(1)),
+        ];
+        let owners = Arc::new(RegionOwnerDirectory::new());
+        let directory = Arc::new(RegionDirectory::with_owners(topology, Arc::clone(&owners)));
+        let mut worker =
+            RegionWorker::with_directory_and_owners(WorkerId(13), Arc::clone(&directory), owners);
+        let mut source = RegionState::new(RegionId(1), 2, 1);
+        assert!(
+            source
+                .build(1, 0, crate::interface::input::BuildingKind::Road)
+                .success
+        );
+        worker
+            .add_region(RegionRuntime::new(source))
+            .expect("source added");
+        worker
+            .add_region(RegionRuntime::new(RegionState::new(RegionId(2), 2, 1)))
+            .expect("target added");
+        assert!(
+            worker
+                .region(RegionId(1))
+                .unwrap()
+                .state()
+                .world
+                .remote_exit_cells
+                .is_empty(),
+            "no matching road in region 2 yet"
+        );
+
+        worker
+            .push_event(
+                RegionId(2),
+                RegionEvent::RunCommand {
+                    request_id: UiRequestId(1),
+                    command: crate::core::regional_types::RegionCommand::Build {
+                        x: 0,
+                        y: 0,
+                        kind: crate::interface::input::BuildingKind::Road,
+                    },
+                },
+            )
+            .expect("build routed");
+        assert!(
+            worker
+                .process_region_events(usize::MAX)
+                .routing_errors
+                .is_empty()
+        );
+        assert!(
+            directory
+                .exits_from(RegionId(1))
+                .unwrap_or_default()
+                .contains_key(&RegionId(2)),
+            "directory routes should learn the new neighbour crossing"
+        );
+
+        worker
+            .push_event(RegionId(1), RegionEvent::StepTravel)
+            .expect("step routed");
+        assert!(
+            worker
+                .process_region_events_for_barrier(usize::MAX)
+                .routing_errors
+                .is_empty()
+        );
+        assert!(
+            worker
+                .region(RegionId(1))
+                .unwrap()
+                .state()
+                .world
+                .remote_exit_cells
+                .contains_key(&RegionId(2)),
+            "clean source region refreshes route exits before StepTravel"
         );
     }
 
