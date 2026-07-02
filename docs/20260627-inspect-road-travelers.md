@@ -87,8 +87,7 @@ open render_citizen_panel(...)      existing popup/table
   |
   +-- local traveler details         NEW local facade call, same inspect-style chain
   |
-  +-- visitor details, v1            only when a token's work is local to this region:
-        remote_workers_at(workplace)
+  +-- visitor endpoint summaries     local-only from TravelToken { home, work }
 ```
 
 Current TUI touchpoints:
@@ -96,9 +95,9 @@ Current TUI touchpoints:
 - `TuiAction::EnterCell` is handled around `src/ui/tui.rs:939`.
 - `cell_has_roster` is currently building-only at `src/ui/tui.rs:1365`.
 - `render_citizen_panel` is the reusable popup at `src/ui/tui.rs:1400`.
-- `fetch_citizen_remote` at `src/ui/tui.rs:761` is workplace-only; road travelers
-  should call `remote_workers_at` directly only for local workplace destinations
-  discovered by the Enter-only facade call.
+- `fetch_citizen_remote` at `src/ui/tui.rs:761` is workplace-only and should not
+  be used for road traveler endpoint rows; `World.tokens` already carries
+  visitor `home`/`work`.
 - The state is still `citizen_panel: bool`; a small `PanelMode` enum is optional,
   not required for P-b.
 
@@ -109,18 +108,22 @@ Region 4 road token:
   home = Region 1
   work = Region 7
 
-remote_workers_at(...) can answer "who works at this local workplace cell?"
-It cannot answer "give me Entity(Region1, n) from its home region" today.
+TravelToken can answer:
+  origin/destination region + endpoint entity identity
+  local endpoint coordinates only when the endpoint is in this region
+
+It cannot answer:
+  remote citizen age/happiness/money
+  remote endpoint coordinates without querying that endpoint's region
 ```
 
 So, with the current protocol:
 
-- Visitor already in its workplace region: `remote_workers_at(workplace)` can return
-  a useful detail list, but it is a **workplace roster superset**, not exactly
-  "the visitors standing on this road cell." It may include foreign commuters
-  assigned to that workplace who are parked at work or walking on another road.
-- Visitor transiting through a middle region: hover shows only the count; full
-  detail needs a new direct by-citizen/home-region query. Do not fake it.
+- Visitor endpoint summary rows are local-only and exact to the token's
+  `home`/`work` fields.
+- Full remote `CitizenDetailView` rows need a new direct by-citizen/home-region
+  query. Do not use `remote_workers_at(workplace)` for this; it returns a
+  workplace roster superset, not "the visitors standing on this road cell."
 
 ### Existing inspect data flow
 
@@ -182,13 +185,19 @@ For Enter, use a separate UI-safe seed instead of storing details in
 ```rust
 pub struct RoadTravelerPanelSeedView {
     pub local_details: Vec<CitizenDetailView>,
-    pub local_visitor_workplaces: Vec<CityCellRef>,
+    pub visitor_endpoints: Vec<RoadTravelerEndpointView>,
+}
+
+pub struct RoadTravelerEndpointView {
+    pub home_region: RegionId,
+    pub work_region: Option<RegionId>,
+    pub local_workplace: Option<CityCellRef>,
 }
 ```
 
-`local_visitor_workplaces` is coarse on purpose. The TUI can call the existing
-`remote_workers_at(workplace)` for those local workplace cells. Transit visitors
-have no local workplace in this region, so they do not get detail rows in v1.
+`visitor_endpoints` is local-only. It uses `token.home` and `token.work`; if the
+workplace is in the inspected region, the adapter can resolve local coordinates
+from `world.positions`. Otherwise it shows only the region/entity identity.
 
 ### New adapter helpers
 
@@ -203,22 +212,13 @@ have no local workplace in this region, so they do not get detail rows in v1.
 - `road_traveler_panel_seed(world, x, y) -> RoadTravelerPanelSeedView`
   - Enter-only detail builder.
   - Local citizens: returns `CitizenDetailView` rows.
-  - Visitors whose `token.work.region == world.region_id`: returns that local
-    workplace cell in `local_visitor_workplaces` so the UI can call
-    `remote_workers_at`.
-  - Transit visitors: no detail in v1.
+  - Visitors: returns endpoint summary rows from `token.home` / `token.work`.
   - Same residential perspective as `citizen_roster`: local citizen detail, no
     direct ECS leak.
 
-Target rule for the Enter-only seed:
+Endpoint rule for the Enter-only seed:
 
 ```text
-target = if schedule_phase(hour) == Work {
-    token.work.unwrap_or(token.home)
-} else {
-    token.home
-}
-
 is_visitor = token.home.region != world.region_id
 
 if token.home.region == world.region_id:
@@ -229,12 +229,16 @@ if token.home.region == world.region_id:
       relation: citizen_relation(world, BuildingKind::Residential, citizen),
   })
 
-if is_visitor && token.work == Some(local workplace):
-  local_visitor_workplaces.push(workplace coords)
+if is_visitor:
+  visitor_endpoints.push({
+      home_region: token.home.region,
+      work_region: token.work.map(|w| w.region),
+      local_workplace: coords if token.work is local and position exists,
+  })
 ```
 
-This mirrors the current stepper in `src/core/systems/travel.rs`: tokens retarget by
-`schedule_phase(hour)` and their stored `home/work` endpoints.
+This uses only the endpoint facts already carried by the token. It does not need
+to ask another region for origin/workplace identity.
 
 ### Facade for Enter details
 
@@ -249,13 +253,8 @@ CityDriver::road_traveler_panel_seed
   -> adapter::road_traveler_panel_seed
 ```
 
-Visitor detail fetch reuses existing calls only when possible:
-
-- `RegionalGame::remote_workers_at` (`src/core/regional_game.rs:489`)
-- `RegionState::remote_workers_for` (current worker-side remote staff path)
-
-No new cross-region protocol is required for P-a2/P-b. Precise transit visitor detail is
-deferred.
+No cross-region protocol is required for P-a2/P-b because visitor endpoints come
+from the token. Full remote citizen demographics are deferred.
 
 ---
 
@@ -282,7 +281,6 @@ fn road_traveler_count(world: &World, x: usize, y: usize) -> usize {
 ```rust
 fn road_traveler_panel_seed(world: &World, x: usize, y: usize) -> RoadTravelerPanelSeedView {
     let Some(cell) = road_cell(world, x, y) else { return default_seed() };
-    let phase = schedule_phase(world.resources.time.hour_of_day());
     let mut seed = RoadTravelerPanelSeedView::default();
 
     let mut tokens: Vec<_> = world.tokens.iter()
@@ -306,19 +304,20 @@ fn road_traveler_panel_seed(world: &World, x: usize, y: usize) -> RoadTravelerPa
             continue;
         }
 
-        // Visitor details can be fetched with existing remote_workers_at only
-        // when the visitor's workplace is local to this region.
-        if phase == SchedulePhase::Work {
-            if let Some(work) = token.work.filter(|w| w.region == world.region_id) {
-                if let Some(pos) = world.positions.get(&work.building) {
-                    seed.local_visitor_workplaces.push(CityCellRef { x: pos.x, y: pos.y });
-                }
-            }
-        }
+        let local_workplace = token
+            .work
+            .filter(|w| w.region == world.region_id)
+            .and_then(|w| world.positions.get(&w.building))
+            .map(|pos| CityCellRef { x: pos.x, y: pos.y });
+        seed.visitor_endpoints.push(RoadTravelerEndpointView {
+            home_region: token.home.region,
+            work_region: token.work.map(|w| w.region),
+            local_workplace,
+        });
     }
 
-    seed.local_visitor_workplaces.sort();
-    seed.local_visitor_workplaces.dedup();
+    seed.visitor_endpoints.sort();
+    seed.visitor_endpoints.dedup();
     seed
 }
 ```
@@ -351,24 +350,11 @@ match action {
         self.state.citizen_panel = true;
         self.state.citizen_selected = 0;
         self.state.citizen_roster = seed.local_details;
-        self.state.citizen_remote = self.fetch_road_traveler_remote(seed.local_visitor_workplaces);
-        self.state.message = "Traveler details (may include workplace roster · Esc close)".to_string();
+        self.state.road_traveler_visitors = seed.visitor_endpoints;
+        self.state.message = "Traveler details (local rows + visitor endpoints · Esc close)".to_string();
     }
     ...
 }
-```
-
-`fetch_road_traveler_remote`:
-
-```text
-for each workplace cell from road_traveler_panel_seed:
-    call remote_workers_at(workplace)
-dedupe/append results
-
-These remote rows are workplace-scoped, not exact road-cell rows.
-
-for transit visitor with no local workplace:
-    no detail fetch in v1
 ```
 
 This is deliberately boring. Add `PanelMode` only if the bool starts making the code
@@ -389,11 +375,11 @@ P-a1 count only
 P-a2 Enter seed facade
   RoadTravelerPanelSeedView
   CityDriver -> RegionalGame -> runner/thread/runtime -> RegionState -> adapter
-  local CitizenDetailView rows + local visitor workplace seeds
+  local CitizenDetailView rows + visitor endpoint summaries from tokens
 
 P-b TUI
   Enter opens existing citizen panel
-  road panel label says remote rows may be workplace roster rows
+  road panel shows local rows and visitor endpoint summaries
 
 P-c ASCII
   render the same road-traveler count
@@ -417,9 +403,9 @@ P-a2 Enter seed facade:
 
 - `road_traveler_panel_seed` returns local `CitizenDetailView` rows for local
   travelers.
-- visitor in workplace region adds that local workplace to
-  `local_visitor_workplaces`.
-- transit visitor does not add a fake detail row or remote workplace.
+- visitor endpoint rows use `token.home` and `token.work` without a remote query.
+- visitor in workplace region includes local workplace coordinates when resolvable.
+- transit visitor still shows endpoint regions, not a fake `CitizenDetailView`.
 
 P-b UI:
 
@@ -427,7 +413,7 @@ P-b UI:
 - `Enter` on road with travelers opens the existing citizen panel.
 - `Enter` on road without travelers still builds.
 - local traveler details come through the facade, not direct ECS access.
-- visitor in workplace region triggers `remote_workers_at`; transit visitor does not.
+- visitor endpoints render from the seed; no `remote_workers_at` call.
 
 P-c optional:
 
@@ -437,9 +423,9 @@ P-c optional:
 
 ## 7. Risks / non-goals
 
-- Full detail for a transit visitor is **not** solved by existing
-  `remote_workers_at`; it needs a new by-home-region/by-citizen query. Do not hide
-  that with a fake row.
+- Full remote `CitizenDetailView` for a visitor is out of scope. It needs a new
+  by-home-region/by-citizen query. Do not use `remote_workers_at`; it is a
+  workplace roster and can return a superset.
 - Hover deliberately does **not** show origin/destination/detail rows. Press Enter
   for details.
 - `road_traveler_count` is an O(tokens) scan on inspect/cursor movement. Fine for
