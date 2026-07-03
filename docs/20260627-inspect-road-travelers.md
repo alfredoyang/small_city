@@ -587,3 +587,91 @@ silent single row indistinguishable from one visitor.
 
 None new. P-b (TUI: `Enter` opens the existing citizen panel using this
 facade, road panel shows local rows + visitor endpoint summaries) is next.
+
+---
+
+## P-b implemented (2026-07-03)
+
+Diff: 1 file (`src/ui/tui.rs`), +263/-4 lines. No core/adapter change. Full
+gate green (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test -q` — 309 tests, up from 307).
+
+### Deviation from the plan's pseudocode
+
+The plan's section 4 sketch reused `citizen_panel`/`citizen_selected` for
+road travelers too. Implementing it exposed why that doesn't fit: the
+building roster panel re-reads `inspect.roster` live every frame/keypress and
+supports an in-list cursor plus jump-to-related-cell on Enter; road-traveler
+data has no live `InspectView` field to re-read (it's Enter-only, fetched
+once via `road_traveler_panel_seed`), and visitor endpoint rows
+(`home_region`/`work_region`/`count`) don't fit the citizen table's five
+columns (age/happiness/money/relation). Per the plan's own escape hatch —
+"Add `PanelMode` only if the bool starts making the code awkward" — this
+patch adds a **separate, simpler modal** instead: its own bool
+(`road_traveler_panel`), its own cached data (`road_traveler_locals`,
+`road_traveler_visitors`), its own key handler (Esc/q only — no cursor, no
+jump), and its own render function. Codex reviewed this deviation explicitly
+and confirmed it's sound: "the split keeps the UI logic simpler and avoids
+pretending visitor endpoint rows are citizen details."
+
+### What changed
+
+- **`TuiState`**: `road_traveler_panel: bool`, `road_traveler_locals:
+  Vec<CitizenDetailView>`, `road_traveler_visitors:
+  Vec<RoadTravelerEndpointView>`. Snapshot-only by design (ponytail-marked):
+  unlike `citizen_remote`, which refreshes on tick, the traveler snapshot is
+  not re-fetched while the panel stays open — tokens move every sub-tick, so
+  a live refresh would mean a facade round-trip that often. Close/reopen to
+  refresh.
+- **`TuiAction::EnterCell`**: third branch — `cell_has_roster` (unchanged) →
+  `inspect.road_traveler_count > 0` (new: fetch the seed once, open the
+  panel) → Build fallback (unchanged).
+- **`handle_road_traveler_panel_key`**: Esc/q closes; wired into the main key
+  dispatch alongside `handle_citizen_panel_key`.
+- **`render_road_traveler_panel`**: local rows as a `Table` (reuses
+  `relation_text`, same 4 data columns as the citizen panel), visitor rows as
+  plain text lines below via `visitor_endpoint_text` (e.g. `2× region 3 →
+  here (1,0)`, `1× region 4 → region 5`, `3× region 3 → no job`;
+  `local_workplace` wins over the bare `work_region` since it's the more
+  precise fact).
+- **`tui_inspect_card`**: Road's hover card gained a `Travellers N` line,
+  always shown — completes P-a1's hover tier (P-a1 only added the
+  `InspectView` field, deferring all rendering to this patch).
+
+### Diagram
+
+```text
+Enter on a cell
+      |
+      v
+inspect = game.inspect(x, y)
+      |
+      +-- cell_has_roster(inspect)?        yes -> existing citizen_panel (unchanged)
+      |
+      +-- inspect.road_traveler_count > 0? yes -> seed = game.road_traveler_panel_seed(x, y)
+      |                                            road_traveler_panel = true
+      |                                            road_traveler_locals = seed.local_details
+      |                                            road_traveler_visitors = seed.visitor_endpoints
+      |
+      +-- else                                  -> Build (unchanged)
+```
+
+### Review
+
+- **codex**: no findings. Explicitly confirmed both open questions I raised —
+  the separate-modal deviation is sound, and skipping a full live-gameplay
+  "Enter opens the panel for a real commuting citizen" test is an acceptable
+  boundary here, since P-a1/P-a2's adapter-level tests (9 tests, already
+  reviewed) already prove the real-`World` data path; this patch's own tests
+  cover the TUI routing/key/render logic on top of that.
+- **opencode**: skipped for this patch at the user's instruction.
+- **Self-review**: mission-scoped (TUI only), UI still reads only through the
+  facade (`tui_does_not_import_ecs_internals` contract test still passes), no
+  simulation change (N/A for determinism), tests meaningful (routing +
+  key-handling + rendering, with the live-gameplay gap explicitly flagged and
+  accepted), no balance risk.
+
+### Risks / next steps
+
+None new. P-c (ASCII: render the same road-traveler count in the ASCII
+fallback UI) is the last patch in the plan's split.

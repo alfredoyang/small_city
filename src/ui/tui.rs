@@ -23,7 +23,7 @@ use crate::interface::events::CommandResult;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
     BuildPreviewView, CellView, CitizenDetailView, CitizenRelation, DemandLevel, GameView,
-    InspectDetailsView, InspectFlag, InspectView,
+    InspectDetailsView, InspectFlag, InspectView, RoadTravelerEndpointView,
 };
 use crate::ui::city_driver::CityDriver;
 use crate::ui::tui_input::{TuiAction, map_key_event};
@@ -66,6 +66,16 @@ struct TuiState {
     /// (and refreshed on tick), never per frame. Empty for residential rosters and workplaces with
     /// no remote staff. Rendered below the local workers, region-tagged via `LivesAt { region }`.
     citizen_remote: Vec<CitizenDetailView>,
+    /// When set, a modal lists the travelers on the selected road cell: local citizens plus
+    /// visiting bodies' endpoint summaries. Opened by Enter on a road with travelers.
+    road_traveler_panel: bool,
+    /// Local travelers' detail rows, fetched once when the panel opens.
+    /// ponytail: snapshot-only, not refreshed on tick like `citizen_remote` — tokens
+    /// move every sub-tick, so a live refresh would need a facade round-trip that
+    /// often; close/reopen to refresh. Revisit if playtesting shows this is confusing.
+    road_traveler_locals: Vec<CitizenDetailView>,
+    /// Visiting bodies' endpoint summaries, fetched once alongside `road_traveler_locals`.
+    road_traveler_visitors: Vec<RoadTravelerEndpointView>,
     /// Whether the chrome panels (header bar, tool strip, City HUD, legend) may use emoji icons.
     /// The map grid is always emoji-free; only these panels fall back to ASCII on bare terminals.
     use_emoji: bool,
@@ -156,6 +166,9 @@ impl Default for TuiState {
             citizen_panel: false,
             citizen_selected: 0,
             citizen_remote: Vec::new(),
+            road_traveler_panel: false,
+            road_traveler_locals: Vec::new(),
+            road_traveler_visitors: Vec::new(),
             use_emoji: true,
             hud_prev: None,
             hud_trend: HudTrend::default(),
@@ -863,6 +876,24 @@ impl TuiRuntime {
         true
     }
 
+    /// Handles a key while the road-traveler modal is open. Returns `true` when the modal
+    /// consumed the key. A static snapshot view: no in-list cursor or jump, just close.
+    fn handle_road_traveler_panel_key(&mut self, key: KeyEvent) -> bool {
+        if !self.state.road_traveler_panel {
+            return false;
+        }
+
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
+        ) {
+            self.state.road_traveler_panel = false;
+        }
+
+        self.dirty = true;
+        true
+    }
+
     /// Handles a key while the quit-confirmation modal is open. Returns `true` when the modal
     /// consumed the key (so it should not fall through to a gameplay action). The actual exit is
     /// signalled via `pending_quit` and carried out by the event loop.
@@ -934,8 +965,9 @@ impl TuiRuntime {
                 self.finish_map_command(x, y, before, result, now);
             }
             TuiAction::EnterCell => {
-                // Context-sensitive: a populated zone opens its citizen roster;
-                // anything else (empty land, road, power, park) behaves as Build.
+                // Context-sensitive: a populated zone opens its citizen roster; a road
+                // with travelers opens the traveler panel; anything else (empty land,
+                // an empty road, power, park) behaves as Build.
                 let (x, y) = (self.state.cursor_x, self.state.cursor_y);
                 let inspect = self.game.inspect(x, y);
                 if cell_has_roster(&inspect) {
@@ -943,6 +975,13 @@ impl TuiRuntime {
                     self.state.citizen_selected = 0;
                     self.state.citizen_remote = self.fetch_citizen_remote(&inspect, x, y);
                     self.state.message = "Citizen roster (↑/↓ select · Esc close)".to_string();
+                    self.dirty = true;
+                } else if inspect.road_traveler_count > 0 {
+                    let seed = self.game.road_traveler_panel_seed(x, y);
+                    self.state.road_traveler_panel = true;
+                    self.state.road_traveler_locals = seed.local_details;
+                    self.state.road_traveler_visitors = seed.visitor_endpoints;
+                    self.state.message = "Traveler details (Esc close)".to_string();
                     self.dirty = true;
                 } else {
                     let before = self.current_money();
@@ -1209,6 +1248,11 @@ pub fn run() -> io::Result<()> {
             continue;
         }
 
+        // The road-traveler modal consumes its own keys while open.
+        if runtime.handle_road_traveler_panel_key(key) {
+            continue;
+        }
+
         // Non-modal keys are normalized into actions before mutating UI state or calling facades.
         let action = map_key_event(key);
         if runtime.apply_action(action, Instant::now()) == TuiFlow::Quit {
@@ -1297,6 +1341,15 @@ fn render(
             inspect,
             &state.citizen_remote,
             state.citizen_selected,
+        );
+    }
+    if state.road_traveler_panel {
+        render_road_traveler_panel(
+            frame,
+            root,
+            inspect,
+            &state.road_traveler_locals,
+            &state.road_traveler_visitors,
         );
     }
 }
@@ -1483,6 +1536,122 @@ fn render_citizen_panel(
             footer,
         );
     }
+}
+
+/// Static (snapshot, non-navigable) detail view of the travelers on the
+/// inspected road cell: local citizens as roster rows, then visiting bodies'
+/// endpoint summaries as plain text lines.
+///
+/// ```text
+/// ┌ Travelers at (1,2) — 4 traveler(s) · Esc close ───────┐
+/// │ #   Age  Happy  $    Works at                         │  (local rows, same
+/// │ #1  27   72     $14  (0,1)                             │   shape as the
+/// ├────────────────────────────────────────────────────────┤   citizen panel)
+/// │ Visitors:                                                │
+/// │  2× region 3 → here (1,0)                                │  (grouped, see
+/// │  1× region 4 → region 5                                  │   RoadTravelerEndpointView)
+/// └────────────────────────────────────────────────────────┘
+/// ```
+fn render_road_traveler_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    inspect: &InspectView,
+    locals: &[CitizenDetailView],
+    visitors: &[RoadTravelerEndpointView],
+) {
+    let popup = centered_rect(60, 60, area);
+    let visitor_total: usize = visitors.iter().map(|endpoint| endpoint.count).sum();
+    let total = locals.len() + visitor_total;
+    let title = format!(
+        "Travelers at ({},{}) — {} traveler(s) · Esc close",
+        inspect.x, inspect.y, total
+    );
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if total == 0 {
+        frame.render_widget(Paragraph::new("No travelers here."), inner);
+        return;
+    }
+
+    // Reserve a section for visitor summary lines only when there are any.
+    let (local_area, visitor_area) = if visitors.is_empty() {
+        (inner, None)
+    } else {
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(visitors.len() as u16 + 1),
+            ])
+            .split(inner);
+        (parts[0], Some(parts[1]))
+    };
+
+    if locals.is_empty() {
+        frame.render_widget(Paragraph::new("No local residents here."), local_area);
+    } else {
+        let header = Row::new(["#", "Age", "Happy", "$", "Works at"]).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+        let rows = locals.iter().enumerate().map(|(index, citizen)| {
+            Row::new([
+                format!("#{}", index + 1),
+                citizen.age.to_string(),
+                citizen.happiness.to_string(),
+                format!("${}", citizen.money),
+                relation_text(citizen),
+            ])
+        });
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(4),
+                Constraint::Length(5),
+                Constraint::Length(6),
+                Constraint::Length(6),
+                Constraint::Min(12),
+            ],
+        )
+        .header(header);
+        frame.render_widget(table, local_area);
+    }
+
+    if let Some(visitor_area) = visitor_area {
+        let mut lines = vec![Line::from(Span::styled(
+            "Visitors:",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))];
+        lines.extend(
+            visitors
+                .iter()
+                .map(|endpoint| Line::from(format!("  {}", visitor_endpoint_text(endpoint)))),
+        );
+        frame.render_widget(Paragraph::new(lines), visitor_area);
+    }
+}
+
+/// Formats one grouped visitor endpoint row, e.g. `2× region 3 → here (1,0)`,
+/// `1× region 4 → region 5`, or `3× region 3 → no job` for a jobless transit
+/// visitor. `local_workplace` takes priority over the bare `work_region` since
+/// it is the more precise fact.
+fn visitor_endpoint_text(endpoint: &RoadTravelerEndpointView) -> String {
+    let destination = match (endpoint.local_workplace, endpoint.work_region) {
+        (Some(cell), _) => format!("here ({},{})", cell.x, cell.y),
+        (None, Some(region)) => format!("region {}", region.0),
+        (None, None) => "no job".to_string(),
+    };
+    format!(
+        "{}× region {} → {destination}",
+        endpoint.count, endpoint.home_region.0
+    )
 }
 
 /// The cell a roster row points at, for the Enter-to-jump action: a resident's
@@ -1870,7 +2039,10 @@ fn tui_inspect_card(inspect: &InspectView) -> (String, Vec<String>) {
             tui_status_line(None, None, None, None),
             format!("Buildable {}", if *buildable { "✓" } else { "✗" }),
         ],
-        InspectDetailsView::Road => vec![tui_status_line(None, None, None, None)],
+        InspectDetailsView::Road => vec![
+            tui_status_line(None, None, None, None),
+            format!("Travellers {}", inspect.road_traveler_count),
+        ],
         InspectDetailsView::Residential {
             powered,
             power_demand,
@@ -4061,8 +4233,95 @@ mod tests {
         runtime.state.selected_build = BuildingKind::Road;
         runtime.apply_action(TuiAction::Build, now);
 
+        // A road with no travelers opens no panel at all; Enter still builds (a
+        // second Build on an already-built road is the existing behavior here).
         runtime.apply_action(TuiAction::EnterCell, now);
         assert!(!runtime.state.citizen_panel);
+        assert!(!runtime.state.road_traveler_panel);
+    }
+
+    /// The `EnterCell` road-traveler branch is exercised at the routing level: given
+    /// an `inspect.road_traveler_count > 0` (proven against a real `World` by the
+    /// adapter's own `road_traveler_panel_seed`/`road_traveler_count` tests), the
+    /// panel opens and its state is populated straight from the facade's seed —
+    /// never by reading roster/token data directly.
+    #[test]
+    fn road_traveler_panel_key_closes_on_esc() {
+        let now = Instant::now();
+        let mut runtime = TuiRuntime::new(now);
+        runtime.game = CityDriver::regional_with_size(4, 3).expect("regional UI driver");
+        runtime.state.road_traveler_panel = true;
+        runtime.state.road_traveler_locals = vec![CitizenDetailView {
+            age: 27,
+            happiness: 72,
+            money: 14,
+            relation: CitizenRelation::Unemployed,
+        }];
+
+        // A non-close key is still consumed (modal keys never fall through), but
+        // leaves the panel open since there is no in-list cursor to move.
+        assert!(
+            runtime
+                .handle_road_traveler_panel_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        );
+        assert!(runtime.state.road_traveler_panel);
+
+        // Esc closes the panel; once closed the handler stops consuming keys.
+        assert!(
+            runtime.handle_road_traveler_panel_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        );
+        assert!(!runtime.state.road_traveler_panel);
+        assert!(
+            !runtime
+                .handle_road_traveler_panel_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        );
+    }
+
+    #[test]
+    fn render_road_traveler_panel_shows_local_rows_and_grouped_visitors() {
+        use crate::core::regions::RegionId;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inspect = InspectView {
+            x: 4,
+            y: 2,
+            in_bounds: true,
+            cell: None,
+            details: Some(InspectDetailsView::Road),
+            local_effects: None,
+            flags: Vec::new(),
+            explanations: Vec::new(),
+            roster: Vec::new(),
+            road_traveler_count: 3,
+        };
+        let locals = vec![CitizenDetailView {
+            age: 27,
+            happiness: 72,
+            money: 14,
+            relation: CitizenRelation::Unemployed,
+        }];
+        let visitors = vec![RoadTravelerEndpointView {
+            home_region: RegionId(3),
+            work_region: None,
+            local_workplace: None,
+            count: 2,
+        }];
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_road_traveler_panel(frame, area, &inspect, &locals, &visitors);
+            })
+            .expect("render road traveler panel");
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("Travelers at (4,2)"));
+        assert!(text.contains("3 traveler(s)"));
+        assert!(text.contains("27")); // local row's age column
+        assert!(text.contains("Visitors:"));
+        assert!(text.contains("2× region 3 → no job"));
     }
 
     #[test]
