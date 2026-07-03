@@ -1,6 +1,7 @@
 //! Adapter that converts private ECS world data into UI-safe view and inspect models.
 
-use crate::core::components::{Citizen, Position};
+use crate::core::city_refs::CityCellRef;
+use crate::core::components::{Citizen, Position, TravelToken};
 use crate::core::entity::Entity;
 use crate::core::regions::RegionId;
 use crate::core::systems::{
@@ -13,6 +14,7 @@ use crate::interface::view::{
     BuildOptionView, CellView, CitizenDetailView, CitizenRelation, CitizenTravelView, CityDemand,
     CityStatusView, DemandLevel, GameTimeView, GameView, InspectDetailsView, InspectFlag,
     InspectView, JobAssignmentView, LocalEffectsView, MapView, PowerStatusView, RoadLinks,
+    RoadTravelerEndpointView, RoadTravelerPanelSeedView,
 };
 
 /// Converts the private ECS World into the only render model the UI may consume.
@@ -210,6 +212,84 @@ fn road_traveler_count(world: &World, x: usize, y: usize) -> usize {
         .filter(|(id, token)| world.citizens.contains_key(id) || token.home.region != self_region)
         .filter(|(_, token)| token.state.current_cell == Some(entity))
         .count()
+}
+
+/// Enter-panel detail for the travelers standing on the road cell at `(x, y)`.
+/// Local travelers (home is this region) get full `CitizenDetailView` rows, same
+/// perspective as a residential roster. Visitors (home elsewhere) get endpoint
+/// summary rows built only from `token.home`/`token.work` — no cross-region query.
+/// Empty for a non-road cell or an out-of-bounds coordinate. Order: local rows by
+/// `Entity` id, then visitor rows grouped by endpoint (see `RoadTravelerEndpointView`).
+pub(crate) fn road_traveler_panel_seed(
+    world: &World,
+    x: usize,
+    y: usize,
+) -> RoadTravelerPanelSeedView {
+    let Some(entity) = world.grid.get(x, y) else {
+        return RoadTravelerPanelSeedView::default();
+    };
+    if !road_connectivity::is_road_entity(world, entity) {
+        return RoadTravelerPanelSeedView::default();
+    }
+
+    let mut tokens: Vec<(&Entity, &TravelToken)> = world
+        .tokens
+        .iter()
+        .filter(|(_, token)| token.state.current_cell == Some(entity))
+        .collect();
+    tokens.sort_by_key(|(id, _)| id.0);
+
+    let mut seed = RoadTravelerPanelSeedView::default();
+    let mut visitor_keys: Vec<(RegionId, Option<RegionId>, Option<CityCellRef>)> = Vec::new();
+    for (id, token) in tokens {
+        if token.home.region == world.region_id {
+            // Stale local token whose citizen was already removed: skip, like
+            // road_traveler_count's alive check.
+            if let Some(citizen) = world.citizens.get(id) {
+                seed.local_details.push(CitizenDetailView {
+                    age: citizen.age,
+                    happiness: citizen.morale.actual,
+                    money: citizen.money,
+                    relation: citizen_relation(world, BuildingKind::Residential, citizen),
+                });
+            }
+            continue;
+        }
+
+        let local_workplace = token
+            .work
+            .filter(|workplace| workplace.region == world.region_id)
+            .and_then(|workplace| world.positions.get(&workplace.building))
+            .map(|position| CityCellRef::local(world.region_id, position.x, position.y));
+        visitor_keys.push((
+            token.home.region,
+            token.work.map(|workplace| workplace.region),
+            local_workplace,
+        ));
+    }
+
+    // Group visitors sharing the exact same endpoint into one row with a count,
+    // so collapsing duplicates never silently loses how many travelers a row
+    // represents (unlike a plain `sort` + `dedup`).
+    visitor_keys.sort();
+    for (home_region, work_region, local_workplace) in visitor_keys {
+        match seed.visitor_endpoints.last_mut() {
+            Some(last)
+                if last.home_region == home_region
+                    && last.work_region == work_region
+                    && last.local_workplace == local_workplace =>
+            {
+                last.count += 1;
+            }
+            _ => seed.visitor_endpoints.push(RoadTravelerEndpointView {
+                home_region,
+                work_region,
+                local_workplace,
+                count: 1,
+            }),
+        }
+    }
+    seed
 }
 
 /// Per-citizen roster for the building at `(x, y)`, kept UI-safe inside the adapter.
@@ -1004,6 +1084,7 @@ fn digit_symbol(value: i32) -> char {
 #[cfg(test)]
 mod tests {
     use super::{calculate_demand, traveler_views, view_world};
+    use crate::core::city_refs::CityCellRef;
     use crate::core::components::{
         Citizen, Morale, PlaceRef, TravelState, TravelStatus, TravelToken,
     };
@@ -1011,7 +1092,10 @@ mod tests {
     use crate::core::systems::placement::place_building;
     use crate::core::world::World;
     use crate::interface::input::BuildingKind;
-    use crate::interface::view::{CitizenTravelView, CityDemand, DemandLevel};
+    use crate::interface::view::{
+        CitizenDetailView, CitizenRelation, CitizenTravelView, CityDemand, DemandLevel,
+        RoadTravelerEndpointView,
+    };
 
     /// Inserts a citizen and its travel state. `cell = None` ⇒ idle (no token).
     fn add_citizen(world: &mut World, local: u32, cell: Option<Entity>) -> Entity {
@@ -1258,6 +1342,226 @@ mod tests {
             super::inspect_world(&world, 0, 0).road_traveler_count,
             1,
             "stale local token must not count, foreign token still does"
+        );
+    }
+
+    /// A local traveler (home is this region) gets a full `CitizenDetailView`
+    /// row, same shape as a residential roster.
+    #[test]
+    fn road_traveler_panel_seed_returns_local_citizen_detail_rows() {
+        let mut world = World::new(2, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        let r0 = world.grid.get(0, 0).expect("r0");
+        add_citizen(&mut world, 1, Some(r0));
+
+        let seed = super::road_traveler_panel_seed(&world, 0, 0);
+
+        assert_eq!(
+            seed.local_details,
+            vec![CitizenDetailView {
+                age: 1,
+                happiness: 50,
+                money: 0,
+                relation: CitizenRelation::Unemployed,
+            }]
+        );
+        assert!(seed.visitor_endpoints.is_empty());
+    }
+
+    /// A visitor's endpoint row is built only from `token.home`/`token.work` —
+    /// no remote-region query. A workplace outside this region has no resolvable
+    /// local coordinates.
+    #[test]
+    fn road_traveler_panel_seed_visitor_endpoint_uses_token_home_and_work() {
+        use crate::core::regions::RegionId;
+
+        let mut world = World::new(2, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        let r0 = world.grid.get(0, 0).expect("r0");
+        world.tokens.insert(
+            Entity::new(RegionId(3), 1),
+            TravelToken {
+                state: TravelState {
+                    status: TravelStatus::Traveling,
+                    current_cell: Some(r0),
+                    destination: None,
+                    building: None,
+                    dwell: 0,
+                    prev_cell: None,
+                },
+                home: PlaceRef {
+                    region: RegionId(3),
+                    building: Entity::new(RegionId(3), 0),
+                },
+                work: Some(PlaceRef {
+                    region: RegionId(5),
+                    building: Entity::new(RegionId(5), 9),
+                }),
+                trip_gen: 1,
+            },
+        );
+
+        let seed = super::road_traveler_panel_seed(&world, 0, 0);
+
+        assert!(seed.local_details.is_empty());
+        assert_eq!(
+            seed.visitor_endpoints,
+            vec![RoadTravelerEndpointView {
+                home_region: RegionId(3),
+                work_region: Some(RegionId(5)),
+                local_workplace: None,
+                count: 1,
+            }]
+        );
+    }
+
+    /// A visitor whose workplace is in the inspected region resolves local
+    /// coordinates from `world.positions`.
+    #[test]
+    fn road_traveler_panel_seed_includes_local_workplace_when_resolvable() {
+        use crate::core::regions::RegionId;
+
+        let mut world = World::new(2, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        place_building(&mut world, 1, 0, BuildingKind::Commercial);
+        let r0 = world.grid.get(0, 0).expect("r0");
+        let workplace = world.grid.get(1, 0).expect("workplace");
+        let region_id = world.region_id;
+
+        world.tokens.insert(
+            Entity::new(RegionId(3), 1),
+            TravelToken {
+                state: TravelState {
+                    status: TravelStatus::Traveling,
+                    current_cell: Some(r0),
+                    destination: None,
+                    building: None,
+                    dwell: 0,
+                    prev_cell: None,
+                },
+                home: PlaceRef {
+                    region: RegionId(3),
+                    building: Entity::new(RegionId(3), 0),
+                },
+                work: Some(PlaceRef {
+                    region: region_id,
+                    building: workplace,
+                }),
+                trip_gen: 1,
+            },
+        );
+
+        let seed = super::road_traveler_panel_seed(&world, 0, 0);
+
+        assert_eq!(
+            seed.visitor_endpoints,
+            vec![RoadTravelerEndpointView {
+                home_region: RegionId(3),
+                work_region: Some(region_id),
+                local_workplace: Some(CityCellRef::local(region_id, 1, 0)),
+                count: 1,
+            }]
+        );
+    }
+
+    /// A jobless transit visitor (no workplace at all) still gets an endpoint
+    /// row showing its home region, never a fake `CitizenDetailView` row.
+    #[test]
+    fn road_traveler_panel_seed_transit_visitor_has_no_fake_local_row() {
+        use crate::core::regions::RegionId;
+
+        let mut world = World::new(2, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        let r0 = world.grid.get(0, 0).expect("r0");
+        world.tokens.insert(
+            Entity::new(RegionId(3), 1),
+            TravelToken {
+                state: TravelState {
+                    status: TravelStatus::Traveling,
+                    current_cell: Some(r0),
+                    destination: None,
+                    building: None,
+                    dwell: 0,
+                    prev_cell: None,
+                },
+                home: PlaceRef {
+                    region: RegionId(3),
+                    building: Entity::new(RegionId(3), 0),
+                },
+                work: None,
+                trip_gen: 1,
+            },
+        );
+
+        let seed = super::road_traveler_panel_seed(&world, 0, 0);
+
+        assert!(seed.local_details.is_empty(), "no fake local row");
+        assert_eq!(
+            seed.visitor_endpoints,
+            vec![RoadTravelerEndpointView {
+                home_region: RegionId(3),
+                work_region: None,
+                local_workplace: None,
+                count: 1,
+            }]
+        );
+    }
+
+    /// Two visitors sharing the exact same endpoint (home region, work region,
+    /// local workplace) group into one row with `count: 2`, instead of a plain
+    /// dedup silently collapsing them into a single, uncounted row. A third
+    /// visitor with a different home region stays a separate row.
+    #[test]
+    fn road_traveler_panel_seed_groups_visitors_sharing_an_endpoint_with_a_count() {
+        use crate::core::regions::RegionId;
+
+        let mut world = World::new(2, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        let r0 = world.grid.get(0, 0).expect("r0");
+        let transit_from = |local: u32, home_region: RegionId| TravelToken {
+            state: TravelState {
+                status: TravelStatus::Traveling,
+                current_cell: Some(r0),
+                destination: None,
+                building: None,
+                dwell: 0,
+                prev_cell: None,
+            },
+            home: PlaceRef {
+                region: home_region,
+                building: Entity::new(home_region, local),
+            },
+            work: None,
+            trip_gen: 1,
+        };
+        world
+            .tokens
+            .insert(Entity::new(RegionId(3), 1), transit_from(0, RegionId(3)));
+        world
+            .tokens
+            .insert(Entity::new(RegionId(3), 2), transit_from(1, RegionId(3)));
+        world
+            .tokens
+            .insert(Entity::new(RegionId(4), 1), transit_from(0, RegionId(4)));
+
+        let seed = super::road_traveler_panel_seed(&world, 0, 0);
+
+        assert_eq!(
+            seed.visitor_endpoints,
+            vec![
+                RoadTravelerEndpointView {
+                    home_region: RegionId(3),
+                    work_region: None,
+                    local_workplace: None,
+                    count: 2,
+                },
+                RoadTravelerEndpointView {
+                    home_region: RegionId(4),
+                    work_region: None,
+                    local_workplace: None,
+                    count: 1,
+                },
+            ]
         );
     }
 

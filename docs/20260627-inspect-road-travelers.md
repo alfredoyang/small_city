@@ -500,3 +500,90 @@ InspectView { .. , road_traveler_count }
 None new. P-a2 (Enter-key detail facade: `RoadTravelerPanelSeedView`, the
 `CityDriver → RegionalGame → runner/thread/runtime → RegionState → adapter`
 chain) is next per the plan's suggested split.
+
+---
+
+## P-a2 implemented (2026-07-03)
+
+Diff: 8 files, +464/-7 lines. Read-only, no simulation change. Full gate green
+(`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test -q` — 307 tests, up from 302). No TUI wiring yet — that's P-b.
+
+### What changed
+
+Added the full single-region facade chain for road-traveler Enter-panel
+detail, mirroring the existing `inspect`/`inspect_region` chain link-for-link
+rather than the multi-worker `remote_workers_at` fan-out, since this data
+needs no cross-region query:
+
+```text
+CityDriver::road_traveler_panel_seed                    src/ui/city_driver.rs
+  -> RegionalGame::road_traveler_panel_seed_selected_region
+  -> RegionalGame::road_traveler_panel_seed              src/core/regional_game.rs
+  -> RegionalGameRunner::road_traveler_panel_seed        src/core/regional_game_runner.rs
+  -> ThreadedRegionWorker::road_traveler_panel_seed      src/core/regions/threaded.rs
+       (ThreadedWorkerCommand::RoadTravelerPanelSeed, run_worker match arm)
+  -> RegionRuntime::road_traveler_panel_seed             src/core/regions/runtime/mod.rs
+  -> RegionState::road_traveler_panel_seed               src/core/regions/mod.rs
+  -> adapter::road_traveler_panel_seed                   src/interface/adapter.rs
+```
+
+- **New view models** (`src/interface/view.rs`): `RoadTravelerPanelSeedView {
+  local_details, visitor_endpoints }`; `RoadTravelerEndpointView {
+  home_region, work_region, local_workplace, count }`.
+- **`adapter::road_traveler_panel_seed`**: local travelers (home is this
+  region) get full `CitizenDetailView` rows via the existing
+  `citizen_relation` helper — same perspective as a residential roster.
+  Visitors get endpoint rows built only from `token.home`/`token.work` — no
+  cross-region query. `local_workplace` resolves only when the workplace is
+  in this region and `world.positions` has it.
+- **`ThreadedWorkerCommand::RoadTravelerPanelSeed`** deliberately skips the
+  `refresh_importable_remote_jobs`/`refresh_cross_region_goods_routes` calls
+  that `inspect_from_worker` does before an inspect read — the seed's data
+  (`world.tokens`, `world.citizens`, `world.positions`) needs no job/goods
+  route refresh. `RegionRuntime::road_traveler_panel_seed` still calls
+  `ensure_derived_state()` first, matching `inspect`.
+
+### Diagram — grouping visitors, not just deduping them
+
+Codex's review caught a real defect in the first version: `sort()` +
+`dedup()` on `RoadTravelerEndpointView` silently collapsed multiple visitors
+sharing an endpoint into one row with no way to tell there had been more than
+one. Fixed by adding a `count` field and folding sorted keys instead of
+deduping structs:
+
+```text
+tokens on this road cell (visitors only)
+      |
+      v
+(home_region, work_region, local_workplace) key per visitor
+      |
+      v  sort keys
+[ (3,None,None), (3,None,None), (4,None,None) ]
+      |
+      v  fold consecutive equal keys, count += 1
+[ RoadTravelerEndpointView{home:3, count:2}, RoadTravelerEndpointView{home:4, count:1} ]
+```
+
+Two visitors from region 3 collapse into one row that says `count: 2`, not a
+silent single row indistinguishable from one visitor.
+
+### Review
+
+- **codex**: round 1 found one medium issue — the lossy `sort()`+`dedup()`
+  described above. Fixed with the `count` field + fold; round 2 re-verified
+  the gate and confirmed clean. Also explicitly confirmed the skipped
+  worker-thread refresh calls are safe (the seed's data is entirely local and
+  already current) and that no new cross-region staleness is introduced.
+- **opencode**: skipped for this patch at the user's instruction.
+- **Self-review**: mission-scoped (facade plumbing only, no TUI wiring),
+  UI still reads only through the adapter/facade chain, deterministic
+  (sorted-key grouping is independent of `HashMap` iteration order), tests
+  meaningful (5 new: local rows, visitor endpoints, local-workplace
+  resolution, no-fake-row-for-transit, and the count-grouping fix itself), no
+  balance risk (read-only).
+
+### Risks / next steps
+
+None new. P-b (TUI: `Enter` opens the existing citizen panel using this
+facade, road panel shows local rows + visitor endpoint summaries) is next.

@@ -597,6 +597,17 @@ impl RegionRuntime {
         self.state.inspect(x, y)
     }
 
+    /// Enter-panel detail for the travelers on a road cell, recomputing the
+    /// derived pass first (DT1), mirroring `inspect`.
+    pub fn road_traveler_panel_seed(
+        &mut self,
+        x: usize,
+        y: usize,
+    ) -> crate::interface::view::RoadTravelerPanelSeedView {
+        self.ensure_derived_state();
+        self.state.road_traveler_panel_seed(x, y)
+    }
+
     /// Residents of THIS region who commute to `(producer_region, pos)` in another
     /// region — the consumer half of a workplace's remote roster.
     ///

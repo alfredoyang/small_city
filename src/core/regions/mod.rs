@@ -44,11 +44,14 @@ use crate::core::systems::{
 };
 use crate::core::world::{CrossRegionGoodsRoutes, World};
 use crate::interface::adapter::{
-    inspect_world, remote_workers_for, view_world, view_world_with_overlay,
+    inspect_world, remote_workers_for, road_traveler_panel_seed, view_world,
+    view_world_with_overlay,
 };
 use crate::interface::events::CommandResult;
 use crate::interface::input::{BuildingKind, MapOverlayInput};
-use crate::interface::view::{BuildPreviewView, CitizenDetailView, GameView, InspectView};
+use crate::interface::view::{
+    BuildPreviewView, CitizenDetailView, GameView, InspectView, RoadTravelerPanelSeedView,
+};
 use serde::{Deserialize, Serialize};
 
 pub mod directory;
@@ -510,6 +513,13 @@ impl RegionState {
     /// Returns a UI-safe inspect model without exposing this region's ECS world.
     pub fn inspect(&self, x: usize, y: usize) -> InspectView {
         inspect_world(&self.world, x, y)
+    }
+
+    /// Enter-panel detail for the travelers on the road cell at `(x, y)`: local
+    /// citizen rows plus visitor endpoint summaries. Local-only — no cross-region
+    /// query, unlike `remote_workers_for`.
+    pub fn road_traveler_panel_seed(&self, x: usize, y: usize) -> RoadTravelerPanelSeedView {
+        road_traveler_panel_seed(&self.world, x, y)
     }
 
     /// Local residents who commute to the workplace at `(producer_region, pos)`

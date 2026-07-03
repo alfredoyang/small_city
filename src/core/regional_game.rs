@@ -33,6 +33,7 @@ use crate::interface::events::{CommandResult, EconomyBreakdownView, GameEventVie
 use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
     BuildPreviewView, CitizenDetailView, CityGoodsView, GameView, InspectView,
+    RoadTravelerPanelSeedView,
 };
 
 const DEFAULT_SINGLE_REGION_ID: RegionId = RegionId(1);
@@ -481,6 +482,27 @@ impl RegionalGame {
         y: usize,
     ) -> Result<InspectView, RegionalGameError> {
         self.inspect_region(self.selected_region_or_first()?, x, y)
+    }
+
+    /// Enter-panel road-traveler detail at `(region_id, x, y)`.
+    pub fn road_traveler_panel_seed(
+        &self,
+        region_id: RegionId,
+        x: usize,
+        y: usize,
+    ) -> Result<RoadTravelerPanelSeedView, RegionalGameError> {
+        self.runner
+            .road_traveler_panel_seed(region_id, x, y)
+            .map_err(RegionalGameError::from)
+    }
+
+    /// `road_traveler_panel_seed` for the currently selected region.
+    pub fn road_traveler_panel_seed_selected_region(
+        &self,
+        x: usize,
+        y: usize,
+    ) -> Result<RoadTravelerPanelSeedView, RegionalGameError> {
+        self.road_traveler_panel_seed(self.selected_region_or_first()?, x, y)
     }
 
     /// Remote staff of the workplace at `(region_id, x, y)`: cross-region commuters

@@ -238,6 +238,33 @@ pub struct InspectView {
     pub road_traveler_count: usize,
 }
 
+/// Enter-panel detail for the travelers standing on one road cell. Built only on
+/// demand (not part of the hover-cost `InspectView`) via a dedicated facade call.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoadTravelerPanelSeedView {
+    /// Full detail rows for travelers whose home is this region, in the same
+    /// shape as a building roster.
+    pub local_details: Vec<CitizenDetailView>,
+    /// Endpoint summaries for visiting bodies whose home is elsewhere. Sorted
+    /// and grouped: several visitors sharing the same home/work endpoint
+    /// summarize as one row with `count > 1` rather than one row per traveler,
+    /// so the group never silently loses how many travelers it represents.
+    pub visitor_endpoints: Vec<RoadTravelerEndpointView>,
+}
+
+/// A visitor's origin/destination, known only from the fields already carried by
+/// its `TravelToken`. `local_workplace` is populated only when the workplace is
+/// in the inspected region; otherwise the visitor's exact remote position is
+/// unknown without a cross-region query (out of scope for v1). `count` is the
+/// number of visitors sharing this exact endpoint (always >= 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RoadTravelerEndpointView {
+    pub home_region: RegionId,
+    pub work_region: Option<RegionId>,
+    pub local_workplace: Option<CityCellRef>,
+    pub count: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Typed inspect diagnostics rendered as compact chips by UI frontends.
 pub enum InspectFlag {

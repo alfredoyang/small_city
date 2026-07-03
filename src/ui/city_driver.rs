@@ -13,7 +13,9 @@ use crate::core::regional_game::{
 use crate::core::regions::{BorderEdge, RegionId};
 use crate::interface::events::{CommandResult, GameEventView};
 use crate::interface::input::{BuildingKind, MapOverlayInput};
-use crate::interface::view::{BuildPreviewView, CitizenDetailView, GameView, InspectView};
+use crate::interface::view::{
+    BuildPreviewView, CitizenDetailView, GameView, InspectView, RoadTravelerPanelSeedView,
+};
 
 const DEFAULT_MAP_WIDTH: usize = 20;
 const DEFAULT_MAP_HEIGHT: usize = 15;
@@ -200,6 +202,17 @@ impl CityDriver {
                 .remote_workers_at_selected_region(x, y)
                 .unwrap_or_default(),
             CityBackend::Unavailable { .. } => Vec::new(),
+        }
+    }
+
+    /// Enter-panel road-traveler detail at `(x, y)` in the selected region. Empty
+    /// on any backend error (matches `remote_workers_at`'s fail-open behavior).
+    pub fn road_traveler_panel_seed(&mut self, x: usize, y: usize) -> RoadTravelerPanelSeedView {
+        match &self.backend {
+            CityBackend::RegionalMultiRegion(game) => game
+                .road_traveler_panel_seed_selected_region(x, y)
+                .unwrap_or_default(),
+            CityBackend::Unavailable { .. } => RoadTravelerPanelSeedView::default(),
         }
     }
 

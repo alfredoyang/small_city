@@ -23,7 +23,9 @@ use crate::core::regions::worker::{
 use crate::core::regions::{RegionId, RegionNeighborLink, RegionState};
 use crate::interface::events::CommandResult;
 use crate::interface::input::MapOverlayInput;
-use crate::interface::view::{CitizenDetailView, CitizenRelation, InspectView};
+use crate::interface::view::{
+    CitizenDetailView, CitizenRelation, InspectView, RoadTravelerPanelSeedView,
+};
 
 const INITIAL_WORKER_ID: WorkerId = WorkerId(1);
 // UI calls are synchronous today, so the runner pumps bounded worker passes
@@ -300,6 +302,24 @@ impl RegionalGameRunner {
             .expect("regional runner operation lock poisoned");
         self.worker_for_region(region_id)?
             .inspect_region(region_id, x, y)
+            .map_err(RegionalGameRunnerError::from)?
+            .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })
+    }
+
+    /// Enter-panel road-traveler detail for `(region_id, x, y)`, local-only like
+    /// `inspect_region` (one worker, no cross-region fan-out).
+    pub fn road_traveler_panel_seed(
+        &self,
+        region_id: RegionId,
+        x: usize,
+        y: usize,
+    ) -> Result<RoadTravelerPanelSeedView, RegionalGameRunnerError> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .expect("regional runner operation lock poisoned");
+        self.worker_for_region(region_id)?
+            .road_traveler_panel_seed(region_id, x, y)
             .map_err(RegionalGameRunnerError::from)?
             .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })
     }

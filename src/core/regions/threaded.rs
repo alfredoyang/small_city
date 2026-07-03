@@ -12,7 +12,7 @@ use crate::core::regions::RegionId;
 use crate::core::regions::worker::{
     ForwardedRegionEvent, RegionWorker, WorkerId, WorkerRoutingError, WorkerRunSummary,
 };
-use crate::interface::view::InspectView;
+use crate::interface::view::{InspectView, RoadTravelerPanelSeedView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Deterministic shutdown behavior for a threaded worker.
@@ -136,6 +136,35 @@ impl ThreadedRegionWorker {
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.commands
             .send(ThreadedWorkerCommand::Inspect {
+                region_id,
+                x,
+                y,
+                reply: reply_sender,
+            })
+            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
+                worker_id: self.worker_id,
+            })?;
+
+        reply_receiver
+            .recv()
+            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
+                worker_id: self.worker_id,
+            })
+    }
+
+    /// Enter-panel road-traveler detail for `(region_id, x, y)`, read on the worker
+    /// thread. Local-only: unlike `inspect_region` this reads directly without any
+    /// job/goods route refresh first, since visitor endpoint data already lives in
+    /// the current tick's `world.tokens`.
+    pub fn road_traveler_panel_seed(
+        &self,
+        region_id: RegionId,
+        x: usize,
+        y: usize,
+    ) -> Result<Option<RoadTravelerPanelSeedView>, ThreadedWorkerError> {
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.commands
+            .send(ThreadedWorkerCommand::RoadTravelerPanelSeed {
                 region_id,
                 x,
                 y,
@@ -310,6 +339,16 @@ enum ThreadedWorkerCommand {
         y: usize,
         reply: Sender<Option<InspectView>>,
     },
+    /// Read the Enter-panel road-traveler detail from one owned runtime.
+    ///
+    /// Local-only, like `Inspect`: no job/goods route refresh, since visitor
+    /// endpoint data already lives in the current tick's tokens.
+    RoadTravelerPanelSeed {
+        region_id: RegionId,
+        x: usize,
+        y: usize,
+        reply: Sender<Option<RoadTravelerPanelSeedView>>,
+    },
     /// Resolve the anchor `Position` of the building at `(region_id, x, y)`.
     ///
     /// Lets the runner normalize a clicked footprint cell to the workplace anchor
@@ -365,6 +404,17 @@ fn run_worker(mut worker: RegionWorker, commands: Receiver<ThreadedWorkerCommand
                 reply,
             } => {
                 let _ = reply.send(inspect_from_worker(&mut worker, region_id, x, y));
+            }
+            ThreadedWorkerCommand::RoadTravelerPanelSeed {
+                region_id,
+                x,
+                y,
+                reply,
+            } => {
+                let seed = worker
+                    .region_mut(region_id)
+                    .map(|runtime| runtime.road_traveler_panel_seed(x, y));
+                let _ = reply.send(seed);
             }
             ThreadedWorkerCommand::BuildingAnchorAt {
                 region_id,
