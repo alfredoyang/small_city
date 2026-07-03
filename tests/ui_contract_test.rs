@@ -10,7 +10,7 @@ use small_city::core::regional_game::RegionalGame;
 use small_city::core::regions::{RegionId, RegionState};
 use small_city::interface::input::{BuildingKind, MapOverlayInput, UiCommand, parse_command};
 use small_city::interface::view::GameView;
-use small_city::ui::city_driver::{CityDriver, CityLaunchMode};
+use small_city::ui::city_driver::CityDriver;
 
 #[test]
 fn game_view_contains_width_times_height_cells() {
@@ -315,8 +315,7 @@ fn ascii_ui_renders_inspect_explanations_from_inspect_view() {
 
 #[test]
 fn regional_ui_driver_uses_facade_commands_and_snapshots() {
-    let mut driver =
-        CityDriver::new(CityLaunchMode::RegionalMultiRegion).expect("regional UI driver");
+    let mut driver = CityDriver::regional_multi_region().expect("regional UI driver");
 
     let preview = driver.preview_build(1, 1, BuildingKind::Residential);
     let build = driver.build(1, 1, BuildingKind::Residential);
@@ -340,8 +339,7 @@ fn regional_ui_driver_load_uses_loaded_selected_region() {
     let path = save_path("regional-ui-selected-region");
     let game = RegionalGame::from_regions(vec![RegionState::new(RegionId(2), 3, 3)]).unwrap();
     let saved_game = game.save_to_file(&path).unwrap();
-    let mut driver =
-        CityDriver::new(CityLaunchMode::RegionalMultiRegion).expect("regional UI driver");
+    let mut driver = CityDriver::regional_multi_region().expect("regional UI driver");
 
     driver.load_from_file(&path).unwrap();
     let build = driver.build(1, 1, BuildingKind::Residential);
@@ -360,8 +358,7 @@ fn regional_ui_driver_load_uses_loaded_selected_region() {
 fn regional_ui_driver_load_accepts_legacy_single_city_save() {
     let path = save_path("regional-ui-legacy-save");
     write_legacy_single_city_save(&path, 3, 3, &[(1, 1, BuildingKind::Residential)]).unwrap();
-    let mut driver =
-        CityDriver::new(CityLaunchMode::RegionalMultiRegion).expect("regional UI driver");
+    let mut driver = CityDriver::regional_multi_region().expect("regional UI driver");
 
     driver.load_from_file(&path).unwrap();
     let view = driver.view();
@@ -380,16 +377,17 @@ fn default_launch_uses_regional_mode_without_legacy_escape_hatch() {
     let tui_source = std::fs::read_to_string("src/ui/tui.rs").expect("tui source");
     let ascii_source = std::fs::read_to_string("src/ui/ascii.rs").expect("ascii source");
 
-    assert!(source.contains("Some(\"regional\")"));
-    assert!(source.contains("small_city::ui::tui::run_regional()"));
     assert!(source.contains("Some(\"tui\") | None => small_city::ui::tui::run()"));
     assert!(source.contains("Some(\"ascii\") => small_city::ui::ascii::run()"));
     assert!(!source.contains("legacy-single"));
     assert!(!source.contains("legacy-ascii"));
-    assert!(tui_source.contains("run_with_mode(CityLaunchMode::RegionalMultiRegion)"));
+    assert!(!source.contains("\"regional\""));
+    assert!(tui_source.contains("CityDriver::regional_multi_region()"));
     assert!(!tui_source.contains("run_legacy_single"));
-    assert!(ascii_source.contains("run_with_mode(CityLaunchMode::RegionalMultiRegion)"));
+    assert!(!tui_source.contains("run_regional"));
+    assert!(ascii_source.contains("CityDriver::regional_multi_region()"));
     assert!(!ascii_source.contains("run_legacy_single"));
+    assert!(!ascii_source.contains("run_regional"));
 }
 
 #[test]

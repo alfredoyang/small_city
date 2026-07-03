@@ -322,7 +322,6 @@ impl World {
     /// **Destination roots.** A non-road **building** uses its adjacent road
     /// cells (in `network`) as Dijkstra sources. A **road entity** (P5
     /// border-exit routing) uses `[dest]` as the single source.
-    #[allow(dead_code)] // P2 standalone; P3 wires this into the movement system.
     pub(crate) fn routes_to<'a>(
         &'a self,
         dest: Entity,

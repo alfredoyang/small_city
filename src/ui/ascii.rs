@@ -7,7 +7,7 @@ use crate::interface::input::{BuildingKind, MapOverlayInput};
 use crate::interface::view::{
     BuildPreviewView, DemandLevel, GameView, InspectDetailsView, InspectFlag, InspectView,
 };
-use crate::ui::city_driver::{CityDriver, CityLaunchMode};
+use crate::ui::city_driver::CityDriver;
 
 const DEFAULT_SAVE_FILE: &str = "city1";
 
@@ -84,17 +84,9 @@ enum UiAction {
 
 /// Runs the ASCII terminal UI on the regional facade.
 pub fn run() -> io::Result<()> {
-    run_with_mode(CityLaunchMode::RegionalMultiRegion)
-}
-
-/// Backward-compatible alias for the default regional ASCII mode.
-pub fn run_regional() -> io::Result<()> {
-    run_with_mode(CityLaunchMode::RegionalMultiRegion)
-}
-
-fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
     let _raw_terminal = RawTerminal::enter()?;
-    let mut game = CityDriver::new(mode).map_err(|error| io::Error::other(error.to_string()))?;
+    let mut game =
+        CityDriver::regional_multi_region().map_err(|error| io::Error::other(error.to_string()))?;
     let mut state = AsciiUiState::default();
     let mut message = String::from("Tiny City Builder");
 

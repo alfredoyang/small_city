@@ -274,7 +274,6 @@ fn road_distances(
 /// **Stale-heap skip** — `if cost != dist[current] { continue; }` ignores
 /// stale heap entries from a relaxed update (a node may be in the heap with
 /// an old cost before its `dist` is lowered).
-#[allow(dead_code)] // P1 is a standalone patch; P2 wires this into the route cache.
 pub(crate) fn road_predecessors(
     world: &World,
     network: &RoadNetwork,

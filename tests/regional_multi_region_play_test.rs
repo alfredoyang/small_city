@@ -4,7 +4,7 @@ use small_city::core::regional_game::RegionalGame;
 use small_city::core::regions::RegionId;
 use small_city::interface::input::BuildingKind;
 use small_city::interface::view::{CitizenRelation, InspectDetailsView, InspectFlag};
-use small_city::ui::city_driver::{CityDriver, CityLaunchMode};
+use small_city::ui::city_driver::CityDriver;
 
 fn has_generic_imported_resource_note(game: &RegionalGame, region_id: RegionId) -> bool {
     game.inspect_region(region_id, 0, 0)
@@ -16,8 +16,7 @@ fn has_generic_imported_resource_note(game: &RegionalGame, region_id: RegionId) 
 
 #[test]
 fn player_can_build_in_two_regions_through_ui_driver() {
-    let mut driver =
-        CityDriver::new(CityLaunchMode::RegionalMultiRegion).expect("regional UI driver");
+    let mut driver = CityDriver::regional_multi_region().expect("regional UI driver");
 
     assert!(driver.build(1, 1, BuildingKind::Residential).success);
     assert!(driver.region_label().contains("1/9"));

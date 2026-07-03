@@ -44,8 +44,6 @@ You can choose a frontend explicitly:
 ```sh
 cargo run -- tui              # default panel-based TUI
 cargo run -- ascii            # ASCII fallback
-cargo run -- regional         # compatibility alias for the regional TUI
-cargo run -- regional-ascii   # compatibility alias for the regional ASCII UI
 ```
 
 The TUI uses `ratatui` and `crossterm` for panels, styling, alternate-screen rendering, keyboard input, and raw terminal mode. The older ASCII UI remains available as a fallback/debug frontend.

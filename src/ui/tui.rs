@@ -25,7 +25,7 @@ use crate::interface::view::{
     BuildPreviewView, CellView, CitizenDetailView, CitizenRelation, DemandLevel, GameView,
     InspectDetailsView, InspectFlag, InspectView,
 };
-use crate::ui::city_driver::{CityDriver, CityLaunchMode};
+use crate::ui::city_driver::CityDriver;
 use crate::ui::tui_input::{TuiAction, map_key_event};
 
 const DEFAULT_SAVE_FILE: &str = "city1";
@@ -601,15 +601,12 @@ struct TuiRuntime {
 impl TuiRuntime {
     #[cfg(test)]
     fn new(now: Instant) -> Self {
-        Self::with_mode(now, CityLaunchMode::RegionalMultiRegion).expect("regional TUI runtime")
+        Self::launch(now).expect("regional TUI runtime")
     }
 
-    fn with_mode(
-        now: Instant,
-        mode: CityLaunchMode,
-    ) -> Result<Self, crate::ui::city_driver::CityDriverError> {
+    fn launch(now: Instant) -> Result<Self, crate::ui::city_driver::CityDriverError> {
         Ok(Self {
-            game: CityDriver::new(mode)?,
+            game: CityDriver::regional_multi_region()?,
             state: TuiState::default(),
             next_auto_tick: now + RunSpeed::One.interval(),
             dirty: true,
@@ -1134,18 +1131,9 @@ enum TuiFlow {
 
 /// Runs the ratatui frontend on the regional facade.
 pub fn run() -> io::Result<()> {
-    run_with_mode(CityLaunchMode::RegionalMultiRegion)
-}
-
-/// Backward-compatible alias for the default regional TUI mode.
-pub fn run_regional() -> io::Result<()> {
-    run_with_mode(CityLaunchMode::RegionalMultiRegion)
-}
-
-fn run_with_mode(mode: CityLaunchMode) -> io::Result<()> {
     let mut terminal = TerminalGuard::enter()?;
-    let mut runtime = TuiRuntime::with_mode(Instant::now(), mode)
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut runtime =
+        TuiRuntime::launch(Instant::now()).map_err(|error| io::Error::other(error.to_string()))?;
     runtime.state.tile_theme = default_tile_theme();
     // Chrome panels use emoji only when the locale advertises UTF-8 (matching the tile theme).
     runtime.state.use_emoji = locale_supports_unicode(current_terminal_locale().as_deref());
@@ -3108,20 +3096,6 @@ fn overlay_label(overlay: MapOverlayInput) -> &'static str {
         MapOverlayInput::Population => "Population",
         MapOverlayInput::LandValue => "Land Value",
         MapOverlayInput::Desirability => "Desirability",
-    }
-}
-
-#[allow(dead_code)]
-fn inspect_title(inspect: &InspectView) -> &'static str {
-    match inspect.details {
-        Some(InspectDetailsView::Empty { .. }) => "Empty Land",
-        Some(InspectDetailsView::Road) => "Road",
-        Some(InspectDetailsView::Residential { .. }) => "Residential",
-        Some(InspectDetailsView::Commercial { .. }) => "Commercial",
-        Some(InspectDetailsView::Industrial { .. }) => "Industrial",
-        Some(InspectDetailsView::PowerPlant { .. }) => "Power Plant",
-        Some(InspectDetailsView::Park { .. }) => "Park",
-        Some(InspectDetailsView::Unknown) | None => "Selected Cell",
     }
 }
 

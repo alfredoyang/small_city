@@ -18,12 +18,6 @@ use crate::interface::view::{BuildPreviewView, CitizenDetailView, GameView, Insp
 const DEFAULT_MAP_WIDTH: usize = 20;
 const DEFAULT_MAP_HEIGHT: usize = 15;
 
-/// Launch mode selected by the binary before entering a terminal frontend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CityLaunchMode {
-    RegionalMultiRegion,
-}
-
 /// UI-facing errors from selecting or driving a city backend.
 #[derive(Debug)]
 pub enum CityDriverError {
@@ -73,12 +67,6 @@ enum CityBackend {
 }
 
 impl CityDriver {
-    pub fn new(mode: CityLaunchMode) -> Result<Self, CityDriverError> {
-        match mode {
-            CityLaunchMode::RegionalMultiRegion => Self::regional_multi_region(),
-        }
-    }
-
     pub fn regional_multi_region() -> Result<Self, CityDriverError> {
         Self::regional_with_size(DEFAULT_MAP_WIDTH, DEFAULT_MAP_HEIGHT)
     }
