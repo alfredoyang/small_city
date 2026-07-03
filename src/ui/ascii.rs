@@ -517,6 +517,7 @@ pub fn inspect_card_lines(inspect: &InspectView) -> Vec<String> {
             vec![
                 header_line(inspect, "ROAD", None),
                 status_line(None, None, None),
+                format!("Travellers {}", inspect.road_traveler_count),
                 local_effects_line(inspect),
             ],
         ),
@@ -951,6 +952,29 @@ mod tests {
 
         state.move_cursor(10, 10, &view);
         assert_eq!((state.cursor_x, state.cursor_y), (2, 1));
+    }
+
+    #[test]
+    fn inspect_formatter_shows_road_traveler_count() {
+        let inspect = InspectView {
+            x: 2,
+            y: 5,
+            in_bounds: true,
+            cell: None,
+            details: Some(InspectDetailsView::Road),
+            local_effects: Some(LocalEffectsView {
+                land_value: 1,
+                pollution_pressure: 0,
+                accessibility: 2,
+                desirability: 1,
+            }),
+            flags: Vec::new(),
+            explanations: Vec::new(),
+            roster: Vec::new(),
+            road_traveler_count: 3,
+        };
+
+        assert!(format_inspect(&inspect).contains("Travellers 3"));
     }
 
     #[test]

@@ -675,3 +675,47 @@ inspect = game.inspect(x, y)
 
 None new. P-c (ASCII: render the same road-traveler count in the ASCII
 fallback UI) is the last patch in the plan's split.
+
+---
+
+## P-c implemented (2026-07-03) — plan complete
+
+Diff: 1 file (`src/ui/ascii.rs`), +24/-0 lines. Full gate green
+(`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test -q` — 310 tests, up from 309).
+
+### What changed
+
+`inspect_card_lines`'s `Road` arm gained a `Travellers {count}` line between
+`status_line` and `local_effects_line`, mirroring P-b's identical addition to
+the TUI's `tui_inspect_card` (always shown, not gated on `count > 0`, for a
+stable card shape). One new test,
+`inspect_formatter_shows_road_traveler_count`, confirms the line renders with
+the right value. No Enter-panel/modal for ASCII — the plan only asked for the
+hover count in this frontend, not the full traveler detail panel P-b added to
+the TUI.
+
+### Review
+
+- **codex**: no findings. Confirmed always-showing (vs. gating on `count >
+  0`) is the right call, matching the TUI's identical choice and keeping the
+  road card's line count stable.
+- **opencode**: skipped for this patch at the user's instruction.
+- **Self-review**: mission-scoped (ASCII count line only), no ECS/simulation
+  touch, one meaningful test, no balance risk.
+
+### Plan status: complete
+
+All four patches from this plan are implemented, reviewed, and committed:
+
+| Patch | What | Commit |
+|-------|------|--------|
+| P-a1 | Hover-only `InspectView.road_traveler_count` | `7a35335` |
+| P-a2 | Enter-panel facade chain (`road_traveler_panel_seed`) | `ed0b066` |
+| P-b  | TUI wiring: dedicated traveler modal + hover line | `a1dcf77` |
+| P-c  | ASCII hover line | *(this commit)* |
+
+No further work planned under this doc unless new requirements emerge (e.g.
+a full ASCII traveler detail panel, or a live-gameplay integration test for
+the TUI Enter path — both explicitly deferred as acceptable scope boundaries
+during review).
