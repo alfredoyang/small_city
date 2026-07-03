@@ -15,7 +15,7 @@ pub enum BuildingKind {
 }
 
 /// Map render mode requested by UI without exposing ECS internals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MapOverlayInput {
     Normal,
     Power,
@@ -117,7 +117,7 @@ impl BuildingKind {
 }
 
 /// Parsed command vocabulary for text-based frontends and command tests.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UiCommand {
     Build {
         kind: BuildingKind,

@@ -76,13 +76,21 @@ pub enum RegionalGameError {
     WorkerStopped,
     WorkerPanicked,
 }
-
-#[derive(Debug)]
+/// Save version stamped on every write; load rejects any format that doesn't match.
+const SAVE_FORMAT_VERSION: u32 = 1;
 /// File and format errors returned by regional save/load operations.
+#[derive(Debug)]
 pub enum RegionalGameSaveError {
     Io(std::io::Error),
     SaveFormat(serde_json::Error),
     Regional(RegionalGameError),
+    /// Load rejected an unsupported save format version. `expected` is the current format;
+    /// `found` reports what was read (if any) so users know whether they're hitting a legacy
+    /// file (`None`) or a future one (`Some(v)`).
+    UnsupportedSaveFormat {
+        expected: u32,
+        found: Option<u32>,
+    },
 }
 
 impl fmt::Display for RegionalGameSaveError {
@@ -91,6 +99,16 @@ impl fmt::Display for RegionalGameSaveError {
             Self::Io(error) => write!(formatter, "File error: {error}"),
             Self::SaveFormat(error) => write!(formatter, "Save file error: {error}"),
             Self::Regional(error) => write!(formatter, "Regional game error: {error:?}"),
+            Self::UnsupportedSaveFormat { expected, found } => match found {
+                Some(v) => write!(
+                    formatter,
+                    "save format not supported: expected v{expected}, got v{v}"
+                ),
+                None => write!(
+                    formatter,
+                    "save format not supported: expected v{expected}, file has no version stamp"
+                ),
+            },
         }
     }
 }
@@ -101,6 +119,7 @@ impl std::error::Error for RegionalGameSaveError {
             Self::Io(error) => Some(error),
             Self::SaveFormat(error) => Some(error),
             Self::Regional(_) => None,
+            Self::UnsupportedSaveFormat { .. } => None,
         }
     }
 }
@@ -165,6 +184,8 @@ struct RegionalGameSave {
     // saves written before this field existed.
     #[serde(default)]
     building_rules: BuildingRules,
+    /// Stamped on every write; load-side validation uses serde's default = `None` path for legacy
+    save_version: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,8 +197,9 @@ struct RegionalGameSaveWire {
     layout: Option<RegionalLayoutSave>,
     #[serde(default)]
     building_rules: BuildingRules,
+    /// Stamped on writes since v1; absent in legacy pre-stamp saves (deserializes as `None`).
+    save_version: Option<u32>,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Compact row-major regional map shape saved instead of explicit topology.
 ///
@@ -836,6 +858,7 @@ impl RegionalGame {
                 .collect(),
             layout,
             building_rules,
+            save_version: Some(SAVE_FORMAT_VERSION),
         };
 
         let file = match File::create(path) {
@@ -902,12 +925,9 @@ impl RegionalGame {
 
     fn from_save_bytes(bytes: &[u8]) -> Result<Self, RegionalGameSaveError> {
         match serde_json::from_slice::<RegionalGameSaveWire>(bytes) {
-            Ok(save) => Self::from_save(save.into_current()).map_err(RegionalGameSaveError::from),
-            Err(regional_error) => match Self::from_legacy_world_bytes(bytes) {
+            Ok(save) => Self::from_save(save.into_current()?).map_err(RegionalGameSaveError::from),
+            Err(_) => match Self::from_legacy_world_bytes(bytes) {
                 Ok(game) => Ok(game),
-                Err(RegionalGameSaveError::SaveFormat(_)) => {
-                    Err(RegionalGameSaveError::SaveFormat(regional_error))
-                }
                 Err(error) => Err(error),
             },
         }
@@ -936,16 +956,26 @@ impl RegionalGame {
 }
 
 impl RegionalGameSaveWire {
-    fn into_current(self) -> RegionalGameSave {
+    fn into_current(self) -> Result<RegionalGameSave, RegionalGameSaveError> {
+        match self.save_version {
+            Some(v) if v == SAVE_FORMAT_VERSION => {}
+            _ => {
+                return Err(RegionalGameSaveError::UnsupportedSaveFormat {
+                    expected: SAVE_FORMAT_VERSION,
+                    found: self.save_version,
+                });
+            }
+        }
         let layout = self
             .layout
             .unwrap_or_else(|| infer_layout_for_region_count(self.regions.len()));
-        RegionalGameSave {
+        Ok(RegionalGameSave {
             selected_region: self.selected_region,
             regions: self.regions,
             layout,
             building_rules: self.building_rules,
-        }
+            save_version: None,
+        })
     }
 }
 

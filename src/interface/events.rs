@@ -1,10 +1,12 @@
 //! UI-safe command result and event types returned by player-facing facades.
 
+use serde::{Deserialize, Serialize};
+
 use crate::interface::input::BuildingKind;
 use crate::interface::view::GameTimeView;
 
 /// UI-safe result returned by player-facing commands.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandResult {
     pub success: bool,
     pub event: GameEventView,
@@ -13,10 +15,11 @@ pub struct CommandResult {
 
 impl CommandResult {
     pub fn success(event: GameEventView) -> Self {
+        let snapshot = event.clone();
         Self {
             success: true,
-            events: vec![event.clone()],
             event,
+            events: vec![snapshot],
         }
     }
 
@@ -33,9 +36,10 @@ impl CommandResult {
     }
 
     pub fn failure(event: GameEventView) -> Self {
+        let snapshot = event.clone();
         Self {
             success: false,
-            events: vec![event.clone()],
+            events: vec![snapshot],
             event,
         }
     }
@@ -51,7 +55,7 @@ impl CommandResult {
 }
 
 /// Before and after values for one UI-safe simulation metric.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetricChange<T> {
     pub before: T,
     pub after: T,
@@ -66,7 +70,7 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EconomyBreakdownView {
     pub salaries_paid: i32,
     pub workplace_tax: i32,
@@ -158,7 +162,7 @@ impl GameEventView {
 }
 
 /// Event vocabulary emitted by player-facing commands.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GameEventView {
     Built {
         x: usize,

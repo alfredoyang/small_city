@@ -1,11 +1,13 @@
 //! UI-safe view models used by renderers instead of exposing ECS internals.
 
+use serde::{Deserialize, Serialize};
+
 use crate::core::city_refs::CityCellRef;
 use crate::core::regions::RegionId;
 use crate::interface::input::BuildingKind;
 
 /// Complete read-only snapshot required to render the city UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameView {
     pub map: MapView,
     pub status: CityStatusView,
@@ -18,14 +20,14 @@ pub struct GameView {
 
 /// P4: a single moving-citizen marker — just the map cell it occupies this tick.
 /// No identity, heading, or destination (P4 draws a plain dot; facing is deferred).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CitizenTravelView {
     pub x: usize,
     pub y: usize,
 }
 
 /// Map dimensions plus cells in row-major order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MapView {
     pub width: usize,
     pub height: usize,
@@ -33,7 +35,7 @@ pub struct MapView {
 }
 
 /// UI-safe description of one map cell.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellView {
     pub x: usize,
     pub y: usize,
@@ -59,10 +61,10 @@ pub struct CellView {
     pub footprint_area: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// UI-safe workplace location for one employed resident.
 ///
 /// Local ECS entity ids and remote producer slot ids are intentionally omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobAssignmentView {
     /// The workplace cell, region-tagged (self-describing). `is_remote` is derived from
     /// whether `cell.region` is the inspected region.
@@ -75,7 +77,7 @@ pub struct JobAssignmentView {
 ///
 /// Carries only display data; the ECS `Entity` id is intentionally omitted, like
 /// every other view model. `happiness` is the citizen's current morale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CitizenDetailView {
     pub age: u32,
     pub happiness: i32,
@@ -91,7 +93,7 @@ pub struct CitizenDetailView {
 ///  Residential          WorksAt{..} | Unemployed   (where the resident works)
 ///  Commercial/Industrial LivesAt{..}               (where the worker lives)
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CitizenRelation {
     /// Residential roster: where this resident works (local or remote region).
     WorksAt {
@@ -118,7 +120,7 @@ pub enum CitizenRelation {
 }
 
 /// Orthogonal road neighbors for a road cell, exposed as derived UI-safe data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RoadLinks {
     pub north: bool,
     pub east: bool,
@@ -126,7 +128,7 @@ pub struct RoadLinks {
     pub west: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LocalEffectsView {
     pub land_value: i32,
     pub pollution_pressure: i32,
@@ -135,7 +137,7 @@ pub struct LocalEffectsView {
 }
 
 /// Aggregate city numbers shown by status panels.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CityStatusView {
     pub money: i32,
     pub turn: u32,
@@ -154,14 +156,14 @@ pub struct CityStatusView {
     pub goods: CityGoodsView,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CityGoodsView {
     pub city_goods_produced: i32,
     pub goods_imported_from_outside: i32,
     pub goods_exported_outside: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameTimeView {
     pub total_hours: u64,
     pub year: u32,
@@ -172,7 +174,7 @@ pub struct GameTimeView {
     pub label: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PowerStatusView {
     pub total_capacity: i32,
     pub total_demand: i32,
@@ -181,7 +183,7 @@ pub struct PowerStatusView {
 }
 
 /// Simple zone demand levels derived from current city stats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DemandLevel {
     Low,
     Medium,
@@ -189,7 +191,7 @@ pub enum DemandLevel {
 }
 
 /// Residential, commercial, and industrial demand exposed through the UI boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CityDemand {
     pub residential: DemandLevel,
     pub commercial: DemandLevel,
@@ -197,7 +199,7 @@ pub struct CityDemand {
 }
 
 /// Build menu entry exposed to UI without requiring access to core systems or resources.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildOptionView {
     pub kind: BuildingKind,
     pub label: String,
@@ -206,7 +208,7 @@ pub struct BuildOptionView {
 }
 
 /// UI-safe explanation of whether a build command would succeed at a coordinate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildPreviewView {
     pub kind: BuildingKind,
     pub label: String,
@@ -217,7 +219,7 @@ pub struct BuildPreviewView {
 }
 
 /// Result of inspecting one coordinate, including out-of-bounds information.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectView {
     pub x: usize,
     pub y: usize,
@@ -240,7 +242,7 @@ pub struct InspectView {
 
 /// Enter-panel detail for the travelers standing on one road cell. Built only on
 /// demand (not part of the hover-cost `InspectView`) via a dedicated facade call.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RoadTravelerPanelSeedView {
     /// Full detail rows for travelers whose home is this region, in the same
     /// shape as a building roster.
@@ -257,7 +259,7 @@ pub struct RoadTravelerPanelSeedView {
 /// in the inspected region; otherwise the visitor's exact remote position is
 /// unknown without a cross-region query (out of scope for v1). `count` is the
 /// number of visitors sharing this exact endpoint (always >= 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RoadTravelerEndpointView {
     pub home_region: RegionId,
     pub work_region: Option<RegionId>,
@@ -265,7 +267,7 @@ pub struct RoadTravelerEndpointView {
     pub count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Typed inspect diagnostics rendered as compact chips by UI frontends.
 pub enum InspectFlag {
     GrowthBlockedNoJobs,
@@ -274,7 +276,7 @@ pub enum InspectFlag {
 }
 
 /// Type-specific details for the inspected coordinate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InspectDetailsView {
     Empty {
         buildable: bool,

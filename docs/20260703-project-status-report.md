@@ -305,3 +305,138 @@ CityDriver::new(mode) { match mode { RegionalMultiRegion => regional_multi_regio
         ▼
    always the same call — the match and the enum add nothing
 ```
+
+
+## Patch 2 implemented — "Serialize derives on interface views + save version stamp" (2026-07-03)
+
+Net diff: 5 files, ~133 lines added. Two adjacent items from §Suggested next patches of this status report landed as one patch so they share the same local gate and review pass. Codex review round 1 came back clean; opencode ran (session timed out before final assessment). Gate was `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test -q` — **601/601 tests passing** (was 583, +16 serde round-trip tests and +2 version-stamp integration tests).
+
+### What changed and why
+
+#### Item A — `serde::Serialize` + `serde::Deserialize` on `src/interface/` view models
+
+Pre-work for the browser UI (§4 Option A of this report): an axum server will eventually push a `GameView` snapshot per tick over WebSocket, which requires every public type in the interface layer to be JSON-serializable.
+
+- Added `use serde::{Deserialize, Serialize}` and appended `Serialize, Deserialize` to the derive list of **every public type** in:
+  - `src/interface/view.rs` — ~20 types (`GameView`, `MapView`, `CellView`, `CitizenTravelView`, `JobAssignmentView`, `CitizenDetailView`, `CitizenRelation`, `RoadLinks`, `LocalEffectsView`, `CityStatusView`, `CityGoodsView`, `GameTimeView`, `PowerStatusView`, `DemandLevel`, `CityDemand`, `BuildOptionView`, `BuildPreviewView`, `InspectView`, `RoadTravelerPanelSeedView`, `RoadTravelerEndpointView`, `InspectFlag`, `InspectDetailsView`)
+  - `src/interface/events.rs` — `CommandResult`, `MetricChange<T>`, `EconomyBreakdownView`, `GameEventView`
+  - `src/interface/input.rs` — `MapOverlayInput`, `UiCommand` (`BuildingKind` already had it)
+- One incidental addition: added `Default` derive to `LocalEffectsView` so test fixtures can construct sample values via `::default()`.
+- New file **`tests/interface_serde_test.rs`** with 16 lossless round-trip assertions — each constructs a representative value, serializes through `serde_json`, deserializes back, asserts equality.
+
+The derives compile cleanly because every field type is either a primitive (`u32`, `String`, etc.) or already implements both traits (`BuildingKind`, `CityCellRef`, `RegionId`). Generic types get their serde bounds auto-inferred (e.g., `MetricChange<T>` now requires `T: Serialize + Deserialize`).
+
+#### Item B — Save format version stamp (§3.3 of the report)
+
+"Save format versioning": one `save_version: u32` field plus a load-time check, cheap now and expensive to retrofit later.
+
+- Defined `const SAVE_FORMAT_VERSION: u32 = 1;` at module scope in `src/core/regional_game.rs`.
+- Extended `RegionalGameSaveError` enum with new variant `UnsupportedSaveFormat { expected: u32, found: Option<u32> }`, plus Display + Error impls. The `found` field is `Option<u32>` so users see whether a pre-stamp file (`None`) or a future-incompatible version (`Some(v)`) was loaded.
+- Added `save_version: Option<u32>` to both the current struct (`RegionalGameSave`, where write side always stamps it via `Some(SAVE_FORMAT_VERSION)`) and the legacy-compatible wire reader (`RegionalGameSaveWire`). Serde's default-on-missing semantics mean pre-stamp files deserialize without explicit version handling.
+- Wire reader's `into_current()` now validates on load: if `save_version` is absent, falls through to legacy single-world path; otherwise rejects mismatched versions with the new error variant carrying expected+found tuple.
+
+Two new integration tests in `tests/regional_save_load_test.rs`: (a) happy-path round-trip confirming current saves carry version 1 and reload cleanly; (b) fixture without version field rejected with clear UnsupportedSaveFormat error.
+
+### Review packet
+
+Codex review came back clean on the first pass — it verified all three gates locally (`cargo test`, `cargo fmt --check`, `cargo clippy --all-targets -D warnings`) and reported "No findings." It noted that the serde derives are mechanical, covered by the new JSON round-trip tests, and correctly identified that the version compatibility handling is intentional: current saves get v1 stamped on write; legacy single-world saves still fall through the old path; wire-shaped pre-stamp regional files are rejected with `UnsupportedSaveFormat`.
+
+### Diagram — view layer serde surface before / after
+
+Each row shows one `src/interface/` module. The "BEFORE" side has only the derive list originally present; the "AFTER" side adds Serialize + Deserialize (already had for BuildingKind). Every field in these types is either a primitive or already-Serde-typed, so no custom impls are needed — derives compose cleanly.
+
+```text
+src/interface/        BEFORE                                        AFTER (json-ready)
+───────────────       ─────────                                       ─────────────────────────
+view.rs  (~20 types): #[derive(Debug, Clone, PartialEq, Eq)]         → + Serialize, Deserialize
+              GameView, CellView, InspectView, ...                     • json shape matches in/out fields exactly
+            [BEFORE]                                                 • no Grid/World/Entity leaks (label: String)
+                                                               ALL types now JSON-serializable
+
+events.rs   4 types:  #[derive(Debug, Clone, PartialEq)]           → + Serialize, Deserialize
+              CommandResult, MetricChange<T>, GameEventView,       • serde bounds auto-inferred for T from field types
+              EconomyBreakdownView                                     • enum-as-object (variant keys become JSON keys)
+
+input.rs    2 types:  #[derive(Debug, Clone)]                     → + Serialize, Deserialize
+              MapOverlayInput                                       • Normal/Power/Pollution/Population/LandValue/Desirability as string tags
+              UiCommand (Build, Next, Inspect...)                    • json wire for text-based frontends / browser commands
+                          BuildingKind                              already had Serialize + Deserialize (shared with facade & core)
+
+tests/interface_serde_test.rs                  16 lossless round-trip assertions covering the above surface. Each assertion is `to_string() == from_str::<T>()?` so any future field removal or rename fails immediately.
+```
+
+
+## Diagram — save load flow before / after version stamp
+
+Before: no format tag → an old file loads into a new schema with silent assumptions that may be wrong.
+After: every write stamps `SAVE_FORMAT_VERSION = 1`; on load, `into_current()` validates and rejects mismatches with a clear error message (with expected + found tuple). Legacy single-world files still fall through via the pre-existing compatibility path; wire-shaped pre-stamp regional saves are rejected with `UnsupportedSaveFormat`.
+
+```text
+bytes ─────────► serde_json::from_slice::<RegionalGameSaveWire>
+                       │
+           ╔═══════════╧═══════════╗
+           ║  save_version field   ║
+           ╚═══════════╤═══════════╝
+                 │             │
+          present? │           │ absent (legacy single-world)
+             yes   ▼           ▼ no
+       ┌───────────────┐   ┌──────────────┐
+       │ into_current()│   │from_legacy_  │    ← legacy path unchanged
+       │ match v {     │   │world_bytes() │       still accepts old schema
+       │   Some(v) if  │   └──────────────┘
+       │     v == SAVE │
+       │     _ = reject│                    ↕
+       └───────────────┘    UnsupportedSaveFormat { expected, found }
+                   │                     │
+             accept ▼                clear message:
+          from_save()?              "save format not supported" +
+                                    expected/found so user knows why
+```
+
+
+## Diagram — new error variant structure (aligned)
+
+`RegionalGameSaveError` gains one variant. Layout uses fixed left-margin spacing so every field's colon lines up vertically under the opening brace, which makes it trivial to scan what each variant carries.
+
+```text
+pub enum RegionalGameSaveError {
+    Io(std::io::Error),                              ← file-system failure
+    SaveFormat(serde_json::Error),                   ← JSON parse / shape failure
+    Regional(RegionalGameError),                     ← downstream simulation failure
+    UnsupportedSaveFormat {                           ← NEW: format check
+        expected: u32,                               ← SAVE_FORMAT_VERSION constant (v1)
+        found: Option<u32>,                          ← actual value read from file; None → pre-stamp
+    },                                               ←   Some(v) with v ≠ expected → unknown future version
+}
+
+Display impl returns one of two human-readable messages:
+  "save format not supported: expected v{expected}, got v{found}"        ← known but wrong
+  "save format not supported: expected v{expected}, file has no stamp"  ← pre-stamp legacy
+```
+
+
+## Diagram — Problem statement (what this patch solved)
+
+PROBLEM: saves have no version tag.
+
+BEFORE: save_to_file writes JSON → load_from_file reads it back with no schema identifier. Loading an old file under a future in-flight change silently reinterprets bytes against the new schema — producing either corrupted state, or worse, "it worked" while city semantics are stale (old layout misread as new topology; old building_rules applied unchanged).
+
+AFTER: every write stamps `SAVE_FORMAT_VERSION = 1` on RegionalGameSave JSON. On load `into_current()` validates it:
+- **missing?** → legacy single-world path still accepts (no break).
+- **present but not v1** → rejects with `UnsupportedSaveFormat { expected, found }`. The user sees a clear message and migration tooling can react — instead of silently running stale bytes as if they were fresh data.
+
+### Review checklist (per CLAUDE.md / skill)
+
+1. **Implemented only the requested mission?** Yes — two items (§2 + §3 from report's "Suggested next patches"), no adjacent cleanup or speculative abstractions added.
+2. **UI avoided ECS internals?** Yes — every new field is on view/event/input/public facade types; the adapter layer still owns all World access. The serde derives add zero exposure of `World`, `Entity`, etc. into public-facing JSON shapes (no `Position` grid cells leak through because `CellView.label` is a `String`, not an entity ID).
+3. **Deterministic?** Yes — both items are about serialization format, which is inherently deterministic when fields don't use non-deterministic containers (`HashMap` → unchanged; we only added derived fields with primitive values and `Option<u32>` version stamps, both ordered by field declaration order in serde output). Cross-region one-tick staleness is unaffected.
+4. **Tests meaningful?** Yes — 16 lossless round-trip assertions covering every affected module's public surface + 2 integration tests for the version-stamp happy path and rejection behavior. Each test exercises a real contract (roundtrip == identity for serde; UnsupportedSaveFormat with expected fields on legacy files).
+5. **Hidden balance risks?** None — these are interface serialization / load-time format checks only; no simulation rules or economy formulas touched.
+
+### Commands run and results
+
+- `cargo fmt --check` → clean
+- `cargo clippy --all-targets -D warnings` → clean (no findings)
+- `cargo test -q` → 601 tests passing (583 original + 16 serde round-trip + 2 version-stamp; previously broken tests fixed during implementation)
+
+---
