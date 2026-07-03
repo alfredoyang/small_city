@@ -294,8 +294,12 @@ pub(crate) fn refresh_derived_state_for_world(world: &mut World, local_region: R
 
 /// Imported-power grants currently held by consumers, captured before a local
 /// power recompute so a paused derived pass can restore them (see
-/// `refresh_derived_state_for_world`).
-fn imported_power_grants(world: &World) -> Vec<(Entity, i32, RegionId)> {
+/// `refresh_derived_state_for_world`). Also used by
+/// `RegionState::begin_tick_power_demand_phase` (`regions/mod.rs`) to protect
+/// reads that happen later in the same tick, after the raw recompute in
+/// `begin_tick_power_phase` — see
+/// `docs/20260703-bug-cross-region-export-starvation-fix.md`.
+pub(crate) fn imported_power_grants(world: &World) -> Vec<(Entity, i32, RegionId)> {
     world
         .power_consumers
         .iter()
@@ -311,7 +315,7 @@ fn imported_power_grants(world: &World) -> Vec<(Entity, i32, RegionId)> {
 /// Re-applies previously-held imported power to consumers that local resolution
 /// left unpowered (mirrors `RegionState::apply_power_export_grant`). Keeps the
 /// reservation reflected in the consumer flag and the supplied/shortage stats.
-fn reapply_imported_power(world: &mut World, imported: &[(Entity, i32, RegionId)]) {
+pub(crate) fn reapply_imported_power(world: &mut World, imported: &[(Entity, i32, RegionId)]) {
     for &(entity, demand, source_region) in imported {
         let Some(consumer) = world.power_consumers.get_mut(&entity) else {
             continue;

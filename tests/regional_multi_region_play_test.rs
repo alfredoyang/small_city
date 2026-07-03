@@ -1,7 +1,7 @@
 //! Integration tests for player-visible multi-region regional gameplay.
 
 use small_city::core::regional_game::RegionalGame;
-use small_city::core::regions::RegionId;
+use small_city::core::regions::{RegionId, RegionState};
 use small_city::interface::input::BuildingKind;
 use small_city::interface::view::{CitizenRelation, InspectDetailsView, InspectFlag};
 use small_city::ui::city_driver::CityDriver;
@@ -677,5 +677,75 @@ fn road_builds_do_not_create_cross_region_imports() {
     assert!(
         !has_generic_imported_resource_note(&game, RegionId(2)),
         "common road placement should not fan out regional resource offers"
+    );
+}
+
+// ── docs/20260703-bug-cross-region-export-starvation-fix.md ────────────────
+//
+// A three-region chain A - B - C. A has residents and no local jobs. B has
+// jobs but no local power plant (it must import power across its B<->C
+// border). C has both jobs and its own power plant, so it never depends on
+// a cross-region grant to stay powered.
+//
+// A single level-1 Residential building caps at 5 population
+// (`capacity_for(Residential, 1) == 5`); a single level-1 Commercial caps at
+// 2 jobs (`capacity_for(Commercial, 1) == 2`). So once A's Residential
+// building is near full, its demand (up to 5 seekers) exceeds C's capacity
+// alone (2), and some of it can only be satisfied by B's 2 jobs — which
+// requires B to actually be discovered as a candidate producer, the thing
+// the bug broke.
+fn build_export_starvation_fixture() -> RegionalGame {
+    let region_a = RegionState::new(RegionId(1), 3, 1);
+    let region_b = RegionState::new(RegionId(2), 3, 2);
+    let region_c = RegionState::new(RegionId(3), 2, 2);
+    let game = RegionalGame::from_regions(vec![region_a, region_b, region_c]).unwrap();
+
+    // Region A: one resident-holding building, road-connected to its east
+    // border (offset 0), which borders region B's west border (offset 0).
+    build(&game, RegionId(1), 0, 0, BuildingKind::Residential);
+    build(&game, RegionId(1), 1, 0, BuildingKind::Road);
+    build(&game, RegionId(1), 2, 0, BuildingKind::Road);
+
+    // Region B: a road spine from its west border (offset 0, faces A) to its
+    // east border (offset 0, faces C), with one Commercial building
+    // road-adjacent to the spine. No PowerPlant here — B's jobs are only
+    // effective once a cross-region power grant from C lands.
+    build(&game, RegionId(2), 0, 0, BuildingKind::Road);
+    build(&game, RegionId(2), 1, 0, BuildingKind::Road);
+    build(&game, RegionId(2), 2, 0, BuildingKind::Road);
+    build(&game, RegionId(2), 1, 1, BuildingKind::Commercial);
+
+    // Region C: a road cell on its west border (offset 0, faces B), with a
+    // Commercial building and a PowerPlant both adjacent to it. Self-powered,
+    // so its jobs are always effective.
+    build(&game, RegionId(3), 0, 0, BuildingKind::Road);
+    build(&game, RegionId(3), 1, 0, BuildingKind::Commercial);
+    build(&game, RegionId(3), 0, 1, BuildingKind::PowerPlant);
+
+    game
+}
+
+#[test]
+fn power_importing_producer_region_eventually_gets_remote_workers() {
+    let game = build_export_starvation_fixture();
+
+    // Let A's population grow toward its Residential cap and give the daily
+    // job-export phase several days to discover and fill both producers.
+    tick_city_for_hours(&game, 24 * 5);
+
+    let region_b_workers = game.remote_workers_at(RegionId(2), 1, 1).unwrap();
+    assert!(
+        !region_b_workers.is_empty(),
+        "region B (power-importing producer) should have at least one remote \
+         worker after 5 days — its job slots must be discoverable even though \
+         its power depends on a cross-region grant, not stuck at 0 forever \
+         while region C (self-powered) absorbs all demand"
+    );
+
+    let region_c_workers = game.remote_workers_at(RegionId(3), 1, 0).unwrap();
+    assert!(
+        !region_c_workers.is_empty(),
+        "region C (self-powered producer) should also have remote workers, \
+         confirming the fixture's demand genuinely exceeds one producer alone"
     );
 }

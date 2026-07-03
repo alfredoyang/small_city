@@ -37,7 +37,7 @@ use crate::core::resources::CityStats;
 use crate::core::simulation::{
     TickJobPhase, TickPowerPhase, begin_tick_power_phase, continue_to_job_phase,
     ensure_derived_state, finish_tick_after_goods_phase, finish_tick_after_job_phase,
-    refresh_derived_state_for_world,
+    imported_power_grants, reapply_imported_power, refresh_derived_state_for_world,
 };
 use crate::core::systems::{
     build, bulldoze, economy, power, replace, road_connectivity, travel, upgrade,
@@ -1011,8 +1011,43 @@ impl RegionState {
     }
 
     pub(crate) fn begin_tick_power_demand_phase(&mut self) -> RegionalTickPowerPhase {
+        // Capture before the raw local recompute, exactly like
+        // `refresh_derived_state_for_world` does for the paused-read path (see
+        // its comment) — a consumer's imported grant is still valid at this
+        // instant; it is not released until `reconcile_power_export_allocations`
+        // runs after this phase returns.
+        //
+        // Unlike that path, restore happens AFTER `pending_power_demands()`
+        // below, not before: demand collection must see the true, freshly
+        // cleared state so an imported consumer is correctly re-included in
+        // this tick's fresh request batch (skipping it here would desync the
+        // caller's local "still powered" flag from the producer's ledger,
+        // which releases the old reservation unconditionally every tick).
+        // The restore only protects reads that happen later in this same
+        // pass — e.g. this region answering another region's incoming job
+        // export request before its own fresh grant has round-tripped back —
+        // see docs/20260703-bug-cross-region-export-starvation-fix.md.
+        let imported = imported_power_grants(&self.world);
         let phase = begin_tick_power_phase(&mut self.world, self.id);
         let power_demands = self.pending_power_demands();
+        // Only restore a captured import for a consumer that actually made it
+        // into this tick's fresh demand batch. `pending_power_demands` skips
+        // a consumer with no border-connected road network to request through
+        // (e.g. a bulldozed connecting road, or the whole region losing its
+        // last border link) — no fresh request means no reply will ever
+        // arrive to confirm or deny it, so `apply_power_export_grant`'s
+        // denial-cleanup never runs. Restoring it anyway would leave it
+        // optimistically "powered" forever with no producer reservation
+        // behind it, even though the old one was already unconditionally
+        // released above (`reconcile_power_export_allocations` releases every
+        // tick regardless of whether a replacement request follows).
+        let requestable: std::collections::HashSet<Entity> =
+            power_demands.iter().map(|demand| demand.consumer).collect();
+        let restorable_imports = imported
+            .into_iter()
+            .filter(|(entity, _, _)| requestable.contains(entity))
+            .collect::<Vec<_>>();
+        reapply_imported_power(&mut self.world, &restorable_imports);
         RegionalTickPowerPhase {
             phase,
             power_demands,
@@ -1099,6 +1134,25 @@ impl RegionState {
         // before imported power resolved or was lost.
         self.world.invalidate_jobs_registry();
         if !grant.granted {
+            // This consumer was included in this tick's fresh demand batch, so
+            // begin_tick_power_demand_phase's optimistic restore (see its
+            // comment) is the only thing that could have left it marked
+            // powered — the old reservation it protected was already released
+            // by reconcile_power_export_allocations before this request was
+            // sent. A denied replacement must undo that optimism, or the
+            // consumer would read as powered forever with no reservation
+            // backing it anywhere.
+            if let Some(consumer) = self.world.power_consumers.get_mut(&demand.consumer) {
+                if consumer.powered {
+                    consumer.powered = false;
+                    consumer.source = None;
+                    self.world.stats.power.total_power_supplied -= demand.demand;
+                    self.world.stats.power.total_power_shortage =
+                        (self.world.stats.power.total_power_demand
+                            - self.world.stats.power.total_power_supplied)
+                            .max(0);
+                }
+            }
             return;
         }
         let Some(source_region) = grant.source_region else {
@@ -1532,6 +1586,188 @@ mod tests {
 
         assert_eq!(region.imported_job_slots(), vec![(RegionId(2), 42)]);
         assert_eq!(region.world.cached_job_counts().unemployment, 0);
+    }
+
+    /// Regression for docs/20260703-bug-cross-region-export-starvation-fix.md.
+    /// `begin_tick_power_demand_phase` must both (a) still collect a fresh
+    /// demand for a consumer that already holds an imported grant — otherwise
+    /// the caller's per-tick reconciliation (which unconditionally releases
+    /// the old producer-side reservation every tick) desyncs from the
+    /// producer's ledger — and (b) leave the consumer reading as powered
+    /// immediately afterward, so another region asking this one for export
+    /// eligibility before the fresh grant round-trips back doesn't see a
+    /// false zero. An earlier version of this fix restored power *before*
+    /// demand collection, which broke (a); caught in review.
+    #[test]
+    fn begin_tick_power_demand_phase_still_requests_fresh_demand_for_an_imported_consumer() {
+        let mut region = RegionState::new(RegionId(1), 2, 1);
+        assert!(region.build(0, 0, BuildingKind::Residential).success);
+        assert!(region.build(1, 0, BuildingKind::Road).success);
+        let consumer = region.world.grid.get(0, 0).expect("residential entity");
+        let demand = region.world.power_consumers[&consumer].demand;
+        let caller_network = RegionRoadNetworkId {
+            region: RegionId(1),
+            road_network: 0,
+        };
+
+        // Simulate: this consumer already holds an import grant from a
+        // producer, as if a previous tick's request/grant round trip landed.
+        region.apply_power_export_grant(
+            PendingPowerDemand {
+                token: 1,
+                consumer,
+                demand,
+                caller_network,
+            },
+            PowerExportGrant {
+                token: 1,
+                granted: true,
+                source_region: Some(RegionId(2)),
+            },
+        );
+        assert!(region.world.power_consumers[&consumer].powered);
+
+        let phase = region.begin_tick_power_demand_phase();
+
+        assert!(
+            phase
+                .power_demands
+                .iter()
+                .any(|pending| pending.consumer == consumer),
+            "an already-imported consumer must still be included in this \
+             tick's fresh power demand batch, so the caller's reconciliation \
+             re-requests the allocation it is about to release"
+        );
+        assert!(
+            region.world.power_consumers[&consumer].powered,
+            "the not-yet-released import must still read as powered for the \
+             rest of this tick, protecting reads that happen before the \
+             fresh grant round-trips back"
+        );
+    }
+
+    /// Regression for docs/20260703-bug-cross-region-export-starvation-fix.md
+    /// (second review round). If the fresh power request that follows the
+    /// optimistic restore above gets DENIED — the producer had no capacity
+    /// after all — the consumer must end unpowered with no import source and
+    /// no phantom supplied-power stat, not stay optimistically powered
+    /// forever with nothing backing it (the old reservation was already
+    /// released; no new one replaced it).
+    #[test]
+    fn apply_power_export_grant_denial_clears_the_optimistic_restore() {
+        let mut region = RegionState::new(RegionId(1), 2, 1);
+        assert!(region.build(0, 0, BuildingKind::Residential).success);
+        assert!(region.build(1, 0, BuildingKind::Road).success);
+        let consumer = region.world.grid.get(0, 0).expect("residential entity");
+        let demand = region.world.power_consumers[&consumer].demand;
+        let caller_network = RegionRoadNetworkId {
+            region: RegionId(1),
+            road_network: 0,
+        };
+
+        region.apply_power_export_grant(
+            PendingPowerDemand {
+                token: 1,
+                consumer,
+                demand,
+                caller_network,
+            },
+            PowerExportGrant {
+                token: 1,
+                granted: true,
+                source_region: Some(RegionId(2)),
+            },
+        );
+        region.begin_tick_power_demand_phase();
+        assert!(
+            region.world.power_consumers[&consumer].powered,
+            "optimistically restored after this tick's demand collection"
+        );
+        let supplied_while_optimistic = region.world.stats.power.total_power_supplied;
+
+        // The fresh request this tick's demand collection triggered comes
+        // back denied (the producer had no spare capacity after all).
+        region.apply_power_export_grant(
+            PendingPowerDemand {
+                token: 2,
+                consumer,
+                demand,
+                caller_network,
+            },
+            PowerExportGrant {
+                token: 2,
+                granted: false,
+                source_region: None,
+            },
+        );
+
+        assert!(
+            !region.world.power_consumers[&consumer].powered,
+            "a denied replacement must clear the optimistic restore, not \
+             leave the consumer powered with nothing backing it"
+        );
+        assert!(region.world.power_consumers[&consumer].source.is_none());
+        assert_eq!(
+            region.world.stats.power.total_power_supplied,
+            supplied_while_optimistic - demand,
+            "the phantom supplied-power stat must be unwound too"
+        );
+    }
+
+    /// Regression for docs/20260703-bug-cross-region-export-starvation-fix.md
+    /// (third review round). `pending_power_demands` skips a consumer with no
+    /// border-connected road network to request exported power through — e.g.
+    /// the whole region has no border link at all, as reproduced here. If
+    /// that consumer held an import from an earlier tick, no fresh request
+    /// will ever be sent for it, so no reply will ever arrive to confirm or
+    /// deny it — `apply_power_export_grant`'s denial cleanup never runs.
+    /// Restoring it anyway would leave it powered forever even though the old
+    /// reservation was already unconditionally released.
+    #[test]
+    fn begin_tick_power_demand_phase_does_not_restore_a_disconnected_consumers_import() {
+        let mut region = RegionState::new(RegionId(1), 5, 5);
+        assert!(region.build(2, 2, BuildingKind::Residential).success);
+        assert!(region.build(2, 1, BuildingKind::Road).success);
+        let consumer = region.world.grid.get(2, 2).expect("residential entity");
+        let demand = region.world.power_consumers[&consumer].demand;
+        let caller_network = RegionRoadNetworkId {
+            region: RegionId(1),
+            road_network: 0,
+        };
+        // No cell in this 5x5 region touches a map edge, so there is no
+        // border link anywhere for a fresh request to go through.
+        assert!(region.network_border_links().is_empty());
+
+        // Simulate: this consumer held an import from an earlier tick, back
+        // when it (or the region) still had a border link to request through.
+        region.apply_power_export_grant(
+            PendingPowerDemand {
+                token: 1,
+                consumer,
+                demand,
+                caller_network,
+            },
+            PowerExportGrant {
+                token: 1,
+                granted: true,
+                source_region: Some(RegionId(2)),
+            },
+        );
+        assert!(region.world.power_consumers[&consumer].powered);
+
+        let phase = region.begin_tick_power_demand_phase();
+
+        assert!(
+            phase.power_demands.is_empty(),
+            "no border-connected network exists, so no fresh request can be made"
+        );
+        assert!(
+            !region.world.power_consumers[&consumer].powered,
+            "an import with no fresh request in flight must not be \
+             optimistically restored — nothing will ever confirm or deny it \
+             this tick, so it would stay powered forever with no producer \
+             reservation behind it"
+        );
     }
 
     #[test]
