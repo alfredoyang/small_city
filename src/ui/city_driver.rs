@@ -387,6 +387,7 @@ impl CityDriver {
             flags: Vec::new(),
             explanations: vec![message],
             roster: Vec::new(),
+            road_traveler_count: 0,
         }
     }
 

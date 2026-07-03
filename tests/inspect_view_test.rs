@@ -445,6 +445,7 @@ fn inspect_card_layout_is_fixed_slot_aligned() {
         flags: Vec::new(),
         explanations: Vec::new(),
         roster: Vec::new(),
+        road_traveler_count: 0,
     };
 
     assert_eq!(

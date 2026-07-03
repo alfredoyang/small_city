@@ -4269,6 +4269,7 @@ mod tests {
                     relation: CitizenRelation::Unemployed,
                 },
             ],
+            road_traveler_count: 0,
         };
 
         let backend = TestBackend::new(100, 20);
@@ -4371,6 +4372,7 @@ mod tests {
                     y: 1,
                 },
             }],
+            road_traveler_count: 0,
         };
         // One remote commuter living in region 1 at (4,11).
         let remote = [CitizenDetailView {
@@ -4958,6 +4960,7 @@ mod tests {
             flags: vec![InspectFlag::GoodsSupplyNeighbor],
             explanations: Vec::new(),
             roster: Vec::new(),
+            road_traveler_count: 0,
         };
 
         let (title, body) = tui_inspect_card(&inspect);
@@ -5003,6 +5006,7 @@ mod tests {
             flags: Vec::new(),
             explanations: Vec::new(),
             roster: Vec::new(),
+            road_traveler_count: 0,
         };
         let (_, body) = tui_inspect_card(&inspect);
         let source = body

@@ -185,6 +185,7 @@ pub fn render(view: &GameView) {
         flags: Vec::new(),
         explanations: Vec::new(),
         roster: Vec::new(),
+        road_traveler_count: 0,
     };
     let preview = BuildPreviewView {
         kind: state.selected_build,
@@ -985,6 +986,7 @@ mod tests {
             flags: vec![InspectFlag::GoodsSupplyNeighbor],
             explanations: Vec::new(),
             roster: Vec::new(),
+            road_traveler_count: 0,
         };
 
         let output = format_inspect(&inspect);

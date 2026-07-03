@@ -232,6 +232,10 @@ pub struct InspectView {
     /// workers imported from another region are not listed (they live in their
     /// home region's world); residents holding a remote job are still listed.
     pub roster: Vec<CitizenDetailView>,
+    /// Count of travel tokens (local residents and visiting bodies alike) whose
+    /// `current_cell` is this road cell. Zero for non-road cells. Hover-only
+    /// summary; per-traveler detail is a separate Enter-panel facade.
+    pub road_traveler_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

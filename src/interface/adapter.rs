@@ -185,7 +185,31 @@ pub(crate) fn inspect_world(world: &World, x: usize, y: usize) -> InspectView {
         roster: in_bounds
             .then(|| citizen_roster(world, x, y))
             .unwrap_or_default(),
+        road_traveler_count: in_bounds
+            .then(|| road_traveler_count(world, x, y))
+            .unwrap_or_default(),
     }
+}
+
+/// Count of travel tokens currently standing on the road cell at `(x, y)`.
+/// Zero for a non-road cell or an out-of-bounds coordinate. Hover-only summary;
+/// mirrors the same local-token-alive-or-visitor filter as [`traveler_views`] so
+/// the count always matches what the map dot shows.
+fn road_traveler_count(world: &World, x: usize, y: usize) -> usize {
+    let Some(entity) = world.grid.get(x, y) else {
+        return 0;
+    };
+    if !road_connectivity::is_road_entity(world, entity) {
+        return 0;
+    }
+
+    let self_region = world.region_id;
+    world
+        .tokens
+        .iter()
+        .filter(|(id, token)| world.citizens.contains_key(id) || token.home.region != self_region)
+        .filter(|(_, token)| token.state.current_cell == Some(entity))
+        .count()
 }
 
 /// Per-citizen roster for the building at `(x, y)`, kept UI-safe inside the adapter.
@@ -1134,6 +1158,107 @@ mod tests {
         let key = Entity::new(world.region_id, 90);
         world.tokens.insert(key, token);
         key
+    }
+
+    /// A road with no tokens on it reports zero travelers.
+    #[test]
+    fn road_traveler_count_is_zero_with_no_tokens() {
+        let mut world = World::new(2, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        add_citizen(&mut world, 1, None); // idle citizen contributes nothing
+
+        assert_eq!(super::inspect_world(&world, 0, 0).road_traveler_count, 0);
+    }
+
+    /// A non-road cell always reports zero, even with tokens standing on
+    /// neighbouring road cells.
+    #[test]
+    fn road_traveler_count_is_zero_for_non_road_cell() {
+        let mut world = World::new(2, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        let r0 = world.grid.get(0, 0).expect("r0");
+        add_citizen(&mut world, 1, Some(r0));
+
+        assert_eq!(super::inspect_world(&world, 1, 0).road_traveler_count, 0);
+    }
+
+    /// Local travelers and a visiting foreign token on the same road cell all
+    /// count, matching how many dots `traveler_views` would draw there.
+    #[test]
+    fn road_traveler_count_includes_local_and_visitor_tokens() {
+        use crate::core::regions::RegionId;
+
+        let mut world = World::new(2, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        let r0 = world.grid.get(0, 0).expect("r0");
+
+        add_citizen(&mut world, 1, Some(r0));
+        add_citizen(&mut world, 2, Some(r0));
+        world.tokens.insert(
+            Entity::new(RegionId(3), 1),
+            TravelToken {
+                state: TravelState {
+                    status: TravelStatus::Traveling,
+                    current_cell: Some(r0),
+                    destination: None,
+                    building: None,
+                    dwell: 0,
+                    prev_cell: None,
+                },
+                home: PlaceRef {
+                    region: RegionId(3),
+                    building: Entity::new(RegionId(3), 0),
+                },
+                work: None,
+                trip_gen: 1,
+            },
+        );
+
+        assert_eq!(super::inspect_world(&world, 0, 0).road_traveler_count, 3);
+    }
+
+    /// A removed local citizen's not-yet-pruned token is excluded from the
+    /// count, mirroring `traveler_views`'s stale-dot guard; a foreign token
+    /// on the same cell is still counted.
+    #[test]
+    fn road_traveler_count_excludes_removed_local_citizen_but_counts_foreign_token() {
+        use crate::core::regions::RegionId;
+
+        let mut world = World::new(2, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        let r0 = world.grid.get(0, 0).expect("r0");
+
+        let id = add_citizen(&mut world, 1, Some(r0));
+        world.tokens.insert(
+            Entity::new(RegionId(3), 1),
+            TravelToken {
+                state: TravelState {
+                    status: TravelStatus::Traveling,
+                    current_cell: Some(r0),
+                    destination: None,
+                    building: None,
+                    dwell: 0,
+                    prev_cell: None,
+                },
+                home: PlaceRef {
+                    region: RegionId(3),
+                    building: Entity::new(RegionId(3), 0),
+                },
+                work: None,
+                trip_gen: 1,
+            },
+        );
+        assert_eq!(super::inspect_world(&world, 0, 0).road_traveler_count, 2);
+
+        // Remove the citizen but leave the (not-yet-pruned) token.
+        world.citizens.remove(&id);
+        assert!(world.tokens.contains_key(&id));
+
+        assert_eq!(
+            super::inspect_world(&world, 0, 0).road_traveler_count,
+            1,
+            "stale local token must not count, foreign token still does"
+        );
     }
 
     /// The marker list reaches the public `view_world` render model.

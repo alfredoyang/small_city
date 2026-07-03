@@ -431,3 +431,72 @@ P-c optional:
 - `road_traveler_count` is an O(tokens) scan on inspect/cursor movement. Fine for
   now. Add a cell index only if this shows up in profiling.
 - No core movement, routing, worker barrier, or economy behavior changes.
+
+---
+
+## P-a1 implemented (2026-07-03)
+
+Diff: 6 files, +137/-0 lines. Read-only, no simulation change. Full gate green
+(`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test -q` — 302 tests, up from 298).
+
+### What changed
+
+- **`src/interface/view.rs`** — `InspectView.road_traveler_count: usize`, doc'd
+  as hover-only; per-traveler detail is a separate later facade (P-a2/P-b).
+- **`src/interface/adapter.rs`** — new private `road_traveler_count(world, x, y)`,
+  wired into `inspect_world`. Returns `0` out of bounds or off-road
+  (`road_connectivity::is_road_entity`); otherwise scans `world.tokens` with the
+  **same filter `traveler_views` uses** for its map dots:
+  `world.citizens.contains_key(id) || token.home.region != self_region`. This
+  keeps the count and the dot in lockstep — a cell only shows a dot if its count
+  is nonzero, and vice versa.
+- **`src/ui/city_driver.rs`, `src/ui/ascii.rs`, `src/ui/tui.rs`,
+  `tests/inspect_view_test.rs`** — every other `InspectView { .. }` literal
+  (fallback/mock inspect views) gets `road_traveler_count: 0`; only
+  `adapter::inspect_world` computes a real value.
+- **4 new adapter tests**: zero with no tokens, zero for a non-road cell, local
+  + visitor tokens both count, and a removed-but-not-yet-pruned local citizen's
+  token is excluded while a foreign token on the same cell still counts
+  (mirrors the existing `traveler_views_excludes_removed_citizen` test for the
+  same stale-token guard).
+
+### Diagram
+
+```text
+cursor hovers a ROAD cell
+      |
+      v
+inspect_world(world, x, y)                    src/interface/adapter.rs
+      |
+      +-- citizen_roster(..)     existing, building-only
+      |
+      +-- road_traveler_count(world, x, y)     NEW
+             |
+             +-- world.grid.get(x, y) -> entity, else 0
+             +-- is_road_entity(entity)?  no -> 0
+             +-- world.tokens.iter()
+                    .filter(alive-local || visiting-foreign)   same as traveler_views
+                    .filter(current_cell == entity)
+                    .count()
+      |
+      v
+InspectView { .. , road_traveler_count }
+```
+
+### Review
+
+- **codex**: one low finding — the field's doc comment said "press Enter for
+  per-traveler detail," which doesn't exist in this patch. Fixed to "per-traveler
+  detail is a separate Enter-panel facade." Re-verified, confirmed clean.
+- **opencode**: skipped for this patch at the user's instruction.
+- **Self-review**: mission-scoped (count only, no Enter/ASCII rendering yet),
+  UI still reads only through the adapter, deterministic (pure scan, same
+  filter as an existing deterministic function), tests meaningful, no balance
+  risk (read-only).
+
+### Risks / next steps
+
+None new. P-a2 (Enter-key detail facade: `RoadTravelerPanelSeedView`, the
+`CityDriver → RegionalGame → runner/thread/runtime → RegionState → adapter`
+chain) is next per the plan's suggested split.
