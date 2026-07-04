@@ -380,6 +380,64 @@ fn stale_spare_power_hint_routes_to_producer_but_denies_cleanly() {
 }
 
 #[test]
+fn quiet_power_tick_skips_reconcile_after_first_grant() {
+    // Event-driven plan, P-2: once a consumer's import is granted and nothing
+    // local or cross-region changes afterward, its NEXT tick's power gate must
+    // stay quiet — no release, no fresh request — even though the import
+    // still needs to keep working every tick. This is the positive proof for
+    // the property `tick_without_exportable_demand_finishes_immediately` (a
+    // unit test on a bare, empty `RegionRuntime`) can't cover: a REAL,
+    // ongoing cross-region import, routed through a real worker + directory,
+    // that keeps its grant without a repeated round trip.
+    let caller = RegionId(82);
+    let producer = RegionId(83);
+    let directory = Arc::new(RegionDirectory::new(vec![neighbor(
+        82,
+        BorderEdge::East,
+        83,
+    )]));
+    let mut worker = test_worker_with_directory(WorkerId(62), Arc::clone(&directory));
+    worker
+        .add_region(RegionRuntime::new(power_export_consumer_region(caller)))
+        .unwrap();
+    worker
+        .add_region(RegionRuntime::new(power_export_producer_region(producer)))
+        .unwrap();
+
+    worker.push_event(caller, tick(1)).unwrap();
+    for _ in 0..3 {
+        assert!(worker.process_region_events(1).routing_errors.is_empty());
+    }
+    assert!(
+        cell_powered(&worker, caller, 0, 0),
+        "setup: first tick's dirty reconcile must grant the import"
+    );
+    assert_eq!(turn(&worker, caller), 1);
+
+    // Second tick, nothing changed anywhere: the gate must go quiet. Same-
+    // worker routing is immediate (`route_region_event`), so a request would
+    // show up as a pending event on the producer within this single pass.
+    worker.push_event(caller, tick(2)).unwrap();
+    let second_pass = worker.process_region_events(1);
+    assert!(second_pass.routing_errors.is_empty());
+    assert_eq!(
+        second_pass.tick_replies.len(),
+        1,
+        "tick must still complete"
+    );
+    assert_eq!(
+        pending_events(&worker, producer),
+        0,
+        "quiet tick must not re-request power from the producer"
+    );
+    assert!(
+        cell_powered(&worker, caller, 0, 0),
+        "the existing grant must persist untouched through a quiet tick"
+    );
+    assert_eq!(turn(&worker, caller), 2);
+}
+
+#[test]
 fn event_idle_region_republishes_dirty_hints_on_next_pass() {
     // P-1 (event-driven plan): a region's hints_dirty flag is set by every
     // attach_* chokepoint, including the ones `RegionState::build` runs during

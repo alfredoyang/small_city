@@ -493,6 +493,16 @@ impl RegionState {
         self.world.clear_hints_dirty();
     }
 
+    /// Event-driven plan, P-2: whether this region's power export demand/
+    /// capacity may have changed since its last reconcile.
+    pub(crate) fn is_power_exports_dirty(&self) -> bool {
+        self.world.is_power_exports_dirty()
+    }
+
+    pub(crate) fn clear_power_exports_dirty(&self) {
+        self.world.clear_power_exports_dirty();
+    }
+
     /// Returns a UI-safe snapshot without exposing this region's ECS world.
     ///
     /// This is a pure read of already-applied derived state. Because regions are
@@ -1060,6 +1070,27 @@ impl RegionState {
         RegionalTickPowerPhase {
             phase,
             power_demands,
+        }
+    }
+
+    /// Quiet-tick variant of `begin_tick_power_demand_phase` (event-driven
+    /// plan, P-2): used when the reconcile gate finds no local or
+    /// cross-region change since the last reconcile, so this tick will
+    /// neither release nor request anything. Skips the demand scan entirely
+    /// — but still runs today's raw `power::run` (via `begin_tick_power_phase`;
+    /// P-3's diff-apply makes this a no-op on clean cache), which would
+    /// otherwise drop existing imported grants. So it captures them first and
+    /// reapplies ALL of them unconditionally, UNFILTERED — unlike the dirty
+    /// path's filter-by-requestable restore, no filter is needed here because
+    /// nothing is released this tick, so every kept import still has its
+    /// producer-side reservation intact.
+    pub(crate) fn begin_tick_power_phase_quiet(&mut self) -> RegionalTickPowerPhase {
+        let imported = imported_power_grants(&self.world);
+        let phase = begin_tick_power_phase(&mut self.world, self.id);
+        reapply_imported_power(&mut self.world, &imported);
+        RegionalTickPowerPhase {
+            phase,
+            power_demands: Vec::new(),
         }
     }
 

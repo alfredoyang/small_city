@@ -533,12 +533,17 @@ impl RegionWorker {
             }
 
             processed_regions += 1;
+            let discovery = self.directory.discovery_snapshot();
             let importable_remote_jobs = importable_remote_jobs_for_region(
-                &self.directory.discovery_snapshot(),
+                &discovery,
                 runtime.region_id(),
                 &runtime.state().network_border_links(),
             );
             runtime.set_importable_remote_jobs(importable_remote_jobs);
+            // Event-driven plan, P-2: install this pass's directory generation
+            // before processing events, so the power reconcile gate compares
+            // against the same snapshot this slice's routing already used.
+            runtime.set_discovery_generation(discovery.generation);
             let source_region = runtime.region_id();
             // P-c: install the current Layer-1 route exits before processing events,
             // so `StepTravel` uses the latest published route snapshot. A post-event

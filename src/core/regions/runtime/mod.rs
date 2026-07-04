@@ -305,6 +305,15 @@ pub struct RegionRuntime {
     job_export_producers: Vec<RegionId>,
     goods_export_producers: Vec<RegionId>,
     pending_goods_stock: Vec<(Entity, u32)>,
+    // Event-driven plan (docs/20260703-event-driven-architecture.md), P-2: the
+    // directory snapshot generation as of this worker pass's per-slice install
+    // (`set_discovery_generation`, mirrors `set_region_routes`), and the
+    // generation this region last reconciled its power exports against. Both
+    // start at 0 so a fresh/loaded runtime always reconciles once — matching
+    // the "load = all-dirty" decision `hints_dirty` already follows. Neither
+    // is serialized (`RegionRuntime` never is).
+    discovery_generation: u64,
+    seen_power_generation: u64,
     handle: RegionHandle,
     receiver: RegionEventReceiver,
 }
@@ -558,6 +567,8 @@ impl RegionRuntime {
             job_export_producers: Vec::new(),
             goods_export_producers: Vec::new(),
             pending_goods_stock: Vec::new(),
+            discovery_generation: 0,
+            seen_power_generation: 0,
             handle,
             receiver,
         }
@@ -573,6 +584,14 @@ impl RegionRuntime {
 
     pub(crate) fn set_importable_remote_jobs(&mut self, jobs: i32) {
         self.state.set_importable_remote_jobs(jobs);
+    }
+
+    /// Event-driven plan, P-2: install this pass's directory snapshot
+    /// generation (mirrors `set_region_routes`'s per-slice install). Read by
+    /// the power reconcile gate in `start_tick_power_phase` to decide whether
+    /// a cross-region change happened since this region's last reconcile.
+    pub(crate) fn set_discovery_generation(&mut self, generation: u64) {
+        self.discovery_generation = generation;
     }
 
     /// P-c: install this region's slice of the directory's `region_routes`
@@ -818,7 +837,30 @@ impl RegionRuntime {
         })
     }
 
+    /// Event-driven plan, P-2: gate the power reconcile on local/cross-region
+    /// change instead of running it every tick unconditionally.
+    ///
+    /// The gate is decided BEFORE any demand collection — deliberately: once
+    /// P-3 lands (diff-apply `power::run`), a kept import stays `powered`, so
+    /// a demand scan taken first would not list it, and a dirty reconcile's
+    /// release-all would then strip its producer reservation with no
+    /// replacement request (the starvation fix's round-1 desync,
+    /// reintroduced). The gate's own inputs (the dirty flag and the
+    /// generation) need no demand scan, so this ordering is free even before
+    /// P-3 lands.
     fn start_tick_power_phase(&mut self, request_id: UiRequestId) -> Vec<OutboundMessage> {
+        let dirty = self.state.is_power_exports_dirty()
+            || self.discovery_generation > self.seen_power_generation;
+        if !dirty {
+            // Quiet path: time still advances and `power::run` still runs
+            // (P-3 makes it a diff-apply no-op on clean cache), but no demand
+            // scan and no release/request traffic. Grants and the producer's
+            // ledger are untouched.
+            let phase = self.state.begin_tick_power_phase_quiet();
+            return self.enter_job_phase(request_id, phase);
+        }
+        self.seen_power_generation = self.discovery_generation;
+        self.state.clear_power_exports_dirty();
         let phase = self.state.begin_tick_power_demand_phase();
         self.reconcile_power_export_allocations(request_id, phase)
     }
@@ -1462,6 +1504,13 @@ mod tick_state_tests {
 
     #[test]
     fn tick_without_exportable_demand_finishes_immediately() {
+        // Event-driven plan, P-2: an empty, never-touched region starts with
+        // both `power_exports_dirty` and the seen/current generation clean
+        // (0 == 0), so its first tick takes the quiet path — no demand scan,
+        // no release/request traffic at all, not even the previously
+        // unconditional (and, for an empty region, always-empty-payload)
+        // `PowerExportAllocationsReleased`. The tick still completes
+        // immediately; that part of this test's name is even more true now.
         let mut runtime = RegionRuntime::new(RegionState::new(RegionId(1), 2, 2));
         runtime.push_event(RegionEvent::Tick {
             request_id: UiRequestId(1),
@@ -1471,14 +1520,26 @@ mod tick_state_tests {
 
         assert!(!runtime.tick_state.is_waiting());
         assert!(has_tick_completed(&outbound));
-        assert!(matches!(
-            outbound.first(),
-            Some(OutboundMessage::PowerExportAllocationsReleased(_))
-        ));
+        assert!(
+            !outbound.iter().any(|message| matches!(
+                message,
+                OutboundMessage::PowerExportAllocationsReleased(_)
+                    | OutboundMessage::PowerExportRequested(_)
+            )),
+            "a quiet tick must not emit any power export traffic"
+        );
     }
 
     #[test]
     fn daily_tick_without_job_demands_releases_job_allocations_before_finishing() {
+        // Event-driven plan, P-2: this empty region's power gate goes quiet
+        // after its first tick (nothing ever dirties it or moves its
+        // generation across these 24 ticks), so it no longer emits a
+        // `PowerExportAllocationsReleased` on the 24th (daily) tick — that
+        // part of the original assertion tested the pre-P-2 unconditional
+        // reconcile, not this test's actual subject. Jobs are ungated until
+        // P-4, so `reconcile_job_export_allocations` still runs unconditionally
+        // on every daily boundary; that ordering guarantee is what remains.
         let mut runtime = RegionRuntime::new(RegionState::new(RegionId(1), 2, 2));
         let mut last_outbound = Vec::new();
 
@@ -1490,9 +1551,6 @@ mod tick_state_tests {
             assert!(!runtime.tick_state.is_waiting());
         }
 
-        let power_release = message_index(&last_outbound, |message| {
-            matches!(message, OutboundMessage::PowerExportAllocationsReleased(_))
-        });
         let job_release = message_index(&last_outbound, |message| {
             matches!(message, OutboundMessage::JobExportAllocationsReleased(_))
         });
@@ -1500,10 +1558,6 @@ mod tick_state_tests {
             matches!(message, OutboundMessage::RegionTickCompleted(_))
         });
 
-        assert!(
-            power_release < job_release,
-            "power reconciliation should run before daily job reconciliation"
-        );
         assert!(
             job_release < completed,
             "job reconciliation should release old allocations before finishing"
@@ -1565,6 +1619,18 @@ mod tick_state_tests {
         let finished_first = runtime.process_next_event();
         assert!(has_tick_completed(&finished_first));
         assert!(!runtime.tick_state.is_waiting());
+
+        // Event-driven plan, P-2: this test drives `RegionRuntime` directly,
+        // bypassing the worker loop that would normally call
+        // `set_discovery_generation` before every slice. The first tick's
+        // dirty reconcile already cleared `power_exports_dirty` and set
+        // `seen_power_generation` to match, so without this the second tick
+        // would (correctly, per the new gate) go quiet — defeating this
+        // test's actual subject, which is the tick-state machine's
+        // deferred-event mechanics, not the reconcile gate. Bump the
+        // installed generation to simulate what a real worker pass would
+        // have found if something discoverable changed, reopening the gate.
+        runtime.set_discovery_generation(1);
 
         // The deferred second tick now runs; the still-short consumer pauses again.
         let started_second = runtime.process_next_event();

@@ -38,6 +38,14 @@ use crate::core::regions::{
 ///
 /// Components are keyed by `(region, road-network)`, not just by region.
 pub struct CrossRegionDiscovery {
+    /// Event-driven plan, P-2: monotonic snapshot generation, bumped once per
+    /// `rebuild_discovery` call. Stored on the snapshot itself so a reader
+    /// gets it atomically with the discovery data it's paired to — no
+    /// separate read can observe a generation newer than the data it names.
+    /// Regions read this per-slice (`RegionRuntime::set_discovery_generation`)
+    /// and compare against their own `seen_*_generation` to decide whether a
+    /// cross-region change happened since their last reconcile.
+    pub generation: u64,
     pub components: Vec<Vec<RegionRoadNetworkId>>,
     pub availability_hints: Vec<RegionalAvailabilityHint>,
     /// P-a: per-region INPUT for the Layer-1 Dijkstra. Each region prices its
@@ -113,6 +121,9 @@ struct DirectoryPublishState {
     region_hints: HashMap<RegionId, Vec<RegionalAvailabilityHint>>,
     /// P-a: per-region road reports (INPUT for the Layer-1 Dijkstra in P-b).
     region_road_reports: HashMap<RegionId, RegionRoadReport>,
+    /// Event-driven plan, P-2: monotonic counter bumped once per
+    /// `rebuild_discovery`, under the same lock as every other field here.
+    generation: u64,
 }
 
 impl RegionDirectory {
@@ -179,7 +190,7 @@ impl RegionDirectory {
             .lock()
             .expect("region directory publish state lock poisoned");
         state.topology = topology;
-        self.rebuild_discovery(&state);
+        self.rebuild_discovery(&mut state);
     }
 
     /// Publishes one region's owned discovery summaries.
@@ -206,7 +217,7 @@ impl RegionDirectory {
 
         set_or_remove(&mut state.region_links, region, links);
         set_or_remove(&mut state.region_hints, region, hints);
-        self.rebuild_discovery(&state);
+        self.rebuild_discovery(&mut state);
         true
     }
 
@@ -227,11 +238,11 @@ impl RegionDirectory {
             report.region,
             report.clone(),
         );
-        self.rebuild_discovery(&state);
+        self.rebuild_discovery(&mut state);
         true
     }
 
-    fn rebuild_discovery(&self, state: &DirectoryPublishState) {
+    fn rebuild_discovery(&self, state: &mut DirectoryPublishState) {
         let links = flattened_region_values(&state.region_links);
         let availability_hints = flattened_region_values(&state.region_hints);
         let mut regions: Vec<RegionId> = state.region_road_reports.keys().copied().collect();
@@ -241,7 +252,9 @@ impl RegionDirectory {
             .map(|region| state.region_road_reports[&region].clone())
             .collect();
         let region_routes = build_region_routes(&road_reports, &self.owners);
+        state.generation += 1;
         let discovery = CrossRegionDiscovery {
+            generation: state.generation,
             components: build_component_graph(&links, &availability_hints, &state.topology),
             availability_hints,
             road_reports,

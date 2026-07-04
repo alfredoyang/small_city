@@ -1220,3 +1220,146 @@ regress the existing "clean tick does nothing new" property since nothing in
 this patch skips previously-mandatory work; it only stops skipping a publish
 that should have happened. P-2 is next: the discovery generation counter and
 the first reconcile gate that actually skips work on a quiet tick.
+
+---
+
+## P-2 — implemented (commit follows this section)
+
+**Files changed:** `src/core/regions/directory.rs`, `src/core/regions/mod.rs`,
+`src/core/regions/runtime/mod.rs`, `src/core/regions/worker.rs`,
+`src/core/world.rs`, `tests/region_worker_test.rs`. 6 files, ~216 lines
+(slightly over the 5-file soft guideline; directory generation, the gate that
+reads it, and the tests proving both are too tightly coupled to split without
+leaving broken intermediate states).
+
+**What changed, mapped to the design above:**
+
+- `CrossRegionDiscovery::generation: u64` — bumped once per `rebuild_discovery`
+  call, stored on the snapshot itself. `rebuild_discovery`'s signature changed
+  from `&DirectoryPublishState` to `&mut DirectoryPublishState` so the counter
+  (added to `DirectoryPublishState`, protected by the existing `publish_state`
+  mutex — no new lock) can be mutated under the SAME lock all three callers
+  already hold; all three call sites (`set_topology`, `publish_region`,
+  `publish_region_road_report`) updated to pass `&mut state`.
+- `World::power_exports_dirty: Cell<bool>` — set inside
+  `invalidate_resource_registry` and `mark_road_topology_dirty` only.
+  Deliberately **not** `invalidate_jobs_registry`: jobs and power are
+  orthogonal registries (a citizen spawning doesn't change power demand), so a
+  per-resource dirty flag must only be set by chokepoints that can actually
+  affect that resource — the exact bug the "per-resource seen generation"
+  review finding warned about, now honored by construction, not just by the
+  seen-marker split.
+- `RegionRuntime::discovery_generation` (installed per-slice by the worker,
+  mirroring the existing `set_region_routes` pattern) and
+  `seen_power_generation` (persistent gate memory, survives across passes,
+  starts at 0 so a fresh/loaded runtime always reconciles once).
+- `start_tick_power_phase` gate: `dirty = power_exports_dirty ||
+  discovery_generation > seen_power_generation`, decided **before** any
+  demand collection (the ordering codex's plan-review flagged: once P-3 lands,
+  collecting demands before the gate would make a kept import invisible to
+  `pending_power_demands`, and a dirty reconcile's release-all would then
+  strip its producer reservation with nothing to replace it — the starvation
+  fix's round-1 desync, reintroduced). Quiet path:
+  `RegionState::begin_tick_power_phase_quiet` — still advances time and runs
+  today's raw `power::run` (P-3 makes this a no-op via diff-apply), but wraps
+  it in the *existing* capture/reapply-all import-preservation helpers,
+  UNFILTERED (safe here because nothing is released on this path, unlike the
+  dirty path's filter-by-requestable restore) — then goes straight to
+  `enter_job_phase` with zero demand collection and zero release/request
+  traffic.
+
+**Anatomy of the gate:**
+
+```text
+                         RegionEvent::Tick
+                                │
+                                ▼
+                 start_tick_power_phase (runtime/mod.rs)
+                                │
+              dirty = power_exports_dirty
+                      || discovery_generation > seen_power_generation
+                                │
+              ┌─────────────────┴─────────────────┐
+              │ NO (quiet)                         │ YES (dirty)
+              ▼                                    ▼
+  begin_tick_power_phase_quiet          seen_power_generation = discovery_generation
+    time advance + power::run                clear_power_exports_dirty
+    capture imports → reapply ALL         begin_tick_power_demand_phase (unchanged)
+    (unfiltered — nothing released)         capture → power::run → collect demands
+    power_demands: empty                    → filter-by-requestable → restore
+              │                                    │
+              ▼                                    ▼
+       enter_job_phase directly          reconcile_power_export_allocations
+       (no release, no request)            (release-all + request-per-demand,
+                                             today's unchanged code)
+```
+
+**The "denied import never retries" question — the crux of this patch's test
+adaptations.** A consumer whose import request was denied (no candidate
+producer had spare capacity) does not get its own independent retry-every-tick
+mechanism beyond the gate. This is deliberate, not an oversight: repeating an
+identical request against unchanged producer state is guaranteed by
+determinism to produce an identical (denied) outcome — so skipping the retry
+loses no correctness, only redundant work that could never have changed the
+answer. The only two ways the answer *could* change are covered by the gate's
+two inputs: this region's own demand/capacity changing
+(`power_exports_dirty`), or the discoverable producer landscape changing
+(`discovery_generation` moving — bumped by *any* region's hint republish,
+including the producer later freeing capacity). Codex confirmed this
+reasoning independently after a targeted re-check: "unchanged producer state
+plus unchanged caller demand gives the same denial; capacity becoming
+available requires some local/cross-region change that bumps the directory
+generation or local dirty flag, which reopens the gate."
+
+**Test adaptations (3 pre-existing, all encoding the old "reconcile every
+tick unconditionally" assumption) plus 1 new regression test:**
+
+```text
+  tick_without_exportable_demand_finishes_immediately
+    OLD: asserted outbound[0] == PowerExportAllocationsReleased
+    NEW: asserts NO power export traffic at all (an empty, never-touched
+         region's first tick correctly goes quiet — even more "finishes
+         immediately" than the name originally claimed)
+
+  daily_tick_without_job_demands_releases_job_allocations_before_finishing
+    OLD: asserted power_release < job_release < completed across 24 ticks
+    NEW: drops the power assertion (power's gate goes quiet after tick 1 in
+         this steady-state region; nothing to release starting tick 2) and
+         keeps job_release < completed (jobs are ungated until P-4, still
+         unconditional every daily tick)
+
+  second_tick_is_deferred_while_waiting
+    Tests TickState's deferred-event mechanics directly on a bare
+    RegionRuntime, bypassing the worker (so discovery_generation is never
+    installed). Without adaptation the second tick would (correctly) go
+    quiet, defeating the test's actual subject. Fixed with one line —
+    runtime.set_discovery_generation(1) before the second tick — simulating
+    what a real worker pass would install if something discoverable changed,
+    explicitly isolating tick-state mechanics from the new gate.
+
+  NEW: quiet_power_tick_skips_reconcile_after_first_grant (region_worker_test.rs)
+    Real consumer/producer pair via a single worker + directory (not a bare
+    RegionRuntime): ticks to a GRANTED import, ticks again with nothing
+    changed, asserts pending_events(producer) == 0 (same-worker routing is
+    immediate, so a fresh request would show up as a pending event) and the
+    grant persists. Confirmed failing (gate forced dirty=true unconditionally)
+    before the fix, passing after.
+```
+
+**Review:** codex `reviewer` session. First pass: "No findings," though its
+summary paragraph initially mis-described the new test (echoing P-1's
+test instead) — caught and re-verified with a targeted follow-up naming the
+exact test and gate functions; codex re-checked file contents directly and
+confirmed "No findings on that P-2 test or the gate path," independently
+validating both the gate-ordering and the denied-import reasoning above.
+`cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test -q` all
+green throughout.
+
+**Risks / notes carried forward:** the `begin_tick_power_demand_phase` name
+is intentionally left unchanged even though it's now the *dirty-path-only*
+entry point — P-3 is where diff-apply lands and the capture/restore dance
+this function still does becomes deletable; renaming now would be premature
+churn ahead of that deletion. P-3 is next: diff-apply `power::run` itself,
+which removes the need for `begin_tick_power_phase_quiet`'s capture/reapply
+wrapper entirely and deletes the starvation-fix workaround on the dirty path
+too.

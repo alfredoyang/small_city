@@ -129,6 +129,20 @@ pub(crate) struct World {
     // freshly loaded region republishes once.
     #[serde(skip, default)]
     hints_dirty: Cell<bool>,
+    // Event-driven plan, P-2: marks that a local input to THIS region's power
+    // export demand/capacity may have changed since its last reconcile. Set
+    // inside `invalidate_resource_registry` (provider/consumer/topology
+    // changes) and `mark_road_topology_dirty` (network merges/splits) — the
+    // two chokepoints that can change what this region needs to import or has
+    // spare to export. Deliberately narrower than `hints_dirty`:
+    // `invalidate_jobs_registry` (citizen/workplace-effect changes) does not
+    // affect power at all, so it does not set this flag — a per-resource
+    // dirty flag must not be set by a chokepoint that only invalidates a
+    // different resource, or one resource's gate would spuriously reconcile
+    // on the other's changes. Cleared only by the power reconcile gate
+    // (`RegionRuntime::start_tick_power_phase`) after it actually reconciles.
+    #[serde(skip, default)]
+    power_exports_dirty: Cell<bool>,
     // Tunable footprint/building rules. `#[serde(skip)]` so they are not duplicated per region in
     // the save; the regional layer injects the save-stamped rules into each world (until then every
     // world deterministically gets the embedded default).
@@ -181,6 +195,7 @@ impl World {
             derived_dirty: Cell::new(false),
             road_topology_dirty: Cell::new(false),
             hints_dirty: Cell::new(false),
+            power_exports_dirty: Cell::new(false),
             building_rules: crate::core::building_rules::BuildingRules::default(),
             positions: HashMap::new(),
             buildings: HashMap::new(),
@@ -308,6 +323,7 @@ impl World {
     pub(crate) fn invalidate_resource_registry(&self) {
         self.registry_cache.borrow_mut().invalidate_all();
         self.hints_dirty.set(true);
+        self.power_exports_dirty.set(true);
     }
 
     /// Mark only job entries dirty after citizen or workplace-effect changes.
@@ -432,6 +448,7 @@ impl World {
     pub(crate) fn mark_road_topology_dirty(&self) {
         self.road_topology_dirty.set(true);
         self.hints_dirty.set(true);
+        self.power_exports_dirty.set(true);
     }
 
     pub(crate) fn is_road_topology_dirty(&self) -> bool {
@@ -455,6 +472,16 @@ impl World {
 
     pub(crate) fn clear_hints_dirty(&self) {
         self.hints_dirty.set(false);
+    }
+
+    /// Event-driven plan, P-2: whether a local input to this region's power
+    /// export demand/capacity changed since its last reconcile.
+    pub(crate) fn is_power_exports_dirty(&self) -> bool {
+        self.power_exports_dirty.get()
+    }
+
+    pub(crate) fn clear_power_exports_dirty(&self) {
+        self.power_exports_dirty.set(false);
     }
 
     /// Return cached local power resolution, recomputing lazily when dirty.
