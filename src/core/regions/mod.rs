@@ -35,9 +35,10 @@ use crate::core::components::{
 use crate::core::entity::Entity;
 use crate::core::resources::CityStats;
 use crate::core::simulation::{
-    TickJobPhase, TickPowerPhase, begin_tick_power_phase, continue_to_job_phase,
-    ensure_derived_state, finish_tick_after_goods_phase, finish_tick_after_job_phase,
-    imported_power_grants, reapply_imported_power, refresh_derived_state_for_world,
+    TickJobPhase, TickPowerPhase, begin_tick_power_phase, clear_imported_power,
+    continue_to_job_phase, ensure_derived_state, finish_tick_after_goods_phase,
+    finish_tick_after_job_phase, imported_power_grants, reapply_imported_power,
+    refresh_derived_state_for_world,
 };
 use crate::core::systems::{
     build, bulldoze, economy, power, replace, road_connectivity, travel, upgrade,
@@ -1030,23 +1031,26 @@ impl RegionState {
     }
 
     pub(crate) fn begin_tick_power_demand_phase(&mut self) -> RegionalTickPowerPhase {
-        // Capture before the raw local recompute, exactly like
-        // `refresh_derived_state_for_world` does for the paused-read path (see
-        // its comment) — a consumer's imported grant is still valid at this
-        // instant; it is not released until `reconcile_power_export_allocations`
-        // runs after this phase returns.
+        // Event-driven plan, P-3: capture before explicitly clearing. Diff-
+        // apply `power::run` keeps an existing `Imported` source on its own
+        // when no fresh local grant covers a consumer, so a dirty reconcile
+        // — which is about to release every producer reservation and request
+        // only what this tick's demand scan finds — must clear the captured
+        // imports itself first (`clear_imported_power`), or an import-needing
+        // consumer would still read as `powered` and never make it into the
+        // fresh batch (the round-1 desync from the starvation fix,
+        // reintroduced; see that clear/collect ordering note there).
         //
-        // Unlike that path, restore happens AFTER `pending_power_demands()`
-        // below, not before: demand collection must see the true, freshly
-        // cleared state so an imported consumer is correctly re-included in
-        // this tick's fresh request batch (skipping it here would desync the
-        // caller's local "still powered" flag from the producer's ledger,
-        // which releases the old reservation unconditionally every tick).
-        // The restore only protects reads that happen later in this same
-        // pass — e.g. this region answering another region's incoming job
-        // export request before its own fresh grant has round-tripped back —
-        // see docs/20260703-bug-cross-region-export-starvation-fix.md.
+        // Restore happens AFTER `pending_power_demands()` below, not before:
+        // demand collection must see the true, freshly cleared state so an
+        // imported consumer is correctly re-included in this tick's fresh
+        // request batch. The restore only protects reads that happen later
+        // in this same pass — e.g. this region answering another region's
+        // incoming job export request before its own fresh grant has
+        // round-tripped back — see
+        // docs/20260703-bug-cross-region-export-starvation-fix.md.
         let imported = imported_power_grants(&self.world);
+        clear_imported_power(&mut self.world, &imported);
         let phase = begin_tick_power_phase(&mut self.world, self.id);
         let power_demands = self.pending_power_demands();
         // Only restore a captured import for a consumer that actually made it
@@ -1076,18 +1080,12 @@ impl RegionState {
     /// Quiet-tick variant of `begin_tick_power_demand_phase` (event-driven
     /// plan, P-2): used when the reconcile gate finds no local or
     /// cross-region change since the last reconcile, so this tick will
-    /// neither release nor request anything. Skips the demand scan entirely
-    /// — but still runs today's raw `power::run` (via `begin_tick_power_phase`;
-    /// P-3's diff-apply makes this a no-op on clean cache), which would
-    /// otherwise drop existing imported grants. So it captures them first and
-    /// reapplies ALL of them unconditionally, UNFILTERED — unlike the dirty
-    /// path's filter-by-requestable restore, no filter is needed here because
-    /// nothing is released this tick, so every kept import still has its
-    /// producer-side reservation intact.
+    /// neither release nor request anything. Skips the demand scan entirely.
+    /// `power::run` (via `begin_tick_power_phase`) diff-applies (P-3): a
+    /// consumer with no fresh local grant keeps its existing `Imported`
+    /// source structurally, so no capture/restore is needed here at all.
     pub(crate) fn begin_tick_power_phase_quiet(&mut self) -> RegionalTickPowerPhase {
-        let imported = imported_power_grants(&self.world);
         let phase = begin_tick_power_phase(&mut self.world, self.id);
-        reapply_imported_power(&mut self.world, &imported);
         RegionalTickPowerPhase {
             phase,
             power_demands: Vec::new(),

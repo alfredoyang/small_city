@@ -1363,3 +1363,173 @@ churn ahead of that deletion. P-3 is next: diff-apply `power::run` itself,
 which removes the need for `begin_tick_power_phase_quiet`'s capture/reapply
 wrapper entirely and deletes the starvation-fix workaround on the dirty path
 too.
+
+---
+
+## P-3 — implemented (commit follows this section)
+
+**Files changed:** `src/core/systems/power.rs`, `src/core/regions/mod.rs`,
+`src/core/simulation.rs`, `src/core/resource_registry.rs`. 4 files, ~212
+lines.
+
+**Correction to P-2's closing note:** it said P-3 "deletes the starvation-fix
+workaround on the dirty path too." That turned out to be wrong once the
+ordering hazard was worked through in full — the dirty path's clear + collect
++ filter-restore dance **survives**, adapted for diff-apply; only the
+*quiet*-path wrapper (`begin_tick_power_phase_quiet`) and the *paused-refresh*
+capture/restore (`refresh_derived_state_for_world`) are fully deleted. See
+below for why the dirty path still needs it.
+
+**What changed:**
+
+- `power::run` (`power.rs`) diff-applies: for each consumer, a fresh matching
+  local grant always overwrites (imported or not); otherwise an existing
+  `Imported` source is **kept** untouched; otherwise unpowered/`None`. An
+  import now survives a raw `power::run` call structurally — no capture
+  needed to protect it from a blanket clear that no longer happens.
+- `begin_tick_power_phase_quiet` (P-2's quiet path, `regions/mod.rs`): the
+  capture/reapply-all wrapper is deleted — it now just calls
+  `begin_tick_power_phase` directly, relying on diff-apply.
+- `refresh_derived_state_for_world` (the paused build/bulldoze read path,
+  `simulation.rs`): same deletion, same reason — a paused command's derived
+  refresh no longer needs to protect imports from `power::run`.
+- `begin_tick_power_demand_phase` (the **dirty** reconcile path,
+  `regions/mod.rs`) **keeps** the capture → clear → collect → filter-restore
+  shape, with one change: it now calls the new `clear_imported_power`
+  (`simulation.rs`) explicitly, instead of relying on `power::run`'s old
+  blanket clear to do it as a side effect.
+
+**Why the dirty path still needs an explicit clear — the ordering hazard
+that survived diff-apply.** A dirty reconcile is about to release every
+producer reservation and request only what this tick's fresh demand scan
+finds. `pending_power_demands` skips any consumer already reading as
+`powered`. If diff-apply's "keep" rule were left to run unmodified here, an
+existing import would stay `powered=true` straight through `power::run`,
+`pending_power_demands` would never include it in the fresh batch, and its
+old reservation would still be released moments later — one-sided again,
+this time the ledger vanishing but the *local* grant surviving instead of
+the reverse (the starvation fix's round-1 shape, just flipped). So
+`begin_tick_power_demand_phase` calls `clear_imported_power` on the captured
+imports **before** `begin_tick_power_phase` (hence before `power::run`
+diff-applies), making them correctly appear as needing a request; the
+existing filtered restore afterward — unchanged, still only restoring
+consumers that made it into the fresh demand batch (the round-4 fix) —
+protects mid-wait reads while the fresh request is in flight, exactly as
+before.
+
+```text
+  dirty tick, before → after, step by step:
+
+  imported_power_grants(&world)        capture: [(X, demand, region_B)]
+       │
+       ▼
+  clear_imported_power(&mut world, …)   X: powered=false, source=None
+       │                                (NEW — power::run no longer
+       │                                 does this as a side effect)
+       ▼
+  begin_tick_power_phase (power::run)   diff-apply sees X with source=None:
+                                         no local grant either → stays
+                                         unpowered (correctly — nothing
+                                         to "keep", nothing local covers it)
+       │
+       ▼
+  pending_power_demands()               X now shows unpowered → included
+                                         in this tick's fresh demand batch ✓
+       │
+       ▼
+  filter by requestable, restore        X is in the batch → restored:
+                                         powered=true, source=Imported again
+                                         (mid-wait reads see X as still
+                                         effective while the fresh request
+                                         round-trips back to producer B)
+```
+
+**The stats gap codex caught.** `power::run`'s stats block computes
+`total_power_supplied`/`total_power_shortage` from `resolution` alone —
+`ResourceRegistryCache`'s local-only power resolution, which has no concept
+of cross-region imports at all (`total_demand` sums every consumer's demand
+regardless of source, but `total_supplied` only sums *local* grants). Under
+the old code, this was masked: `reapply_imported_power`'s restore step
+explicitly added the import's demand back into `total_power_supplied` every
+time it ran, and it ran on every call site. After P-3, two of those three
+call sites (quiet path, paused refresh) lost their restore step entirely —
+so a kept import's demand would silently vanish from citywide stats, showing
+a shortage that doesn't exist. Fixed inside `power::run` itself: the
+diff-apply loop now accumulates `kept_imported_demand` and adds it into
+`total_power_supplied` before the shortage computation — the one place that
+now has full visibility into which consumers are kept-imported, regardless
+of which call site invoked it.
+
+```text
+  BEFORE (bug):                          AFTER (fixed):
+  resolution.total_supplied              resolution.total_supplied
+    (local grants only)                    + kept_imported_demand
+         │                                      │
+         ▼                                      ▼
+  total_power_supplied UNDER-counts      total_power_supplied correctly
+  kept imports → shortage OVER-counts    reflects imports too → shortage
+  (visible in UI stats on every quiet    accurate on quiet ticks and the
+   tick and every paused refresh)         paused-refresh path
+```
+
+**Test changes:**
+
+```text
+  resource_registry.rs: cached_jobs_rebuild_when_imported_power_is_lost
+    OLD: relied on power::run's own blanket clear to observe an Imported→
+         unpowered transition (manually set up, no power plant in the world)
+    NEW: calls the real production mechanism directly —
+         imported_power_grants + clear_imported_power — before power::run,
+         so the test exercises actual code paths instead of a side effect
+         of the old (now-gone) unconditional clear
+
+  power.rs: two new unit tests
+    diff_apply_keeps_imported_source_when_no_local_grant_exists
+      — the core P-3 property. Confirmed fails if power::run is reverted to
+        clear-all-then-reapply-local (manually verified via revert/rerun).
+        Extended per codex's finding to also assert total_power_supplied ==
+        total_power_demand and shortage == 0 — confirmed THIS assertion
+        specifically fails if the kept_imported_demand accounting is
+        reverted alone, everything else kept
+    diff_apply_overwrites_imported_source_with_a_fresh_local_grant
+      — a consumer gaining local coverage transitions to Local, not stuck
+        showing a stale import. Passes under old code too (this property
+        was never broken) — a characterization test, not a P-3-discriminating
+        regression proof; noted as such rather than overclaiming
+```
+
+**The jobs-registry-invalidation gap found mid-implementation.**
+`clear_imported_power`'s clearing now happens *before* `power::run`'s own
+before/after snapshot — under the old code, `power::run` was both the
+clearer and the detector in one call, so its `power_state_changed` check
+always saw the transition. Splitting the clearing out means that check no
+longer observes it. A consumer that ends up restored right back nets to no
+observable change (and `apply_power_export_grant` invalidates jobs again
+regardless, once its round trip resolves) — but one that is *not* restored
+(lost its border connection, no longer requestable) has a real, lasting
+transition that nothing else would ever flag, leaving a stale "still
+effective workplace" answer in the jobs cache indefinitely. Fixed by having
+`clear_imported_power` call `world.invalidate_jobs_registry()` itself, once,
+whenever it actually clears something — coarse (a restored consumer pays a
+redundant invalidation) but correct, matching this plan's established
+"false positives are safe, false negatives are not" philosophy for dirty
+flags. Codex confirmed this reasoning independently: "closes the real
+cache-staleness gap when an import is cleared before `power::run` can
+observe the transition."
+
+**Review:** codex `reviewer` session, two passes. First pass: one High
+(the stats gap above) and one Low (a comment left describing the dirty
+path's dance as deleted when it in fact survives, adapted) — both fixed.
+Second pass, after the fixes: "No findings," including explicit
+confirmation that the dirty-path clear-before-`power::run` ordering doesn't
+double-count a cleared-then-possibly-restored consumer in
+`kept_imported_demand`. `cargo fmt`, `cargo clippy --all-targets -- -D
+warnings`, `cargo test -q` green throughout, including the full pre-existing
+cross-region starvation-fix regression suite (`regional_multi_region_play_test.rs`
+and the 3 dedicated unit tests in `regions/mod.rs`), all passing with their
+original *meaning* intact, not just green.
+
+**Risks / notes carried forward:** none new. P-4 is next: the job reconcile
+gate, mechanically repeating P-2's shape at `enter_job_phase` — no diff-apply
+equivalent needed there (jobs have no analogous "clear-then-reapply" system;
+`assign_local_jobs_for_daily_tick` already only runs on daily boundaries).

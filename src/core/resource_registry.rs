@@ -608,7 +608,7 @@ mod tests {
     use super::*;
     use crate::core::components::{BuildingData, BusinessFinance, PowerSource};
     use crate::core::regions::RegionId;
-    use crate::core::simulation::tick_world;
+    use crate::core::simulation::{clear_imported_power, imported_power_grants, tick_world};
     use crate::core::systems::{
         business_growth, citizens, placement, power, road_network_analysis,
     };
@@ -817,6 +817,17 @@ mod tests {
         road_network_analysis::run(&mut world);
 
         assert_eq!(world.cached_job_resolution().total_jobs, 2);
+
+        // Event-driven plan, P-3: `power::run` diff-applies and now KEEPS an
+        // existing `Imported` source when no local grant covers the consumer
+        // (there is no power plant anywhere in this world), instead of
+        // unconditionally clearing every consumer first. Losing an import is
+        // now `clear_imported_power`'s job (called by a dirty reconcile
+        // before re-requesting), not something `power::run` does on its own
+        // — exercise that real mechanism so this test still proves the cache
+        // invalidates and rebuilds in response to an actual power-state loss.
+        let imported = imported_power_grants(&world);
+        clear_imported_power(&mut world, &imported);
         power::run(&mut world);
 
         assert_eq!(world.cached_job_resolution().total_jobs, 0);

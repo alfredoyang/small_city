@@ -1,8 +1,10 @@
 //! Road-network power system with plant capacity, consumer demand, and deterministic allocation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use crate::core::components::PowerSource;
 use crate::core::entity::Entity;
+use crate::core::resource_registry::PowerGrant;
 use crate::core::resources::PowerStats;
 use crate::core::systems::road_connectivity;
 use crate::core::world::World;
@@ -14,27 +16,55 @@ pub(crate) fn run(world: &mut World) {
         .map(|(entity, consumer)| (*entity, consumer.powered, consumer.source))
         .collect::<Vec<_>>();
 
-    for consumer in world.power_consumers.values_mut() {
-        consumer.powered = false;
-        consumer.source = None;
-    }
-
+    // Event-driven plan, P-3: diff-apply instead of clear-then-reapply. A
+    // consumer with no local grant this pass KEEPS an existing `Imported`
+    // source untouched — imports now survive a raw `power::run` structurally,
+    // so the capture/reapply-all wrapper `begin_tick_power_phase_quiet` used
+    // to need, and the capture/restore `refresh_derived_state_for_world`
+    // used to need, are both gone. The dirty reconcile path
+    // (`begin_tick_power_demand_phase`, `regions/mod.rs`) still explicitly
+    // clears + filter-restores around this call, because it needs kept
+    // imports to become visible to that tick's fresh demand scan before its
+    // reservations are released — diff-apply alone would hide them from it.
+    // A consumer that gets a fresh local grant always overwrites any prior
+    // source, imported or not.
     let resolution = world.cached_power_resolution();
-    for grant in &resolution.grants {
-        if let Some(consumer) = world.power_consumers.get_mut(&grant.consumer) {
-            if consumer.demand != grant.amount {
-                continue;
+    let local_grants: HashMap<Entity, &PowerGrant> = resolution
+        .grants
+        .iter()
+        .map(|grant| (grant.consumer, grant))
+        .collect();
+
+    // `resolution`'s stats only ever reflect LOCAL supply — imports are a
+    // cross-region concept the registry has no visibility into. A kept
+    // import's demand must be added back in here, or it silently vanishes
+    // from total_power_supplied (and inflates shortage) the instant nothing
+    // downstream still re-adds it, which is now true on quiet ticks and the
+    // paused derived-refresh path (neither has a restore step anymore).
+    let mut kept_imported_demand = 0;
+    for (entity, consumer) in world.power_consumers.iter_mut() {
+        match local_grants.get(entity) {
+            Some(grant) if consumer.demand == grant.amount => {
+                consumer.powered = true;
+                consumer.source = Some(grant.source);
             }
-            consumer.powered = true;
-            consumer.source = Some(grant.source);
+            _ => {
+                if matches!(consumer.source, Some(PowerSource::Imported { .. })) {
+                    kept_imported_demand += consumer.demand;
+                } else {
+                    consumer.powered = false;
+                    consumer.source = None;
+                }
+            }
         }
     }
 
+    let total_power_supplied = resolution.total_supplied + kept_imported_demand;
     world.stats.power = PowerStats {
         total_power_capacity: resolution.total_capacity,
         total_power_demand: resolution.total_demand,
-        total_power_supplied: resolution.total_supplied,
-        total_power_shortage: (resolution.total_demand - resolution.total_supplied).max(0),
+        total_power_supplied,
+        total_power_shortage: (resolution.total_demand - total_power_supplied).max(0),
     };
 
     let power_state_changed = before.iter().any(|(entity, powered, source)| {
@@ -84,6 +114,7 @@ fn network_capacity(world: &World, roads: &HashSet<Entity>) -> i32 {
 mod tests {
     use super::*;
     use crate::core::components::PowerSource;
+    use crate::core::regions::RegionId;
     use crate::core::systems::placement;
     use crate::interface::input::BuildingKind;
 
@@ -171,6 +202,88 @@ mod tests {
             );
             assert!(consumer.source.is_some());
         }
+    }
+
+    #[test]
+    fn diff_apply_keeps_imported_source_when_no_local_grant_exists() {
+        // Event-driven plan, P-3: a consumer with an existing `Imported`
+        // source and no local grant available (no power plant anywhere in
+        // this world) must survive `power::run` untouched — the whole point
+        // of diff-apply is that imports no longer get wiped by a raw local
+        // recompute.
+        let mut world = World::new(3, 2);
+        placement::place_building(&mut world, 0, 0, BuildingKind::Residential);
+        placement::place_building(&mut world, 0, 1, BuildingKind::Road);
+        let consumer_entity = world.grid.get(0, 0).expect("residential");
+        let consumer = world
+            .power_consumers
+            .get_mut(&consumer_entity)
+            .expect("power consumer");
+        consumer.powered = true;
+        consumer.source = Some(PowerSource::Imported {
+            source_region: RegionId(2),
+        });
+
+        run(&mut world);
+
+        let consumer = world
+            .power_consumers
+            .get(&consumer_entity)
+            .expect("power consumer");
+        assert!(consumer.powered, "kept import must stay powered");
+        assert_eq!(
+            consumer.source,
+            Some(PowerSource::Imported {
+                source_region: RegionId(2)
+            }),
+            "diff-apply must not clear an import with no local grant to replace it"
+        );
+        assert_eq!(
+            world.stats.power.total_power_capacity, 0,
+            "capacity reflects only local resolution; no plant exists"
+        );
+        assert_eq!(
+            world.stats.power.total_power_supplied, world.stats.power.total_power_demand,
+            "a kept import's demand must count as supplied, not vanish from stats \
+             (resolution alone has no visibility into cross-region imports)"
+        );
+        assert_eq!(
+            world.stats.power.total_power_shortage, 0,
+            "a fully-covered import must not read as a shortage"
+        );
+    }
+
+    #[test]
+    fn diff_apply_overwrites_imported_source_with_a_fresh_local_grant() {
+        // Event-driven plan, P-3: a consumer marked `Imported` that GAINS
+        // local coverage (e.g. a plant was just connected) must transition to
+        // `Local`, not get stuck showing the stale import.
+        let mut world = World::new(3, 2);
+        placement::place_building(&mut world, 0, 0, BuildingKind::Residential);
+        placement::place_building(&mut world, 0, 1, BuildingKind::Road);
+        let consumer_entity = world.grid.get(0, 0).expect("residential");
+        let consumer = world
+            .power_consumers
+            .get_mut(&consumer_entity)
+            .expect("power consumer");
+        consumer.powered = true;
+        consumer.source = Some(PowerSource::Imported {
+            source_region: RegionId(2),
+        });
+        placement::place_building(&mut world, 1, 1, BuildingKind::PowerPlant);
+
+        run(&mut world);
+
+        let consumer = world
+            .power_consumers
+            .get(&consumer_entity)
+            .expect("power consumer");
+        assert!(consumer.powered);
+        assert!(
+            matches!(consumer.source, Some(PowerSource::Local(_))),
+            "a fresh local grant must overwrite a stale imported source, got {:?}",
+            consumer.source
+        );
     }
 
     fn consumer_demand_mut(world: &mut World, x: usize, y: usize) -> &mut i32 {

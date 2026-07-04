@@ -280,16 +280,13 @@ pub(crate) fn refresh_derived_state_for_world(world: &mut World, local_region: R
     if world.region_id != local_region {
         world.set_region_id(local_region);
     }
-    // Cross-region imported power is reserved in the runtime ledger and only
-    // (re)applied during a tick's export phase. `power::run` clears every consumer
-    // and re-applies only *local* grants, so running this derived pass for a paused
-    // config change (build/bulldoze) would drop still-valid imports and make
-    // imported-powered buildings flash unpowered until the next tick. Capture the
-    // imports first, then restore the ones local power did not cover. The next real
-    // tick re-derives imports authoritatively through the cross-region flow.
-    let imported = imported_power_grants(world);
+    // Event-driven plan, P-3: `power::run` diff-applies — a consumer with no
+    // fresh local grant keeps its existing `Imported` source structurally, so
+    // running this derived pass for a paused config change (build/bulldoze)
+    // no longer needs a capture/restore to protect still-valid imports; the
+    // next real tick re-derives imports authoritatively through the
+    // cross-region flow, same as before.
     power::run(world);
-    reapply_imported_power(world, &imported);
     road_network_analysis::run(world);
     stats::refresh_population_and_jobs(world);
     pollution::run(world);
@@ -299,13 +296,12 @@ pub(crate) fn refresh_derived_state_for_world(world: &mut World, local_region: R
     happiness::run(world);
 }
 
-/// Imported-power grants currently held by consumers, captured before a local
-/// power recompute so a paused derived pass can restore them (see
-/// `refresh_derived_state_for_world`). Also used by
-/// `RegionState::begin_tick_power_demand_phase` (`regions/mod.rs`) to protect
-/// reads that happen later in the same tick, after the raw recompute in
-/// `begin_tick_power_phase` — see
-/// `docs/20260703-bug-cross-region-export-starvation-fix.md`.
+/// Imported-power grants currently held by consumers. Used by
+/// `RegionState::begin_tick_power_demand_phase` (`regions/mod.rs`), which
+/// pairs this with `clear_imported_power` and `reapply_imported_power` to
+/// protect reads that happen later in the same tick, after the recompute in
+/// `begin_tick_power_phase`, while a dirty reconcile's fresh demand batch is
+/// still in flight — see `docs/20260703-bug-cross-region-export-starvation-fix.md`.
 pub(crate) fn imported_power_grants(world: &World) -> Vec<(Entity, i32, RegionId)> {
     world
         .power_consumers
@@ -317,6 +313,41 @@ pub(crate) fn imported_power_grants(world: &World) -> Vec<(Entity, i32, RegionId
             _ => None,
         })
         .collect()
+}
+
+/// Clears previously-held imported power on the given consumers (event-driven
+/// plan, P-3). Diff-apply `power::run` keeps an existing `Imported` source by
+/// default when no fresh local grant covers a consumer, so a dirty reconcile
+/// — about to release every producer reservation and request only what this
+/// tick's demand scan finds — must explicitly clear the ones it captured
+/// first. Skipping this would leave an import-needing consumer still reading
+/// as `powered`, so `pending_power_demands` (which skips anything already
+/// powered) would never include it in the fresh batch even though its old
+/// reservation is unconditionally released — the starvation fix's round-1
+/// desync, reintroduced. `power::run` (called after this) recomputes
+/// `world.stats.power` from scratch, so no stats adjustment is needed here.
+///
+/// Invalidates the jobs registry itself (once, if anything was actually
+/// cleared): this clearing happens *before* `power::run`'s own before/after
+/// snapshot, so `power::run`'s `power_state_changed` check — which used to
+/// catch this transition for free when it was the one doing the clearing —
+/// can no longer see it. A consumer that ends up restored by
+/// `reapply_imported_power` right after nets out to no observable change (an
+/// `apply_power_export_grant` reply invalidates jobs again either way once
+/// the round trip resolves), but one that is *not* restored (e.g. it lost its
+/// border connection) has a real, lasting transition that nothing else would
+/// ever flag.
+pub(crate) fn clear_imported_power(world: &mut World, imported: &[(Entity, i32, RegionId)]) {
+    if imported.is_empty() {
+        return;
+    }
+    for &(entity, ..) in imported {
+        if let Some(consumer) = world.power_consumers.get_mut(&entity) {
+            consumer.powered = false;
+            consumer.source = None;
+        }
+    }
+    world.invalidate_jobs_registry();
 }
 
 /// Re-applies previously-held imported power to consumers that local resolution
