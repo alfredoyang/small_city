@@ -514,6 +514,16 @@ impl RegionState {
         self.world.clear_jobs_exports_dirty();
     }
 
+    /// Event-driven plan, P-5: whether this region's goods export demand/
+    /// capacity may have changed since its last reconcile.
+    pub(crate) fn is_goods_exports_dirty(&self) -> bool {
+        self.world.is_goods_exports_dirty()
+    }
+
+    pub(crate) fn clear_goods_exports_dirty(&self) {
+        self.world.clear_goods_exports_dirty();
+    }
+
     /// Returns a UI-safe snapshot without exposing this region's ECS world.
     ///
     /// This is a pure read of already-applied derived state. Because regions are
@@ -1262,10 +1272,14 @@ impl RegionState {
 
     pub(crate) fn add_commercial_goods(&mut self, commercial: Entity, units: u32) {
         economy::add_commercial_goods(&mut self.world, commercial, units as i32);
-        // Event-driven plan, P-1: this cross-region delivery path writes
+        // Event-driven plan, P-1/P-5: this cross-region delivery path writes
         // `local_goods_stored` directly and bypasses every invalidate_*/mark_*
-        // chokepoint, so it needs its own explicit hints_dirty mark.
+        // chokepoint, so it needs its own explicit marks — both hints (so
+        // remote shoppers see updated availability) and this region's own
+        // goods export dirty flag (a delivered shipment changes this
+        // building's future free capacity).
         self.world.mark_hints_dirty();
+        self.world.mark_goods_exports_dirty();
     }
 
     /// Returns spare local workplace slot entities reachable from one road network.

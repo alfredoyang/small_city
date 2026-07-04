@@ -186,6 +186,24 @@ pub(crate) fn finish_tick_after_goods_phase(
         // bypasses every invalidate_*/mark_* chokepoint — mark explicitly so a
         // goods-only change still republishes this region's availability hints.
         world.mark_hints_dirty();
+        // Event-driven plan, P-5: same bypass applies to the goods export
+        // dirty flag, but UNLIKE hints (a cheap, idempotence-checked
+        // republish), a spurious mark here forces a real cross-region round
+        // trip attempt. Marking unconditionally on every daily tick would
+        // dirty every region's goods gate forever, regardless of whether it
+        // has any commercial/industrial building at all (this call site is
+        // gated only on the daily boundary, not on goods activity) — making
+        // the whole gate a no-op. So: only when the settlement's own
+        // breakdown shows nonzero goods activity, which is exactly what a
+        // goods-inactive region (zero commercial/industrial buildings)
+        // never has.
+        if economy.local_goods_produced != 0
+            || economy.local_goods_sold != 0
+            || economy.imported_goods_sold != 0
+            || economy.exported_goods != 0
+        {
+            world.mark_goods_exports_dirty();
+        }
         economy
     } else {
         economy::EconomyBreakdown::default()

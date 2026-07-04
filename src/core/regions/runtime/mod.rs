@@ -319,6 +319,8 @@ pub struct RegionRuntime {
     // (which updates its own marker every hour) can never absorb a bump or
     // local change destined for the daily job gate.
     seen_jobs_generation: u64,
+    // Event-driven plan, P-5: same shape, for the goods reconcile gate.
+    seen_goods_generation: u64,
     handle: RegionHandle,
     receiver: RegionEventReceiver,
 }
@@ -575,6 +577,7 @@ impl RegionRuntime {
             discovery_generation: 0,
             seen_power_generation: 0,
             seen_jobs_generation: 0,
+            seen_goods_generation: 0,
             handle,
             receiver,
         }
@@ -1050,6 +1053,15 @@ impl RegionRuntime {
         outbound
     }
 
+    /// Event-driven plan, P-5: same gate shape as P-2/P-4, wrapping the
+    /// whole reconcile decision. `enter_goods_phase` is only ever reached on
+    /// a daily boundary in practice — `enter_job_phase`'s own `is_daily()`
+    /// early-out (above) returns before calling this on an hourly tick — so
+    /// no separate `is_daily()` check is needed here; this gate only ever
+    /// decides dirty-vs-quiet for the daily case, same cadence as before
+    /// this patch. `apply_pending_goods_stock` and
+    /// `continue_tick_to_goods_demand_phase` always run regardless of the
+    /// gate (same as power's quiet path still running `power::run`).
     fn enter_goods_phase(
         &mut self,
         request_id: UiRequestId,
@@ -1057,6 +1069,18 @@ impl RegionRuntime {
     ) -> Vec<OutboundMessage> {
         self.apply_pending_goods_stock();
         let phase = self.state.continue_tick_to_goods_demand_phase(job_phase);
+        let dirty = self.state.is_goods_exports_dirty()
+            || self.discovery_generation > self.seen_goods_generation;
+        if !dirty {
+            // Quiet: existing grants + the producer's ledger persist; no
+            // release, no requests.
+            let response = self.finish_goods_phase(request_id, phase);
+            let mut outbound = vec![OutboundMessage::RegionTickCompleted(response)];
+            outbound.extend(self.drained_traveler_handoff_messages());
+            return outbound;
+        }
+        self.seen_goods_generation = self.discovery_generation;
+        self.state.clear_goods_exports_dirty();
         self.reconcile_goods_export_allocations(request_id, phase)
     }
 
@@ -1637,6 +1661,66 @@ mod tick_state_tests {
                         | OutboundMessage::JobExportRequested(_)
                 )),
                 "day 2 must be genuinely quiet: no job export traffic at all"
+            );
+        }
+    }
+
+    #[test]
+    fn daily_tick_without_goods_demands_releases_goods_allocations_before_finishing() {
+        // Event-driven plan, P-5: mirrors the job version above, but for
+        // goods. Same border-safe fixture (a lone Commercial building on a
+        // grid large enough that its road never touches an edge, so
+        // pending_goods_demands's border_networks check is always empty,
+        // and nothing can ever pause waiting for a producer that doesn't
+        // exist in this bare-runtime test). Placing the Commercial building
+        // dirties goods_exports_dirty from construction
+        // (invalidate_resource_registry), so day 1's reconcile genuinely
+        // fires with zero actual goods demands.
+        let mut region = RegionState::new(RegionId(2), 5, 5);
+        assert!(region.build(2, 2, BuildingKind::Commercial).success);
+        assert!(region.build(2, 1, BuildingKind::Road).success);
+        let mut runtime = RegionRuntime::new(region);
+        let mut last_outbound = Vec::new();
+
+        for request_id in 1..=24 {
+            runtime.push_event(RegionEvent::Tick {
+                request_id: UiRequestId(request_id),
+            });
+            last_outbound = runtime.process_next_event();
+            assert!(!runtime.tick_state.is_waiting());
+        }
+
+        let goods_release = message_index(&last_outbound, |message| {
+            matches!(message, OutboundMessage::GoodsExportAllocationsReleased(_))
+        });
+        let completed = message_index(&last_outbound, |message| {
+            matches!(message, OutboundMessage::RegionTickCompleted(_))
+        });
+        assert!(
+            goods_release < completed,
+            "goods reconciliation should release old allocations before finishing"
+        );
+
+        // Event-driven plan, P-5 (positive proof): this region has no
+        // industrial building and no citizens, so the daily economy
+        // settlement's own EconomyBreakdown shows zero goods activity every
+        // day (local_goods_produced/sold, imported_goods_sold,
+        // exported_goods all stay 0) — the conditional mark in
+        // finish_tick_after_goods_phase never re-dirties goods_exports_dirty
+        // after day 1's reconcile clears it. Day 2 must be genuinely quiet.
+        for request_id in 25..=48 {
+            runtime.push_event(RegionEvent::Tick {
+                request_id: UiRequestId(request_id),
+            });
+            let outbound = runtime.process_next_event();
+            assert!(!runtime.tick_state.is_waiting());
+            assert!(
+                !outbound.iter().any(|message| matches!(
+                    message,
+                    OutboundMessage::GoodsExportAllocationsReleased(_)
+                        | OutboundMessage::GoodsExportRequested(_)
+                )),
+                "day 2 must be genuinely quiet: no goods export traffic at all"
             );
         }
     }

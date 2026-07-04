@@ -1662,3 +1662,117 @@ assignments? If goods stock and export reservations *persist* (accumulate)
 rather than reset-and-reassign, P-5's quiet path may behave more like power's
 (broadly reachable) than jobs' (narrowly reachable) — this must be verified
 against the actual goods code before assuming either shape.
+
+---
+
+## P-5 — implemented (commit follows this section)
+
+**Files changed:** `src/core/world.rs`, `src/core/regions/mod.rs`,
+`src/core/regions/runtime/mod.rs`, `src/core/simulation.rs`. 4 files, ~156
+lines.
+
+**The risk flagged at the end of P-4 turned out not to apply — goods has no
+wipe-and-reassign mechanic.** `continue_tick_to_goods_demand_phase`'s demand
+collection (`pending_goods_demands`) is a **pure, side-effect-free
+projection** off `local_goods_stored` — unlike jobs, nothing resets it before
+collection. So goods was structurally safe for a straightforward gate. But a
+**different, more severe deviation** from "identical shape to P-2/P-4"
+surfaced instead, caught during design rather than after a broken test.
+
+**What changed:** `World::goods_exports_dirty` and
+`RegionRuntime::seen_goods_generation`, gating `enter_goods_phase` the same
+shape as power/jobs. `goods_exports_dirty` set inside
+`invalidate_resource_registry` and `mark_road_topology_dirty` (goods flow
+gates on `is_effective_workplace = powered && road_connected`, same
+dependency jobs has on power — confirmed by reading
+`goods_distribution_after_local_storage`'s own use of `is_effective_workplace`)
+— deliberately **not** `invalidate_jobs_registry`, since goods cares about
+powered/connected buildings, never citizen/employment state. No separate
+`is_daily()` early-out needed in `enter_goods_phase` itself:
+`enter_job_phase`'s own `is_daily()` early-out already means
+`enter_goods_phase` is never reached on an hourly tick in practice, so one
+gate decision covers the (always daily) case cleanly.
+
+**The deviation: `hints_dirty`'s existing unconditional-mark pattern would
+have made this whole patch a no-op.** P-1 already marks `hints_dirty`
+unconditionally inside `finish_tick_after_goods_phase`'s daily-settlement
+block, because `distribute_local_goods`/`consume_local_good` write
+`local_goods_stored` directly, bypassing every chokepoint. The natural,
+"identical shape" move would be to mark `goods_exports_dirty` the same way,
+at the same site. That would have been wrong:
+
+```text
+  finish_tick_after_goods_phase's `if phase.is_daily` block runs for
+  EVERY region's EVERY daily tick — regardless of whether that region
+  has a single commercial or industrial building.
+
+  hints_dirty unconditional there:  fine — republishing a hint is a cheap,
+                                     idempotence-checked no-op at the
+                                     directory when nothing changed.
+
+  goods_exports_dirty unconditional there:  NOT fine — the gate skipping
+                                     a reconcile means skipping an actual
+                                     cross-region release/request attempt.
+                                     Marking it dirty every day, for every
+                                     region, forever, makes the whole gate
+                                     permanently dirty — zero regions ever
+                                     go quiet — P-5 provides NO savings
+                                     to ANYONE, silently.
+```
+
+Caught this before writing the unconditional version at all, by asking "does
+this call site fire regardless of goods activity" before copying the P-1
+precedent. The fix: mark `goods_exports_dirty` **conditionally**, gated on
+whether the just-computed `EconomyBreakdown` shows any nonzero goods activity
+(`local_goods_produced`, `local_goods_sold`, `imported_goods_sold`,
+`exported_goods`) — a signal that costs nothing extra, since the breakdown is
+already computed by the settlement call this mark sits inside. Verified this
+distinction is load-bearing, not cosmetic, by manually reverting to the
+unconditional version (keeping everything else) and re-running the new
+regression test — it failed the same way the real bug would have. Codex
+confirmed independently: "`hints_dirty` can be over-eager because publish is
+cheap/idempotence-checked; goods dirty forces release/request work, so
+unconditional daily marking would erase the win."
+
+**Test:** `daily_tick_without_goods_demands_releases_goods_allocations_before_finishing`
+(runtime/mod.rs) — same border-safe fixture shape as the jobs test (a lone
+Commercial building on a grid large enough its road never touches an edge,
+so nothing can pause waiting for a producer that doesn't exist in this
+bare-runtime test). Day 1's reconcile fires (dirty from construction) with
+zero actual demands; day 2 must be genuinely quiet — confirmed both that the
+real gate makes this pass and that forcing `dirty = true` breaks it, **and**
+that reverting only the conditional-mark logic (to the unconditional
+`hints_dirty`-style version) also breaks it, proving the conditional design
+specifically matters, not just the gate's existence. No pre-existing test
+needed adaptation this time — nothing previously asserted the old
+unconditional-release behavior for goods specifically, and all of the
+existing active-goods-trade tests (`goods_trade_worker` and friends) still
+pass: a region with ongoing goods trade stays dirty via the same mechanism
+jobs' remote-employment case does (consumer-side delivery marks through
+`add_commercial_goods`, producer-side activity marks through the
+conditional daily-settlement check) — it simply never goes quiet, which
+matches the gate's model rather than breaking it.
+
+**Review:** codex `reviewer` session, two passes. First: one Low (a comment
+overstating that the goods gate handles hourly ticks directly, when in fact
+`enter_job_phase`'s own early-out means goods never sees one) — fixed.
+Second, targeted re-check: clean. Confirmed independently: the
+conditional-vs-unconditional distinction between `hints_dirty` and
+`goods_exports_dirty` is correct; the `EconomyBreakdown` condition is
+complete for current goods-mutation paths; the `invalidate_jobs_registry`
+exclusion is correct (goods cares about powered/connected buildings, not
+employment); `seen_goods_generation` as a third independent marker is
+deterministic and avoids resource-gate absorption. `cargo fmt`, `cargo
+clippy --all-targets -- -D warnings`, `cargo test -q` green throughout.
+
+**Risks / notes carried forward:** none new. All three resource gates
+(power/jobs/goods) now share the identical structural shape
+(`*_exports_dirty` flag + `seen_*_generation` marker + gate-before-reconcile),
+even though their *reachable quiet states* differ meaningfully: power's is
+broad (any settled import, granted or denied, goes quiet once nothing
+changes); jobs' and goods' are narrow (any ongoing remote employment or
+active goods trade keeps reconciling daily, by design, matching what each
+resource's underlying gameplay mechanic actually requires). P-6 is next:
+slimming `begin_tick_power_phase` to make a fully quiet tick's cost explicit,
+plus documentation and absorbing the two live `TODO(CR allocation
+lifecycle)` comments this whole patch series has been implementing.

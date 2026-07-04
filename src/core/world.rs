@@ -155,6 +155,25 @@ pub(crate) struct World {
     // actually reconciles.
     #[serde(skip, default)]
     jobs_exports_dirty: Cell<bool>,
+    // Event-driven plan, P-5: marks that a local input to THIS region's goods
+    // export demand/capacity may have changed since its last reconcile. Set
+    // inside `invalidate_resource_registry` (goods flow gates on
+    // `is_effective_workplace`, same as jobs, so power/topology changes
+    // apply) and `mark_road_topology_dirty` (goods routing). NOT set by
+    // `invalidate_jobs_registry`: `is_effective_workplace` checks
+    // `powered && road_connected`, never citizen/employment state, so a
+    // citizen spawning does not affect which buildings can trade goods.
+    // Unlike `hints_dirty`'s unconditional per-settlement mark (a
+    // republish there is cheap and idempotence-checked), the daily-economy
+    // mutation site marks this flag ONLY when the settlement's own
+    // breakdown shows nonzero goods activity — an unconditional mark would
+    // dirty every region's goods gate every single day regardless of
+    // whether it has any commercial/industrial building at all, since that
+    // call site is gated only on the daily boundary, not on goods activity,
+    // making the whole gate a no-op. Cleared only by the goods reconcile
+    // gate (`RegionRuntime::enter_goods_phase`) after it actually reconciles.
+    #[serde(skip, default)]
+    goods_exports_dirty: Cell<bool>,
     // Tunable footprint/building rules. `#[serde(skip)]` so they are not duplicated per region in
     // the save; the regional layer injects the save-stamped rules into each world (until then every
     // world deterministically gets the embedded default).
@@ -209,6 +228,7 @@ impl World {
             hints_dirty: Cell::new(false),
             power_exports_dirty: Cell::new(false),
             jobs_exports_dirty: Cell::new(false),
+            goods_exports_dirty: Cell::new(false),
             building_rules: crate::core::building_rules::BuildingRules::default(),
             positions: HashMap::new(),
             buildings: HashMap::new(),
@@ -338,6 +358,7 @@ impl World {
         self.hints_dirty.set(true);
         self.power_exports_dirty.set(true);
         self.jobs_exports_dirty.set(true);
+        self.goods_exports_dirty.set(true);
     }
 
     /// Mark only job entries dirty after citizen or workplace-effect changes.
@@ -465,6 +486,7 @@ impl World {
         self.hints_dirty.set(true);
         self.power_exports_dirty.set(true);
         self.jobs_exports_dirty.set(true);
+        self.goods_exports_dirty.set(true);
     }
 
     pub(crate) fn is_road_topology_dirty(&self) -> bool {
@@ -508,6 +530,22 @@ impl World {
 
     pub(crate) fn clear_jobs_exports_dirty(&self) {
         self.jobs_exports_dirty.set(false);
+    }
+
+    /// Event-driven plan, P-5: whether a local input to this region's goods
+    /// export demand/capacity changed since its last reconcile. Also set
+    /// explicitly by the daily economy settlement when it reports nonzero
+    /// goods activity (goods stock mutations bypass every chokepoint above).
+    pub(crate) fn mark_goods_exports_dirty(&self) {
+        self.goods_exports_dirty.set(true);
+    }
+
+    pub(crate) fn is_goods_exports_dirty(&self) -> bool {
+        self.goods_exports_dirty.get()
+    }
+
+    pub(crate) fn clear_goods_exports_dirty(&self) {
+        self.goods_exports_dirty.set(false);
     }
 
     /// Return cached local power resolution, recomputing lazily when dirty.
