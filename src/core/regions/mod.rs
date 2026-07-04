@@ -484,6 +484,15 @@ impl RegionState {
         self.world.clear_road_topology_dirty();
     }
 
+    /// Event-driven plan, P-1: whether this region's availability hints are stale.
+    pub(crate) fn is_hints_dirty(&self) -> bool {
+        self.world.is_hints_dirty()
+    }
+
+    pub(crate) fn clear_hints_dirty(&self) {
+        self.world.clear_hints_dirty();
+    }
+
     /// Returns a UI-safe snapshot without exposing this region's ECS world.
     ///
     /// This is a pure read of already-applied derived state. Because regions are
@@ -1214,6 +1223,10 @@ impl RegionState {
 
     pub(crate) fn add_commercial_goods(&mut self, commercial: Entity, units: u32) {
         economy::add_commercial_goods(&mut self.world, commercial, units as i32);
+        // Event-driven plan, P-1: this cross-region delivery path writes
+        // `local_goods_stored` directly and bypasses every invalidate_*/mark_*
+        // chokepoint, so it needs its own explicit hints_dirty mark.
+        self.world.mark_hints_dirty();
     }
 
     /// Returns spare local workplace slot entities reachable from one road network.
@@ -1303,6 +1316,10 @@ impl RegionState {
         // the `home` Entity already packs its birth region.
         world.set_region_id(id);
         refresh_derived_state_for_world(&mut world, id);
+        // Event-driven plan, P-1: force hints_dirty true on load (runtime state,
+        // including this flag, is never serialized) so the first worker pass
+        // after load republishes this region's availability hints.
+        world.mark_hints_dirty();
 
         Self { id, world }
     }

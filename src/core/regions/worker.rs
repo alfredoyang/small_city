@@ -575,11 +575,27 @@ impl RegionWorker {
                 runtime.set_region_routes(&exits);
                 runtime.state().clear_road_topology_dirty();
             }
+        }
+
+        // P-1 (event-driven plan): a second sweep over EVERY owned region, not
+        // only ones with pending events this pass — closes the stale-hint gap
+        // where an event-idle region's directory entry never catches up.
+        // Gated on hints_dirty: a clean region costs one flag check.
+        for runtime in &mut self.regions {
+            if !runtime.state().is_hints_dirty() {
+                continue;
+            }
+            // Hints read derived state; a region reached only through this
+            // sweep (zero events this pass) may still have a paused command
+            // from an earlier pass, so ensure it's current before reading.
+            runtime.ensure_derived_state();
+            let region_id = runtime.region_id();
             changed_summaries.push((
-                source_region,
+                region_id,
                 runtime.state().network_border_links(),
                 runtime.state().availability_hints(),
             ));
+            runtime.state().clear_hints_dirty();
         }
 
         for (region_id, links, hints) in changed_summaries {

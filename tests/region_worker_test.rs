@@ -334,6 +334,16 @@ fn stale_spare_power_hint_routes_to_producer_but_denies_cleanly() {
             &[(0, 0)],
         )))
         .unwrap();
+    // Event-driven plan P-1: a freshly constructed region starts with
+    // hints_dirty=true (every attach_* during setup sets it) and the worker's
+    // event-idle sweep republishes any owned region with hints_dirty set on
+    // its very next pass, regardless of pending events. Prime both regions
+    // with a no-op pass first so that sweep runs and clears the flag on their
+    // accurate state, THEN overwrite the directory with the deliberately
+    // stale hint below — otherwise the sweep would immediately correct
+    // producer's entry before `request_pass` ever reads it, defeating the
+    // staleness this test exercises.
+    assert_eq!(worker.process_region_events(1).processed_regions, 0);
     directory.publish_region(
         producer,
         vec![NetworkBorderLink {
@@ -367,6 +377,58 @@ fn stale_spare_power_hint_routes_to_producer_but_denies_cleanly() {
     assert_eq!(turn(&worker, caller), 1);
     assert!(!cell_powered(&worker, caller, 0, 0));
     assert_eq!(turn(&worker, producer), 0);
+}
+
+#[test]
+fn event_idle_region_republishes_dirty_hints_on_next_pass() {
+    // P-1 (event-driven plan): a region's hints_dirty flag is set by every
+    // attach_* chokepoint, including the ones `RegionState::build` runs during
+    // test setup — and `add_region`'s one-time initial publish does NOT clear
+    // it, so the flag stays true even though the hint it just published is
+    // accurate. Simulate the directory drifting out of sync afterward (as if
+    // published by a stale process) and confirm the worker's event-idle sweep
+    // self-corrects it on the very next pass, even though this region never
+    // receives a single event. Before P-1, only regions with
+    // `pending_event_count() > 0` republished, so this correction would never
+    // happen — the stale, manually-corrupted entry would persist forever.
+    let region_id = RegionId(91);
+    let mut region = RegionState::new(region_id, 3, 2);
+    assert!(region.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(region.build(0, 1, BuildingKind::Road).success);
+    let directory = Arc::new(RegionDirectory::new(Vec::new()));
+    let mut worker = test_worker_with_directory(WorkerId(61), Arc::clone(&directory));
+    worker.add_region(RegionRuntime::new(region)).unwrap();
+
+    // Corrupt the directory as if a stale process published the wrong hint.
+    let links = worker
+        .region(region_id)
+        .unwrap()
+        .state()
+        .network_border_links();
+    directory.publish_region(
+        region_id,
+        links,
+        vec![RegionalAvailabilityHint {
+            network: network(91, 0),
+            has_spare_power: false,
+            spare_job_slot_ids: Vec::new(),
+            spare_goods_units: 0,
+        }],
+    );
+    assert!(!directory.discovery_snapshot().availability_hints[0].has_spare_power);
+
+    // No event pushed anywhere: the region is event-idle this pass.
+    let summary = worker.process_region_events(1);
+    assert_eq!(
+        summary.processed_regions, 0,
+        "region had zero pending events"
+    );
+
+    let discovery = directory.discovery_snapshot();
+    assert!(
+        discovery.availability_hints[0].has_spare_power,
+        "event-idle sweep must self-correct the region's real (accurate) hint"
+    );
 }
 
 #[test]

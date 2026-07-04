@@ -115,6 +115,20 @@ pub(crate) struct World {
     // invalidation flags; split by subsystem if config mutation grows.
     #[serde(skip, default)]
     road_topology_dirty: Cell<bool>,
+    // Event-driven plan (docs/20260703-event-driven-architecture.md), P-1:
+    // marks this region's cross-region availability hints (`availability_hints`)
+    // stale. Set inside the same chokepoints that already invalidate the inputs
+    // hints are derived from (`invalidate_resource_registry`,
+    // `invalidate_jobs_registry`, `mark_road_topology_dirty`) so both command-side
+    // AND tick-internal mutations (citizen growth, business growth, applied
+    // cross-region grants) flip it — unlike `derived_dirty`, which is
+    // deliberately commands-only. Goods stock bypasses all three chokepoints
+    // (it mutates `building.data.local_goods_stored` directly), so it gets an
+    // explicit mark at its two write sites instead. Cleared only by the worker
+    // after a successful publish; forced true again on load (`from_world`) so a
+    // freshly loaded region republishes once.
+    #[serde(skip, default)]
+    hints_dirty: Cell<bool>,
     // Tunable footprint/building rules. `#[serde(skip)]` so they are not duplicated per region in
     // the save; the regional layer injects the save-stamped rules into each world (until then every
     // world deterministically gets the embedded default).
@@ -166,6 +180,7 @@ impl World {
             away_generation: HashMap::new(),
             derived_dirty: Cell::new(false),
             road_topology_dirty: Cell::new(false),
+            hints_dirty: Cell::new(false),
             building_rules: crate::core::building_rules::BuildingRules::default(),
             positions: HashMap::new(),
             buildings: HashMap::new(),
@@ -292,11 +307,13 @@ impl World {
     /// Mark all registry entries dirty after topology/provider/consumer changes.
     pub(crate) fn invalidate_resource_registry(&self) {
         self.registry_cache.borrow_mut().invalidate_all();
+        self.hints_dirty.set(true);
     }
 
     /// Mark only job entries dirty after citizen or workplace-effect changes.
     pub(crate) fn invalidate_jobs_registry(&self) {
         self.registry_cache.borrow_mut().invalidate_jobs();
+        self.hints_dirty.set(true);
     }
 
     /// P2: drop every entry in the route cache. Called when a road is created
@@ -414,6 +431,7 @@ impl World {
     /// Marks the local road graph / border-link report stale for Layer-1 pricing.
     pub(crate) fn mark_road_topology_dirty(&self) {
         self.road_topology_dirty.set(true);
+        self.hints_dirty.set(true);
     }
 
     pub(crate) fn is_road_topology_dirty(&self) -> bool {
@@ -422,6 +440,21 @@ impl World {
 
     pub(crate) fn clear_road_topology_dirty(&self) {
         self.road_topology_dirty.set(false);
+    }
+
+    /// Marks this region's cross-region availability hints stale (P-1). Also
+    /// called explicitly at the goods-stock write sites, which bypass every
+    /// other chokepoint above.
+    pub(crate) fn mark_hints_dirty(&self) {
+        self.hints_dirty.set(true);
+    }
+
+    pub(crate) fn is_hints_dirty(&self) -> bool {
+        self.hints_dirty.get()
+    }
+
+    pub(crate) fn clear_hints_dirty(&self) {
+        self.hints_dirty.set(false);
     }
 
     /// Return cached local power resolution, recomputing lazily when dirty.
