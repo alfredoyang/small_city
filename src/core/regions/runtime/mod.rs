@@ -314,6 +314,11 @@ pub struct RegionRuntime {
     // is serialized (`RegionRuntime` never is).
     discovery_generation: u64,
     seen_power_generation: u64,
+    // Event-driven plan, P-4: same shape as `seen_power_generation`, but for
+    // the job reconcile gate — a separate marker so the hourly power gate
+    // (which updates its own marker every hour) can never absorb a bump or
+    // local change destined for the daily job gate.
+    seen_jobs_generation: u64,
     handle: RegionHandle,
     receiver: RegionEventReceiver,
 }
@@ -569,6 +574,7 @@ impl RegionRuntime {
             pending_goods_stock: Vec::new(),
             discovery_generation: 0,
             seen_power_generation: 0,
+            seen_jobs_generation: 0,
             handle,
             receiver,
         }
@@ -953,6 +959,15 @@ impl RegionRuntime {
     /// Emits a job allocation release for this caller generation, then either
     /// finishes the tick immediately (no job seekers need a remote slot) or sends
     /// one job export request per seeker and pauses in `WaitingForJobExports`.
+    ///
+    /// Event-driven plan, P-4: the daily cadence stays (jobs only ever
+    /// resolve on a daily boundary — gameplay hysteresis, not this plan's
+    /// concern); on top of it, a gate mirroring P-2's power shape decides
+    /// whether the daily reconcile does any release/request work at all.
+    /// Local job assignment (`continue_tick_to_job_demand_phase`, which also
+    /// collects `phase.job_demands`) always runs regardless of the gate —
+    /// same as power's quiet path still running `power::run` — only the
+    /// cross-region release/request round trip is skipped.
     fn enter_job_phase(
         &mut self,
         request_id: UiRequestId,
@@ -967,6 +982,20 @@ impl RegionRuntime {
             outbound.extend(self.drained_traveler_handoff_messages());
             return outbound;
         }
+        let dirty = self.state.is_jobs_exports_dirty()
+            || self.discovery_generation > self.seen_jobs_generation;
+        if !dirty {
+            // Quiet daily: existing grants + the producer's ledger persist;
+            // no release, no requests. `phase.job_demands` may still be
+            // non-empty (a persistent, still-unmet seeker) — repeating an
+            // identical request against unchanged producer state is
+            // guaranteed by determinism to produce an identical outcome, so
+            // skipping it loses no correctness (the same reasoning already
+            // applied to a denied power import in P-2).
+            return self.enter_goods_phase(request_id, phase);
+        }
+        self.seen_jobs_generation = self.discovery_generation;
+        self.state.clear_jobs_exports_dirty();
         self.reconcile_job_export_allocations(request_id, phase)
     }
 
@@ -1532,15 +1561,34 @@ mod tick_state_tests {
 
     #[test]
     fn daily_tick_without_job_demands_releases_job_allocations_before_finishing() {
-        // Event-driven plan, P-2: this empty region's power gate goes quiet
-        // after its first tick (nothing ever dirties it or moves its
-        // generation across these 24 ticks), so it no longer emits a
+        // Event-driven plan, P-2: this region's power gate goes quiet after
+        // its first tick (nothing ever dirties it or moves its generation
+        // across these 24 ticks), so it no longer emits a
         // `PowerExportAllocationsReleased` on the 24th (daily) tick — that
         // part of the original assertion tested the pre-P-2 unconditional
-        // reconcile, not this test's actual subject. Jobs are ungated until
-        // P-4, so `reconcile_job_export_allocations` still runs unconditionally
-        // on every daily boundary; that ordering guarantee is what remains.
-        let mut runtime = RegionRuntime::new(RegionState::new(RegionId(1), 2, 2));
+        // reconcile, not this test's actual subject.
+        //
+        // Event-driven plan, P-4: jobs are now gated too, on `jobs_exports_dirty`
+        // (or a moved generation). A genuinely empty region (the original
+        // fixture here) starts and stays clean forever, so its daily
+        // reconcile would ALSO go quiet — no longer able to exercise this
+        // test's actual subject at all. One building is enough to dirty
+        // `jobs_exports_dirty` from construction (placement's
+        // `invalidate_resource_registry` chokepoint sets it, same as
+        // `power_exports_dirty`), so day 1's reconcile genuinely fires, with
+        // zero actual job demands (no citizens exist yet to seek one) — the
+        // exact "without_job_demands" shape this test's name describes. Built
+        // on a grid large enough that the road sits away from every edge, so
+        // `network_border_links` reports no border link at all — nothing
+        // (power, jobs, or goods) can attempt a real cross-region request, so
+        // the tick can never pause waiting for a producer that doesn't exist
+        // in this bare-runtime test. The gate itself doesn't care: it decides
+        // purely from `jobs_exports_dirty`/generation, independent of whether
+        // `phase.job_demands` ends up empty.
+        let mut region = RegionState::new(RegionId(1), 5, 5);
+        assert!(region.build(2, 2, BuildingKind::Commercial).success);
+        assert!(region.build(2, 1, BuildingKind::Road).success);
+        let mut runtime = RegionRuntime::new(region);
         let mut last_outbound = Vec::new();
 
         for request_id in 1..=24 {
@@ -1562,6 +1610,35 @@ mod tick_state_tests {
             job_release < completed,
             "job reconciliation should release old allocations before finishing"
         );
+
+        // Event-driven plan, P-4 (positive proof): this region never spawns a
+        // citizen (no Residential) and never receives a grant, so nothing
+        // ever re-dirties `jobs_exports_dirty` after day 1's reconcile clears
+        // it (unlike a region with an ongoing remote-employed citizen —
+        // `assign_local_jobs_for_daily_tick` unconditionally wipes every
+        // workplace assignment, local AND remote, every day "so remote jobs
+        // can be requested again from producer regions after local matching
+        // has taken its current slots" (economy.rs), and a successful grant
+        // re-dirties the flag via `apply_job_export_grant`'s own
+        // `invalidate_jobs_registry` call — so a region with ANY ongoing
+        // remote employment can never go quiet; it must genuinely
+        // re-reconcile every day, by design). Day 2 here has none of that:
+        // it must emit zero job export traffic at all.
+        for request_id in 25..=48 {
+            runtime.push_event(RegionEvent::Tick {
+                request_id: UiRequestId(request_id),
+            });
+            let outbound = runtime.process_next_event();
+            assert!(!runtime.tick_state.is_waiting());
+            assert!(
+                !outbound.iter().any(|message| matches!(
+                    message,
+                    OutboundMessage::JobExportAllocationsReleased(_)
+                        | OutboundMessage::JobExportRequested(_)
+                )),
+                "day 2 must be genuinely quiet: no job export traffic at all"
+            );
+        }
     }
 
     #[test]

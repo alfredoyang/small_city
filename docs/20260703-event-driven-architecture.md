@@ -1533,3 +1533,132 @@ original *meaning* intact, not just green.
 gate, mechanically repeating P-2's shape at `enter_job_phase` — no diff-apply
 equivalent needed there (jobs have no analogous "clear-then-reapply" system;
 `assign_local_jobs_for_daily_tick` already only runs on daily boundaries).
+
+---
+
+## P-4 — implemented (commit follows this section)
+
+**Files changed:** `src/core/world.rs`, `src/core/regions/mod.rs`,
+`src/core/regions/runtime/mod.rs`. 3 files, ~120 lines.
+
+**What changed:** mechanically repeats P-2's power gate shape for jobs.
+`World::jobs_exports_dirty` set inside `invalidate_jobs_registry`,
+`invalidate_resource_registry` (jobs depend on power too —
+`is_effective_workplace` reads `PowerConsumer::powered` — the asymmetry is
+real: power's dirty flag does *not* need to react to jobs-only changes, but
+jobs' flag *does* need to react to power changes), and
+`mark_road_topology_dirty`. `RegionRuntime::seen_jobs_generation`, a separate
+marker from `seen_power_generation`, so the hourly power gate can never
+absorb a bump destined for the daily job gate (the exact absorption bug the
+plan's own review caught in §3, now honored by construction). `enter_job_phase`
+gates the daily `reconcile_job_export_allocations` call the same shape as
+P-2: `continue_tick_to_job_demand_phase` (local assignment + demand
+collection) always runs regardless — same as power's quiet path still
+running `power::run` — only the release/request round trip is skipped when
+nothing's dirty and the generation hasn't moved.
+
+**The discovery that reshaped this patch: ongoing remote employment can
+never go quiet.** While building the positive regression test (mirroring
+P-2's `quiet_power_tick_skips_reconcile_after_first_grant`), a fixture with an
+already-granted remote worker never went quiet on any subsequent day, no
+matter how long nothing else changed. Root cause, not a bug:
+
+```text
+  economy::assign_local_jobs_for_daily_tick (economy.rs:77-82) —
+  EVERY daily tick, unconditionally:
+    for citizen in world.citizens.values_mut() {
+        citizen.workplace_assignment = None;      // wipes local AND remote
+    }
+    assign_local_jobs(world, local_region);         // re-fills LOCAL slots only
+
+  "Daily ticks clear all prior assignments first so remote jobs can be
+   requested again from producer regions after local matching has taken
+   its current slots." — deliberate design, predates this plan.
+```
+
+This runs inside `continue_tick_to_job_demand_phase`, called **before** the
+new gate decision, unconditionally — matching how power's quiet path still
+runs `power::run`. So every daily tick, a remote-employed citizen's
+assignment is wiped and `pending_job_demands` correctly re-lists them as a
+fresh seeker, *regardless* of the gate. Separately,
+`apply_job_export_grant`'s success path calls `world.invalidate_jobs_registry()`
+— correctly, since the citizen's employment just changed and cached
+unemployment/job counts must recompute — and under this patch's flag wiring,
+that call now *also* sets `jobs_exports_dirty = true`. The two combine into a
+closed loop:
+
+```text
+  day N:   grant applied → invalidate_jobs_registry() → jobs_exports_dirty = true
+                                                              │
+  day N+1: gate sees jobs_exports_dirty=true → DIRTY          │
+             → assign_local_jobs_for_daily_tick wipes the      │
+               assignment (unconditional, runs regardless)     │
+             → pending_job_demands re-lists the same citizen    │
+             → reconcile_job_export_allocations re-requests     │
+             → producer re-grants → invalidate_jobs_registry() again
+                                                              │
+             (repeats forever, for as long as this citizen's job stays remote)
+```
+
+Nothing here is a defect — it emerges naturally from reusing the *existing*
+`invalidate_jobs_registry` chokepoint (zero new call sites, this plan's own
+design principle) to also drive the gate. The practical consequence: **the
+"quiet daily job tick" savings this patch targets apply only to regions with
+zero ongoing remote job dependents** — self-sufficient regions, or regions
+with no citizens/workplaces needing cross-region jobs at all. A region with
+even one remote-employed citizen correctly, necessarily reconciles jobs every
+single day, exactly as it did before this patch — P-4's win for such a
+region is still real (it already only paid this cost daily, not hourly,
+before this patch — unaffected) but the *additional* daily-quiet savings this
+patch adds don't reach it. Codex confirmed independently: "Ongoing remote
+employment does not go quiet under this patch... consistent with the
+existing release/re-request model," and confirmed the
+`invalidate_resource_registry` → `jobs_exports_dirty` link is correct
+("job export eligibility depends on powered workplaces... so power/resource
+changes can affect jobs").
+
+**Test changes:**
+
+```text
+  daily_tick_without_job_demands_releases_job_allocations_before_finishing
+  (runtime/mod.rs) — third round of adaptation on this same test across
+  P-2/P-3/P-4:
+    P-2: dropped the power-release assertion (power's own gate went quiet)
+    P-4: switched the fixture from a bare empty region (which would now
+      ALSO start quiet for jobs, unable to exercise anything) to a region
+      with one Commercial building on a border-safe grid (placement's
+      invalidate_resource_registry dirties jobs_exports_dirty from
+      construction, matching how power_exports_dirty already does — day 1's
+      reconcile genuinely fires, with zero actual demands since no citizens
+      exist to seek one)
+    P-4 (extension): added a positive proof — a second day on this SAME
+      fixture (no citizens, ever, so nothing ever re-dirties the flag after
+      day 1's one-time reconcile) must emit zero job export traffic at all.
+      Confirmed fails if the gate is forced dirty=true, passes with the real
+      gate.
+
+  An earlier attempt at this positive test used the existing
+  job_seeker_region/job_slot_producer_region/run_job_growth_days(...,10)
+  fixture (reused by several already-passing organic-growth tests),
+  expecting it to go quiet once population growth saturates. It never did —
+  exactly the daily wipe-and-re-grant loop above. Abandoned and removed
+  rather than forced to pass on a wrong premise.
+```
+
+**Review:** codex `reviewer` session, one pass, "No findings." Confirmed all
+three points raised: the wipe-and-re-grant conclusion, the
+`invalidate_resource_registry` → `jobs_exports_dirty` link, and
+`seen_jobs_generation`'s separateness from `seen_power_generation`. `cargo
+fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test -q` green
+throughout, including every existing organic-growth job-export test
+(`cross_region_job_export_employs_jobless_citizen` and siblings) — confirming
+the gate doesn't disturb their daily-reconcile convergence.
+
+**Risks / notes carried forward:** P-5 (goods) needs the SAME question asked
+up front, before assuming P-2's shape transfers cleanly: does anything in the
+goods pipeline **unconditionally wipe** accumulated/reserved state every
+daily tick the way `assign_local_jobs_for_daily_tick` does for job
+assignments? If goods stock and export reservations *persist* (accumulate)
+rather than reset-and-reassign, P-5's quiet path may behave more like power's
+(broadly reachable) than jobs' (narrowly reachable) — this must be verified
+against the actual goods code before assuming either shape.

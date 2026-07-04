@@ -504,6 +504,16 @@ impl RegionState {
         self.world.clear_power_exports_dirty();
     }
 
+    /// Event-driven plan, P-4: whether this region's job export demand/
+    /// capacity may have changed since its last reconcile.
+    pub(crate) fn is_jobs_exports_dirty(&self) -> bool {
+        self.world.is_jobs_exports_dirty()
+    }
+
+    pub(crate) fn clear_jobs_exports_dirty(&self) {
+        self.world.clear_jobs_exports_dirty();
+    }
+
     /// Returns a UI-safe snapshot without exposing this region's ECS world.
     ///
     /// This is a pure read of already-applied derived state. Because regions are
