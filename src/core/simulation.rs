@@ -15,6 +15,18 @@
 //!   -> derived summary refresh for the tick event and next paused read
 //! ```
 //!
+//! Event-driven plan (docs/20260703-event-driven-architecture.md, P-1..P-6):
+//! this local ordering is unchanged — every step above still runs in the same
+//! sequence when it runs. What changed is *whether* two of them run at all on
+//! a quiet tick: `derived: power` is skipped entirely by
+//! `begin_tick_power_phase_quiet` (P-6) when nothing that could affect power
+//! changed since the last reconcile, and the *cross-region* remote grant
+//! round-trip (not shown in this local-only diagram; see
+//! `RegionRuntime::start_tick_power_phase` / `enter_job_phase` /
+//! `enter_goods_phase`) is skipped per-resource by the `*_exports_dirty` +
+//! discovery-generation gates (P-2/P-4/P-5). A quiet tick's only writes are
+//! time, turn, and the DT2 (time-driven) outputs above.
+//!
 //! Audit notes:
 //! - `population::run` reads derived power/roads/jobs/local effects and writes
 //!   citizen/population accumulators only. It creates a time -> derived edge
@@ -82,11 +94,9 @@ impl TickJobPhase {
     }
 }
 
-/// Starts one tick and resolves local power before downstream systems read it.
-///
-/// Regional runtimes can pause after this phase to request producer-exported
-/// power, then call `finish_tick_after_power_phase` once export grants apply.
-pub(crate) fn begin_tick_power_phase(world: &mut World, local_region: RegionId) -> TickPowerPhase {
+/// Advances the clock and derived state shared by both power-phase entry
+/// points, before either decides whether to run `power::run`.
+fn begin_tick_time_advance(world: &mut World, local_region: RegionId) -> TickPowerPhase {
     // The world is simulated as `local_region`, so record it (and re-stamp citizen
     // homes, preserving the CW2 invariant `home.region == region_id`). In production
     // this already equals the id RegionState stamped, so the guard skips it every tick;
@@ -104,13 +114,36 @@ pub(crate) fn begin_tick_power_phase(world: &mut World, local_region: RegionId) 
     let before_time = world.resources.time;
     world.resources.time.advance_hours(1);
     let after_time = world.resources.time;
-    power::run(world);
 
     TickPowerPhase {
         before,
         before_time,
         after_time,
     }
+}
+
+/// Starts one tick and resolves local power before downstream systems read it.
+///
+/// Regional runtimes can pause after this phase to request producer-exported
+/// power, then call `finish_tick_after_power_phase` once export grants apply.
+pub(crate) fn begin_tick_power_phase(world: &mut World, local_region: RegionId) -> TickPowerPhase {
+    let phase = begin_tick_time_advance(world, local_region);
+    power::run(world);
+    phase
+}
+
+/// Event-driven plan, P-6: the quiet-tick counterpart of `begin_tick_power_phase`.
+/// Skips `power::run` entirely rather than relying on it being a cheap no-op —
+/// the caller (`RegionRuntime::start_tick_power_phase`'s quiet branch) has
+/// already established that nothing which could affect power changed since
+/// the last reconcile, so every consumer's grant is already exactly what a
+/// fresh recompute would produce; running it again would only re-write
+/// identical values across every consumer, at O(consumers) cost, for nothing.
+pub(crate) fn begin_tick_power_phase_quiet(
+    world: &mut World,
+    local_region: RegionId,
+) -> TickPowerPhase {
+    begin_tick_time_advance(world, local_region)
 }
 
 /// Chains the job phase for the synchronous (single-region) tick path.
@@ -432,7 +465,10 @@ fn game_time_view(time: GameTime) -> GameTimeView {
 
 #[cfg(test)]
 mod tests {
-    use super::{refresh_derived_state_for_world, tick_world};
+    use super::{
+        begin_tick_power_phase, begin_tick_power_phase_quiet, refresh_derived_state_for_world,
+        tick_world,
+    };
     use crate::core::components::WorkplaceAssignment;
     use crate::core::regions::RegionId;
     use crate::core::resources::{CityStats, LocalEffectsMap};
@@ -479,6 +515,42 @@ mod tests {
 
         assert!(tick_world(&mut world).success);
         assert_eq!(world.stats.population, 1);
+    }
+
+    #[test]
+    fn begin_tick_power_phase_quiet_skips_power_run_entirely() {
+        // Event-driven plan, P-6: the quiet variant must not merely make
+        // `power::run` cheap (that's P-3's diff-apply) — it must not call it
+        // at all. Prove this by corrupting a properly-powered consumer's
+        // state directly (bypassing every chokepoint, so nothing marks
+        // anything dirty) and confirming the quiet phase leaves the
+        // corruption untouched, while the regular (dirty) phase still
+        // corrects it on the same world.
+        let mut world = World::new(4, 2);
+        placement::place_building(&mut world, 0, 0, BuildingKind::PowerPlant);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Road);
+        placement::place_building(&mut world, 2, 0, BuildingKind::Residential);
+        let consumer = world.grid.get(2, 0).expect("residential");
+        begin_tick_power_phase(&mut world, RegionId(1));
+        assert!(
+            world.power_consumers[&consumer].powered,
+            "setup: consumer should be locally powered before corruption"
+        );
+
+        world.power_consumers.get_mut(&consumer).unwrap().powered = false;
+        world.power_consumers.get_mut(&consumer).unwrap().source = None;
+
+        begin_tick_power_phase_quiet(&mut world, RegionId(1));
+        assert!(
+            !world.power_consumers[&consumer].powered,
+            "quiet phase must not run power::run: the corruption must persist"
+        );
+
+        begin_tick_power_phase(&mut world, RegionId(1));
+        assert!(
+            world.power_consumers[&consumer].powered,
+            "the regular (dirty) phase must still run power::run and correct the state"
+        );
     }
 
     #[test]

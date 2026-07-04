@@ -35,10 +35,10 @@ use crate::core::components::{
 use crate::core::entity::Entity;
 use crate::core::resources::CityStats;
 use crate::core::simulation::{
-    TickJobPhase, TickPowerPhase, begin_tick_power_phase, clear_imported_power,
-    continue_to_job_phase, ensure_derived_state, finish_tick_after_goods_phase,
-    finish_tick_after_job_phase, imported_power_grants, reapply_imported_power,
-    refresh_derived_state_for_world,
+    TickJobPhase, TickPowerPhase, begin_tick_power_phase, begin_tick_power_phase_quiet,
+    clear_imported_power, continue_to_job_phase, ensure_derived_state,
+    finish_tick_after_goods_phase, finish_tick_after_job_phase, imported_power_grants,
+    reapply_imported_power, refresh_derived_state_for_world,
 };
 use crate::core::systems::{
     build, bulldoze, economy, power, replace, road_connectivity, travel, upgrade,
@@ -1101,11 +1101,14 @@ impl RegionState {
     /// plan, P-2): used when the reconcile gate finds no local or
     /// cross-region change since the last reconcile, so this tick will
     /// neither release nor request anything. Skips the demand scan entirely.
-    /// `power::run` (via `begin_tick_power_phase`) diff-applies (P-3): a
-    /// consumer with no fresh local grant keeps its existing `Imported`
-    /// source structurally, so no capture/restore is needed here at all.
+    /// Event-driven plan, P-6: uses `begin_tick_power_phase_quiet`
+    /// (simulation.rs), which skips `power::run` itself rather than relying
+    /// on P-3's diff-apply making it a cheap no-op — the gate already
+    /// guarantees nothing that could affect power changed, so every
+    /// consumer's grant is already exactly what a fresh recompute would
+    /// produce; no capture/restore is needed here at all.
     pub(crate) fn begin_tick_power_phase_quiet(&mut self) -> RegionalTickPowerPhase {
-        let phase = begin_tick_power_phase(&mut self.world, self.id);
+        let phase = begin_tick_power_phase_quiet(&mut self.world, self.id);
         RegionalTickPowerPhase {
             phase,
             power_demands: Vec::new(),

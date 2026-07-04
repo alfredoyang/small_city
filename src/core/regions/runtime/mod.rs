@@ -861,10 +861,11 @@ impl RegionRuntime {
         let dirty = self.state.is_power_exports_dirty()
             || self.discovery_generation > self.seen_power_generation;
         if !dirty {
-            // Quiet path: time still advances and `power::run` still runs
-            // (P-3 makes it a diff-apply no-op on clean cache), but no demand
-            // scan and no release/request traffic. Grants and the producer's
-            // ledger are untouched.
+            // Quiet path: time still advances, but `power::run` is skipped
+            // entirely (P-6 — the gate already guarantees nothing that could
+            // affect power changed, so there's nothing for it to recompute),
+            // and there's no demand scan and no release/request traffic.
+            // Grants and the producer's ledger are untouched.
             let phase = self.state.begin_tick_power_phase_quiet();
             return self.enter_job_phase(request_id, phase);
         }
@@ -902,17 +903,14 @@ impl RegionRuntime {
         outbound
     }
 
-    // Reconciliation currently uses the simple policy:
-    // release all previous allocations for this caller generation, then request all
-    // current demands. Future patches can make this incremental by tracking granted
-    // producer regions and invalidating only when local demand, producer capacity,
-    // or road components change.
-    // TODO(CR allocation lifecycle): trigger reconciliation from explicit demand,
-    // producer-capacity, or component-change events so it runs only when needed
-    // instead of every tick. Tracked under "Deferred optimizations" in
-    // docs/regional-multi-worker-plan.md: incremental reconciliation is a
-    // distributed cache-coherence problem, kept eager (correct, simple) until scale
-    // justifies it.
+    // Reconciliation itself uses the simple policy: release all previous
+    // allocations for this caller generation, then request all current
+    // demands. This function's own body is unchanged and deliberately stays
+    // eager/simple — but P-2 (docs/20260703-event-driven-architecture.md)
+    // absorbed the "only when needed instead of every tick" half of this
+    // TODO: the caller (`start_tick_power_phase`) now gates whether this
+    // function runs at all on `power_exports_dirty` / the discovery
+    // generation, so a quiet tick never calls it.
     fn reconcile_power_export_allocations(
         &mut self,
         request_id: UiRequestId,
@@ -1002,17 +1000,16 @@ impl RegionRuntime {
         self.reconcile_job_export_allocations(request_id, phase)
     }
 
-    // Reconciliation currently uses the simple policy:
-    // release all previous allocations for this caller generation, then request all
-    // current demands. Future patches can make this incremental by tracking granted
-    // producer regions and invalidating only when local demand, producer capacity,
-    // or road components change.
-    // TODO(CR allocation lifecycle): trigger reconciliation from explicit demand,
-    // producer-capacity, or component-change events so it runs only when needed
-    // instead of every daily job tick. Tracked under "Deferred optimizations" in
-    // docs/regional-multi-worker-plan.md: incremental reconciliation is a
-    // distributed cache-coherence problem, kept eager (correct, simple) until scale
-    // justifies it.
+    // Reconciliation itself uses the simple policy: release all previous
+    // allocations for this caller generation, then request all current
+    // demands. This function's own body is unchanged and deliberately stays
+    // eager/simple — but P-4 (docs/20260703-event-driven-architecture.md)
+    // absorbed the "only when needed instead of every daily tick" half of
+    // this TODO: the caller (`enter_job_phase`) now gates whether this
+    // function runs at all on `jobs_exports_dirty` / the discovery
+    // generation, so a quiet daily tick never calls it. (A region with any
+    // ongoing remote-employed citizen still calls it every day, by design —
+    // see the P-4 write-up.)
     fn reconcile_job_export_allocations(
         &mut self,
         request_id: UiRequestId,

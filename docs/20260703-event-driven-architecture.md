@@ -1776,3 +1776,172 @@ resource's underlying gameplay mechanic actually requires). P-6 is next:
 slimming `begin_tick_power_phase` to make a fully quiet tick's cost explicit,
 plus documentation and absorbing the two live `TODO(CR allocation
 lifecycle)` comments this whole patch series has been implementing.
+
+---
+
+## P-6 — implemented (commit follows this section)
+
+**Files changed:** `src/core/simulation.rs`, `src/core/regions/mod.rs`,
+`src/core/regions/runtime/mod.rs`, plus `CLAUDE.md` (gitignored, local-only —
+not part of the commit). 3 tracked files, ~113 lines.
+
+**The correctness subtlety that made "guard on the registry's dirty state"
+not as simple as it reads.** The plan's own framing suggested checking
+`World::is_power_exports_dirty()` directly inside `begin_tick_power_phase`
+to decide whether to call `power::run`. Tracing the call order found this
+would be silently broken: `RegionRuntime::start_tick_power_phase` (P-2's
+gate) reads the flag to decide dirty-vs-quiet, and on the **dirty** branch
+calls `clear_power_exports_dirty()` **before** calling down into
+`begin_tick_power_demand_phase` → `begin_tick_power_phase`. So by the time
+`begin_tick_power_phase` would run, the flag has already been cleared to
+`false` by its own caller — checking it again inside `begin_tick_power_phase`
+would always read `false`, meaning `power::run` would never run via that
+check, **even on a genuinely dirty tick**. This would have silently broken
+every real power reconcile.
+
+```text
+  the bug a naive "guard on the flag" implementation would have had:
+
+  start_tick_power_phase:
+    dirty = is_power_exports_dirty() || generation moved   ← reads TRUE
+    if dirty:
+      clear_power_exports_dirty()                           ← flag now FALSE
+      begin_tick_power_demand_phase()
+        └─► begin_tick_power_phase()
+              if is_power_exports_dirty() { power::run() }  ← reads FALSE!
+                                                                 power::run
+                                                                 NEVER RUNS,
+                                                                 even here
+```
+
+**The fix:** extracted the shared prefix (region-id stamp, `ensure_derived_state`,
+time advance) into a private `begin_tick_time_advance` helper, then split
+into two thin, unconditional variants: `begin_tick_power_phase` (dirty path —
+time-advance + `power::run`, byte-identical to before) and a new
+`begin_tick_power_phase_quiet` (time-advance only, `power::run` **never**
+called). `RegionState::begin_tick_power_phase_quiet` (P-2's existing
+quiet-path wrapper) now calls the new simulation-level quiet variant instead
+of the full one. This sidesteps the bug entirely — no flag is ever re-checked
+downstream; the gate's decision is made exactly once, by the gate, and
+`simulation.rs` just offers the two outcomes as separate, named functions.
+
+```text
+  the fix — decide once, offer two named outcomes:
+
+  start_tick_power_phase:
+    dirty = is_power_exports_dirty() || generation moved
+    if !dirty:
+      begin_tick_power_phase_quiet()   ← time advance only, no power::run,
+                                          no flag re-check needed: the gate
+                                          ITSELF is the only check
+    else:
+      clear_power_exports_dirty()
+      begin_tick_power_demand_phase() → begin_tick_power_phase()
+                                          (unconditional power::run, exactly
+                                           as before this patch)
+```
+
+**Test:** `begin_tick_power_phase_quiet_skips_power_run_entirely`
+(simulation.rs) — proves `power::run` is genuinely never called on the quiet
+path, not just cheap. Builds a properly-powered consumer, establishes the
+powered baseline via one real `begin_tick_power_phase` call, then corrupts
+the consumer's `powered`/`source` fields directly (bypassing every
+chokepoint, so nothing marks anything dirty) — a `power::run` call would
+normally overwrite this corruption on any invocation. Confirms
+`begin_tick_power_phase_quiet` leaves it untouched, then confirms the
+regular `begin_tick_power_phase` on the same world still corrects it.
+Verified by temporarily restoring `power::run` inside the quiet variant that
+this test fails without the fix, passes with it restored.
+
+**The two absorbed TODOs.** Both `TODO(CR allocation lifecycle)` comments
+(power and job reconcile) asked for exactly what P-2/P-4 built: "trigger
+reconciliation from explicit demand, producer-capacity, or component-change
+events so it runs only when needed instead of every tick." Rewritten to
+state this is now done in the caller (the gate), while the reconcile
+functions' own release-all + request-all **policy** is unchanged and
+deliberately still simple — and repointed away from
+`docs/regional-multi-worker-plan.md`'s "Deferred optimizations" section
+(confirmed earlier in this series not to actually exist there) to this plan
+doc.
+
+**Documentation:** the DT4 local derived→time dependency comment at the top
+of `simulation.rs` gained a note (not a diagram rewrite — the local ordering
+itself is genuinely unchanged) explaining that `derived: power` can now be
+skipped entirely on a quiet tick, and that the cross-region reconcile round
+trips (not shown in that local-only diagram) are similarly gated. `CLAUDE.md`
+(gitignored, local-only) gained a paragraph on the `runtime/mod.rs` bullet
+describing the gating machinery and the power/jobs+goods asymmetry in
+reachable quiet states.
+
+**Review:** codex `reviewer` session, two passes. First: one Low (a stale
+comment in `start_tick_power_phase`'s quiet branch still describing the
+pre-P-6 "power::run runs, made cheap by diff-apply" behavior) — fixed.
+Second, targeted re-check: clean, and confirmed independently that the
+call-order trace was correct, the three-way function split is the right
+minimal fix, other `power::run` call sites (load settlement, paused derived
+refresh) correctly keep running it unconditionally (matching their own
+"always refresh from scratch" contracts, untouched by this patch), and that
+`power::run` was indeed the last remaining unconditional per-tick cost this
+plan identified. `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test -q` green throughout, all 317 lib tests plus every integration
+suite.
+
+---
+
+## Series complete: P-1 through P-6
+
+All six patches landed on branch `event-driven-architecture`:
+
+```text
+  4684c9e  P-1  hints_dirty + gated cross-region hint publishing
+  3add126  P-2  discovery generation + power reconcile gate
+  ba00d6d  P-3  diff-apply power::run, delete the starvation-fix workaround
+  83ebc98  P-4  job reconcile gate (daily cadence kept)
+  4f6a7ad  P-5  goods reconcile gate
+  (P-6)    P-6  slim the tick, absorb the two TODOs, documentation
+```
+
+**What a quiet tick costs now, versus at the start of this plan:** zero
+export releases/requests for any resource with nothing to reconcile, zero
+hint recomputes for regions nothing dirtied, zero consumer-flag churn (no
+`power::run` body execution at all on the quiet path) — only time advance,
+turn increment, and the DT2 (time-driven) systems that were always meant to
+run every tick regardless. Goal #1 from the plan's introduction is met.
+
+**What this series discovered that the plan didn't anticipate**, each one
+found and fixed *during* implementation rather than assumed correct from the
+design phase:
+
+- **P-1**: a naive regression test can be tautological — proving a property
+  that's already true for an unrelated reason. Caught by deliberately
+  reverting the fix and observing the "regression" test still passed.
+- **P-2**: gate-then-collect ordering matters once diff-apply lands (flagged
+  by codex reviewing the *plan document* before code existed) — collecting
+  demands before deciding dirty-vs-quiet would make a kept import invisible
+  to the demand scan, reintroducing the starvation fix's round-1 desync in
+  reverse.
+- **P-3**: diff-apply's stats block undercounted supplied power for kept
+  imports (a codex finding), and splitting the clear out of `power::run`
+  broke that function's own jobs-registry invalidation side effect (found by
+  tracing the mid-wait window the original starvation fix was about).
+- **P-4**: a region with any ongoing remote-employed citizen can never go
+  quiet — `assign_local_jobs_for_daily_tick`'s unconditional daily wipe,
+  combined with a successful grant's own re-invalidation, closes a loop that
+  forces genuine daily reconciliation for as long as that employment stays
+  remote. Not a bug; a real, permanent narrowing of where the savings reach.
+- **P-5**: mirroring P-1's `hints_dirty` unconditional-mark pattern at the
+  shared daily-settlement chokepoint would have made this entire patch a
+  no-op — every region's goods gate would stay dirty forever, regardless of
+  activity. Caught *before* writing the wrong version, by asking "does this
+  call site fire regardless of the thing I'm gating on" before copying a
+  precedent that looked identical but wasn't safe to reuse as-is.
+- **P-6**: the plan's own "guard on the dirty state" phrasing would have
+  silently disabled power reconciliation entirely, because the gate that
+  reads the flag also clears it before calling down into the function that
+  would re-check it.
+
+Every one of these was caught by grounding each patch in the actual call
+graph and data flow before trusting a design document's shorthand — the same
+discipline the plan itself was built with (see the P-1 stale-hint-hypothesis
+correction near the top of this document) — rather than mechanically
+implementing what the plan said and finding out from a broken test later.
