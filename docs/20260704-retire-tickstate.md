@@ -1,0 +1,659 @@
+# Retire TickState — settle each tick with whatever's already held
+
+Status: **plan** (not implemented). Reviewed three times by codex. First
+pass (core tick-retirement; P-a/P-c/P-d/P-e): 2 High + 2 Medium. Second
+pass (eager nudge P-b + self-describing-reply redesign): 2 High — the
+denial-cleanup guard and the per-worker id partition (item 4/6). Third
+pass: 1 High — a stale *granted* reply must actively release the
+producer's stuck reservation, not just drop (item 4); 1 Low — worker-id
+bit layout overlap (item 6). All findings fixed here; see the "caught in
+review" callouts.
+
+Both earlier plans this session made the tick *cheap* (`P-1..P-6`) and, in
+an abandoned attempt, *faster to react*. Neither touched the one real piece
+of complexity left: a tick that needs a cross-region reply **stops and
+waits** for it. This plan removes the waiting.
+
+## The problem
+
+```text
+ Tick asks for power it doesn't have yet
+   → PARKS in TickState::WaitingForPowerExports
+   → remembers what it's owed in a continuation struct
+   → a second Tick that shows up now has to wait its turn
+   → reply arrives → resume → chain into jobs → maybe park again → ...
+```
+
+Everything below exists *only* to make that parking possible:
+`TickState`'s 4 waiting variants, the `is_waiting()` machinery, a special
+"which events may jump the queue while paused" filter, and "was that the
+last reply? then chain to the next phase" logic in three grant handlers.
+None of it is wrong — it's just a lot of machinery whose one job is "let a
+tick wait." If nothing waits, it all goes — continuation structs included:
+the reply is made to carry its own context back, so there's nothing left to
+remember between asking and hearing the answer (see the pseudocode).
+
+## The fix, mentally
+
+**A tick always finishes in one pass**, using whatever power/jobs/goods it
+already holds from last time. It still fires off release/request messages
+for what it needs *next* — just doesn't block on the reply. Whenever a
+reply lands, it's written straight into world state for the *next* tick to
+pick up.
+
+Not a new idea here — goods already work exactly this way: a granted
+import is stashed in `pending_goods_stock`, applied at the *start* of the
+next goods phase, not the one that asked. And the code already argues this
+is fine for the producer side of job tax ("settlement can lag by one daily
+tick, by design... deterministic and self-correcting"). This plan just
+applies the same idea to the consumer side, and to the whole tick.
+
+```text
+ TODAY — one Tick, several possible stops              AFTER — one Tick, one pass, always
+ ───────────────────────────────────────              ───────────────────────────────────
+ Tick → power  → [pause? WaitingForPowerExports]       Tick → power (use what's held)
+      → resume → jobs   → [pause? WaitingForJob…]           → jobs  (use what's held)
+      → resume → goods  → [pause? WaitingForGoods…]         → goods (use what's held)
+      → resume → finish                                     → finish        ← same pass, always
+
+                                                        separately, fire-and-forget:
+                                                        release stale + request what's next
+                                                          → reply lands whenever → written to
+                                                            world state → ready for NEXT tick
+```
+
+```text
+ A grant, before and after
+ ──────────────────────────
+ TODAY:  send "#12?"        → PAUSE, remember what #12 meant in a continuation
+         reply "#12: yes"   → look up #12 in the continuation → apply
+                            → last one? chain forward. else keep waiting.
+
+ AFTER:  send the question  → move on NOW — remember nothing;
+                              the reply will bring its own context back
+         reply (whenever)   → echoes the full request it answers
+                              ("batch N, House-1, 5 units: yes")
+                            → my current batch?  apply it — everything
+                                                 needed is in the reply
+                            → an old batch?      stale, drop it
+```
+
+## What changes
+
+```text
+              DELETE                            KEEP                         ADD
+ ──────────  ───────────────────────────────    ─────────────────────────    ──────────────────────
+ State        TickState's 4 waiting variants     —  (nothing to keep:         one scalar per
+              AND all 4 continuation structs —      the reply carries its     resource — the
+              the reply now describes itself,       own context back)         current batch's
+              so nothing needs parking                                        request_id
+ Dispatch     pop_next_runnable_event's          plain FIFO always            —
+              mid-wait allow-list
+ Grant        "last reply? chain to next         the ECS write itself         one guard in the
+ handlers     phase" branch                      (apply_power_export_grant,   denial branch —
+                                                  etc.)                        see item 4
+ Tick shape   the phase-by-phase pause/           local order power→jobs→     one straight-through
+              resume chain                       goods→economy (DT4,         run_tick, no pauses
+                                                  unchanged)
+ Producer     —                                   completely untouched —     —
+ side                                              it only ever answers,
+                                                    never waits
+ Discovery    —                                    the poll/gate, unchanged  PowerCapacityRecheck:
+ (power)                                         (still the backstop)     fan out on hint
+                                                                           republish, so a
+                                                                           neighbor can ask
+                                                                           right away instead
+                                                                           of waiting for its
+                                                                           own next tick
+```
+
+## The cost, plainly
+
+**A grant now pays out starting next tick, not the tick that asked.** The
+tick that asks finishes still using what it already had; the *next* tick
+sees the reply. One tick behind — for power ~1 hour, for jobs/goods a full
+day (they only settle daily anyway). Real, felt gameplay change; needs an
+explicit yes, not a buried diff.
+
+That's the **worst case**. For power, the eager nudge (next section) shrinks
+it to "usually unnoticeable" — the neighbor is nudged the instant the change
+happens, so its request is usually answered before its next tick even fires.
+Jobs/goods get no such nudge and stay one daily tick behind by design (the
+daily cadence is the point — see "The eager nudge" for why nudging them buys
+nothing).
+
+**Determinism is unaffected.** Same barrier-sorted delivery, same
+event-log-in/state-out reproducibility — only *which tick* a reply lands in
+shifts, never whether the result repeats.
+
+## The eager nudge
+
+A region only asks for power when its own tick's gate notices something
+changed — that's the one-tick lag above. The gate itself is already a hard
+guarantee: every tick checks `discovery_generation > seen_power_generation`
+directly off the shared snapshot, no matter what else happened. **This
+plan also nudges neighbors the instant a hint republishes** (already
+immediate — P-1), instead of making them wait for their own next tick to
+notice.
+
+```text
+ two clocks:        Tick(H) ───────────────────── Tick(H+1)      ← slow, external
+                     pass·pass·pass·pass·pass·pass·pass·pass·pass  ← fast, nonstop
+
+ common case:  hint updates → nudge → ask → grant lands
+               ├── a handful of fast passes ──┤  ← usually done
+               well before Tick(H+1) even fires
+
+ worst case:   nudge too slow/lost — doesn't matter:
+               Tick(H+1)'s gate checks anyway → notices → asks on its own
+               Tick(H+2) → that request had a whole tick to round-trip → done
+```
+
+**Why this is safe, not just faster:** the gate never depends on the
+nudge. Worst case stays exactly what this plan already promised — one
+tick behind whichever tick first asks. The nudge only moves *when* that
+first ask happens: usually right away instead of only guaranteed by next
+tick. Better common case, same worst case, never worse.
+
+**Why power only.** The nudge shrinks the gap between "change happened" and
+"neighbor asks." That only helps if asking sooner lets the answer land
+sooner — true for power (hourly). Jobs and goods settle on a *daily*
+boundary by design (deliberate hysteresis — a citizen shouldn't rethink its
+job every hour). A job/goods nudge mid-day has nothing to do: the demand
+list is only recomputed at the daily boundary, and the answer couldn't be
+applied before then anyway. So the nudge would add cost for zero latency
+win. Power is the only resource where it pays off.
+
+**The cost of adding it:** a new fire-and-forget event, and its own fresh
+request id minted by the worker (this fan-out isn't triggered by any UI
+request — see the worker id counter in the pseudocode). It fans out
+coarsely (whole connected component, not just actual importers); see Risks
+for why that's a safe, deliberate choice.
+
+## Pseudocode
+
+**1. Make the reply carry its own context — then there is nothing to
+remember.** A grant today echoes only its `token`; the caller must keep a
+list of what each token *meant*. That list (and a counter to keep tokens
+unique) was this plan's original design — superseded: the worker already
+holds the full original request at the moment it routes the result back
+(`route_export_request_result` has it in hand and discards it, forwarding
+only the bare grant). Forward the request *with* the grant instead, and the
+caller-side memory disappears — the message *is* the memory:
+
+```text
+ TODAY:  reply = "#12: granted"
+           → caller: "what was #12 about?" → must have written it down
+
+ AFTER:  reply = "batch N, House-1, 5 units: granted, from region C"
+           → apply directly — nothing to look up, nothing was written down
+```
+
+```rust
+// Requests gain the ONE field needed to re-derive the demand on arrival:
+pub struct PowerExportRequest {
+    pub request_id: UiRequestId,   // already there — becomes the staleness check
+    pub caller_region: RegionId,   // already there
+    pub caller_network: RegionRoadNetworkId, // already there
+    pub token: u32,                // already there — stays a batch position
+    pub demand: i32,               // already there
+    pub consumer: Entity,          // NEW — jobs echo the citizen instead,
+}                                   //       goods echo the commercial building
+
+// The caller-side apply event carries request + grant, not the grant alone
+// (ExportResource::apply_grant_event gains the request parameter; the worker
+//  already holds it at route_export_request_result — zero new plumbing):
+RegionEvent::ApplyPowerExportGrant { request: PowerExportRequest, grant: PowerExportGrant }
+```
+
+**2. One scalar per resource replaces the continuation: "which batch is
+current."** All four continuation structs are deleted outright. What
+survives is the one field we originally *trimmed away* — `request_id`:
+
+```rust
+// RegionRuntime — the ONLY caller-side bookkeeping left, per resource:
+current_power_request_id: UiRequestId,
+// current_job_request_id / current_goods_request_id: same.
+```
+
+Why the floor is one scalar, not zero: a producer reserves capacity the
+moment it grants. When the caller starts a new batch, its release wipes the
+old batch's reservations — so a *late* grant from that old batch, if
+applied, would mark a consumer powered with **no reservation backing it
+anywhere**, and the quiet gate would never look at it again. Something must
+distinguish "my current batch" from "an old one." The reply already carries
+`request_id` (per item 1), so one comparison does it:
+
+```text
+ batch N (request_id 7):  tokens 0,1,2     batch N+1 (request_id 9):  tokens 0,1
+                                            ▲ same token numbers — fine now!
+ late reply for (id 7, token 0) arrives:
+   7 ≠ current (9) → dropped before any token is even looked at ✓
+```
+
+Tokens stay exactly what they are today — batch-local positions — because
+their only remaining job is telling demands apart *within* one batch. This
+mirrors the producer's existing semantics precisely: reservations are
+already keyed `(caller_region, request_id, token)`, and
+`release_stale_for_caller` already treats `request_id` as the staleness
+generation. Caller and producer now speak the same language. (An earlier
+draft solved the cross-batch token collision with a never-resetting token
+counter — caught in review as a real bug in the batch-position scheme; the
+request_id comparison supersedes that fix by dropping whole stale batches
+at once.)
+
+**3. Release + request, no pausing** — stamp the new generation, send, done:
+
+```rust
+fn release_and_request_power(
+    &mut self,
+    request_id: UiRequestId,
+    demands: &[PendingPowerDemand],
+) -> Vec<OutboundMessage> {
+    self.current_power_request_id = request_id; // everything older is now stale
+    let producer_regions = std::mem::take(&mut self.power_export_producers);
+    let mut outbound = vec![OutboundMessage::PowerExportAllocationsReleased(
+        PowerExportAllocationRelease { caller_region: self.region_id(), request_id, producer_regions }
+    )];
+    outbound.extend(demands.iter().map(|demand| {
+        OutboundMessage::PowerExportRequested(PowerExportRequest {
+            request_id,
+            caller_region: self.region_id(),
+            caller_network: demand.caller_network,
+            token: demand.token,       // batch position, unchanged from today
+            demand: demand.demand,
+            consumer: demand.consumer, // NEW: echoed back by the reply
+        })
+    }));
+    outbound
+}
+// release_and_request_job / release_and_request_goods: identical shape,
+// own current_*_request_id each, swap the message/demand types.
+```
+
+**4. Grant handlers — staleness check, then apply. No matching, no
+chaining. A stale *granted* reply must actively release, not just drop:**
+
+```rust
+RegionEvent::ApplyPowerExportGrant { request, grant } => {
+    self.remember_power_export_producer(&grant);
+    if request.request_id != self.current_power_request_id {
+        // Superseded batch — but if it was GRANTED, the producer reserved
+        // capacity we will never apply, and our next real release may not
+        // reach that producer (see below). Clear it NOW, keyed to the
+        // current generation so the producer drops this old reservation and
+        // keeps any current one.
+        return release_stale_granted_power(self.region_id(),
+                                           self.current_power_request_id, &grant);
+    }
+    let demand = PendingPowerDemand {
+        token: request.token,
+        consumer: request.consumer,
+        demand: request.demand,
+        caller_network: request.caller_network,
+    };
+    self.state.apply_power_export_grant(demand, grant); // ECS write — ONE
+    Vec::new()                                          // guard added, below
+}
+
+RegionEvent::ApplyJobExportGrant { request, grant } => {
+    self.remember_job_export_producer(&grant);
+    if request.request_id != self.current_job_request_id {
+        return release_stale_granted_job(self.region_id(),
+                                         self.current_job_request_id, &grant);
+    }
+    self.state.apply_job_export_grant(demand_from(&request), grant); // unchanged ECS write
+    Vec::new()
+}
+
+RegionEvent::ApplyGoodsExportGrant { request, grant } => {
+    self.remember_goods_export_producer(&grant);
+    if request.request_id != self.current_goods_request_id {
+        return release_stale_granted_goods(self.region_id(),
+                                           self.current_goods_request_id, &grant);
+    }
+    if grant.granted && grant.units > 0 {
+        // UNCHANGED: goods already stage into pending_goods_stock,
+        // applied at the next goods phase. Power/jobs now match this.
+        self.pending_goods_stock.push((request.commercial, grant.units));
+    }
+    Vec::new()
+}
+
+// Same shape for all three (helper per resource, or one generic over the
+// release message type): a granted-but-stale reply emits a targeted release
+// to just that producer, stamped with the CURRENT generation.
+fn release_stale_granted_power(
+    caller: RegionId, current: UiRequestId, grant: &PowerExportGrant,
+) -> Vec<OutboundMessage> {
+    match grant.source_region {
+        Some(producer) if grant.granted => {
+            vec![OutboundMessage::PowerExportAllocationsReleased(PowerExportAllocationRelease {
+                caller_region: caller,
+                request_id: current,       // release_stale_for_caller drops
+                producer_regions: vec![producer], // the old generation, keeps current
+            })]
+        }
+        _ => Vec::new(), // a denial reserved nothing — nothing to release
+    }
+}
+```
+
+**Caught in review — why the stale-granted reply must actively release.**
+Today `remember_*_export_producer` runs before the staleness check on the
+theory that "the next release will reach that producer and clear it." That
+holds under pausing: batch N+1 can't start until batch N settled, so N's
+grant is always in `power_export_producers` when N+1's release fires.
+Unpaused, it's a plain race:
+
+```text
+ batch N   → request to producer P
+ batch N+1 → release (P not in the list yet!) + new request   ← supersedes N
+ batch N's grant arrives late → remembered, but request_id stale → DROPPED
+ region goes quiet → no next release → P's reservation for N stuck forever
+```
+
+The targeted release above closes it: the instant a stale *granted* reply
+lands, fire a release to just that producer with the current generation —
+`release_stale_for_caller` drops the old generation and keeps any current
+one (`runtime/mod.rs:484`). A stale *denial* reserved nothing, so it needs
+no release. This is the one place the old "remember, clear next time"
+assumption doesn't survive un-pausing.
+
+**Caught in review — one required change *inside* the power ECS write.**
+`apply_power_export_grant`'s denial branch assumes any still-powered
+consumer can only be the optimistic restore, and clears it unconditionally
+(`regions/mod.rs:1197`). That assumption is *made true today by pausing* —
+nothing can run between request and reply. Once nothing pauses, a later
+tick or the nudge can give that consumer **local** power before a
+same-batch denial lands; the unguarded clear would wipe real local power
+and subtract it from the supplied stats. One guard fixes it — a denial
+may only undo an *imported* source, because local power is never the
+optimistic restore's doing:
+
+```rust
+// RegionState::apply_power_export_grant, denial branch
+// was: if consumer.powered {
+if consumer.powered && matches!(consumer.source, Some(PowerSource::Imported { .. })) {
+    /* clear + stats rollback — unchanged */
+}
+```
+
+The job and goods ECS writes have no such denial cleanup — they really are
+unchanged.
+
+**5. The nudge itself — a fire-and-forget event, modeled on
+`RegionEvent::ReceiveTraveler`** (no grant, no tick pause, no reply):
+
+```rust
+RegionEvent::PowerCapacityRecheck { request_id, .. } => {
+    let demands = self.state.power_demand_recheck(); // time-neutral, below
+    self.release_and_request_power(request_id, &demands) // same helper as run_tick
+}
+```
+
+Unlike a normal tick, this must **not** advance the game clock — a random
+cross-region nudge shouldn't tick the hour along as a side effect. So it
+needs its own time-neutral way to collect fresh demand, instead of
+`begin_tick_power_demand_phase` (which does, via `begin_tick_power_phase`):
+
+```rust
+// regions/mod.rs, RegionState — new:
+pub(crate) fn power_demand_recheck(&mut self) -> Vec<PendingPowerDemand> {
+    ensure_derived_state(&mut self.world, self.id); // catch up any pending
+                                                      // config change, no time advance
+    let imported = imported_power_grants(&self.world);
+    clear_imported_power(&mut self.world, &imported);
+    power::run(&mut self.world); // NOT begin_tick_power_phase — no advance_hours
+    let power_demands = self.pending_power_demands();
+    let requestable: HashSet<Entity> = power_demands.iter().map(|d| d.consumer).collect();
+    let restorable = imported.into_iter()
+        .filter(|(e, _, _)| requestable.contains(e))
+        .collect::<Vec<_>>();
+    reapply_imported_power(&mut self.world, &restorable);
+    power_demands
+}
+```
+
+**6. The worker-level fan-out**, right after the existing P-1 hint-publish
+sweep — gated on `publish_region`'s own idempotence check (only fans out on
+a *real* change), minting a fresh id per republish so the request doesn't
+collide with anything a UI-driven tick already assigned:
+
+```rust
+for (region_id, links, hints) in &changed_summaries {
+    let republished = self.directory.publish_region(region_id, links.clone(), hints.clone());
+    if !republished { continue; } // nothing actually changed — nothing to nudge
+    let recheck_id = self.next_worker_request_id(); // see below
+    let discovery = self.directory.discovery_snapshot();
+    let mut notified = HashSet::new();
+    for hint in &hints {
+        let Some(component) = discovery.component_of(hint.network) else { continue };
+        for network in component {
+            if network.region == *region_id || !notified.insert(network.region) {
+                continue; // skip self and duplicates
+            }
+            let order_key = ForwardedEventOrderKey {
+                target_region: network.region, source_region: *region_id,
+                request_id: recheck_id, token: hint.network.road_network,
+                resource_rank: 0, event_rank: 3, // after release/request/reply
+            };
+            if let Ok(WorkerRoutedMessage::Forwarded(event)) = self.route_region_event(
+                network.region, *region_id,
+                RegionEvent::PowerCapacityRecheck { request_id: recheck_id, source_region: *region_id },
+                order_key, routing_mode,
+            ) {
+                forwarded_events.push(event);
+            }
+        }
+    }
+}
+```
+
+**Why the worker needs its own id counter.** This fan-out isn't triggered
+by any UI request, so there's no `UiRequestId` to borrow — but the
+resulting requests still need a fresh generation (both the producer's
+`release_stale_for_caller` and the caller's own
+`current_power_request_id` staleness check depend on batch ids actually
+changing between batches). Caught in review: "top bit set" alone isn't
+enough — a multi-worker game has several `RegionWorker`s, and two workers
+each running their own counter *can* mint the same id and nudge the same
+target with it, defeating both staleness checks. So the id must encode
+*who* minted it. Every worker already knows its `WorkerId` (a `u32`):
+
+```rust
+// RegionWorker — new field: recheck_counter: u32 (starts at 0)
+fn next_worker_request_id(&mut self) -> UiRequestId {
+    // WorkerId starts at 1 and stays tiny (INITIAL_WORKER_ID = 1, +index);
+    // 31 bits is astronomically more than any real deployment, and the
+    // assert makes the ceiling explicit rather than a silent wraparound.
+    debug_assert!(self.worker_id.0 < (1 << 31));
+    self.recheck_counter += 1;
+    //   bit 63: "worker-minted"   bits 32..62: which worker (31 bits)   bits 0..31: counter
+    UiRequestId((1u64 << 63) | (u64::from(self.worker_id.0) << 32) | u64::from(self.recheck_counter))
+}
+```
+
+`RegionalGame`'s UI counter starts at 1 and increments per player action —
+it never reaches bit 63. Disjoint bit ranges structurally cannot collide:
+not UI vs. worker, and (given the assert) not worker vs. worker.
+
+**7. One straight-through tick.** Caught in review: an earlier draft ran
+goods every hour, unconditionally — but goods (like jobs) only ever
+resolve on a daily boundary; an hourly tick must skip them entirely,
+exactly like today's `enter_job_phase` early-return does:
+
+```rust
+fn run_tick(&mut self, request_id: UiRequestId) -> Vec<OutboundMessage> {
+    let mut outbound = Vec::new();
+
+    // ---- power: always runs, gated release/request same as today ----
+    let power_dirty = self.state.is_power_exports_dirty()
+        || self.discovery_generation > self.seen_power_generation;
+    let power_phase = if power_dirty {
+        self.seen_power_generation = self.discovery_generation;
+        self.state.clear_power_exports_dirty();
+        self.state.begin_tick_power_demand_phase() // P-3's dirty path, unchanged
+    } else {
+        self.state.begin_tick_power_phase_quiet() // P-6's quiet path, unchanged
+    };
+    if power_dirty {
+        outbound.extend(self.release_and_request_power(request_id, &power_phase.power_demands));
+    }
+
+    // ---- jobs + goods: ONLY on a daily boundary, exactly like today ----
+    let job_phase = self.state.continue_tick_to_job_demand_phase(power_phase); // always runs
+    let result = if !job_phase.is_daily() {
+        // hourly: finish right after jobs, exported_goods_units = 0,
+        // same as today's finish_tick_after_job_phase — no goods touched
+        let exported_job_slots = self.job_export_allocations.units().collect::<Vec<_>>();
+        self.state.finish_tick_job_demand_phase(job_phase, &exported_job_slots)
+    } else {
+        let jobs_dirty = self.state.is_jobs_exports_dirty()
+            || self.discovery_generation > self.seen_jobs_generation;
+        if jobs_dirty {
+            self.seen_jobs_generation = self.discovery_generation;
+            self.state.clear_jobs_exports_dirty();
+            outbound.extend(self.release_and_request_jobs(request_id, &job_phase.job_demands));
+        }
+
+        self.apply_pending_goods_stock(); // last tick's granted goods land now
+        let goods_phase = self.state.continue_tick_to_goods_demand_phase(job_phase);
+        let goods_dirty = self.state.is_goods_exports_dirty()
+            || self.discovery_generation > self.seen_goods_generation;
+        if goods_dirty {
+            self.seen_goods_generation = self.discovery_generation;
+            self.state.clear_goods_exports_dirty();
+            outbound.extend(self.release_and_request_goods(request_id, &goods_phase.goods_demands));
+        }
+
+        let exported_job_slots = self.job_export_allocations.units().collect::<Vec<_>>();
+        let exported_goods_units = self.goods_export_allocations.units().sum();
+        self.state.finish_tick_goods_demand_phase(goods_phase, &exported_job_slots, exported_goods_units)
+    };
+
+    outbound.push(OutboundMessage::RegionTickCompleted(
+        RegionTickResponse { request_id, region_id: self.region_id(), result }
+    ));
+    outbound.extend(self.drained_traveler_handoff_messages()); // unchanged
+    outbound
+}
+
+// process_event's Tick arm:
+RegionEvent::Tick { request_id } => self.run_tick(request_id),
+```
+
+**8. Dispatch collapses to plain FIFO** — nothing waits, so nothing needs
+the mid-wait filter:
+
+```rust
+fn pop_next_runnable_event(&mut self) -> Option<RegionEvent> {
+    self.receiver.pop_event() // TickState::is_waiting() is gone
+}
+```
+
+**9. `SettlePowerImports`** (load-time re-negotiation) reuses the same
+helper — becomes a plain fire-and-forget call:
+
+```rust
+fn start_power_import_settlement(&mut self, request_id: UiRequestId) -> Vec<OutboundMessage> {
+    let demands = self.state.power_import_settlement_demands(); // unchanged, time-neutral
+    self.release_and_request_power(request_id, &demands)
+}
+```
+
+This only works because `release_and_request_power` doesn't care how the
+demands were collected — settlement's collector is time-neutral (calls
+`power::run` directly); a normal tick's collector advances time. **Don't
+merge the two collectors later** — keeping `release_and_request_power`
+demand-agnostic is what keeps that distinction safe.
+
+## Decisions locked
+
+- Determinism unaffected — same barrier-sorted delivery either way; only
+  *which tick* a reply lands in shifts, never reproducibility.
+- The gates (`*_exports_dirty`, `discovery_generation`/`seen_*_generation`)
+  don't change — this plan removes the pause *after* that decision, not
+  the decision.
+- Goods' `pending_goods_stock` pattern is the template for power and jobs,
+  not a new invention.
+- **Replies are self-describing** — the apply event carries the original
+  request (the worker already holds it when routing the result), so the
+  caller keeps no demand list and no token counter. Caller-side state is
+  exactly one `request_id` scalar per resource, mirroring the producer's
+  existing `(caller_region, request_id, token)` reservation key semantics.
+- The one-tick-later gameplay cost gets called out explicitly in review,
+  not left implicit in the diff.
+- **The eager nudge (`PowerCapacityRecheck`) is part of this plan, not an
+  optional extra** — power only (see "The eager nudge" for why jobs/goods
+  gain nothing from it). It shrinks the *common* case; it never changes the
+  *worst* case, which the gate alone already bounds.
+
+## Risks / notes
+
+- **Biggest re-baselining risk of any plan this session.** Confirmed in
+  review: ~9 tests in `runtime/mod.rs`'s `tick_state_tests` assert a
+  specific wait state or continuation directly (enter-wait,
+  last-grant-resumes, second-tick-deferred, unknown-token-keeps-waiting,
+  job wait-state coverage), plus ~4 paused-handshake tests in
+  `tests/region_worker_test.rs`. All need real rewrites, not edits —
+  expect this to be the largest part of the work, bigger than the code
+  change itself.
+- **Open question, not a decided removal**: whether the starvation-fix
+  capture/clear/restore dance in `begin_tick_power_demand_phase`
+  (`docs/20260703-bug-cross-region-export-starvation-fix.md`) can also
+  simplify once nothing pauses. Needs its own trace — don't assume it
+  falls out for free.
+- The mid-wait deadlock-avoidance reasoning (why some events had to jump
+  the queue while paused) disappears entirely once nothing pauses — worth
+  confirming nothing else still assumes it's needed.
+- Perf: strictly less work per tick — no pause bookkeeping, no per-pause
+  `TickState` transitions, no deferred second-`Tick` handling, no
+  caller-side demand list at all. A simplification in both code size and
+  per-tick cost, not a tradeoff.
+- **Event-shape ripple**: the three `Apply*ExportGrant` events change from
+  carrying a bare grant to `{ request, grant }`, and each request type
+  gains one echoed entity field (`consumer`/citizen/commercial). That
+  touches the `ExportResource` trait's `apply_grant_event` and every
+  constructor of those events — mechanical, but wide.
+- **Dead-entity echo must be a no-op**: a reply can echo a consumer that
+  was bulldozed after the request went out (same batch, so the staleness
+  check passes). `RegionState::apply_power_export_grant` (and the job/goods
+  equivalents) must tolerate an entity that no longer exists — verify this
+  explicitly in P-a, don't assume it.
+- The nudge fans out to a whole connected component, not just actual
+  importers — coarse on purpose, same "false positives are free" tradeoff
+  every dirty flag in this codebase already makes. A precise,
+  holder-only version is a possible later refinement, not required here.
+
+## Patch split
+
+Caught in review: "change the bookkeeping, keep pausing" as a first patch
+doesn't work — while pausing exists, something still has to know when the
+*last* reply landed to chain phases forward. So reply-shape change and
+pause-removal land together, one resource at a time.
+
+```text
+ dependency order:
+
+   P-a ──► P-b          (nudge reuses P-a's helper + generation scalar)
+    │
+    ├──► P-c ─┐
+    ├──► P-d ─┼──► P-e ──► P-f
+    └─────────┘     (delete enum      (optional; may
+                     once nothing       be a no-op)
+                     pauses)
+```
+
+| patch | does | verify |
+|-------|------|--------|
+| **P-a** Power | self-describing replies + `current_power_request_id` + no-pause `run_tick`; delete `WaitingForPower*`/`*Continuation`; `SettlePowerImports` → `release_and_request_power`; denial guard (item 4) + stale-granted release (item 4) | superseded batch → dropped; stale *granted* → emits release (no stuck reservation); bulldozed-consumer echo → no-op; denial after LOCAL power regained → local power untouched |
+| **P-b** Nudge | `PowerCapacityRecheck` from the hint-publish sweep → connected component; `power_demand_recheck` (time-neutral); worker's disjoint id counter | worst case with nudge dropped/delayed == P-a alone (never worse) |
+| **P-c** Jobs | same cutover, citizen echoed | hourly ticks still never touch jobs/goods |
+| **P-d** Goods | same cutover, commercial echoed | `apply_pending_goods_stock` + goods phase daily-only |
+| **P-e** Delete `TickState` | only `Idle` left → drop the enum; `pop_next_runnable_event` → plain FIFO | zero `Waiting*`/continuation refs left |
+| **P-f** Starvation-fix | *(exploratory)* can the capture/restore dance simplify now? | delete only if the guarded race is confirmed gone |
+```text
+ P-a first (everything builds on the power cutover). P-c/P-d any order
+ after it. P-e once nothing pauses. P-f optional — plan is done without it.
+```
