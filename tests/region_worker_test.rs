@@ -269,6 +269,10 @@ fn cross_region_power_export_powers_same_component_consumer() {
 
 #[test]
 fn power_grant_continuation_runs_in_caller_region() {
+    // Retire-tickstate, P-a: the tick completes in the SAME pass it asks
+    // for exported power (no more pause), so `RegionTickCompleted` shows up
+    // in `request_pass` now, not `apply_pass` -- applying a same-generation
+    // grant later is a silent ECS write with no further tick completion.
     let caller = RegionId(70);
     let producer = RegionId(71);
     let consumer = power_export_consumer_region(caller);
@@ -282,6 +286,12 @@ fn power_grant_continuation_runs_in_caller_region() {
     assert!(request_pass.routing_errors.is_empty());
     assert!(!cell_powered(&worker, caller, 0, 0));
     assert_eq!(pending_events(&worker, producer), 1);
+    assert_eq!(
+        request_pass.tick_replies.len(),
+        1,
+        "the tick completes in the same pass it asks for exported power"
+    );
+    assert_eq!(turn(&worker, caller), 1);
 
     let producer_pass = worker.process_region_events(1);
     assert!(producer_pass.routing_errors.is_empty());
@@ -292,12 +302,15 @@ fn power_grant_continuation_runs_in_caller_region() {
     let apply_pass = worker.process_region_events(1);
     assert!(apply_pass.routing_errors.is_empty());
     assert!(cell_powered(&worker, caller, 0, 0));
-    assert_eq!(apply_pass.tick_replies.len(), 1);
-    assert_eq!(turn(&worker, caller), 1);
+    assert_eq!(
+        apply_pass.tick_replies.len(),
+        0,
+        "applying the grant is a silent ECS write, not a second tick completion"
+    );
     assert_eq!(
         turn(&worker, producer),
         0,
-        "producer must not run the caller's paused tick continuation"
+        "producer must not run the caller's tick"
     );
 }
 
@@ -366,6 +379,10 @@ fn stale_spare_power_hint_routes_to_producer_but_denies_cleanly() {
     let request_pass = worker.process_region_events(1);
     assert!(request_pass.routing_errors.is_empty());
     assert_eq!(pending_events(&worker, producer), 1);
+    // Retire-tickstate, P-a: the tick completes in this same pass now, not
+    // when the (denied) reply later applies.
+    assert_eq!(request_pass.tick_replies.len(), 1);
+    assert_eq!(turn(&worker, caller), 1);
 
     let producer_pass = worker.process_region_events(1);
     assert!(producer_pass.routing_errors.is_empty());
@@ -373,8 +390,11 @@ fn stale_spare_power_hint_routes_to_producer_but_denies_cleanly() {
 
     let apply_pass = worker.process_region_events(1);
     assert!(apply_pass.routing_errors.is_empty());
-    assert_eq!(apply_pass.tick_replies.len(), 1);
-    assert_eq!(turn(&worker, caller), 1);
+    assert_eq!(
+        apply_pass.tick_replies.len(),
+        0,
+        "a denial applying late is silent, not a second tick completion"
+    );
     assert!(!cell_powered(&worker, caller, 0, 0));
     assert_eq!(turn(&worker, producer), 0);
 }
@@ -520,6 +540,10 @@ fn cross_worker_power_export_routes_through_deterministic_barrier() {
 
     consumer_worker.push_event(RegionId(82), tick(1)).unwrap();
 
+    // Retire-tickstate, P-a: the tick's own RegionTickCompleted now arrives
+    // on the FIRST pass (no more pause) -- it no longer signals that the
+    // cross-worker grant has round-tripped back too. Run every pass to a
+    // fixed point instead of breaking out as soon as one reply appears.
     let mut tick_replies = Vec::new();
     for _ in 0..8 {
         let summary = process_workers_with_deterministic_barrier(
@@ -533,9 +557,6 @@ fn cross_worker_power_export_routes_through_deterministic_barrier() {
                 .into_iter()
                 .flat_map(|summary| summary.tick_replies),
         );
-        if !tick_replies.is_empty() {
-            break;
-        }
     }
 
     assert_eq!(tick_replies.len(), 1);
@@ -593,7 +614,13 @@ fn deterministic_barrier_orders_competing_cross_worker_power_requests() {
 }
 
 #[test]
-fn ignored_granted_reply_still_targets_next_release_to_producer() {
+fn stale_granted_reply_immediately_releases_producer_reservation() {
+    // Retire-tickstate, P-a: nothing pauses anymore, so a granted reply for a
+    // batch this caller has already moved past (or, as here, never even
+    // requested) can no longer rely on "the next release will reach the
+    // producer" -- there may never be a next release if this caller's own
+    // demand stays quiet. A stale-but-granted reply must release the
+    // producer's reservation right away instead of leaving it stuck.
     let caller = RegionId(87);
     let producer = RegionId(88);
     let unrelated = RegionId(89);
@@ -609,23 +636,30 @@ fn ignored_granted_reply_still_targets_next_release_to_producer() {
     worker
         .push_event(
             caller,
-            RegionEvent::ApplyPowerExportGrant(PowerExportGrant {
-                token: 0,
-                granted: true,
-                source_region: Some(producer),
-            }),
+            RegionEvent::ApplyPowerExportGrant {
+                request: PowerExportRequest {
+                    request_id: UiRequestId(999), // superseded: caller's current is 0
+                    caller_region: caller,
+                    caller_network: network(87, 0),
+                    token: 0,
+                    demand: 1,
+                    consumer: small_city::core::entity::Entity::new(caller, 0),
+                },
+                grant: PowerExportGrant {
+                    token: 0,
+                    granted: true,
+                    source_region: Some(producer),
+                },
+            },
         )
         .unwrap();
-    assert!(worker.process_region_events(1).routing_errors.is_empty());
-
-    worker.push_event(caller, tick(1)).unwrap();
     let summary = worker.process_region_events(1);
 
     assert!(summary.routing_errors.is_empty());
     assert_eq!(
         pending_events(&worker, producer),
         1,
-        "release must reach the producer that granted even though caller ignored the grant"
+        "a stale granted reply must immediately release the producer's reservation"
     );
     assert_eq!(
         pending_events(&worker, unrelated),
@@ -650,6 +684,7 @@ fn missing_caller_for_power_grant_result_is_deterministic_routing_error() {
                     caller_network: network(999, 0),
                     token: 0,
                     demand: 1,
+                    consumer: small_city::core::entity::Entity::new(RegionId(999), 0),
                 },
                 candidates: vec![network(72, 0)],
                 candidate_index: 0,
@@ -766,11 +801,25 @@ fn wrong_region_export_grants_are_ignored_without_mutating_state() {
     worker
         .push_event(
             region,
-            RegionEvent::ApplyPowerExportGrant(PowerExportGrant {
-                token: 0,
-                granted: true,
-                source_region: Some(RegionId(80)),
-            }),
+            RegionEvent::ApplyPowerExportGrant {
+                // request_id 0 matches a never-ticked runtime's current
+                // generation, so this is NOT dropped as stale -- it reaches
+                // the ECS write, which must still no-op: `consumer` names an
+                // entity that does not exist in `region`'s world.
+                request: PowerExportRequest {
+                    request_id: UiRequestId(0),
+                    caller_region: region,
+                    caller_network: network(79, 0),
+                    token: 0,
+                    demand: 1,
+                    consumer: small_city::core::entity::Entity::new(RegionId(80), 0),
+                },
+                grant: PowerExportGrant {
+                    token: 0,
+                    granted: true,
+                    source_region: Some(RegionId(80)),
+                },
+            },
         )
         .unwrap();
     worker

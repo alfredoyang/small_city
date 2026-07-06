@@ -794,22 +794,26 @@ impl RegionWorker {
         routing_mode: RegionRoutingMode,
     ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
         if R::granted(&grant) {
+            let target_region = R::caller_region(&request.request);
+            let order_key = R::request_order_key(&request.request, target_region, 2);
             return self.route_region_event(
-                R::caller_region(&request.request),
-                R::caller_region(&request.request),
-                R::apply_grant_event(grant),
-                R::request_order_key(&request.request, R::caller_region(&request.request), 2),
+                target_region,
+                target_region,
+                R::apply_grant_event(request.request, grant),
+                order_key,
                 routing_mode,
             );
         }
 
         request.candidate_index += 1;
         if request.candidate_index >= request.candidates.len() {
+            let target_region = R::caller_region(&request.request);
+            let order_key = R::request_order_key(&request.request, target_region, 2);
             return self.route_region_event(
-                R::caller_region(&request.request),
-                R::caller_region(&request.request),
-                R::apply_grant_event(grant),
-                R::request_order_key(&request.request, R::caller_region(&request.request), 2),
+                target_region,
+                target_region,
+                R::apply_grant_event(request.request, grant),
+                order_key,
                 routing_mode,
             );
         }
@@ -860,11 +864,14 @@ impl RegionWorker {
         request: &R::Request,
         routing_mode: RegionRoutingMode,
     ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
+        let target_region = R::caller_region(request);
+        let order_key = R::request_order_key(request, target_region, 2);
+        let grant = R::deny_grant(request);
         self.route_region_event(
-            R::caller_region(request),
-            R::caller_region(request),
-            R::apply_grant_event(R::deny_grant(request)),
-            R::request_order_key(request, R::caller_region(request), 2),
+            target_region,
+            target_region,
+            R::apply_grant_event(request.clone(), grant),
+            order_key,
             routing_mode,
         )
     }
@@ -1056,7 +1063,11 @@ trait ExportResource {
     fn token(request: &Self::Request) -> u32;
     fn resource_rank() -> u8;
     fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent;
-    fn apply_grant_event(grant: Self::Grant) -> RegionEvent;
+    /// Retire-tickstate, P-a: takes the original request too, not just the
+    /// grant — power's event now carries both so the caller needs no
+    /// continuation to remember what the reply answers. Job/goods ignore the
+    /// request for now (P-c/P-d); their event shape is unchanged.
+    fn apply_grant_event(request: Self::Request, grant: Self::Grant) -> RegionEvent;
     fn release_event(release: ExportAllocationRelease) -> RegionEvent;
 
     fn request_order_key(
@@ -1127,8 +1138,8 @@ impl ExportResource for PowerExport {
     fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent {
         RegionEvent::ProcessPowerExportRequest(request)
     }
-    fn apply_grant_event(grant: Self::Grant) -> RegionEvent {
-        RegionEvent::ApplyPowerExportGrant(grant)
+    fn apply_grant_event(request: Self::Request, grant: Self::Grant) -> RegionEvent {
+        RegionEvent::ApplyPowerExportGrant { request, grant }
     }
     fn release_event(release: ExportAllocationRelease) -> RegionEvent {
         RegionEvent::ReleasePowerExportAllocations(release)
@@ -1175,7 +1186,7 @@ impl ExportResource for JobExport {
     fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent {
         RegionEvent::ProcessJobExportRequest(request)
     }
-    fn apply_grant_event(grant: Self::Grant) -> RegionEvent {
+    fn apply_grant_event(_request: Self::Request, grant: Self::Grant) -> RegionEvent {
         RegionEvent::ApplyJobExportGrant(grant)
     }
     fn release_event(release: ExportAllocationRelease) -> RegionEvent {
@@ -1222,7 +1233,7 @@ impl ExportResource for GoodsExport {
     fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent {
         RegionEvent::ProcessGoodsExportRequest(request)
     }
-    fn apply_grant_event(grant: Self::Grant) -> RegionEvent {
+    fn apply_grant_event(_request: Self::Request, grant: Self::Grant) -> RegionEvent {
         RegionEvent::ApplyGoodsExportGrant(grant)
     }
     fn release_event(release: ExportAllocationRelease) -> RegionEvent {
@@ -1258,6 +1269,7 @@ mod tests {
             caller_network: network(1, 0),
             token: 10,
             demand: 1,
+            consumer: crate::core::entity::Entity::new(RegionId(1), 0),
         };
         let second = PowerExportRequest {
             request_id: UiRequestId(2),
@@ -1265,6 +1277,7 @@ mod tests {
             caller_network: network(1, 0),
             token: 11,
             demand: 1,
+            consumer: crate::core::entity::Entity::new(RegionId(1), 1),
         };
 
         worker
@@ -1293,6 +1306,7 @@ mod tests {
                 caller_network: network(1, 0),
                 token: 7,
                 demand: 1,
+                consumer: crate::core::entity::Entity::new(RegionId(1), 0),
             },
             candidates: vec![network(2, 0), network(3, 0)],
             candidate_index: 0,

@@ -4,7 +4,10 @@
 //! spawning OS threads or exposing ECS storage. Worker patches can later route
 //! `OutboundMessage` values between runtimes.
 //!
-//! Cross-region power export allocation flow:
+//! Cross-region power export allocation flow (retire-tickstate, P-a): the
+//! tick no longer pauses for power. It fires the release/request and moves
+//! straight on to the job phase; whichever reply lands later is applied to
+//! local state whenever it arrives, for the *next* tick to see:
 //!
 //! ```text
 //! Region A needs power          Worker routing             Region B has spare power
@@ -15,19 +18,10 @@
 //! Run local power
 //!   |
 //!   v
-//! Some consumers still unpowered?
+//! Emit allocation release + export request (fire-and-forget)
 //!   |
-//!   +-- no --> finish tick normally
-//!   |
-//!   +-- yes
-//!         |
-//!         v
-//!    Pause tick after local power
-//!         |
-//!         v
-//!    Emit allocation release + export request
-//!         |
-//!         v
+//!   v
+//! Continue this SAME pass into the job phase --> tick completed
 //!                              Route releases first
 //!                              Route request by topology
 //!                                      |
@@ -42,14 +36,10 @@
 //!                              Route grant back to Region A
 //!         |
 //!         v
-//! Apply grant to matching pending consumer
-//!         |
-//!         v
-//! All pending demands resolved?
-//!   |
-//!   +-- no --> stay paused
-//!   |
-//!   +-- yes --> continue population/economy/events --> tick completed
+//! Apply grant if it matches the current batch (current_power_request_id);
+//! a superseded batch's reply is dropped (and released back to the producer
+//! if it arrived granted). No effect on THIS tick -- picked up by whichever
+//! tick runs next.
 //! ```
 //!
 //! Export allocations are transient runtime coordination owned by the producer.
@@ -118,7 +108,14 @@ pub enum RegionEvent {
     /// Producer-side release for a caller's previous power export allocations.
     ReleasePowerExportAllocations(PowerExportAllocationRelease),
     /// Caller-side power export grant result.
-    ApplyPowerExportGrant(PowerExportGrant),
+    ///
+    /// Retire-tickstate, P-a: the reply carries the request it answers (the
+    /// worker already holds it at the moment it routes the result back), so
+    /// the caller needs no continuation to remember what the token meant.
+    ApplyPowerExportGrant {
+        request: PowerExportRequest,
+        grant: PowerExportGrant,
+    },
     /// Authoritative producer-side job-slot export allocation request.
     ProcessJobExportRequest(JobExportAllocationRequest),
     /// Producer-side release for a caller's previous job export allocations.
@@ -148,6 +145,9 @@ pub struct PowerExportRequest {
     pub caller_network: RegionRoadNetworkId,
     pub token: u32,
     pub demand: i32,
+    /// Retire-tickstate, P-a: echoed back by the grant reply so the caller
+    /// can re-derive the demand it answers without keeping a demand list.
+    pub consumer: Entity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +305,14 @@ pub struct RegionRuntime {
     job_export_producers: Vec<RegionId>,
     goods_export_producers: Vec<RegionId>,
     pending_goods_stock: Vec<(Entity, u32)>,
+    // Retire-tickstate, P-a: the only caller-side memory power needs now that
+    // nothing pauses. A reply echoes the request it answers (its own
+    // `request_id`), so comparing against this one scalar tells "my current
+    // batch" from "a superseded one" -- no continuation, no demand list.
+    // Starts at UiRequestId(0), a sentinel no real UI-driven tick ever mints
+    // (RegionalGame's counter starts at 1), so the very first reply this
+    // runtime ever sees compares correctly.
+    current_power_request_id: UiRequestId,
     // Event-driven plan (docs/20260703-event-driven-architecture.md), P-2: the
     // directory snapshot generation as of this worker pass's per-slice install
     // (`set_discovery_generation`, mirrors `set_region_routes`), and the
@@ -328,33 +336,32 @@ pub struct RegionRuntime {
 #[derive(Debug)]
 /// Explicit tick lifecycle for one region runtime.
 ///
-/// Cross-region export pauses a tick at two points so the importing region resolves
-/// over the event flow before downstream systems read the result. Power resolves
-/// first (it sets `powered`, which jobs and economy then read), then jobs; each is
-/// its own waiting sub-state and is skipped when that resource has no exportable
-/// demand:
+/// Retire-tickstate, P-a: power no longer pauses a tick. It fires its
+/// release/request and moves straight into the job phase in the same pass;
+/// whichever reply lands later is applied to local state whenever it
+/// arrives (see `current_power_request_id`), for the *next* tick to see.
+/// Jobs and goods still pause the tick, one sub-state each, since they only
+/// ever resolve on a daily boundary and are skipped entirely on an hourly
+/// tick:
 ///
 /// ```text
 /// Idle
-///   -- Tick --> WaitingForPowerExports (power demand)
-///            \-> WaitingForJobExports  (no power demand, job demand)
-///            \-> finish immediately, stay Idle (neither)
-/// WaitingForPowerExports
-///   -- ApplyPowerExportGrant (demands remain) --> WaitingForPowerExports
-///   -- ApplyPowerExportGrant (last demand)    --> enter job phase
+///   -- Tick --> WaitingForJobExports  (daily boundary, job demand)
+///            \-> finish immediately, stay Idle (no job demand, or hourly)
 /// WaitingForJobExports
 ///   -- ApplyJobExportGrant (demands remain) --> WaitingForJobExports
-///   -- ApplyJobExportGrant (last demand)    --> finish tick, back to Idle
+///   -- ApplyJobExportGrant (last demand)    --> enter goods phase
+/// WaitingForGoodsExports
+///   -- ApplyGoodsExportGrant (demands remain) --> WaitingForGoodsExports
+///   -- ApplyGoodsExportGrant (last demand)    --> finish tick, back to Idle
 /// ```
 ///
 /// While waiting, only export control events run (grants, producer-side requests,
-/// releases for either resource); a second `Tick` is deferred in the inbox until
-/// the paused tick finishes. A grant that arrives while `Idle`, in the wrong phase,
-/// or with an unknown token, leaves the current state unchanged.
+/// releases for any resource, power included); a second `Tick` is deferred in the
+/// inbox until the paused tick finishes. A grant that arrives while `Idle`, in the
+/// wrong phase, or with an unknown token, leaves the current state unchanged.
 enum TickState {
     Idle,
-    WaitingForPowerExports(TickPowerContinuation),
-    WaitingForPowerSettlement(PowerSettlementContinuation),
     WaitingForJobExports(TickJobContinuation),
     WaitingForGoodsExports(TickGoodsContinuation),
 }
@@ -364,27 +371,9 @@ impl TickState {
     fn is_waiting(&self) -> bool {
         matches!(
             self,
-            TickState::WaitingForPowerExports(_)
-                | TickState::WaitingForPowerSettlement(_)
-                | TickState::WaitingForJobExports(_)
-                | TickState::WaitingForGoodsExports(_)
+            TickState::WaitingForJobExports(_) | TickState::WaitingForGoodsExports(_)
         )
     }
-}
-
-#[derive(Debug)]
-/// Paused tick waiting for cross-region power export grants to resolve.
-struct TickPowerContinuation {
-    request_id: UiRequestId,
-    phase: RegionalTickPowerPhase,
-    pending_demands: Vec<PendingPowerDemand>,
-}
-
-#[derive(Debug)]
-/// Load-time settlement waiting only for imported power grants; it never
-/// advances time or enters the downstream job/goods/economy phases.
-struct PowerSettlementContinuation {
-    pending_demands: Vec<PendingPowerDemand>,
 }
 
 #[derive(Debug)]
@@ -574,6 +563,7 @@ impl RegionRuntime {
             job_export_producers: Vec::new(),
             goods_export_producers: Vec::new(),
             pending_goods_stock: Vec::new(),
+            current_power_request_id: UiRequestId(0),
             discovery_generation: 0,
             seen_power_generation: 0,
             seen_jobs_generation: 0,
@@ -751,7 +741,9 @@ impl RegionRuntime {
                     .release_stale_for_caller(release.caller_region, release.request_id);
                 Vec::new()
             }
-            RegionEvent::ApplyPowerExportGrant(grant) => self.apply_power_export_grant(grant),
+            RegionEvent::ApplyPowerExportGrant { request, grant } => {
+                self.apply_power_export_grant(request, grant)
+            }
             RegionEvent::ProcessJobExportRequest(request) => {
                 let grant = self.process_job_export_request(&request);
                 vec![OutboundMessage::JobExportRequestCompleted { request, grant }]
@@ -826,15 +818,23 @@ impl RegionRuntime {
             return self.receiver.pop_event();
         }
 
-        // A tick paused for exported power or jobs must finish before ordinary
-        // gameplay events run. Export grants are control replies for that paused
-        // tick; producer-side requests must also run, otherwise two regions that
-        // both consume and export on different networks can deadlock each other.
+        // A tick paused for exported jobs or goods must finish before ordinary
+        // gameplay events run. Job/goods grants are control replies for that
+        // paused tick, so they must run immediately -- they're the only thing
+        // that unblocks it. Producer-side requests/releases for ANY resource
+        // (power included) must also run, otherwise two regions that both
+        // consume and export on different networks can deadlock each other.
+        //
+        // Retire-tickstate, P-a: `ApplyPowerExportGrant` is deliberately NOT
+        // in this list. Power never pauses anymore, so nothing needs it to
+        // jump the queue -- and letting it jump would apply the grant to
+        // local state WHILE this same tick is still paused for jobs/goods,
+        // interleaving with that tick's own in-progress phases instead of
+        // landing cleanly for the next tick to see (caught in review).
         self.receiver.pop_event_matching(|event| {
             matches!(
                 event,
-                RegionEvent::ApplyPowerExportGrant(_)
-                    | RegionEvent::ProcessPowerExportRequest(_)
+                RegionEvent::ProcessPowerExportRequest(_)
                     | RegionEvent::ReleasePowerExportAllocations(_)
                     | RegionEvent::ApplyJobExportGrant(_)
                     | RegionEvent::ProcessJobExportRequest(_)
@@ -857,6 +857,11 @@ impl RegionRuntime {
     /// reintroduced). The gate's own inputs (the dirty flag and the
     /// generation) need no demand scan, so this ordering is free even before
     /// P-3 lands.
+    /// Retire-tickstate, P-a: power never pauses the tick anymore. It fires
+    /// its release/request (when dirty) and moves straight into the job
+    /// phase in the same pass; whichever reply lands later is applied
+    /// whenever it arrives (`apply_power_export_grant`, gated on
+    /// `current_power_request_id`), for the *next* tick to see.
     fn start_tick_power_phase(&mut self, request_id: UiRequestId) -> Vec<OutboundMessage> {
         let dirty = self.state.is_power_exports_dirty()
             || self.discovery_generation > self.seen_power_generation;
@@ -872,10 +877,34 @@ impl RegionRuntime {
         self.seen_power_generation = self.discovery_generation;
         self.state.clear_power_exports_dirty();
         let phase = self.state.begin_tick_power_demand_phase();
-        self.reconcile_power_export_allocations(request_id, phase)
+        let mut outbound = self.release_and_request_power(request_id, &phase.power_demands);
+        outbound.extend(self.enter_job_phase(request_id, phase));
+        outbound
     }
 
+    /// Time-neutral load-time re-negotiation: reuses `release_and_request_power`
+    /// as a plain fire-and-forget call, same as a dirty tick's power phase.
     fn start_power_import_settlement(&mut self, request_id: UiRequestId) -> Vec<OutboundMessage> {
+        let demands = self.state.power_import_settlement_demands();
+        self.release_and_request_power(request_id, &demands)
+    }
+
+    /// Release this caller's previous-generation power reservations, then
+    /// request the current demand batch. Fire-and-forget: stamps
+    /// `current_power_request_id` so a later reply can tell "my current
+    /// batch" from "a superseded one" (see `apply_power_export_grant`), and
+    /// returns immediately without waiting for any reply.
+    ///
+    /// Shared by a dirty tick's power phase and load-time import settlement
+    /// (`start_power_import_settlement`) — both just need "release what I
+    /// held, request what I need now," never mind how the demand was
+    /// collected.
+    fn release_and_request_power(
+        &mut self,
+        request_id: UiRequestId,
+        demands: &[PendingPowerDemand],
+    ) -> Vec<OutboundMessage> {
+        self.current_power_request_id = request_id;
         let producer_regions = std::mem::take(&mut self.power_export_producers);
         let mut outbound = vec![OutboundMessage::PowerExportAllocationsReleased(
             PowerExportAllocationRelease {
@@ -884,74 +913,16 @@ impl RegionRuntime {
                 producer_regions,
             },
         )];
-        let pending_demands = self.state.power_import_settlement_demands();
-        if pending_demands.is_empty() {
-            return outbound;
-        }
-
-        outbound.extend(pending_demands.iter().map(|demand| {
+        outbound.extend(demands.iter().map(|demand| {
             OutboundMessage::PowerExportRequested(PowerExportRequest {
                 request_id,
                 caller_region: self.region_id(),
                 caller_network: demand.caller_network,
                 token: demand.token,
                 demand: demand.demand,
+                consumer: demand.consumer,
             })
         }));
-        self.tick_state =
-            TickState::WaitingForPowerSettlement(PowerSettlementContinuation { pending_demands });
-        outbound
-    }
-
-    // Reconciliation itself uses the simple policy: release all previous
-    // allocations for this caller generation, then request all current
-    // demands. This function's own body is unchanged and deliberately stays
-    // eager/simple — but P-2 (docs/20260703-event-driven-architecture.md)
-    // absorbed the "only when needed instead of every tick" half of this
-    // TODO: the caller (`start_tick_power_phase`) now gates whether this
-    // function runs at all on `power_exports_dirty` / the discovery
-    // generation, so a quiet tick never calls it.
-    fn reconcile_power_export_allocations(
-        &mut self,
-        request_id: UiRequestId,
-        phase: RegionalTickPowerPhase,
-    ) -> Vec<OutboundMessage> {
-        let producer_regions = std::mem::take(&mut self.power_export_producers);
-        let release =
-            OutboundMessage::PowerExportAllocationsReleased(PowerExportAllocationRelease {
-                caller_region: self.region_id(),
-                request_id,
-                producer_regions,
-            });
-        if phase.power_demands.is_empty() {
-            // No exported power needed; advance straight to the job phase.
-            let mut outbound = vec![release];
-            outbound.extend(self.enter_job_phase(request_id, phase));
-            return outbound;
-        }
-
-        let pending_demands = phase.power_demands.clone();
-        let mut outbound = vec![release];
-        outbound.extend(
-            pending_demands
-                .iter()
-                .map(|demand| {
-                    OutboundMessage::PowerExportRequested(PowerExportRequest {
-                        request_id,
-                        caller_region: self.region_id(),
-                        caller_network: demand.caller_network,
-                        token: demand.token,
-                        demand: demand.demand,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        );
-
-        self.tick_state = TickState::WaitingForPowerExports(TickPowerContinuation {
-            request_id,
-            phase,
-            pending_demands,
-        });
         outbound
     }
 
@@ -1322,57 +1293,66 @@ impl RegionRuntime {
         }
     }
 
-    fn apply_power_export_grant(&mut self, grant: PowerExportGrant) -> Vec<OutboundMessage> {
+    /// Retire-tickstate, P-a: no continuation to consult — the reply carries
+    /// the request it answers. One staleness check against
+    /// `current_power_request_id` tells "my current batch" (apply it) from
+    /// "a superseded one" (drop it, but see below).
+    fn apply_power_export_grant(
+        &mut self,
+        request: PowerExportRequest,
+        grant: PowerExportGrant,
+    ) -> Vec<OutboundMessage> {
         // The producer reserved capacity as soon as it emitted a granted reply.
         // Remember that producer even if this caller later ignores the grant
         // because its local demand disappeared or was already powered; the next
         // release must still reach the producer and clear that allocation.
         self.remember_power_export_producer(&grant);
-        // A grant only applies to a paused tick. Take the continuation out and
-        // fall back to `Idle`; an unrelated grant restores the prior state below.
-        match std::mem::replace(&mut self.tick_state, TickState::Idle) {
-            TickState::WaitingForPowerSettlement(mut continuation) => {
-                let Some(position) = continuation
-                    .pending_demands
-                    .iter()
-                    .position(|demand| demand.token == grant.token)
-                else {
-                    self.tick_state = TickState::WaitingForPowerSettlement(continuation);
-                    return Vec::new();
-                };
+        if request.request_id != self.current_power_request_id {
+            // Caught in review: a superseded batch's release already fired
+            // (`release_and_request_power` stamped a newer generation and
+            // released this producer at that time) -- UNLESS this exact
+            // grant arrived after that release, in which case the producer
+            // reserved capacity no future release will ever target (this
+            // caller has moved on and won't repeat an old generation). Send
+            // one targeted release, stamped with the CURRENT generation, so
+            // the producer's `release_stale_for_caller` drops this stale
+            // reservation instead of holding it forever.
+            return Self::release_stale_granted_power(
+                self.region_id(),
+                self.current_power_request_id,
+                &grant,
+            );
+        }
+        let demand = PendingPowerDemand {
+            token: request.token,
+            consumer: request.consumer,
+            demand: request.demand,
+            caller_network: request.caller_network,
+        };
+        self.state.apply_power_export_grant(demand, grant);
+        Vec::new()
+    }
 
-                let demand = continuation.pending_demands.remove(position);
-                self.state.apply_power_export_grant(demand, grant);
-                if !continuation.pending_demands.is_empty() {
-                    self.tick_state = TickState::WaitingForPowerSettlement(continuation);
-                }
-                Vec::new()
+    /// A stale but *granted* reply reserved producer capacity that no future
+    /// release is guaranteed to reach (this caller has already moved past
+    /// that generation). Release it now instead of leaving it stuck. A
+    /// stale denial reserved nothing, so it needs no release.
+    fn release_stale_granted_power(
+        caller_region: RegionId,
+        current_request_id: UiRequestId,
+        grant: &PowerExportGrant,
+    ) -> Vec<OutboundMessage> {
+        match grant.source_region {
+            Some(producer) if grant.granted => {
+                vec![OutboundMessage::PowerExportAllocationsReleased(
+                    PowerExportAllocationRelease {
+                        caller_region,
+                        request_id: current_request_id,
+                        producer_regions: vec![producer],
+                    },
+                )]
             }
-            TickState::WaitingForPowerExports(mut continuation) => {
-                let Some(position) = continuation
-                    .pending_demands
-                    .iter()
-                    .position(|demand| demand.token == grant.token)
-                else {
-                    // Unknown token: keep waiting for the demands this tick still expects.
-                    self.tick_state = TickState::WaitingForPowerExports(continuation);
-                    return Vec::new();
-                };
-
-                let demand = continuation.pending_demands.remove(position);
-                self.state.apply_power_export_grant(demand, grant);
-                if !continuation.pending_demands.is_empty() {
-                    self.tick_state = TickState::WaitingForPowerExports(continuation);
-                    return Vec::new();
-                }
-
-                // Last power demand resolved: advance to the job export phase.
-                self.enter_job_phase(continuation.request_id, continuation.phase)
-            }
-            state => {
-                self.tick_state = state;
-                Vec::new()
-            }
+            _ => Vec::new(),
         }
     }
 
@@ -1492,8 +1472,9 @@ impl RegionRuntime {
 
 #[cfg(test)]
 mod tick_state_tests {
-    //! Unit tests for the `TickState` lifecycle: entering and leaving the paused
-    //! `WaitingForPowerExports` state through the runtime event loop.
+    //! Unit tests for the runtime event loop: power's fire-and-forget export
+    //! flow (retire-tickstate, P-a), and the `TickState` lifecycle still
+    //! entered and left for job/goods exports.
 
     use super::*;
     use crate::core::regions::RegionState;
@@ -1535,7 +1516,11 @@ mod tick_state_tests {
     }
 
     #[test]
-    fn tick_with_exportable_demand_enters_waiting_state() {
+    fn tick_with_exportable_demand_completes_immediately_and_requests_export() {
+        // Retire-tickstate, P-a: power no longer pauses the tick. It fires
+        // the release/request fire-and-forget and finishes in the same
+        // pass; whichever reply lands later is applied whenever it
+        // arrives, for the *next* tick to see.
         let mut runtime = consumer_runtime(RegionId(1));
         runtime.push_event(RegionEvent::Tick {
             request_id: UiRequestId(1),
@@ -1543,8 +1528,8 @@ mod tick_state_tests {
 
         let outbound = runtime.process_next_event();
 
-        assert!(runtime.tick_state.is_waiting());
-        assert!(!has_tick_completed(&outbound));
+        assert!(!runtime.tick_state.is_waiting());
+        assert!(has_tick_completed(&outbound));
         assert_eq!(export_requests(&outbound).len(), 1);
         assert!(matches!(
             outbound.first(),
@@ -1723,89 +1708,120 @@ mod tick_state_tests {
     }
 
     #[test]
-    fn last_grant_finishes_tick_and_returns_to_idle() {
+    fn matching_grant_applies_without_completing_a_second_tick() {
+        // Retire-tickstate, P-a: the tick already completed when it asked
+        // (previous test). A later reply for the SAME batch
+        // (`current_power_request_id` unchanged since) is applied straight
+        // to local state -- it must not, and cannot, re-emit
+        // `RegionTickCompleted`; that already happened.
         let mut runtime = consumer_runtime(RegionId(1));
         runtime.push_event(RegionEvent::Tick {
             request_id: UiRequestId(7),
         });
         let started = runtime.process_next_event();
-        let token = export_requests(&started)[0].token;
-        assert!(runtime.tick_state.is_waiting());
+        assert!(has_tick_completed(&started));
+        let request = export_requests(&started)[0].clone();
 
-        runtime.push_event(RegionEvent::ApplyPowerExportGrant(PowerExportGrant {
-            token,
-            granted: true,
-            source_region: Some(RegionId(2)),
-        }));
+        runtime.push_event(RegionEvent::ApplyPowerExportGrant {
+            request: request.clone(),
+            grant: PowerExportGrant {
+                token: request.token,
+                granted: true,
+                source_region: Some(RegionId(2)),
+            },
+        });
         let outbound = runtime.process_next_event();
 
-        assert!(!runtime.tick_state.is_waiting());
-        let completed = outbound
-            .iter()
-            .find_map(|message| match message {
-                OutboundMessage::RegionTickCompleted(reply) => Some(reply),
-                _ => None,
-            })
-            .expect("tick should finish after the last grant resolves");
-        assert_eq!(completed.request_id, UiRequestId(7));
+        assert!(
+            !has_tick_completed(&outbound),
+            "applying a grant must not re-complete a tick that already finished"
+        );
+        assert!(
+            runtime.state().world.power_consumers[&request.consumer].powered,
+            "a grant matching the current batch is applied to local state"
+        );
     }
 
     #[test]
-    fn second_tick_is_deferred_while_waiting() {
+    fn stale_reply_is_dropped_and_releases_the_producer() {
+        // Retire-tickstate, P-a: a reply for a batch this caller has
+        // already superseded (a newer request_id is now current) must be
+        // dropped rather than applied -- applying it would power a
+        // consumer using a producer reservation this caller no longer
+        // holds. Caught in review: a stale but GRANTED reply must also
+        // actively release that producer, or its reservation could get
+        // stuck if this caller then goes quiet.
         let mut runtime = consumer_runtime(RegionId(1));
         runtime.push_event(RegionEvent::Tick {
             request_id: UiRequestId(1),
         });
-        let started = runtime.process_next_event();
-        let token = export_requests(&started)[0].token;
+        let first = runtime.process_next_event();
+        let stale_request = export_requests(&first)[0].clone();
+
+        // A second dirty tick supersedes the first batch's generation. (Bare
+        // `RegionRuntime` tests bypass the worker's per-slice
+        // `set_discovery_generation` call, so bump it directly to reopen the
+        // gate the same way a real worker pass would if something
+        // discoverable had changed.)
+        runtime.set_discovery_generation(1);
         runtime.push_event(RegionEvent::Tick {
             request_id: UiRequestId(2),
         });
+        runtime.process_next_event();
 
-        // The queued second tick is not runnable while the first is paused.
-        let deferred = runtime.process_next_event();
-        assert!(deferred.is_empty());
-        assert!(runtime.tick_state.is_waiting());
-        assert_eq!(runtime.pending_event_count(), 1);
+        // The FIRST tick's (now stale) request comes back granted.
+        runtime.push_event(RegionEvent::ApplyPowerExportGrant {
+            request: stale_request.clone(),
+            grant: PowerExportGrant {
+                token: stale_request.token,
+                granted: true,
+                source_region: Some(RegionId(2)),
+            },
+        });
+        let outbound = runtime.process_next_event();
 
-        // Resolving the grant finishes the first tick and frees the runtime.
-        runtime.push_event(RegionEvent::ApplyPowerExportGrant(PowerExportGrant {
-            token,
-            granted: false,
-            source_region: None,
-        }));
-        let finished_first = runtime.process_next_event();
-        assert!(has_tick_completed(&finished_first));
-        assert!(!runtime.tick_state.is_waiting());
-
-        // Event-driven plan, P-2: this test drives `RegionRuntime` directly,
-        // bypassing the worker loop that would normally call
-        // `set_discovery_generation` before every slice. The first tick's
-        // dirty reconcile already cleared `power_exports_dirty` and set
-        // `seen_power_generation` to match, so without this the second tick
-        // would (correctly, per the new gate) go quiet — defeating this
-        // test's actual subject, which is the tick-state machine's
-        // deferred-event mechanics, not the reconcile gate. Bump the
-        // installed generation to simulate what a real worker pass would
-        // have found if something discoverable changed, reopening the gate.
-        runtime.set_discovery_generation(1);
-
-        // The deferred second tick now runs; the still-short consumer pauses again.
-        let started_second = runtime.process_next_event();
-        assert!(!has_tick_completed(&started_second));
-        assert!(runtime.tick_state.is_waiting());
+        assert!(
+            !runtime.state().world.power_consumers[&stale_request.consumer].powered,
+            "a stale batch's grant must not power the consumer"
+        );
+        assert!(
+            matches!(
+                outbound.as_slice(),
+                [OutboundMessage::PowerExportAllocationsReleased(release)]
+                    if release.producer_regions == vec![RegionId(2)]
+            ),
+            "a stale but granted reply must release the producer's reservation \
+             immediately, since this caller may never send another release"
+        );
     }
 
     #[test]
-    fn grant_while_idle_is_ignored() {
+    fn grant_for_a_since_removed_consumer_is_a_no_op() {
+        // Retire-tickstate, P-a risk: a reply can echo a consumer that was
+        // bulldozed after the request went out (same batch, so the
+        // staleness check passes). The ECS write must tolerate an entity
+        // that no longer exists.
         let mut runtime = consumer_runtime(RegionId(1));
         assert!(!runtime.tick_state.is_waiting());
 
-        runtime.push_event(RegionEvent::ApplyPowerExportGrant(PowerExportGrant {
-            token: 0,
-            granted: true,
-            source_region: Some(RegionId(2)),
-        }));
+        runtime.push_event(RegionEvent::ApplyPowerExportGrant {
+            request: PowerExportRequest {
+                request_id: UiRequestId(0), // matches a never-ticked runtime's current
+                caller_region: RegionId(1),
+                caller_network: RegionRoadNetworkId {
+                    region: RegionId(1),
+                    road_network: 0,
+                },
+                token: 0,
+                demand: 1,
+                consumer: crate::core::entity::Entity::new(RegionId(1), 999), // no such entity
+            },
+            grant: PowerExportGrant {
+                token: 0,
+                granted: true,
+                source_region: Some(RegionId(2)),
+            },
+        });
         let outbound = runtime.process_next_event();
 
         assert!(outbound.is_empty());
@@ -1813,24 +1829,76 @@ mod tick_state_tests {
     }
 
     #[test]
-    fn unknown_grant_token_keeps_waiting() {
-        let mut runtime = consumer_runtime(RegionId(1));
+    fn second_tick_is_deferred_while_waiting_for_job_exports() {
+        // Retire-tickstate, P-a: power no longer pauses, but jobs still do
+        // (P-c). The deferred-second-tick mechanic this test protects is
+        // unchanged production code; only the fixture that drives a runtime
+        // into a waiting state changes, from power to jobs.
+        let mut runtime = RegionRuntime::new(job_seeker_region(RegionId(1)));
+        while runtime.pending_event_count() > 0 {
+            runtime.process_next_event();
+        }
+        let mut request_id = 1u64;
+        let tokens: Vec<u32> = loop {
+            runtime.push_event(RegionEvent::Tick {
+                request_id: UiRequestId(request_id),
+            });
+            let outbound = runtime.process_next_event();
+            if matches!(runtime.tick_state, TickState::WaitingForJobExports(_)) {
+                break outbound
+                    .iter()
+                    .filter_map(|message| match message {
+                        OutboundMessage::JobExportRequested(request) => Some(request.token),
+                        _ => None,
+                    })
+                    .collect();
+            }
+            request_id += 1;
+            assert!(request_id <= 240, "never entered the job wait state");
+        };
+        assert!(
+            !tokens.is_empty(),
+            "job wait state entered with a pending request"
+        );
+
+        // A second Tick queued while paused for job exports is not runnable.
         runtime.push_event(RegionEvent::Tick {
-            request_id: UiRequestId(1),
+            request_id: UiRequestId(request_id + 1),
         });
-        let started = runtime.process_next_event();
-        let token = export_requests(&started)[0].token;
-        assert!(runtime.tick_state.is_waiting());
+        let deferred = runtime.process_next_event();
+        assert!(deferred.is_empty());
+        assert!(matches!(
+            runtime.tick_state,
+            TickState::WaitingForJobExports(_)
+        ));
+        assert_eq!(runtime.pending_event_count(), 1);
 
-        runtime.push_event(RegionEvent::ApplyPowerExportGrant(PowerExportGrant {
-            token: token.wrapping_add(99),
-            granted: true,
-            source_region: Some(RegionId(2)),
+        // Denying every outstanding demand finishes the first (paused) tick
+        // and frees the runtime to run the deferred second one.
+        for token in &tokens[..tokens.len() - 1] {
+            runtime.push_event(RegionEvent::ApplyJobExportGrant(JobExportGrant {
+                token: *token,
+                granted: false,
+                workplace: None,
+                location: None,
+                salary: 0,
+            }));
+            let outbound = runtime.process_next_event();
+            assert!(!has_tick_completed(&outbound));
+        }
+        runtime.push_event(RegionEvent::ApplyJobExportGrant(JobExportGrant {
+            token: tokens[tokens.len() - 1],
+            granted: false,
+            workplace: None,
+            location: None,
+            salary: 0,
         }));
-        let outbound = runtime.process_next_event();
+        let finished_first = runtime.process_next_event();
+        assert!(has_tick_completed(&finished_first));
+        assert!(!runtime.tick_state.is_waiting());
 
-        assert!(runtime.tick_state.is_waiting());
-        assert!(!has_tick_completed(&outbound));
+        let started_second = runtime.process_next_event();
+        assert!(has_tick_completed(&started_second));
     }
 
     #[test]

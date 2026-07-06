@@ -1,13 +1,17 @@
 # Retire TickState — settle each tick with whatever's already held
 
-Status: **plan** (not implemented). Reviewed three times by codex. First
-pass (core tick-retirement; P-a/P-c/P-d/P-e): 2 High + 2 Medium. Second
-pass (eager nudge P-b + self-describing-reply redesign): 2 High — the
-denial-cleanup guard and the per-worker id partition (item 4/6). Third
-pass: 1 High — a stale *granted* reply must actively release the
-producer's stuck reservation, not just drop (item 4); 1 Low — worker-id
-bit layout overlap (item 6). All findings fixed here; see the "caught in
-review" callouts.
+Status: **P-a implemented** (Power — see "P-a, implemented" at the end of
+this doc), P-b/P-c/P-d/P-e/P-f still plan-only. Reviewed three times by
+codex before implementation. First pass (core tick-retirement;
+P-a/P-c/P-d/P-e): 2 High + 2 Medium. Second pass (eager nudge P-b +
+self-describing-reply redesign): 2 High — the denial-cleanup guard and the
+per-worker id partition (item 4/6). Third pass: 1 High — a stale *granted*
+reply must actively release the producer's stuck reservation, not just
+drop (item 4); 1 Low — worker-id bit layout overlap (item 6). All findings
+fixed here; see the "caught in review" callouts. P-a's own implementation
+was then reviewed twice more by codex (one High: a power reply could
+mutate state mid-tick while paused for jobs/goods — fixed, see P-a's
+write-up).
 
 Both earlier plans this session made the tick *cheap* (`P-1..P-6`) and, in
 an abandoned attempt, *faster to react*. Neither touched the one real piece
@@ -657,3 +661,180 @@ pause-removal land together, one resource at a time.
  P-a first (everything builds on the power cutover). P-c/P-d any order
  after it. P-e once nothing pauses. P-f optional — plan is done without it.
 ```
+
+## P-a, implemented
+
+Landed on `retire_tick_statemachine`: `src/core/regions/runtime/mod.rs`,
+`src/core/regions/mod.rs`, `src/core/regions/worker.rs`,
+`tests/region_worker_test.rs`. Power only — jobs/goods untouched except a
+mechanical trait-signature ripple (below). `cargo fmt` / `clippy -D
+warnings` / `test -q` all green; reviewed twice by codex (one High found
+and fixed, see below).
+
+### What changed, structurally
+
+```text
+ RegionEvent::ApplyPowerExportGrant
+   BEFORE: (PowerExportGrant)                       -- bare grant, token only
+   AFTER:  { request: PowerExportRequest, grant }    -- carries its own context
+
+ RegionRuntime (caller-side state for power)
+   BEFORE: tick_state: TickState  (has WaitingForPowerExports/Settlement)
+           power_export_producers: Vec<RegionId>
+   AFTER:  tick_state: TickState  (Idle | WaitingForJobExports | WaitingForGoodsExports)
+           power_export_producers: Vec<RegionId>            -- unchanged
+           current_power_request_id: UiRequestId             -- NEW, the only addition
+```
+
+`TickPowerContinuation` and `PowerSettlementContinuation` are gone
+entirely — deleted, not deprecated. The one thing that survives is
+`request_id`, promoted from "a field inside a struct that gets thrown
+away" to "the caller's whole memory of what it's doing."
+
+### How `ApplyPowerExportGrant` works, end to end
+
+Where the event comes from — the worker already holds `request` at the
+moment it routes the result back; it used to throw it away, now it
+forwards it:
+
+```text
+ Caller region                  Worker                    Producer region
+ ─────────────                  ──────                    ───────────────
+ release_and_request_power
+   PowerExportRequested ────────► route_export_request
+                                    ├─ candidate found?
+                                    │    yes → ProcessPowerExportRequest ─────►
+                                    │                                          process_power_export_request
+                                    │                                              grant / deny
+                                    │◄──────────────────────────────────────── PowerExportRequestCompleted
+                                    │                                          { request, grant }
+                                    │
+                                    │  worker ALREADY holds `request` here —
+                                    │  forwards it instead of just the grant:
+                                    ▼
+                              ApplyPowerExportGrant { request, grant } ──────►
+                                                                              (back to caller region's inbox)
+```
+
+What the caller does with it on arrival — one unconditional step, then one
+branch:
+
+```text
+ RegionEvent::ApplyPowerExportGrant { request, grant } arrives
+        │
+        ▼
+ remember_power_export_producer(&grant)     ← ALWAYS runs first, regardless
+        │                                      of staleness (producer reserved
+        │                                      capacity the moment it granted;
+        │                                      this caller's NEXT release must
+        │                                      still reach it eventually)
+        ▼
+ request.request_id == current_power_request_id ?
+        │
+        ├─ NO  (stale — a newer batch already superseded this one)
+        │       │
+        │       ├─ grant.granted? ──yes──► fire ONE targeted release to
+        │       │                           grant.source_region, stamped
+        │       │                           with the CURRENT generation
+        │       │                           (see "the stale-granted-release
+        │       │                           fix" below)
+        │       └─ grant.granted? ──no───► nothing reserved, nothing to do
+        │
+        └─ YES (this is my current batch)
+                │
+                ▼
+        rebuild PendingPowerDemand from the echoed request
+        (token, consumer, demand, caller_network)
+                │
+                ▼
+        RegionState::apply_power_export_grant(demand, grant)
+          — the ECS write: power the consumer (or undo an
+            Imported-only optimistic restore on denial)
+```
+
+No token lookup in a Vec, no continuation, no "is this the last one, chain
+forward" — the match/mismatch against one scalar is the entire decision.
+
+### The tick, before and after
+
+```text
+ BEFORE                                    AFTER
+ ──────                                    ─────
+ Tick → power::run                         Tick → power::run
+      → demand? → release+request              → demand? → release+request (fire-and-forget)
+      → PARK (WaitingForPowerExports)           → keep going, same pass
+      → ... (later pass) ...                    → jobs (still pauses if daily+demand)
+      → ApplyPowerExportGrant arrives             → RegionTickCompleted (already sent!)
+      → last demand? → unpark → jobs
+      → ...
+      → RegionTickCompleted
+```
+
+`RegionTickCompleted` now shows up on the **first** pass a power-only tick
+runs, not the last. Three integration tests asserted the opposite
+(`tick_replies.len() == 1` on the pass that used to apply the grant) and
+needed that assertion moved — not a behavior bug, a test that was watching
+the wrong pass.
+
+### The stale-granted-release fix (caught in the plan's own 3rd review)
+
+```text
+ batch N:  request sent to producer P --------------------.
+ batch N+1 supersedes N (release + new request)            |
+   producer P's copy of N is now orphaned in this caller's  |
+   own bookkeeping -- P still thinks it granted N           |
+                                                             v
+ N's grant arrives late, GRANTED:  request_id(N) != current(N+1)
+   -> stale. Old code: just drop it. BUG: P's reservation for N
+      is never released if this caller then goes quiet.
+   -> New code: drop it AND fire one targeted release to P,
+      stamped with the CURRENT generation (N+1). P's
+      release_stale_for_caller keeps anything tagged N+1,
+      drops anything tagged older -- so this is safe even if
+      N+1 also granted something at P.
+```
+
+A stale *denial* needs no release (it reserved nothing at the producer).
+
+### The mid-tick interleave codex caught
+
+The first review round found a real gap: the shared dispatch allow-list
+(`pop_next_runnable_event`) still let `ApplyPowerExportGrant` jump the
+queue while a tick was paused for jobs/goods — a leftover from when power
+itself used to pause. Since power's own apply-grant no longer needs to
+unblock anything, letting it jump the queue meant a power reply could
+mutate world state **while that same tick's job/goods phases were still
+in flight**, contradicting the whole point (grant lands for the *next*
+tick, not this one):
+
+```text
+ Tick T: power dirty -> release+request -> enter job phase
+                                              -> daily + demand -> PARK (jobs)
+ (later pass) power's reply for Tick T arrives, GRANTED, still tick T's batch
+   BEFORE fix: allow-listed -> jumps queue -> applies mid-T, ahead of T's
+              own job/goods/economy phases reading power state
+   AFTER fix:  not allow-listed -> waits its turn like an ordinary event ->
+              applied only once T fully finishes and returns to Idle
+```
+
+Fix: removed `ApplyPowerExportGrant` from the allow-list. Kept
+`ProcessPowerExportRequest`/`ReleasePowerExportAllocations` (producer-side
+— still needed so two mutually-exporting regions can't deadlock each
+other) and `ApplyJobExportGrant`/`ApplyGoodsExportGrant` (still the only
+thing that unblocks their own pause).
+
+### Tests
+
+Re-baselining was the bulk of the diff, as the plan warned. Three shapes:
+- **Power tests rewritten for the new contract**: a tick with demand now
+  completes immediately (was: enters a wait state); a matching-generation
+  grant applies silently with no second `RegionTickCompleted`; a stale
+  granted reply is dropped *and* releases the producer; an unmatched/since
+  bulldozed consumer is a no-op; a denial never touches `PowerSource::Local`.
+- **One test moved from power to jobs**: `second_tick_is_deferred_while_waiting`
+  tested the *shared* deferred-dispatch mechanism using a power fixture;
+  since power no longer pauses, it's rebuilt on `job_seeker_region` (jobs
+  still pause, code unchanged) — same mechanism, still covered.
+- **Three integration tests' pass-by-pass assertions shifted** from "grant
+  pass" to "request pass" to match `RegionTickCompleted`'s new timing (see
+  above).

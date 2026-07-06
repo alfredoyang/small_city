@@ -1198,13 +1198,21 @@ impl RegionState {
             // This consumer was included in this tick's fresh demand batch, so
             // begin_tick_power_demand_phase's optimistic restore (see its
             // comment) is the only thing that could have left it marked
-            // powered — the old reservation it protected was already released
-            // by reconcile_power_export_allocations before this request was
-            // sent. A denied replacement must undo that optimism, or the
-            // consumer would read as powered forever with no reservation
-            // backing it anywhere.
+            // powered via an Imported source — the old reservation it
+            // protected was already released by release_and_request_power
+            // before this request was sent. A denied replacement must undo
+            // that optimism, or the consumer would read as powered forever
+            // with no reservation backing it anywhere.
+            //
+            // Retire-tickstate, P-a: only undo an Imported source here, never
+            // Local. Ticks no longer pause between request and reply, so a
+            // later tick (or the eager nudge) can legitimately power this
+            // same consumer locally before this now-late denial arrives;
+            // clearing unconditionally would wipe real local power and
+            // subtract it from the supplied stat.
             if let Some(consumer) = self.world.power_consumers.get_mut(&demand.consumer) {
-                if consumer.powered {
+                if consumer.powered && matches!(consumer.source, Some(PowerSource::Imported { .. }))
+                {
                     consumer.powered = false;
                     consumer.source = None;
                     self.world.stats.power.total_power_supplied -= demand.demand;
@@ -1784,6 +1792,62 @@ mod tests {
             region.world.stats.power.total_power_supplied,
             supplied_while_optimistic - demand,
             "the phantom supplied-power stat must be unwound too"
+        );
+    }
+
+    /// Retire-tickstate, P-a: a stale-but-granted reply's caller-side
+    /// staleness check now happens BEFORE this function is even called
+    /// (`RegionRuntime::apply_power_export_grant`), so `RegionState`'s ECS
+    /// write only ever sees a denial from the caller's OWN current batch.
+    /// But nothing pauses anymore, so between that request going out and its
+    /// denial coming back, a LATER tick (or a local rebuild) can legitimately
+    /// power this same consumer from `PowerSource::Local`. The denial must
+    /// leave that untouched — it protects only the optimistic `Imported`
+    /// restore, never a genuine local supply.
+    #[test]
+    fn apply_power_export_grant_denial_does_not_clear_local_power() {
+        let mut region = RegionState::new(RegionId(1), 2, 1);
+        assert!(region.build(0, 0, BuildingKind::Residential).success);
+        assert!(region.build(1, 0, BuildingKind::Road).success);
+        let consumer = region.world.grid.get(0, 0).expect("residential entity");
+        let demand = region.world.power_consumers[&consumer].demand;
+        let caller_network = RegionRoadNetworkId {
+            region: RegionId(1),
+            road_network: 0,
+        };
+
+        // Simulate: a later tick already powered this consumer locally
+        // (e.g. a power plant was built and connected in the meantime).
+        {
+            let power_consumer = region.world.power_consumers.get_mut(&consumer).unwrap();
+            power_consumer.powered = true;
+            power_consumer.source = Some(PowerSource::Local(Entity::new(RegionId(1), 99)));
+        }
+        region.world.stats.power.total_power_supplied += demand;
+
+        // A denial for an OLDER, now-superseded request arrives late.
+        region.apply_power_export_grant(
+            PendingPowerDemand {
+                token: 1,
+                consumer,
+                demand,
+                caller_network,
+            },
+            PowerExportGrant {
+                token: 1,
+                granted: false,
+                source_region: None,
+            },
+        );
+
+        assert!(
+            region.world.power_consumers[&consumer].powered,
+            "a denial must never clear genuine LOCAL power, only the \
+             optimistic Imported restore it was meant to protect"
+        );
+        assert_eq!(
+            region.world.power_consumers[&consumer].source,
+            Some(PowerSource::Local(Entity::new(RegionId(1), 99)))
         );
     }
 
