@@ -458,6 +458,114 @@ fn quiet_power_tick_skips_reconcile_after_first_grant() {
 }
 
 #[test]
+fn eager_nudge_powers_neighbor_before_its_own_first_tick() {
+    // Retire-tickstate, P-b: a neighbor is nudged the instant a hint
+    // republishes, instead of waiting for its own next tick's discovery-
+    // generation gate to notice. Prove the common-case payoff directly: the
+    // consumer never receives a single Tick, yet ends up powered once the
+    // producer's hint changes and the fan-out + request/grant round trip
+    // settles.
+    let consumer = RegionId(92);
+    let producer = RegionId(93);
+    let mut worker = worker_with_region_states(
+        WorkerId(63),
+        vec![
+            power_export_consumer_region(consumer),
+            // Same shape as `power_export_producer_region`, minus the plant:
+            // the producer starts with no spare power at all.
+            region_with_roads(producer, 2, 2, &[(0, 0)]),
+        ],
+    );
+    worker.set_region_topology(vec![neighbor(92, BorderEdge::East, 93)]);
+
+    // Prime a no-op pass so the initial (no-spare-power) hints settle, same
+    // setup as `stale_spare_power_hint_routes_to_producer_but_denies_cleanly`.
+    assert_eq!(worker.process_region_events(1).processed_regions, 0);
+    assert_eq!(turn(&worker, consumer), 0);
+
+    // The producer builds a power plant -- its availability hint flips
+    // false -> true. This alone must fan out a PowerCapacityRecheck to the
+    // consumer (the connected neighbor), with no Tick involved anywhere.
+    worker
+        .push_event(
+            producer,
+            RegionEvent::RunCommand {
+                request_id: UiRequestId(1),
+                command: RegionCommand::Build {
+                    x: 0,
+                    y: 1,
+                    kind: BuildingKind::PowerPlant,
+                },
+            },
+        )
+        .unwrap();
+    for _ in 0..8 {
+        assert!(worker.process_region_events(1).routing_errors.is_empty());
+    }
+
+    assert!(
+        cell_powered(&worker, consumer, 0, 0),
+        "the nudge should have powered the consumer"
+    );
+    assert_eq!(
+        turn(&worker, consumer),
+        0,
+        "the consumer must never have run its own tick to get here"
+    );
+}
+
+#[test]
+fn eager_nudge_does_not_refire_on_an_unchanged_pass() {
+    // Retire-tickstate, P-b: the fan-out is gated on `publish_region`'s own
+    // idempotence check. Once a real change has been nudged and settled,
+    // a further pass where nothing actually changed must not re-nudge --
+    // no repeated request/release traffic, nothing left to process.
+    let consumer = RegionId(94);
+    let producer = RegionId(95);
+    let mut worker = worker_with_region_states(
+        WorkerId(64),
+        vec![
+            power_export_consumer_region(consumer),
+            region_with_roads(producer, 2, 2, &[(0, 0)]),
+        ],
+    );
+    worker.set_region_topology(vec![neighbor(94, BorderEdge::East, 95)]);
+    assert_eq!(worker.process_region_events(1).processed_regions, 0);
+
+    // A real change: the producer builds a power plant, nudging the
+    // consumer. Drain to a fixed point.
+    worker
+        .push_event(
+            producer,
+            RegionEvent::RunCommand {
+                request_id: UiRequestId(1),
+                command: RegionCommand::Build {
+                    x: 0,
+                    y: 1,
+                    kind: BuildingKind::PowerPlant,
+                },
+            },
+        )
+        .unwrap();
+    for _ in 0..8 {
+        assert!(worker.process_region_events(1).routing_errors.is_empty());
+    }
+    assert!(
+        cell_powered(&worker, consumer, 0, 0),
+        "setup: nudge settled"
+    );
+
+    // Nothing changes now. A further no-op pass must produce zero
+    // additional pending events anywhere -- no repeated nudge, no repeated
+    // request/release traffic.
+    for _ in 0..3 {
+        let summary = worker.process_region_events(1);
+        assert!(summary.routing_errors.is_empty());
+        assert_eq!(summary.processed_regions, 0, "nothing left to process");
+    }
+}
+
+#[test]
 fn event_idle_region_republishes_dirty_hints_on_next_pass() {
     // P-1 (event-driven plan): a region's hints_dirty flag is set by every
     // attach_* chokepoint, including the ones `RegionState::build` runs during

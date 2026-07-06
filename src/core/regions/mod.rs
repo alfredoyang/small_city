@@ -1123,6 +1123,32 @@ impl RegionState {
         self.pending_power_demands()
     }
 
+    /// Retire-tickstate, P-b: time-neutral demand collection for the eager
+    /// nudge (`RegionEvent::PowerCapacityRecheck`) — must NOT advance the
+    /// clock, unlike `begin_tick_power_demand_phase`. Mirrors that
+    /// function's capture/clear/restore dance for the identical reason:
+    /// `release_and_request_power` is about to release every producer
+    /// reservation and request only what this scan finds, so an
+    /// already-imported consumer must be re-included in the scan — diff-
+    /// apply `power::run` otherwise leaves it looking powered and skips it
+    /// (the starvation-fix round-1 desync, reintroduced if skipped).
+    pub(crate) fn power_demand_recheck(&mut self) -> Vec<PendingPowerDemand> {
+        // Catch up any pending config change; no time advance.
+        ensure_derived_state(&mut self.world, self.id);
+        let imported = imported_power_grants(&self.world);
+        clear_imported_power(&mut self.world, &imported);
+        power::run(&mut self.world); // NOT begin_tick_power_phase — no advance_hours
+        let power_demands = self.pending_power_demands();
+        let requestable: std::collections::HashSet<Entity> =
+            power_demands.iter().map(|demand| demand.consumer).collect();
+        let restorable = imported
+            .into_iter()
+            .filter(|(entity, _, _)| requestable.contains(entity))
+            .collect::<Vec<_>>();
+        reapply_imported_power(&mut self.world, &restorable);
+        power_demands
+    }
+
     /// Advances from the resolved power phase into the local job assignment phase.
     ///
     /// Runs the post-power systems and (on a daily boundary) local job assignment,

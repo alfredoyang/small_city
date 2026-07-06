@@ -131,6 +131,17 @@ pub enum RegionEvent {
     /// P5b: a cross-region travel token handed in by a neighbor region (fire and
     /// forget — no grant, no tick pause).
     ReceiveTraveler(TravelerHandoff),
+    /// Retire-tickstate, P-b: the eager nudge. Fired at a neighbor the
+    /// instant this region's availability hint actually changes (worker's
+    /// P-1 hint-publish sweep), instead of waiting for that neighbor's own
+    /// next tick to notice via the discovery-generation gate. Fire and
+    /// forget, modeled on `ReceiveTraveler` — no grant, no tick pause; it
+    /// only ever makes the *common* case faster, never changes the
+    /// gate-guaranteed worst case.
+    PowerCapacityRecheck {
+        request_id: UiRequestId,
+        source_region: RegionId,
+    },
     /// P7c: advance movement by one 10-minute sub-tick (no economy). Broadcast to
     /// every region by the runner's `step_travel_city`; emits the crossings it
     /// buffers as `TravelerHandedOff` for the barrier to route.
@@ -770,6 +781,9 @@ impl RegionRuntime {
                 .into_iter()
                 .map(OutboundMessage::TravelerHandedOff)
                 .collect(),
+            RegionEvent::PowerCapacityRecheck { request_id, .. } => {
+                self.power_capacity_recheck(request_id)
+            }
             RegionEvent::StepTravel => {
                 // P7c: one movement sub-tick, then drain the crossings it buffered
                 // so the barrier routes them to neighbours for the next sub-tick.
@@ -924,6 +938,19 @@ impl RegionRuntime {
             })
         }));
         outbound
+    }
+
+    /// Retire-tickstate, P-b: the eager nudge's handler. Time-neutral —
+    /// unlike a normal tick, a nudge must not advance the game clock as a
+    /// side effect, so it collects fresh demand via
+    /// `RegionState::power_demand_recheck` (mirrors `power::run` directly,
+    /// not `begin_tick_power_phase`) instead of
+    /// `begin_tick_power_demand_phase`. Reuses the same
+    /// `release_and_request_power` helper as a normal dirty tick — fire the
+    /// release/request, don't wait.
+    fn power_capacity_recheck(&mut self, request_id: UiRequestId) -> Vec<OutboundMessage> {
+        let demands = self.state.power_demand_recheck();
+        self.release_and_request_power(request_id, &demands)
     }
 
     /// Advances a tick whose power is resolved into the job export phase.
@@ -1530,6 +1557,37 @@ mod tick_state_tests {
 
         assert!(!runtime.tick_state.is_waiting());
         assert!(has_tick_completed(&outbound));
+        assert_eq!(export_requests(&outbound).len(), 1);
+        assert!(matches!(
+            outbound.first(),
+            Some(OutboundMessage::PowerExportAllocationsReleased(_))
+        ));
+    }
+
+    #[test]
+    fn power_capacity_recheck_requests_export_without_advancing_time() {
+        // Retire-tickstate, P-b: the eager nudge is fire-and-forget and time-
+        // neutral -- it must collect fresh demand and fire release/request
+        // exactly like a dirty tick's power phase, but WITHOUT ticking the
+        // clock (a nudge is triggered by a neighbor's road/building change,
+        // not by this region's own turn advancing).
+        let mut runtime = consumer_runtime(RegionId(1));
+        runtime.push_event(RegionEvent::PowerCapacityRecheck {
+            request_id: UiRequestId(42),
+            source_region: RegionId(2),
+        });
+
+        let outbound = runtime.process_next_event();
+
+        assert_eq!(
+            runtime.state().view().status.turn,
+            0,
+            "a nudge must never advance the clock"
+        );
+        assert!(
+            !has_tick_completed(&outbound),
+            "a nudge is fire-and-forget, not a tick -- it never completes a tick"
+        );
         assert_eq!(export_requests(&outbound).len(), 1);
         assert!(matches!(
             outbound.first(),

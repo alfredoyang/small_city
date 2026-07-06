@@ -1,16 +1,20 @@
 # Retire TickState — settle each tick with whatever's already held
 
-Status: **P-a implemented** (Power — see "P-a, implemented" at the end of
-this doc), P-b/P-c/P-d/P-e/P-f still plan-only. Reviewed three times by
-codex before implementation. First pass (core tick-retirement;
-P-a/P-c/P-d/P-e): 2 High + 2 Medium. Second pass (eager nudge P-b +
-self-describing-reply redesign): 2 High — the denial-cleanup guard and the
-per-worker id partition (item 4/6). Third pass: 1 High — a stale *granted*
-reply must actively release the producer's stuck reservation, not just
-drop (item 4); 1 Low — worker-id bit layout overlap (item 6). All findings
-fixed here; see the "caught in review" callouts. P-a's own implementation
-was then reviewed twice more by codex (one High: a power reply could
-mutate state mid-tick while paused for jobs/goods — fixed, see P-a's
+Status: **P-a and P-b implemented** (Power, plus the eager nudge — see
+"P-a, implemented" and "P-b, implemented" at the end of this doc),
+P-c/P-d/P-e/P-f still plan-only. Reviewed three times by codex before
+implementation. First pass (core tick-retirement; P-a/P-c/P-d/P-e): 2 High
++ 2 Medium. Second pass (eager nudge P-b + self-describing-reply
+redesign): 2 High — the denial-cleanup guard and the per-worker id
+partition (item 4/6). Third pass: 1 High — a stale *granted* reply must
+actively release the producer's stuck reservation, not just drop (item
+4); 1 Low — worker-id bit layout overlap (item 6). All findings fixed
+here; see the "caught in review" callouts. P-a's own implementation was
+then reviewed twice more by codex (one High: a power reply could mutate
+state mid-tick while paused for jobs/goods — fixed, see P-a's write-up).
+P-b's implementation was reviewed twice more (one Low: use a real
+`assert!`/`checked_add` instead of `debug_assert!`/bare `+=` for the
+worker-id scheme so release builds stay protected too — fixed, see P-b's
 write-up).
 
 Both earlier plans this session made the tick *cheap* (`P-1..P-6`) and, in
@@ -838,3 +842,126 @@ Re-baselining was the bulk of the diff, as the plan warned. Three shapes:
 - **Three integration tests' pass-by-pass assertions shifted** from "grant
   pass" to "request pass" to match `RegionTickCompleted`'s new timing (see
   above).
+
+## P-b, implemented
+
+Landed on `retire_tick_statemachine`, depends on P-a. `src/core/regions/mod.rs`,
+`src/core/regions/runtime/mod.rs`, `src/core/regions/worker.rs`,
+`tests/region_worker_test.rs`. `cargo fmt` / `clippy -D warnings` / `test -q`
+all green; reviewed twice by codex (one Low found and fixed).
+
+### The two clocks, made concrete
+
+```text
+ Tick(H) ─────────────────────────────────────────────── Tick(H+1)
+   caller's gate checks discovery_generation, only here
+
+ fast worker passes:  pass · pass · pass · pass · pass · pass · pass
+
+ WITHOUT the nudge:  hint changes → (nothing happens until Tick(H+1))
+                                     → gate notices → asks → Tick(H+2) applies
+                                     worst case: exactly what P-a already promised
+
+ WITH the nudge:     hint changes → PowerCapacityRecheck fires THIS pass
+                                     → ask → grant lands a few passes later
+                                     → usually done well before Tick(H+1)
+```
+
+The gate (`discovery_generation > seen_power_generation`, checked every
+tick — unchanged since P-2) is still the only thing the *worst* case
+depends on. The nudge never touches it; it only sometimes lets a region
+ask sooner than its own next tick would have.
+
+### Where the nudge is triggered from
+
+```text
+ process_region_events_with_mode
+   │
+   ├─ per-region event processing (unchanged)
+   │
+   ├─ P-1 sweep: every region with hints_dirty → changed_summaries
+   │
+   ▼
+ for (region_id, links, hints) in changed_summaries:
+     republished = directory.publish_region(region_id, links, hints.clone())
+       │
+       ├─ false (no real change) ─────────────────────► nothing to nudge
+       │
+       └─ true (a real change) ──► recheck_id = next_worker_request_id()
+                                     │
+                                     ▼
+                              for each OTHER network in this network's
+                              connected component (discovery.component_of):
+                                  route PowerCapacityRecheck{recheck_id, region_id}
+```
+
+`publish_region`'s own idempotence check (it already compared old vs. new
+links/hints to decide whether to rebuild the discovery snapshot) is now
+also the nudge's gate — a hint re-published unchanged fans out nothing.
+
+### What a target region does with the nudge
+
+```text
+ RegionEvent::PowerCapacityRecheck { request_id, .. } arrives
+        │
+        ▼
+ RegionState::power_demand_recheck()   ← time-neutral: NO advance_hours
+        │  (same capture/clear/restore dance as begin_tick_power_demand_phase,
+        │   for the identical reason: release_and_request_power is about to
+        │   release every producer reservation and request only what THIS
+        │   scan finds, so an already-imported consumer must be re-included
+        │   or its reservation is orphaned)
+        ▼
+ release_and_request_power(request_id, demands)   ← the EXACT SAME P-a
+                                                      helper a dirty tick uses
+        │
+        ▼
+ fire release + request, return immediately — no tick, no pause, no reply
+```
+
+Nothing about applying the eventual grant changes: it comes back through
+the ordinary `ApplyPowerExportGrant { request, grant }` path from P-a,
+compared against `current_power_request_id` exactly the same way whether
+it was asked for by a tick or by a nudge.
+
+### The worker-minted id
+
+```text
+ UI-minted ids (RegionalGame's AtomicU64):  1, 2, 3, 4, ...  ─┐
+                                                                ├─ never collide:
+ worker-minted ids (bit 63 always set):                        │  disjoint bit
+   bit 63 | WorkerId (bits 32..62) | counter (bits 0..31)  ────┘  ranges
+
+ worker 1's 1st nudge:  1_000...0001 << 32 | 1
+ worker 2's 1st nudge:  1_000...0010 << 32 | 1     ← same counter value,
+                                                       different WorkerId bits,
+                                                       structurally cannot collide
+```
+
+Both the `WorkerId` ceiling (`< 2^31`) and the counter are checked with a
+real `assert!`/`checked_add` (not `debug_assert!`) — caught in review: a
+release build silently wrapping either would reintroduce exactly the
+collision this scheme exists to rule out.
+
+### Tests
+
+- **`power_capacity_recheck_requests_export_without_advancing_time`**
+  (unit, `runtime/mod.rs`): a nudge on a region with real power demand
+  fires a request and never advances `turn` — proves time-neutrality
+  directly.
+- **`eager_nudge_powers_neighbor_before_its_own_first_tick`** (integration):
+  the money test. A producer builds a power plant; the consumer — which
+  never receives a single `Tick` — ends up powered purely from the nudge
+  fan-out + request/grant round trip.
+- **`eager_nudge_does_not_refire_on_an_unchanged_pass`** (integration):
+  after the above settles, a further no-op pass produces zero additional
+  pending events anywhere — the idempotence gate holds.
+- **`worker_minted_ids_are_disjoint_from_ui_ids_and_other_workers`** (unit,
+  `worker.rs`): two workers' first ids, and one worker's first two ids, are
+  all distinct and all carry bit 63.
+
+No test targets the gate-only worst case directly — it doesn't need one:
+every P-a test already exercises ticks with the nudge never firing (none
+of them run the worker's hint-publish sweep with a genuine change), and
+they all still pass unchanged, which *is* the proof that P-a's worst-case
+guarantee holds with P-b layered on top.

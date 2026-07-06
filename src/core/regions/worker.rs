@@ -22,7 +22,7 @@ use crate::core::regions::{
     RegionalAvailabilityHint,
 };
 use crate::core::world::CrossRegionGoodsRoutes;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -235,6 +235,10 @@ pub struct RegionWorker {
     regions: Vec<RegionRuntime>,
     directory: Arc<RegionDirectory>,
     owners: Arc<RegionOwnerDirectory>,
+    // Retire-tickstate, P-b: mints ids for the eager nudge, which isn't
+    // triggered by any UI request so has no `UiRequestId` to borrow. See
+    // `next_worker_request_id` for the disjoint-bit-range scheme.
+    recheck_counter: u32,
 }
 
 impl RegionWorker {
@@ -258,7 +262,38 @@ impl RegionWorker {
             regions: Vec::new(),
             directory,
             owners,
+            recheck_counter: 0,
         }
+    }
+
+    /// Retire-tickstate, P-b: a fresh id for the eager nudge. This fan-out
+    /// isn't triggered by any UI request, so there's no `UiRequestId` to
+    /// borrow — but the resulting requests still need a fresh generation
+    /// (both the producer's `release_stale_for_caller` and the caller's own
+    /// `current_power_request_id` staleness check depend on batch ids
+    /// actually changing between batches).
+    ///
+    /// Bit 63 marks "worker-minted" (`RegionalGame`'s UI counter starts at 1
+    /// and increments per player action — it never reaches bit 63). Bits
+    /// 32..62 encode which worker minted it, so two workers' independent
+    /// counters can't collide either: a multi-worker game has several
+    /// `RegionWorker`s, and two workers each running their own bare counter
+    /// *can* mint the same id and nudge the same target with it, defeating
+    /// both staleness checks — encoding `WorkerId` makes that structurally
+    /// impossible instead of merely unlikely.
+    fn next_worker_request_id(&mut self) -> UiRequestId {
+        // WorkerId starts at 1 and stays tiny (INITIAL_WORKER_ID = 1, +index);
+        // 31 bits is astronomically more than any real deployment. A real
+        // assert (not debug_assert!) keeps this checked in release builds
+        // too -- an oversized WorkerId silently colliding with another
+        // worker's id range would be exactly the bug this scheme exists to
+        // prevent structurally.
+        assert!(self.id.0 < (1 << 31), "WorkerId must fit in 31 bits");
+        self.recheck_counter = self
+            .recheck_counter
+            .checked_add(1)
+            .expect("recheck_counter overflowed u32");
+        UiRequestId((1u64 << 63) | (u64::from(self.id.0) << 32) | u64::from(self.recheck_counter))
     }
 
     pub fn id(&self) -> WorkerId {
@@ -603,12 +638,59 @@ impl RegionWorker {
             runtime.state().clear_hints_dirty();
         }
 
+        let mut forwarded_events = Vec::new();
+
+        // Retire-tickstate, P-b: the eager nudge. Gated on `publish_region`'s
+        // own idempotence check -- only fans out on a REAL change, not on
+        // every pass a hint happens to get re-published unchanged. Coarse on
+        // purpose: the whole connected component is nudged, not just actual
+        // importers (see the plan's Risks section for why that's a safe,
+        // deliberate choice, same as every other dirty flag in this
+        // codebase). This only ever makes the common case faster; the
+        // discovery-generation gate alone still guarantees the worst case.
         for (region_id, links, hints) in changed_summaries {
-            self.publish_region_summary(region_id, links, hints);
+            let republished = self
+                .directory
+                .publish_region(region_id, links, hints.clone());
+            if !republished {
+                continue; // nothing actually changed -- nothing to nudge
+            }
+            let recheck_id = self.next_worker_request_id();
+            let discovery = self.directory.discovery_snapshot();
+            let mut notified = HashSet::new();
+            for hint in &hints {
+                let Some(component) = discovery.component_of(hint.network) else {
+                    continue;
+                };
+                for network in component {
+                    if network.region == region_id || !notified.insert(network.region) {
+                        continue; // skip self and duplicates
+                    }
+                    let order_key = ForwardedEventOrderKey {
+                        target_region: network.region,
+                        source_region: region_id,
+                        request_id: recheck_id,
+                        token: hint.network.road_network,
+                        resource_rank: 0,
+                        event_rank: 3, // after release/request/reply
+                    };
+                    if let Ok(WorkerRoutedMessage::Forwarded(event)) = self.route_region_event(
+                        network.region,
+                        region_id,
+                        RegionEvent::PowerCapacityRecheck {
+                            request_id: recheck_id,
+                            source_region: region_id,
+                        },
+                        order_key,
+                        routing_mode,
+                    ) {
+                        forwarded_events.push(event);
+                    }
+                }
+            }
         }
 
         let mut routing_errors = Vec::new();
-        let mut forwarded_events = Vec::new();
         let mut command_replies = Vec::new();
         let mut tick_replies = Vec::new();
         let mut snapshot_replies = Vec::new();
@@ -1291,6 +1373,42 @@ mod tests {
         // rebuild. After that, the two route_export_request calls are
         // idempotent (no rebuilt summaries), so the count stays at 1.
         assert_eq!(directory.rebuild_count(), 1);
+    }
+
+    #[test]
+    fn worker_minted_ids_are_disjoint_from_ui_ids_and_other_workers() {
+        // Retire-tickstate, P-b: the nudge mints its own ids since it isn't
+        // triggered by any UI request. Bit 63 must never overlap a
+        // UI-minted id (RegionalGame's counter starts at 1, incrementing per
+        // player action), and bits 32..62 must keep two workers' counters
+        // from ever colliding even if both mint their Nth id at the same
+        // moment.
+        let mut worker_a = RegionWorker::new(WorkerId(1));
+        let mut worker_b = RegionWorker::new(WorkerId(2));
+
+        let a_first = worker_a.next_worker_request_id();
+        let a_second = worker_a.next_worker_request_id();
+        let b_first = worker_b.next_worker_request_id();
+
+        for id in [a_first, a_second, b_first] {
+            assert_eq!(
+                id.0 & (1u64 << 63),
+                1u64 << 63,
+                "worker-minted ids must always have bit 63 set"
+            );
+        }
+        assert_ne!(
+            a_first, a_second,
+            "the same worker's own counter must not repeat"
+        );
+        assert_ne!(
+            a_first, b_first,
+            "two workers minting their first id must not collide"
+        );
+        assert_ne!(
+            a_second, b_first,
+            "different workers' counters must not collide even at the same count"
+        );
     }
 
     #[test]
