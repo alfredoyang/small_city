@@ -133,7 +133,13 @@ pub enum RegionEvent {
     /// Producer-side release for a caller's previous goods export allocations.
     ReleaseGoodsExportAllocations(GoodsExportAllocationRelease),
     /// Caller-side goods export grant result.
-    ApplyGoodsExportGrant(GoodsExportGrant),
+    ///
+    /// Retire-tickstate, P-d: the reply carries the request it answers,
+    /// same shape as power/jobs.
+    ApplyGoodsExportGrant {
+        request: GoodsExportRequest,
+        grant: GoodsExportGrant,
+    },
     /// P5b: a cross-region travel token handed in by a neighbor region (fire and
     /// forget — no grant, no tick pause).
     ReceiveTraveler(TravelerHandoff),
@@ -189,6 +195,9 @@ pub struct GoodsExportRequest {
     pub caller_network: RegionRoadNetworkId,
     pub token: u32,
     pub units: u32,
+    /// Retire-tickstate, P-d: echoed back by the grant reply so the caller
+    /// can stage the goods without keeping a demand list.
+    pub commercial: Entity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,7 +326,6 @@ pub enum OutboundMessage {
 /// Single-region event loop with deterministic FIFO processing.
 pub struct RegionRuntime {
     state: RegionState,
-    tick_state: TickState,
     power_export_allocations: ExportAllocations<i32>,
     job_export_allocations: ExportAllocations<Entity>,
     goods_export_allocations: ExportAllocations<u32>,
@@ -335,6 +343,8 @@ pub struct RegionRuntime {
     current_power_request_id: UiRequestId,
     // Retire-tickstate, P-c: same shape and same reasoning, for jobs.
     current_job_request_id: UiRequestId,
+    // Retire-tickstate, P-d: same shape and same reasoning, for goods.
+    current_goods_request_id: UiRequestId,
     // Event-driven plan (docs/20260703-event-driven-architecture.md), P-2: the
     // directory snapshot generation as of this worker pass's per-slice install
     // (`set_discovery_generation`, mirrors `set_region_routes`), and the
@@ -353,50 +363,6 @@ pub struct RegionRuntime {
     seen_goods_generation: u64,
     handle: RegionHandle,
     receiver: RegionEventReceiver,
-}
-
-#[derive(Debug)]
-/// Explicit tick lifecycle for one region runtime.
-///
-/// Retire-tickstate, P-a/P-c: neither power nor jobs pauses a tick anymore.
-/// Each fires its release/request and moves straight into the next phase
-/// in the same pass; whichever reply lands later is applied to local
-/// state whenever it arrives (see `current_power_request_id` /
-/// `current_job_request_id`), for the *next* tick to see. Goods still
-/// pauses the tick (P-d not yet done), since it only ever resolves on a
-/// daily boundary and is skipped entirely on an hourly tick:
-///
-/// ```text
-/// Idle
-///   -- Tick --> WaitingForGoodsExports  (daily boundary, goods demand)
-///            \-> finish immediately, stay Idle (no goods demand, or hourly)
-/// WaitingForGoodsExports
-///   -- ApplyGoodsExportGrant (demands remain) --> WaitingForGoodsExports
-///   -- ApplyGoodsExportGrant (last demand)    --> finish tick, back to Idle
-/// ```
-///
-/// While waiting, only export control events run (grants, producer-side requests,
-/// releases for any resource, power/jobs included); a second `Tick` is deferred in
-/// the inbox until the paused tick finishes. A grant that arrives while `Idle`, in
-/// the wrong phase, or with an unknown token, leaves the current state unchanged.
-enum TickState {
-    Idle,
-    WaitingForGoodsExports(TickGoodsContinuation),
-}
-
-impl TickState {
-    /// Returns true while a tick is paused waiting for export grants.
-    fn is_waiting(&self) -> bool {
-        matches!(self, TickState::WaitingForGoodsExports(_))
-    }
-}
-
-#[derive(Debug)]
-/// Paused tick waiting for cross-region goods export grants to resolve.
-struct TickGoodsContinuation {
-    request_id: UiRequestId,
-    phase: RegionalTickGoodsPhase,
-    pending_demands: Vec<PendingGoodsDemand>,
 }
 
 // CR3R — one reservation engine shared by power and jobs.
@@ -562,7 +528,6 @@ impl RegionRuntime {
         let (handle, receiver) = mailbox(state.id());
         Self {
             state,
-            tick_state: TickState::Idle,
             power_export_allocations: ExportAllocations::new(),
             job_export_allocations: ExportAllocations::new(),
             goods_export_allocations: ExportAllocations::new(),
@@ -572,6 +537,7 @@ impl RegionRuntime {
             pending_goods_stock: Vec::new(),
             current_power_request_id: UiRequestId(0),
             current_job_request_id: UiRequestId(0),
+            current_goods_request_id: UiRequestId(0),
             discovery_generation: 0,
             seen_power_generation: 0,
             seen_jobs_generation: 0,
@@ -773,7 +739,9 @@ impl RegionRuntime {
                     .release_stale_for_caller(release.caller_region, release.request_id);
                 Vec::new()
             }
-            RegionEvent::ApplyGoodsExportGrant(grant) => self.apply_goods_export_grant(grant),
+            RegionEvent::ApplyGoodsExportGrant { request, grant } => {
+                self.apply_goods_export_grant(request, grant)
+            }
             RegionEvent::ReceiveTraveler(handoff) => self
                 .state
                 .receive_traveler_handoff(handoff)
@@ -827,37 +795,7 @@ impl RegionRuntime {
     }
 
     fn pop_next_runnable_event(&mut self) -> Option<RegionEvent> {
-        if !self.tick_state.is_waiting() {
-            return self.receiver.pop_event();
-        }
-
-        // A tick paused for exported jobs or goods must finish before ordinary
-        // gameplay events run. Job/goods grants are control replies for that
-        // paused tick, so they must run immediately -- they're the only thing
-        // that unblocks it. Producer-side requests/releases for ANY resource
-        // (power included) must also run, otherwise two regions that both
-        // consume and export on different networks can deadlock each other.
-        //
-        // Retire-tickstate, P-a/P-c: `ApplyPowerExportGrant` and
-        // `ApplyJobExportGrant` are deliberately NOT in this list anymore.
-        // Neither power nor jobs pauses now, so nothing needs either to
-        // jump the queue -- and letting either jump would apply the grant
-        // to local state WHILE this same tick is still paused for goods
-        // (the only resource still pausing, until P-d), interleaving with
-        // that tick's own in-progress phase instead of landing cleanly for
-        // the next tick to see (caught in review, P-a).
-        self.receiver.pop_event_matching(|event| {
-            matches!(
-                event,
-                RegionEvent::ProcessPowerExportRequest(_)
-                    | RegionEvent::ReleasePowerExportAllocations(_)
-                    | RegionEvent::ProcessJobExportRequest(_)
-                    | RegionEvent::ReleaseJobExportAllocations(_)
-                    | RegionEvent::ApplyGoodsExportGrant(_)
-                    | RegionEvent::ProcessGoodsExportRequest(_)
-                    | RegionEvent::ReleaseGoodsExportAllocations(_)
-            )
-        })
+        self.receiver.pop_event()
     }
 
     /// Event-driven plan, P-2: gate the power reconcile on local/cross-region
@@ -1068,7 +1006,11 @@ impl RegionRuntime {
         }
         self.seen_goods_generation = self.discovery_generation;
         self.state.clear_goods_exports_dirty();
-        self.reconcile_goods_export_allocations(request_id, phase)
+        let mut outbound = self.release_and_request_goods(request_id, &phase.goods_demands);
+        let response = self.finish_goods_phase(request_id, phase);
+        outbound.push(OutboundMessage::RegionTickCompleted(response));
+        outbound.extend(self.drained_traveler_handoff_messages());
+        outbound
     }
 
     fn apply_pending_goods_stock(&mut self) {
@@ -1080,46 +1022,30 @@ impl RegionRuntime {
         }
     }
 
-    fn reconcile_goods_export_allocations(
+    fn release_and_request_goods(
         &mut self,
         request_id: UiRequestId,
-        phase: RegionalTickGoodsPhase,
+        demands: &[PendingGoodsDemand],
     ) -> Vec<OutboundMessage> {
-        let release =
-            OutboundMessage::GoodsExportAllocationsReleased(GoodsExportAllocationRelease {
+        self.current_goods_request_id = request_id;
+        let producer_regions = std::mem::take(&mut self.goods_export_producers);
+        let mut outbound = vec![OutboundMessage::GoodsExportAllocationsReleased(
+            GoodsExportAllocationRelease {
                 caller_region: self.region_id(),
                 request_id,
-                producer_regions: std::mem::take(&mut self.goods_export_producers),
-            });
-        if phase.goods_demands.is_empty() {
-            let response = self.finish_goods_phase(request_id, phase);
-            let mut outbound = vec![release, OutboundMessage::RegionTickCompleted(response)];
-            outbound.extend(self.drained_traveler_handoff_messages());
-            return outbound;
-        }
-
-        let pending_demands = phase.goods_demands.clone();
-        let mut outbound = vec![release];
-        outbound.extend(
-            pending_demands
-                .iter()
-                .map(|demand| {
-                    OutboundMessage::GoodsExportRequested(GoodsExportRequest {
-                        request_id,
-                        caller_region: self.region_id(),
-                        caller_network: demand.caller_network,
-                        token: demand.token,
-                        units: demand.units,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        );
-
-        self.tick_state = TickState::WaitingForGoodsExports(TickGoodsContinuation {
-            request_id,
-            phase,
-            pending_demands,
-        });
+                producer_regions,
+            },
+        )];
+        outbound.extend(demands.iter().map(|demand| {
+            OutboundMessage::GoodsExportRequested(GoodsExportRequest {
+                request_id,
+                caller_region: self.region_id(),
+                caller_network: demand.caller_network,
+                token: demand.token,
+                units: demand.units,
+                commercial: demand.commercial,
+            })
+        }));
         outbound
     }
 
@@ -1431,36 +1357,52 @@ impl RegionRuntime {
         }
     }
 
-    fn apply_goods_export_grant(&mut self, grant: GoodsExportGrant) -> Vec<OutboundMessage> {
+    /// Retire-tickstate, P-d: same shape as power/jobs. The reply carries
+    /// the request it answers, so a single request-id check replaces the
+    /// old goods continuation and pending demand list.
+    fn apply_goods_export_grant(
+        &mut self,
+        request: GoodsExportRequest,
+        grant: GoodsExportGrant,
+    ) -> Vec<OutboundMessage> {
         self.remember_goods_export_producer(&grant);
-        let TickState::WaitingForGoodsExports(mut continuation) =
-            std::mem::replace(&mut self.tick_state, TickState::Idle)
-        else {
-            return Vec::new();
-        };
-        let Some(position) = continuation
-            .pending_demands
-            .iter()
-            .position(|demand| demand.token == grant.token)
-        else {
-            self.tick_state = TickState::WaitingForGoodsExports(continuation);
-            return Vec::new();
-        };
-
-        let demand = continuation.pending_demands.remove(position);
+        if request.request_id != self.current_goods_request_id {
+            // A stale but granted goods reply reserved producer inventory
+            // after this caller already moved to a newer generation. Clear
+            // that stale reservation now, matching power/jobs.
+            return Self::release_stale_granted_goods(
+                self.region_id(),
+                self.current_goods_request_id,
+                &grant,
+            );
+        }
         if grant.granted && grant.units > 0 {
             self.pending_goods_stock
-                .push((demand.commercial, grant.units));
+                .push((request.commercial, grant.units));
         }
-        if !continuation.pending_demands.is_empty() {
-            self.tick_state = TickState::WaitingForGoodsExports(continuation);
-            return Vec::new();
-        }
+        Vec::new()
+    }
 
-        let response = self.finish_goods_phase(continuation.request_id, continuation.phase);
-        let mut outbound = vec![OutboundMessage::RegionTickCompleted(response)];
-        outbound.extend(self.drained_traveler_handoff_messages());
-        outbound
+    /// A stale but *granted* goods reply reserved producer stock that no
+    /// future release is guaranteed to reach. A stale denial reserved
+    /// nothing, so it needs no release.
+    fn release_stale_granted_goods(
+        caller_region: RegionId,
+        current_request_id: UiRequestId,
+        grant: &GoodsExportGrant,
+    ) -> Vec<OutboundMessage> {
+        match grant.source_region {
+            Some(producer) if grant.granted => {
+                vec![OutboundMessage::GoodsExportAllocationsReleased(
+                    GoodsExportAllocationRelease {
+                        caller_region,
+                        request_id: current_request_id,
+                        producer_regions: vec![producer],
+                    },
+                )]
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn run_command(
@@ -1514,16 +1456,15 @@ impl RegionRuntime {
 
 #[cfg(test)]
 mod tick_state_tests {
-    //! Unit tests for the runtime event loop: power's fire-and-forget export
-    //! flow (retire-tickstate, P-a), and the `TickState` lifecycle still
-    //! entered and left for job/goods exports.
+    //! Unit tests for the runtime event loop's fire-and-forget export flows
+    //! (retire-tickstate P-a/P-c/P-d) and producer-side allocation handling.
 
     use super::*;
     use crate::core::regions::RegionState;
     use crate::interface::input::BuildingKind;
 
     // A residential consumer next to a border road has no local power and one
-    // exportable demand, so ticking it pauses the tick for power exports.
+    // exportable demand.
     fn consumer_runtime(region_id: RegionId) -> RegionRuntime {
         let mut region = RegionState::new(region_id, 2, 2);
         assert!(region.build(0, 0, BuildingKind::Residential).success);
@@ -1536,6 +1477,16 @@ mod tick_state_tests {
             .iter()
             .filter_map(|message| match message {
                 OutboundMessage::PowerExportRequested(request) => Some(request),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn goods_export_requests(outbound: &[OutboundMessage]) -> Vec<&GoodsExportRequest> {
+        outbound
+            .iter()
+            .filter_map(|message| match message {
+                OutboundMessage::GoodsExportRequested(request) => Some(request),
                 _ => None,
             })
             .collect()
@@ -1569,8 +1520,6 @@ mod tick_state_tests {
         });
 
         let outbound = runtime.process_next_event();
-
-        assert!(!runtime.tick_state.is_waiting());
         assert!(has_tick_completed(&outbound));
         assert_eq!(export_requests(&outbound).len(), 1);
         assert!(matches!(
@@ -1625,8 +1574,6 @@ mod tick_state_tests {
         });
 
         let outbound = runtime.process_next_event();
-
-        assert!(!runtime.tick_state.is_waiting());
         assert!(has_tick_completed(&outbound));
         assert!(
             !outbound.iter().any(|message| matches!(
@@ -1675,7 +1622,6 @@ mod tick_state_tests {
                 request_id: UiRequestId(request_id),
             });
             last_outbound = runtime.process_next_event();
-            assert!(!runtime.tick_state.is_waiting());
         }
 
         let job_release = message_index(&last_outbound, |message| {
@@ -1708,7 +1654,6 @@ mod tick_state_tests {
                 request_id: UiRequestId(request_id),
             });
             let outbound = runtime.process_next_event();
-            assert!(!runtime.tick_state.is_waiting());
             assert!(
                 !outbound.iter().any(|message| matches!(
                     message,
@@ -1742,7 +1687,6 @@ mod tick_state_tests {
                 request_id: UiRequestId(request_id),
             });
             last_outbound = runtime.process_next_event();
-            assert!(!runtime.tick_state.is_waiting());
         }
 
         let goods_release = message_index(&last_outbound, |message| {
@@ -1768,7 +1712,6 @@ mod tick_state_tests {
                 request_id: UiRequestId(request_id),
             });
             let outbound = runtime.process_next_event();
-            assert!(!runtime.tick_state.is_waiting());
             assert!(
                 !outbound.iter().any(|message| matches!(
                     message,
@@ -1875,7 +1818,6 @@ mod tick_state_tests {
         // staleness check passes). The ECS write must tolerate an entity
         // that no longer exists.
         let mut runtime = consumer_runtime(RegionId(1));
-        assert!(!runtime.tick_state.is_waiting());
 
         runtime.push_event(RegionEvent::ApplyPowerExportGrant {
             request: PowerExportRequest {
@@ -1898,79 +1840,112 @@ mod tick_state_tests {
         let outbound = runtime.process_next_event();
 
         assert!(outbound.is_empty());
-        assert!(!runtime.tick_state.is_waiting());
     }
 
     #[test]
-    fn second_tick_is_deferred_while_waiting_for_goods_exports() {
-        // Retire-tickstate, P-c: neither power nor jobs pauses anymore, but
-        // goods still does (P-d). The deferred-second-tick mechanic this
-        // test protects is unchanged production code; only the fixture
-        // that drives a runtime into a waiting state changes, from jobs to
-        // goods.
+    fn daily_tick_with_goods_demand_completes_immediately_and_requests_export() {
+        // Retire-tickstate, P-d: goods now matches power/jobs. A daily
+        // goods demand fires release/request and completes the tick in the
+        // same pass; the grant, if it arrives, is staged for a later daily
+        // goods phase.
         let mut runtime = RegionRuntime::new(goods_seeker_region(RegionId(1)));
         while runtime.pending_event_count() > 0 {
             runtime.process_next_event();
         }
-        let mut request_id = 1u64;
-        let tokens: Vec<u32> = loop {
+
+        let mut requested = false;
+        for request_id in 1..=24 {
             runtime.push_event(RegionEvent::Tick {
                 request_id: UiRequestId(request_id),
             });
             let outbound = runtime.process_next_event();
-            if matches!(runtime.tick_state, TickState::WaitingForGoodsExports(_)) {
-                break outbound
-                    .iter()
-                    .filter_map(|message| match message {
-                        OutboundMessage::GoodsExportRequested(request) => Some(request.token),
-                        _ => None,
-                    })
-                    .collect();
+            if outbound
+                .iter()
+                .any(|message| matches!(message, OutboundMessage::GoodsExportRequested(_)))
+            {
+                let release = message_index(&outbound, |message| {
+                    matches!(message, OutboundMessage::GoodsExportAllocationsReleased(_))
+                });
+                let request = message_index(&outbound, |message| {
+                    matches!(message, OutboundMessage::GoodsExportRequested(_))
+                });
+                let completed = message_index(&outbound, |message| {
+                    matches!(message, OutboundMessage::RegionTickCompleted(_))
+                });
+                assert!(release < request);
+                assert!(request < completed);
+                requested = true;
+                break;
             }
-            request_id += 1;
-            assert!(request_id <= 24, "never entered the goods wait state");
-        };
+        }
         assert!(
-            !tokens.is_empty(),
-            "goods wait state entered with a pending request"
+            requested,
+            "a daily tick should eventually request remote goods"
+        );
+    }
+
+    #[test]
+    fn matching_goods_grant_applies_on_next_daily_goods_phase() {
+        // Goods imports were already delayed via `pending_goods_stock`; P-d
+        // keeps that behavior while removing the pause. A grant received
+        // after day 1's tick is not stored immediately. It lands when the
+        // next daily goods phase starts.
+        let mut runtime = RegionRuntime::new(goods_seeker_region(RegionId(1)));
+        while runtime.pending_event_count() > 0 {
+            runtime.process_next_event();
+        }
+
+        let mut day1_outbound = Vec::new();
+        for request_id in 1..=24 {
+            runtime.push_event(RegionEvent::Tick {
+                request_id: UiRequestId(request_id),
+            });
+            day1_outbound = runtime.process_next_event();
+        }
+        let request = goods_export_requests(&day1_outbound)[0].clone();
+        let commercial = request.commercial;
+        assert_eq!(
+            crate::core::systems::economy::commercial_goods_stored(
+                &runtime.state().world,
+                commercial
+            ),
+            0
         );
 
-        // A second Tick queued while paused for goods exports is not runnable.
-        runtime.push_event(RegionEvent::Tick {
-            request_id: UiRequestId(request_id + 1),
+        runtime.push_event(RegionEvent::ApplyGoodsExportGrant {
+            request: request.clone(),
+            grant: GoodsExportGrant {
+                token: request.token,
+                granted: true,
+                source_region: Some(RegionId(2)),
+                units: 2,
+            },
         });
-        let deferred = runtime.process_next_event();
-        assert!(deferred.is_empty());
-        assert!(matches!(
-            runtime.tick_state,
-            TickState::WaitingForGoodsExports(_)
-        ));
-        assert_eq!(runtime.pending_event_count(), 1);
+        let grant_outbound = runtime.process_next_event();
+        assert!(grant_outbound.is_empty());
+        assert_eq!(
+            crate::core::systems::economy::commercial_goods_stored(
+                &runtime.state().world,
+                commercial
+            ),
+            0,
+            "granted goods are staged, not applied immediately"
+        );
 
-        // Denying every outstanding demand finishes the first (paused) tick
-        // and frees the runtime to run the deferred second one.
-        for token in &tokens[..tokens.len() - 1] {
-            runtime.push_event(RegionEvent::ApplyGoodsExportGrant(GoodsExportGrant {
-                token: *token,
-                granted: false,
-                source_region: None,
-                units: 0,
-            }));
-            let outbound = runtime.process_next_event();
-            assert!(!has_tick_completed(&outbound));
+        for request_id in 25..=48 {
+            runtime.push_event(RegionEvent::Tick {
+                request_id: UiRequestId(request_id),
+            });
+            runtime.process_next_event();
         }
-        runtime.push_event(RegionEvent::ApplyGoodsExportGrant(GoodsExportGrant {
-            token: tokens[tokens.len() - 1],
-            granted: false,
-            source_region: None,
-            units: 0,
-        }));
-        let finished_first = runtime.process_next_event();
-        assert!(has_tick_completed(&finished_first));
-        assert!(!runtime.tick_state.is_waiting());
-
-        let started_second = runtime.process_next_event();
-        assert!(has_tick_completed(&started_second));
+        assert_eq!(
+            crate::core::systems::economy::commercial_goods_stored(
+                &runtime.state().world,
+                commercial
+            ),
+            2,
+            "pending goods stock applies at the next daily goods phase"
+        );
     }
 
     #[test]
@@ -1982,7 +1957,6 @@ mod tick_state_tests {
         // generation, so this is NOT dropped as stale; it reaches the ECS
         // write, which must still no-op.
         let mut runtime = consumer_runtime(RegionId(1));
-        assert!(!runtime.tick_state.is_waiting());
 
         runtime.push_event(RegionEvent::ApplyJobExportGrant {
             request: JobExportRequest {
@@ -2010,7 +1984,6 @@ mod tick_state_tests {
         let outbound = runtime.process_next_event();
 
         assert!(outbound.is_empty());
-        assert!(!runtime.tick_state.is_waiting());
     }
 
     #[test]
@@ -2085,6 +2058,55 @@ mod tick_state_tests {
     }
 
     #[test]
+    fn stale_goods_reply_is_dropped_and_releases_the_producer() {
+        // Retire-tickstate, P-d: same staleness protection as power/jobs.
+        // A stale granted goods reply reserved producer stock, so dropping
+        // it locally must also emit a targeted release.
+        let mut runtime = RegionRuntime::new(goods_seeker_region(RegionId(1)));
+        while runtime.pending_event_count() > 0 {
+            runtime.process_next_event();
+        }
+
+        let mut day1_outbound = Vec::new();
+        for request_id in 1..=24 {
+            runtime.push_event(RegionEvent::Tick {
+                request_id: UiRequestId(request_id),
+            });
+            day1_outbound = runtime.process_next_event();
+        }
+        let stale_request = goods_export_requests(&day1_outbound)[0].clone();
+
+        runtime.set_discovery_generation(1);
+        for request_id in 25..=48 {
+            runtime.push_event(RegionEvent::Tick {
+                request_id: UiRequestId(request_id),
+            });
+            runtime.process_next_event();
+        }
+
+        let producer = RegionId(9);
+        runtime.push_event(RegionEvent::ApplyGoodsExportGrant {
+            request: stale_request.clone(),
+            grant: GoodsExportGrant {
+                token: stale_request.token,
+                granted: true,
+                source_region: Some(producer),
+                units: stale_request.units,
+            },
+        });
+        let outbound = runtime.process_next_event();
+
+        assert!(
+            matches!(
+                outbound.as_slice(),
+                [OutboundMessage::GoodsExportAllocationsReleased(release)]
+                    if release.producer_regions == vec![producer]
+            ),
+            "a stale but granted goods reply must release the producer's reservation"
+        );
+    }
+
+    #[test]
     fn daily_tick_with_jobless_seeker_completes_immediately_and_requests_export() {
         // Retire-tickstate, P-c: a locally-powered residential whose only
         // workplace sits on a separate, unreachable road network grows
@@ -2102,7 +2124,6 @@ mod tick_state_tests {
                 request_id: UiRequestId(request_id),
             });
             let outbound = runtime.process_next_event();
-            assert!(!runtime.tick_state.is_waiting());
             if outbound
                 .iter()
                 .any(|message| matches!(message, OutboundMessage::JobExportRequested(_)))
@@ -2266,6 +2287,7 @@ mod tick_state_tests {
                 caller_network: producer_network,
                 token,
                 units,
+                commercial: crate::core::entity::Entity::new(caller, token),
             },
             candidates: vec![producer_network],
             candidate_index: 0,

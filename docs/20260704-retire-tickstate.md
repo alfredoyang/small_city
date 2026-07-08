@@ -1,8 +1,9 @@
 # Retire TickState — settle each tick with whatever's already held
 
-Status: **P-a, P-b, and P-c implemented** (Power, the eager nudge, and
-Jobs — see "P-a, implemented", "P-b, implemented", and "P-c, implemented"
-at the end of this doc), P-d/P-e/P-f still plan-only. Reviewed three
+Status: **P-a, P-b, P-c, P-d, and P-e implemented** (Power, the eager
+nudge, Jobs, Goods, and the now-dead `TickState` cleanup — see
+"P-a, implemented", "P-b, implemented", "P-c, implemented", and
+"P-d/P-e, implemented" at the end of this doc), P-f still plan-only. Reviewed three
 times by codex before implementation. First pass (core tick-retirement;
 P-a/P-c/P-d/P-e): 2 High + 2 Medium. Second pass (eager nudge P-b +
 self-describing-reply redesign): 2 High — the denial-cleanup guard and the
@@ -1132,3 +1133,47 @@ was asked directly whether the self-dirtying-loop fix should have split
 out separately and agreed it couldn't have: it's a necessary correctness
 fix for P-c to work at all, not an independent improvement, so there was
 no prior point where it could have landed on its own.
+
+## P-d/P-e, implemented
+
+Landed on `retire_tick_statemachine`, depends on P-a/P-c. Goods now uses
+the same self-describing, fire-and-forget flow as power and jobs:
+
+```text
+ GoodsExportRequest gains: commercial: Entity
+ ApplyGoodsExportGrant:    (GoodsExportGrant) -> { request: GoodsExportRequest, grant }
+ RegionRuntime:            + current_goods_request_id
+                           - TickGoodsContinuation, WaitingForGoodsExports
+ reconcile_goods_export_allocations -> release_and_request_goods
+ apply_goods_export_grant: staleness check against current_goods_request_id,
+                           release_stale_granted_goods on stale-but-granted,
+                           granted units still stage into pending_goods_stock
+ pop_next_runnable_event:  plain FIFO
+```
+
+The user-facing cadence stays the same where it matters: goods are still
+daily-only. `enter_job_phase` returns before goods on hourly ticks, so no
+hourly goods release/request traffic is emitted. On a dirty daily goods
+phase, the runtime applies last tick's `pending_goods_stock`, collects
+current commercial demand, releases old producer allocations, requests the
+new batch, and finishes the tick immediately. A grant that lands later
+stages stock for the next daily goods phase.
+
+P-e was included because P-d removed the last waiting state. Keeping an
+`Idle`-only `TickState` enum and the mid-wait mailbox filter made the code
+dead under `clippy -D warnings`, so the cleanup is mechanical fallout from
+P-d, not a separate gameplay change.
+
+### Tests
+
+- **`daily_tick_with_goods_demand_completes_immediately_and_requests_export`**
+  (`runtime/mod.rs`): a daily commercial goods demand emits release/request
+  and `RegionTickCompleted` in the same pass.
+- **`matching_goods_grant_applies_on_next_daily_goods_phase`**
+  (`runtime/mod.rs`): a granted import is not stored immediately; it lands
+  through `apply_pending_goods_stock` on the next daily goods phase.
+- **`stale_goods_reply_is_dropped_and_releases_the_producer`**
+  (`runtime/mod.rs`): a stale-but-granted goods reply emits a targeted
+  release for the producer reservation it would otherwise strand.
+- Existing goods quiet-path and worker routing tests were updated through
+  the new self-describing request shape.

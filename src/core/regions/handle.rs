@@ -65,15 +65,6 @@ impl RegionEventReceiver {
             .pop_front()
     }
 
-    pub(crate) fn pop_event_matching(
-        &mut self,
-        predicate: impl FnMut(&RegionEvent) -> bool,
-    ) -> Option<RegionEvent> {
-        let mut queue = self.queue.lock().expect("region mailbox poisoned");
-        let position = queue.iter().position(predicate)?;
-        queue.remove(position)
-    }
-
     pub(crate) fn pending_event_count(&self) -> usize {
         self.queue.lock().expect("region mailbox poisoned").len()
     }

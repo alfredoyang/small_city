@@ -1145,10 +1145,9 @@ trait ExportResource {
     fn token(request: &Self::Request) -> u32;
     fn resource_rank() -> u8;
     fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent;
-    /// Retire-tickstate, P-a: takes the original request too, not just the
-    /// grant — power's event now carries both so the caller needs no
-    /// continuation to remember what the reply answers. Job/goods ignore the
-    /// request for now (P-c/P-d); their event shape is unchanged.
+    /// Retire-tickstate, P-a/P-c/P-d: takes the original request too, not
+    /// just the grant. The caller-side apply event carries both so no
+    /// resource needs a continuation to remember what the reply answers.
     fn apply_grant_event(request: Self::Request, grant: Self::Grant) -> RegionEvent;
     fn release_event(release: ExportAllocationRelease) -> RegionEvent;
 
@@ -1315,8 +1314,8 @@ impl ExportResource for GoodsExport {
     fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent {
         RegionEvent::ProcessGoodsExportRequest(request)
     }
-    fn apply_grant_event(_request: Self::Request, grant: Self::Grant) -> RegionEvent {
-        RegionEvent::ApplyGoodsExportGrant(grant)
+    fn apply_grant_event(request: Self::Request, grant: Self::Grant) -> RegionEvent {
+        RegionEvent::ApplyGoodsExportGrant { request, grant }
     }
     fn release_event(release: ExportAllocationRelease) -> RegionEvent {
         RegionEvent::ReleaseGoodsExportAllocations(release)
@@ -1496,6 +1495,7 @@ mod tests {
                     caller_network: network(1, 0),
                     token: 0,
                     units: 1,
+                    commercial: crate::core::entity::Entity::new(RegionId(1), 0),
                 },
                 RegionRoutingMode::Immediate,
             )
