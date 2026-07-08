@@ -84,6 +84,12 @@ pub(crate) struct TickJobPhase {
     before_time: GameTime,
     after_time: GameTime,
     is_daily: bool,
+    /// Retire-tickstate, P-c: whether the daily wipe/reconcile actually ran.
+    /// Computed AFTER `population::run` inside `continue_to_job_phase` (not
+    /// snapshotted before it), so a citizen spawned by growth THIS tick is
+    /// never missed -- see that function's doc comment (caught in review).
+    /// Always `false` on an hourly (non-daily) tick.
+    jobs_dirty: bool,
 }
 
 impl TickJobPhase {
@@ -91,6 +97,12 @@ impl TickJobPhase {
     /// resolve. Cross-region job export only engages on daily ticks.
     pub(crate) fn is_daily(&self) -> bool {
         self.is_daily
+    }
+
+    /// Whether the daily wipe/local-match/cross-region-reconcile ran this
+    /// tick. Only meaningful when `is_daily()`; always `false` otherwise.
+    pub(crate) fn jobs_dirty(&self) -> bool {
+        self.jobs_dirty
     }
 }
 
@@ -156,7 +168,11 @@ pub(crate) fn finish_tick_after_power_phase(
     local_region: RegionId,
     phase: TickPowerPhase,
 ) -> CommandResult {
-    let job_phase = continue_to_job_phase(world, local_region, phase);
+    // Test-only single-region path: no cross-region reconcile gate exists
+    // here, so always wipe and rematch (discovery_dirty: true forces
+    // jobs_dirty true regardless of the fresh in-function check), unchanged
+    // from before P-c.
+    let job_phase = continue_to_job_phase(world, local_region, phase, true);
     finish_tick_after_job_phase(world, job_phase, &[])
 }
 
@@ -165,10 +181,30 @@ pub(crate) fn finish_tick_after_power_phase(
 /// Local assignment happens here (before the economy settles salaries/taxes) so a
 /// citizen left without a reachable local slot becomes a candidate for an imported
 /// remote workplace during the cross-region job export phase.
+///
+/// Retire-tickstate, P-c: the daily wipe is now gated on jobs-dirtiness, not
+/// unconditional, so a quiet day (nothing jobs-relevant changed locally or
+/// remotely) skips it entirely, leaving every citizen's existing assignment
+/// -- local AND remote -- untouched. This closes a real bug: applying a
+/// granted remote assignment no longer re-dirties the gate (see
+/// `World::refresh_jobs_cache_after_grant_applied`), so a settled remote
+/// worker is left alone instead of being wiped and re-requested (jobless,
+/// unpaid) every single day forever.
+///
+/// `discovery_dirty` is the caller's own reconcile gate (discovery
+/// generation moved) -- snapshotted before this runs, since it cannot
+/// change mid-tick. It is OR'd with a FRESH read of `jobs_exports_dirty`
+/// taken AFTER `population::run`, not a value snapshotted before it: caught
+/// in review, `population::run` can spawn a citizen this same tick (via
+/// `attach_citizen`, which itself sets `jobs_exports_dirty`), and a citizen
+/// born this tick must not wait a full extra day for its first job
+/// attempt. The effective result is returned via `TickJobPhase::jobs_dirty`
+/// for the caller to act on (release/request, generation bookkeeping).
 pub(crate) fn continue_to_job_phase(
     world: &mut World,
     local_region: RegionId,
     phase: TickPowerPhase,
+    discovery_dirty: bool,
 ) -> TickJobPhase {
     let is_daily = is_new_day(phase.before_time, phase.after_time);
     stats::run(world);
@@ -182,7 +218,8 @@ pub(crate) fn continue_to_job_phase(
     citizens::update_happiness_targets(world);
     citizens::update_happiness(world);
     local_effects::run(world);
-    if is_daily {
+    let jobs_dirty = is_daily && (world.is_jobs_exports_dirty() || discovery_dirty);
+    if jobs_dirty {
         economy::assign_local_jobs_for_daily_tick(world, local_region);
     }
 
@@ -191,6 +228,7 @@ pub(crate) fn continue_to_job_phase(
         before_time: phase.before_time,
         after_time: phase.after_time,
         is_daily,
+        jobs_dirty,
     }
 }
 
@@ -466,8 +504,8 @@ fn game_time_view(time: GameTime) -> GameTimeView {
 #[cfg(test)]
 mod tests {
     use super::{
-        begin_tick_power_phase, begin_tick_power_phase_quiet, refresh_derived_state_for_world,
-        tick_world,
+        begin_tick_power_phase, begin_tick_power_phase_quiet, continue_to_job_phase,
+        finish_tick_after_job_phase, refresh_derived_state_for_world, tick_world,
     };
     use crate::core::components::WorkplaceAssignment;
     use crate::core::regions::RegionId;
@@ -515,6 +553,49 @@ mod tests {
 
         assert!(tick_world(&mut world).success);
         assert_eq!(world.stats.population, 1);
+    }
+
+    #[test]
+    fn jobs_dirty_is_rechecked_after_population_spawns_a_citizen_same_tick() {
+        // Retire-tickstate, P-c (caught in review): `jobs_dirty` is read
+        // AFTER `population::run`, not snapshotted before it -- a citizen
+        // spawned by growth THIS SAME daily tick must be noticed the same
+        // day, not missed because nothing else was dirty when the tick
+        // started. Drives `continue_to_job_phase` directly (not `tick_world`,
+        // which always passes `discovery_dirty: true` and would hide this).
+        let mut world = World::new(5, 3);
+        placement::place_building(&mut world, 0, 0, BuildingKind::PowerPlant);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Residential);
+        placement::place_building(&mut world, 2, 0, BuildingKind::Commercial);
+        for x in 0..=2 {
+            placement::place_building(&mut world, x, 1, BuildingKind::Road);
+        }
+
+        for _ in 0..23 {
+            let phase = begin_tick_power_phase(&mut world, RegionId(1));
+            let job_phase = continue_to_job_phase(&mut world, RegionId(1), phase, false);
+            assert!(!job_phase.is_daily());
+            finish_tick_after_job_phase(&mut world, job_phase, &[]);
+        }
+        assert!(world.citizens.is_empty(), "setup: no growth yet");
+
+        // Genuinely quiet at entry: nothing (placement's own dirtying
+        // included) should be why the next assertion passes.
+        world.clear_jobs_exports_dirty();
+        assert!(!world.is_jobs_exports_dirty(), "setup: quiet at entry");
+
+        let phase = begin_tick_power_phase(&mut world, RegionId(1));
+        let job_phase = continue_to_job_phase(&mut world, RegionId(1), phase, false);
+
+        assert!(job_phase.is_daily());
+        assert_eq!(world.citizens.len(), 1, "setup: growth happened this tick");
+        assert!(
+            job_phase.jobs_dirty(),
+            "a citizen spawned by population growth THIS tick must be \
+             noticed the same day, not missed because jobs_dirty was \
+             snapshotted before population::run ran"
+        );
+        finish_tick_after_job_phase(&mut world, job_phase, &[]);
     }
 
     #[test]

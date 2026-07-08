@@ -330,6 +330,12 @@ impl RegionalTickJobPhase {
     pub(crate) fn is_daily(&self) -> bool {
         self.phase.is_daily()
     }
+
+    /// Retire-tickstate, P-c: whether the daily wipe/reconcile actually ran
+    /// (computed fresh after population growth — see `continue_to_job_phase`).
+    pub(crate) fn jobs_dirty(&self) -> bool {
+        self.phase.jobs_dirty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,7 +414,10 @@ impl RegionState {
     /// Advances only this region's local simulation using the shared tick order.
     pub fn tick_local(&mut self) -> CommandResult {
         let phase = begin_tick_power_phase(&mut self.world, self.id);
-        let job_phase = continue_to_job_phase(&mut self.world, self.id, phase);
+        // Single-region path: no cross-region reconcile gate exists here, so
+        // there's nothing to skip -- always wipe and rematch, unchanged from
+        // before P-c.
+        let job_phase = continue_to_job_phase(&mut self.world, self.id, phase, true);
         finish_tick_after_job_phase(&mut self.world, job_phase, &[])
     }
 
@@ -502,12 +511,6 @@ impl RegionState {
 
     pub(crate) fn clear_power_exports_dirty(&self) {
         self.world.clear_power_exports_dirty();
-    }
-
-    /// Event-driven plan, P-4: whether this region's job export demand/
-    /// capacity may have changed since its last reconcile.
-    pub(crate) fn is_jobs_exports_dirty(&self) -> bool {
-        self.world.is_jobs_exports_dirty()
     }
 
     pub(crate) fn clear_jobs_exports_dirty(&self) {
@@ -1151,17 +1154,28 @@ impl RegionState {
 
     /// Advances from the resolved power phase into the local job assignment phase.
     ///
-    /// Runs the post-power systems and (on a daily boundary) local job assignment,
-    /// then collects the job seekers that found no reachable local slot so the
-    /// runtime can request remote workplace slots before the economy settles.
+    /// Runs the post-power systems and (on a daily boundary, when jobs-dirty)
+    /// local job assignment, then collects the job seekers that found no
+    /// reachable local slot so the runtime can request remote workplace slots
+    /// before the economy settles.
+    ///
+    /// Retire-tickstate, P-c: `discovery_dirty` is only the caller's own
+    /// reconcile-gate half (discovery generation moved); the full jobs-dirty
+    /// decision is made inside `continue_to_job_phase`, AFTER population
+    /// growth, and read back via `RegionalTickJobPhase::jobs_dirty()` — see
+    /// that function's doc comment for why (a citizen born this same tick
+    /// must not wait a full extra day for its first job attempt).
     pub(crate) fn continue_tick_to_job_demand_phase(
         &mut self,
         power_phase: RegionalTickPowerPhase,
+        discovery_dirty: bool,
     ) -> RegionalTickJobPhase {
-        let phase = continue_to_job_phase(&mut self.world, self.id, power_phase.phase);
+        let phase =
+            continue_to_job_phase(&mut self.world, self.id, power_phase.phase, discovery_dirty);
         // Jobs (and the economy) resolve only on a daily boundary, so cross-region
         // job export is sought only then; hourly ticks carry no job demands.
-        let job_demands = if phase.is_daily() {
+        // A quiet daily tick skipped the wipe, so nothing changed to collect either.
+        let job_demands = if phase.jobs_dirty() {
             self.pending_job_demands()
         } else {
             Vec::new()
@@ -1304,7 +1318,10 @@ impl RegionState {
             location,
             salary: grant.salary,
         });
-        self.world.invalidate_jobs_registry();
+        // Retire-tickstate, P-c: NOT invalidate_jobs_registry() -- that
+        // would re-flag jobs_exports_dirty, which now also gates the daily
+        // wipe. See refresh_jobs_cache_after_grant_applied's doc comment.
+        self.world.refresh_jobs_cache_after_grant_applied();
     }
 
     pub(crate) fn add_commercial_goods(&mut self, commercial: Entity, units: u32) {
@@ -2384,5 +2401,72 @@ mod tests {
         for c in &report.crossing_costs {
             assert_ne!(c.entry, c.exit, "self-pair must be filtered out");
         }
+    }
+
+    /// Retire-tickstate, P-c self-dirtying-loop fix (caught while
+    /// implementing this cutover, not in the original plan text): applying
+    /// a granted remote job must NOT re-flag `jobs_exports_dirty`, or the
+    /// daily wipe -- now also gated on that same flag, so a quiet day skips
+    /// it entirely -- would undo this very assignment on the very next
+    /// daily tick, permanently starving the citizen of salary every day
+    /// forever (economy also only runs on the daily boundary, right after
+    /// the wipe). Regression guard for
+    /// `regional_view_reports_city_goods_and_city_aware_inspect_notes`,
+    /// which caught this at the full multi-region-gameplay level.
+    #[test]
+    fn apply_job_export_grant_does_not_redirty_jobs_exports() {
+        let mut region = RegionState::new(RegionId(1), 2, 2);
+        let citizen = Entity::new(RegionId(1), 0);
+        region.world.attach_citizen(
+            citizen,
+            crate::core::components::Citizen {
+                id: citizen,
+                age: 0,
+                home: Entity::new(RegionId(1), 1),
+                workplace_assignment: None,
+                morale: crate::core::components::Morale {
+                    actual: 0,
+                    target: 0,
+                    decay: 0,
+                    rent_stress: 0,
+                },
+                money: 0,
+            },
+        );
+        // attach_citizen itself dirties the flag; clear it to isolate the
+        // grant-application call under test.
+        region.clear_jobs_exports_dirty();
+        assert!(!region.world.is_jobs_exports_dirty());
+
+        region.apply_job_export_grant(
+            PendingJobDemand {
+                token: 0,
+                citizen,
+                caller_network: RegionRoadNetworkId {
+                    region: RegionId(1),
+                    road_network: 0,
+                },
+            },
+            JobExportGrant {
+                token: 0,
+                granted: true,
+                workplace: Some(Entity::new(RegionId(2), 0)),
+                location: Some(CityCellRef::local(RegionId(2), 0, 0)),
+                salary: 4,
+            },
+        );
+
+        assert!(
+            region.world.citizens[&citizen]
+                .workplace_assignment
+                .is_some(),
+            "the grant should have been applied"
+        );
+        assert!(
+            !region.world.is_jobs_exports_dirty(),
+            "applying a grant must not re-dirty jobs_exports_dirty, or the \
+             daily wipe (gated on this same flag) would undo this very \
+             assignment on the very next daily tick, forever"
+        );
     }
 }

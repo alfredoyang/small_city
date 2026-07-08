@@ -1,21 +1,26 @@
 # Retire TickState — settle each tick with whatever's already held
 
-Status: **P-a and P-b implemented** (Power, plus the eager nudge — see
-"P-a, implemented" and "P-b, implemented" at the end of this doc),
-P-c/P-d/P-e/P-f still plan-only. Reviewed three times by codex before
-implementation. First pass (core tick-retirement; P-a/P-c/P-d/P-e): 2 High
-+ 2 Medium. Second pass (eager nudge P-b + self-describing-reply
-redesign): 2 High — the denial-cleanup guard and the per-worker id
-partition (item 4/6). Third pass: 1 High — a stale *granted* reply must
-actively release the producer's stuck reservation, not just drop (item
-4); 1 Low — worker-id bit layout overlap (item 6). All findings fixed
-here; see the "caught in review" callouts. P-a's own implementation was
-then reviewed twice more by codex (one High: a power reply could mutate
-state mid-tick while paused for jobs/goods — fixed, see P-a's write-up).
-P-b's implementation was reviewed twice more (one Low: use a real
-`assert!`/`checked_add` instead of `debug_assert!`/bare `+=` for the
+Status: **P-a, P-b, and P-c implemented** (Power, the eager nudge, and
+Jobs — see "P-a, implemented", "P-b, implemented", and "P-c, implemented"
+at the end of this doc), P-d/P-e/P-f still plan-only. Reviewed three
+times by codex before implementation. First pass (core tick-retirement;
+P-a/P-c/P-d/P-e): 2 High + 2 Medium. Second pass (eager nudge P-b +
+self-describing-reply redesign): 2 High — the denial-cleanup guard and the
+per-worker id partition (item 4/6). Third pass: 1 High — a stale *granted*
+reply must actively release the producer's stuck reservation, not just
+drop (item 4); 1 Low — worker-id bit layout overlap (item 6). All findings
+fixed here; see the "caught in review" callouts. P-a's own implementation
+was then reviewed twice more by codex (one High: a power reply could
+mutate state mid-tick while paused for jobs/goods — fixed, see P-a's
+write-up). P-b's implementation was reviewed twice more (one Low: use a
+real `assert!`/`checked_add` instead of `debug_assert!`/bare `+=` for the
 worker-id scheme so release builds stay protected too — fixed, see P-b's
-write-up).
+write-up). P-c's implementation was reviewed three times more (one High
+found *during* implementation, not by codex — a real gameplay regression
+in the daily job-wipe cadence, fixed by the user's own direction before
+codex ever saw the patch; then one further High from codex on that same
+fix's own edge case — fixed; see P-c's write-up, it's the most involved
+of the three).
 
 Both earlier plans this session made the tick *cheap* (`P-1..P-6`) and, in
 an abandoned attempt, *faster to react*. Neither touched the one real piece
@@ -965,3 +970,165 @@ every P-a test already exercises ticks with the nudge never firing (none
 of them run the worker's hint-publish sweep with a genuine change), and
 they all still pass unchanged, which *is* the proof that P-a's worst-case
 guarantee holds with P-b layered on top.
+
+## P-c, implemented
+
+Landed on `retire_tick_statemachine`, depends on P-a. Same mechanical
+cutover as power (self-describing replies, `current_job_request_id`,
+delete `WaitingForJobExports`/`TickJobContinuation`), but this one
+uncovered a real gameplay bug the plan text never anticipated, plus a
+sharp edge in the fix for it. `cargo fmt` / `clippy -D warnings` /
+`test -q` all green; three codex review rounds (2 High found and fixed
+across the two rounds after the mechanical part; the mechanical part
+itself was clean).
+
+### The mechanical part (same shape as P-a)
+
+```text
+ JobExportRequest gains:  citizen: Entity            (echoed back, like power's consumer)
+ ApplyJobExportGrant:     (JobExportGrant)  ->  { request: JobExportRequest, grant }
+ RegionRuntime:           + current_job_request_id: UiRequestId
+                          - TickJobContinuation, WaitingForJobExports (deleted)
+ reconcile_job_export_allocations  ->  release_and_request_job  (fire-and-forget)
+ apply_job_export_grant:  staleness check against current_job_request_id,
+                          release_stale_granted_job on a stale-but-granted reply
+ pop_next_runnable_event: ApplyJobExportGrant removed from the mid-wait
+                          allow-list (jobs no longer pauses; goods still
+                          does, P-d not done, so goods keeps its slot)
+```
+
+Nothing here surprised review. The surprise was underneath it.
+
+### The bug this cutover woke up
+
+```text
+ EVERY daily tick, today, already does this, back to back:
+   1. WIPE     every citizen's job (workplace_assignment = None)
+   2. re-match local slots first
+   3. request  still-jobless citizens to a remote region
+   4. ECONOMY  pay salary, let citizens shop      ← reads job state RIGHT NOW
+
+ OLD (paused):   1 → 2 → 3 → [ freeze until reply lands ] → 4
+                                                   economy always sees FRESH state
+
+ P-c as first written:  1 → 2 → 3 → 4 (immediately, reply not back yet)
+                                       economy sees "just wiped" — salary 0
+                                       EVERY day, forever (the wipe recurs daily)
+```
+
+Power didn't have this problem because a granted consumer's `powered` flag
+is diff-applied and *sticks* across ticks. Jobs *actively* wipe and rebuild
+every day, by design (so a citizen can grab a newly-opened local slot
+instead of staying stuck remote) — removing the pause turned a one-time
+transient delay into a permanent recurring one. Caught by
+`regional_view_reports_city_goods_and_city_aware_inspect_notes` (an
+existing integration test asserting a commercial building keeps selling
+goods after 7 days) flipping from pass to fail.
+
+### The fix: gate the wipe with the gate that already exists
+
+```text
+ Today, split-brain: the WIPE is unconditional; only the re-request that
+ could repair it is gated.
+
+ assign_local_jobs_for_daily_tick  ← wipes everyone           (today: always)
+ assign_local_jobs                 ← matches jobless only,     (today: never
+                                      preserves remote           called on its
+                                      assignments — its OWN       own on a daily
+                                      doc comment already          tick)
+                                      says so
+ jobs_exports_dirty gate           ← already exists, already decides
+                                      "did anything change?" every daily tick
+                                      — today only gates the re-request
+
+ P-c: one decision, not two.
+   quiet day  → skip the wipe entirely, leave every assignment alone
+   dirty day  → wipe → match → request, exactly like before
+```
+
+A stable remote worker is left alone not by luck: every chokepoint that
+could make the wipe *worth doing* already flips the SAME flag —
+`attach_citizen`/`attach_population` (new job seeker), `invalidate_resource_registry`
+(building built/bulldozed/replaced — local slots may have changed),
+discovery-generation moving (the remote side changed). The gate was
+already trustworthy; P-c just also asks it about the wipe.
+
+**The self-dirtying loop.** One thing was NOT trustworthy at first: a
+granted remote assignment landing was itself flagged as "something
+changed" (`apply_job_export_grant`'s ECS write called the general
+`World::invalidate_jobs_registry()`, which sets `jobs_exports_dirty`). That
+re-opens the gate the very next day, wiping the assignment right back out
+— the bug, recreated even after gating the wipe. Fix: a narrower
+`World::refresh_jobs_cache_after_grant_applied()` that refreshes the job
+cache and hints (still needed — the cache is stale, and a slot got filled)
+but does **not** re-flag `jobs_exports_dirty`. Applying a grant is the
+gate's own answer arriving, not new information for it to notice.
+
+```text
+ day D:   dirty (new seeker) → wipe → request
+ async:    grant lands → apply → refresh_jobs_cache_after_grant_applied
+                                   (cache refreshed, gate STAYS clear)
+ day D+1: gate reads clear → QUIET → assignment left alone → citizen paid
+```
+
+### The edge codex caught in the fix itself
+
+```text
+ continue_to_job_phase, in order:
+   ... → population::run (can spawn a citizen THIS tick, which itself
+                           calls attach_citizen → sets jobs_exports_dirty)
+       → [ decide: wipe or not? ]
+```
+
+My first pass read the dirty gate BEFORE calling into this function at
+all — meaning a citizen born partway through it could never be reflected
+in a decision already made. Fix: split the gate into two halves.
+`discovery_dirty` (the runtime's own generation check) genuinely can't
+change mid-tick, so it's still snapshotted before and passed in. But
+`jobs_exports_dirty` is now read **fresh, after `population::run`**,
+inside the function — combined into one effective answer, `jobs_dirty()`,
+carried back out on `TickJobPhase`/`RegionalTickJobPhase` for the caller
+to act on:
+
+```text
+ BEFORE (caught in review):                AFTER:
+ read dirty → call function                call function → population::run
+   → population::run (too late             → NOW read jobs_exports_dirty
+     to matter, already decided)              (population's spawn already
+                                               counted) → return jobs_dirty()
+```
+
+Without this, a citizen spawned by growth would wait a full extra day for
+its first job attempt even on an otherwise-quiet day — not the permanent
+bug above, but a real, avoidable one-day miss the cheap fix closes
+outright.
+
+### Tests
+
+- **`apply_job_export_grant_does_not_redirty_jobs_exports`** (regions/mod.rs):
+  the self-dirtying-loop regression guard — verified red without the fix
+  (reverted one line, confirmed failure, restored).
+- **`jobs_dirty_is_rechecked_after_population_spawns_a_citizen_same_tick`**
+  (simulation.rs): the population-timing edge — drives `continue_to_job_phase`
+  directly (not `tick_world`, which forces dirty unconditionally) to reach a
+  genuinely quiet day-24 boundary, spawns a citizen via real growth, asserts
+  `jobs_dirty()` is true anyway. Also verified red-then-green.
+- **Rewritten in runtime/mod.rs's `tick_state_tests`** (same shapes as
+  P-a's): a daily tick with a jobless seeker now completes immediately
+  instead of entering a wait state; a stale job reply is dropped and
+  releases the producer; a since-removed citizen's grant is a no-op;
+  `second_tick_is_deferred_while_waiting` moved from a jobs fixture to a
+  goods one, since jobs no longer pauses (goods still does — P-d).
+- The existing integration test that caught the original bug
+  (`regional_view_reports_city_goods_and_city_aware_inspect_notes`) is
+  itself now the regression guard for the full gameplay path — it went
+  fail → pass across this work and needed no changes of its own.
+
+### Risk noted, not chased
+
+This patch touches 6 files (~450 changed lines) across two review passes
+— over this repo's usual 5-file/400-line guideline for one patch. Codex
+was asked directly whether the self-dirtying-loop fix should have split
+out separately and agreed it couldn't have: it's a necessary correctness
+fix for P-c to work at all, not an independent improvement, so there was
+no prior point where it could have landed on its own.

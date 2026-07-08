@@ -855,6 +855,7 @@ fn job_export_request_completed_routes_apply_event_back_to_caller() {
                     caller_region: caller,
                     caller_network: network(73, 0),
                     token: 0,
+                    citizen: small_city::core::entity::Entity::new(caller, 0),
                 },
                 candidates: vec![network(74, 0)],
                 candidate_index: 0,
@@ -933,17 +934,29 @@ fn wrong_region_export_grants_are_ignored_without_mutating_state() {
     worker
         .push_event(
             region,
-            RegionEvent::ApplyJobExportGrant(JobExportGrant {
-                token: 0,
-                granted: true,
-                workplace: Some(small_city::core::entity::Entity::new(RegionId(80), 0)),
-                location: Some(small_city::core::city_refs::CityCellRef::local(
-                    RegionId(80),
-                    0,
-                    0,
-                )),
-                salary: 4,
-            }),
+            RegionEvent::ApplyJobExportGrant {
+                // Same reasoning as the power grant above: request_id 0
+                // matches current, so this reaches the ECS write, which
+                // must still no-op since no citizen with this id exists.
+                request: JobExportRequest {
+                    request_id: UiRequestId(0),
+                    caller_region: region,
+                    caller_network: network(79, 0),
+                    token: 0,
+                    citizen: small_city::core::entity::Entity::new(RegionId(80), 0),
+                },
+                grant: JobExportGrant {
+                    token: 0,
+                    granted: true,
+                    workplace: Some(small_city::core::entity::Entity::new(RegionId(80), 0)),
+                    location: Some(small_city::core::city_refs::CityCellRef::local(
+                        RegionId(80),
+                        0,
+                        0,
+                    )),
+                    salary: 4,
+                },
+            },
         )
         .unwrap();
 

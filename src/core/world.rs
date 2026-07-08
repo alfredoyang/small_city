@@ -368,6 +368,25 @@ impl World {
         self.jobs_exports_dirty.set(true);
     }
 
+    /// Retire-tickstate, P-c: refreshes the job cache after applying an
+    /// already-requested export grant, WITHOUT re-flagging
+    /// `jobs_exports_dirty`.
+    ///
+    /// `jobs_exports_dirty` now also gates the daily wipe in
+    /// `assign_local_jobs_for_daily_tick` (a quiet day skips the wipe
+    /// entirely, leaving existing assignments — local and remote — alone).
+    /// A grant landing is the reconcile gate's own answer arriving, not new
+    /// information for it to notice; re-setting the flag here would wipe
+    /// this very assignment again on the very next daily tick, forever
+    /// re-opening the same request with the citizen jobless every time
+    /// economy settles — the bug this method exists to close. Hints still
+    /// republish (harmless no-op via `publish_region`'s idempotence check
+    /// if nothing actually changed).
+    pub(crate) fn refresh_jobs_cache_after_grant_applied(&self) {
+        self.registry_cache.borrow_mut().invalidate_jobs();
+        self.hints_dirty.set(true);
+    }
+
     /// P2: drop every entry in the route cache. Called when a road is created
     /// or removed (the affected set isn't computable from a single road change
     /// — a new road can connect previously-disconnected areas, a removed road

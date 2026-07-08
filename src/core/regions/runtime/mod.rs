@@ -121,7 +121,13 @@ pub enum RegionEvent {
     /// Producer-side release for a caller's previous job export allocations.
     ReleaseJobExportAllocations(JobExportAllocationRelease),
     /// Caller-side job export grant result.
-    ApplyJobExportGrant(JobExportGrant),
+    ///
+    /// Retire-tickstate, P-c: the reply carries the request it answers,
+    /// same shape as `ApplyPowerExportGrant` (P-a).
+    ApplyJobExportGrant {
+        request: JobExportRequest,
+        grant: JobExportGrant,
+    },
     /// Authoritative producer-side goods export allocation request.
     ProcessGoodsExportRequest(GoodsExportAllocationRequest),
     /// Producer-side release for a caller's previous goods export allocations.
@@ -170,6 +176,9 @@ pub struct JobExportRequest {
     pub caller_region: RegionId,
     pub caller_network: RegionRoadNetworkId,
     pub token: u32,
+    /// Retire-tickstate, P-c: echoed back by the grant reply so the caller
+    /// can re-derive the demand it answers without keeping a demand list.
+    pub citizen: Entity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +333,8 @@ pub struct RegionRuntime {
     // (RegionalGame's counter starts at 1), so the very first reply this
     // runtime ever sees compares correctly.
     current_power_request_id: UiRequestId,
+    // Retire-tickstate, P-c: same shape and same reasoning, for jobs.
+    current_job_request_id: UiRequestId,
     // Event-driven plan (docs/20260703-event-driven-architecture.md), P-2: the
     // directory snapshot generation as of this worker pass's per-slice install
     // (`set_discovery_generation`, mirrors `set_region_routes`), and the
@@ -347,52 +358,37 @@ pub struct RegionRuntime {
 #[derive(Debug)]
 /// Explicit tick lifecycle for one region runtime.
 ///
-/// Retire-tickstate, P-a: power no longer pauses a tick. It fires its
-/// release/request and moves straight into the job phase in the same pass;
-/// whichever reply lands later is applied to local state whenever it
-/// arrives (see `current_power_request_id`), for the *next* tick to see.
-/// Jobs and goods still pause the tick, one sub-state each, since they only
-/// ever resolve on a daily boundary and are skipped entirely on an hourly
-/// tick:
+/// Retire-tickstate, P-a/P-c: neither power nor jobs pauses a tick anymore.
+/// Each fires its release/request and moves straight into the next phase
+/// in the same pass; whichever reply lands later is applied to local
+/// state whenever it arrives (see `current_power_request_id` /
+/// `current_job_request_id`), for the *next* tick to see. Goods still
+/// pauses the tick (P-d not yet done), since it only ever resolves on a
+/// daily boundary and is skipped entirely on an hourly tick:
 ///
 /// ```text
 /// Idle
-///   -- Tick --> WaitingForJobExports  (daily boundary, job demand)
-///            \-> finish immediately, stay Idle (no job demand, or hourly)
-/// WaitingForJobExports
-///   -- ApplyJobExportGrant (demands remain) --> WaitingForJobExports
-///   -- ApplyJobExportGrant (last demand)    --> enter goods phase
+///   -- Tick --> WaitingForGoodsExports  (daily boundary, goods demand)
+///            \-> finish immediately, stay Idle (no goods demand, or hourly)
 /// WaitingForGoodsExports
 ///   -- ApplyGoodsExportGrant (demands remain) --> WaitingForGoodsExports
 ///   -- ApplyGoodsExportGrant (last demand)    --> finish tick, back to Idle
 /// ```
 ///
 /// While waiting, only export control events run (grants, producer-side requests,
-/// releases for any resource, power included); a second `Tick` is deferred in the
-/// inbox until the paused tick finishes. A grant that arrives while `Idle`, in the
-/// wrong phase, or with an unknown token, leaves the current state unchanged.
+/// releases for any resource, power/jobs included); a second `Tick` is deferred in
+/// the inbox until the paused tick finishes. A grant that arrives while `Idle`, in
+/// the wrong phase, or with an unknown token, leaves the current state unchanged.
 enum TickState {
     Idle,
-    WaitingForJobExports(TickJobContinuation),
     WaitingForGoodsExports(TickGoodsContinuation),
 }
 
 impl TickState {
     /// Returns true while a tick is paused waiting for export grants.
     fn is_waiting(&self) -> bool {
-        matches!(
-            self,
-            TickState::WaitingForJobExports(_) | TickState::WaitingForGoodsExports(_)
-        )
+        matches!(self, TickState::WaitingForGoodsExports(_))
     }
-}
-
-#[derive(Debug)]
-/// Paused tick waiting for cross-region job-slot export grants to resolve.
-struct TickJobContinuation {
-    request_id: UiRequestId,
-    phase: RegionalTickJobPhase,
-    pending_demands: Vec<PendingJobDemand>,
 }
 
 #[derive(Debug)]
@@ -575,6 +571,7 @@ impl RegionRuntime {
             goods_export_producers: Vec::new(),
             pending_goods_stock: Vec::new(),
             current_power_request_id: UiRequestId(0),
+            current_job_request_id: UiRequestId(0),
             discovery_generation: 0,
             seen_power_generation: 0,
             seen_jobs_generation: 0,
@@ -764,7 +761,9 @@ impl RegionRuntime {
                     .release_stale_for_caller(release.caller_region, release.request_id);
                 Vec::new()
             }
-            RegionEvent::ApplyJobExportGrant(grant) => self.apply_job_export_grant(grant),
+            RegionEvent::ApplyJobExportGrant { request, grant } => {
+                self.apply_job_export_grant(request, grant)
+            }
             RegionEvent::ProcessGoodsExportRequest(request) => {
                 let grant = self.process_goods_export_request(&request);
                 vec![OutboundMessage::GoodsExportRequestCompleted { request, grant }]
@@ -839,18 +838,19 @@ impl RegionRuntime {
         // (power included) must also run, otherwise two regions that both
         // consume and export on different networks can deadlock each other.
         //
-        // Retire-tickstate, P-a: `ApplyPowerExportGrant` is deliberately NOT
-        // in this list. Power never pauses anymore, so nothing needs it to
-        // jump the queue -- and letting it jump would apply the grant to
-        // local state WHILE this same tick is still paused for jobs/goods,
-        // interleaving with that tick's own in-progress phases instead of
-        // landing cleanly for the next tick to see (caught in review).
+        // Retire-tickstate, P-a/P-c: `ApplyPowerExportGrant` and
+        // `ApplyJobExportGrant` are deliberately NOT in this list anymore.
+        // Neither power nor jobs pauses now, so nothing needs either to
+        // jump the queue -- and letting either jump would apply the grant
+        // to local state WHILE this same tick is still paused for goods
+        // (the only resource still pausing, until P-d), interleaving with
+        // that tick's own in-progress phase instead of landing cleanly for
+        // the next tick to see (caught in review, P-a).
         self.receiver.pop_event_matching(|event| {
             matches!(
                 event,
                 RegionEvent::ProcessPowerExportRequest(_)
                     | RegionEvent::ReleasePowerExportAllocations(_)
-                    | RegionEvent::ApplyJobExportGrant(_)
                     | RegionEvent::ProcessJobExportRequest(_)
                     | RegionEvent::ReleaseJobExportAllocations(_)
                     | RegionEvent::ApplyGoodsExportGrant(_)
@@ -953,26 +953,38 @@ impl RegionRuntime {
         self.release_and_request_power(request_id, &demands)
     }
 
-    /// Advances a tick whose power is resolved into the job export phase.
+    /// Retire-tickstate, P-c: jobs no longer pause the tick either (same
+    /// cutover as P-a for power). Fires the release/request (when dirty)
+    /// and moves straight into the goods phase in the same pass; whichever
+    /// reply lands later is applied whenever it arrives
+    /// (`apply_job_export_grant`, gated on `current_job_request_id`), for
+    /// the *next* tick to see.
     ///
-    /// Emits a job allocation release for this caller generation, then either
-    /// finishes the tick immediately (no job seekers need a remote slot) or sends
-    /// one job export request per seeker and pauses in `WaitingForJobExports`.
+    /// Self-dirtying-loop fix (caught while implementing this cutover, not
+    /// in the original plan text): applying a grant no longer re-dirties
+    /// the gate (`World::refresh_jobs_cache_after_grant_applied`), so once
+    /// a remote assignment settles, the next day reads quiet and leaves it
+    /// alone — exactly like power's quiet path leaving `powered` alone.
+    /// Without this, the daily wipe would re-run every day even for a
+    /// citizen whose remote job was already granted, permanently starving
+    /// them of salary (economy also only runs on the daily boundary, right
+    /// after the wipe).
     ///
-    /// Event-driven plan, P-4: the daily cadence stays (jobs only ever
-    /// resolve on a daily boundary — gameplay hysteresis, not this plan's
-    /// concern); on top of it, a gate mirroring P-2's power shape decides
-    /// whether the daily reconcile does any release/request work at all.
-    /// Local job assignment (`continue_tick_to_job_demand_phase`, which also
-    /// collects `phase.job_demands`) always runs regardless of the gate —
-    /// same as power's quiet path still running `power::run` — only the
-    /// cross-region release/request round trip is skipped.
+    /// Only the discovery-generation half of the gate is read here, before
+    /// `continue_tick_to_job_demand_phase` runs: the OTHER half
+    /// (`jobs_exports_dirty`) is checked fresh, inside that call, AFTER
+    /// population growth — a citizen population growth spawns THIS tick
+    /// must not wait an extra day to be noticed (caught in review). The
+    /// effective, combined answer comes back via `phase.jobs_dirty()`.
     fn enter_job_phase(
         &mut self,
         request_id: UiRequestId,
         power_phase: RegionalTickPowerPhase,
     ) -> Vec<OutboundMessage> {
-        let phase = self.state.continue_tick_to_job_demand_phase(power_phase);
+        let discovery_dirty = self.discovery_generation > self.seen_jobs_generation;
+        let phase = self
+            .state
+            .continue_tick_to_job_demand_phase(power_phase, discovery_dirty);
         if !phase.is_daily() {
             // Jobs resolve only on a daily boundary; an hourly tick neither makes
             // nor invalidates job reservations, so it sends no release or requests.
@@ -981,70 +993,50 @@ impl RegionRuntime {
             outbound.extend(self.drained_traveler_handoff_messages());
             return outbound;
         }
-        let dirty = self.state.is_jobs_exports_dirty()
-            || self.discovery_generation > self.seen_jobs_generation;
-        if !dirty {
-            // Quiet daily: existing grants + the producer's ledger persist;
-            // no release, no requests. `phase.job_demands` may still be
-            // non-empty (a persistent, still-unmet seeker) — repeating an
-            // identical request against unchanged producer state is
-            // guaranteed by determinism to produce an identical outcome, so
-            // skipping it loses no correctness (the same reasoning already
-            // applied to a denied power import in P-2).
-            return self.enter_goods_phase(request_id, phase);
-        }
-        self.seen_jobs_generation = self.discovery_generation;
-        self.state.clear_jobs_exports_dirty();
-        self.reconcile_job_export_allocations(request_id, phase)
+        let mut outbound = if phase.jobs_dirty() {
+            self.seen_jobs_generation = self.discovery_generation;
+            self.state.clear_jobs_exports_dirty();
+            self.release_and_request_job(request_id, &phase.job_demands)
+        } else {
+            // Quiet daily: existing assignments (local AND remote) and the
+            // producer's ledger all persist untouched -- no wipe, no
+            // release, no requests. Mirrors power's quiet path (P-6):
+            // trust the gate, skip the recompute entirely.
+            Vec::new()
+        };
+        outbound.extend(self.enter_goods_phase(request_id, phase));
+        outbound
     }
 
-    // Reconciliation itself uses the simple policy: release all previous
-    // allocations for this caller generation, then request all current
-    // demands. This function's own body is unchanged and deliberately stays
-    // eager/simple — but P-4 (docs/20260703-event-driven-architecture.md)
-    // absorbed the "only when needed instead of every daily tick" half of
-    // this TODO: the caller (`enter_job_phase`) now gates whether this
-    // function runs at all on `jobs_exports_dirty` / the discovery
-    // generation, so a quiet daily tick never calls it. (A region with any
-    // ongoing remote-employed citizen still calls it every day, by design —
-    // see the P-4 write-up.)
-    fn reconcile_job_export_allocations(
+    /// Release this caller's previous-generation job reservations, then
+    /// request the current demand batch. Fire-and-forget, mirrors
+    /// `release_and_request_power` exactly (P-a): stamps
+    /// `current_job_request_id` so a later reply can tell "my current
+    /// batch" from "a superseded one" (see `apply_job_export_grant`), and
+    /// returns immediately without waiting for any reply.
+    fn release_and_request_job(
         &mut self,
         request_id: UiRequestId,
-        phase: RegionalTickJobPhase,
+        demands: &[PendingJobDemand],
     ) -> Vec<OutboundMessage> {
-        let release = OutboundMessage::JobExportAllocationsReleased(JobExportAllocationRelease {
-            caller_region: self.region_id(),
-            request_id,
-            producer_regions: std::mem::take(&mut self.job_export_producers),
-        });
-        if phase.job_demands.is_empty() {
-            let mut outbound = vec![release];
-            outbound.extend(self.enter_goods_phase(request_id, phase));
-            return outbound;
-        }
-
-        let pending_demands = phase.job_demands.clone();
-        let mut outbound = vec![release];
-        outbound.extend(
-            pending_demands
-                .iter()
-                .map(|demand| {
-                    OutboundMessage::JobExportRequested(JobExportRequest {
-                        request_id,
-                        caller_region: self.region_id(),
-                        caller_network: demand.caller_network,
-                        token: demand.token,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        );
-
-        self.tick_state = TickState::WaitingForJobExports(TickJobContinuation {
-            request_id,
-            phase,
-            pending_demands,
-        });
+        self.current_job_request_id = request_id;
+        let producer_regions = std::mem::take(&mut self.job_export_producers);
+        let mut outbound = vec![OutboundMessage::JobExportAllocationsReleased(
+            JobExportAllocationRelease {
+                caller_region: self.region_id(),
+                request_id,
+                producer_regions,
+            },
+        )];
+        outbound.extend(demands.iter().map(|demand| {
+            OutboundMessage::JobExportRequested(JobExportRequest {
+                request_id,
+                caller_region: self.region_id(),
+                caller_network: demand.caller_network,
+                token: demand.token,
+                citizen: demand.citizen,
+            })
+        }));
         outbound
     }
 
@@ -1383,37 +1375,60 @@ impl RegionRuntime {
         }
     }
 
-    fn apply_job_export_grant(&mut self, grant: JobExportGrant) -> Vec<OutboundMessage> {
+    /// Retire-tickstate, P-c: same shape as `apply_power_export_grant`
+    /// (P-a) — no continuation to consult, one staleness check against
+    /// `current_job_request_id` tells "my current batch" from "a
+    /// superseded one."
+    fn apply_job_export_grant(
+        &mut self,
+        request: JobExportRequest,
+        grant: JobExportGrant,
+    ) -> Vec<OutboundMessage> {
         // Same producer-owned allocation invariant as power: a granted reply
         // means the producer may hold a transient slot allocation even if this
         // caller no longer applies it locally.
         self.remember_job_export_producer(&grant);
-        // A job grant only applies while waiting for job exports; ignore it
-        // otherwise (idle or still in the power phase).
-        let TickState::WaitingForJobExports(mut continuation) =
-            std::mem::replace(&mut self.tick_state, TickState::Idle)
-        else {
-            return Vec::new();
-        };
-        let Some(position) = continuation
-            .pending_demands
-            .iter()
-            .position(|demand| demand.token == grant.token)
-        else {
-            // Unknown token: keep waiting for the demands this tick still expects.
-            self.tick_state = TickState::WaitingForJobExports(continuation);
-            return Vec::new();
-        };
-
-        let demand = continuation.pending_demands.remove(position);
-        self.state.apply_job_export_grant(demand, grant);
-        if !continuation.pending_demands.is_empty() {
-            self.tick_state = TickState::WaitingForJobExports(continuation);
-            return Vec::new();
+        if request.request_id != self.current_job_request_id {
+            // Same reasoning as power's stale-granted-release fix: a stale
+            // but granted reply reserved producer capacity that no future
+            // release is guaranteed to reach (this caller has already moved
+            // past that generation). Release it now instead of leaving it
+            // stuck.
+            return Self::release_stale_granted_job(
+                self.region_id(),
+                self.current_job_request_id,
+                &grant,
+            );
         }
+        let demand = PendingJobDemand {
+            token: request.token,
+            citizen: request.citizen,
+            caller_network: request.caller_network,
+        };
+        self.state.apply_job_export_grant(demand, grant);
+        Vec::new()
+    }
 
-        // Last job demand resolved: advance to the goods export phase.
-        self.enter_goods_phase(continuation.request_id, continuation.phase)
+    /// A stale but *granted* job reply reserved a producer's workplace slot
+    /// that no future release is guaranteed to reach. Release it now. A
+    /// stale denial reserved nothing, so it needs no release.
+    fn release_stale_granted_job(
+        caller_region: RegionId,
+        current_request_id: UiRequestId,
+        grant: &JobExportGrant,
+    ) -> Vec<OutboundMessage> {
+        match grant.workplace {
+            Some(workplace) if grant.granted => {
+                vec![OutboundMessage::JobExportAllocationsReleased(
+                    JobExportAllocationRelease {
+                        caller_region,
+                        request_id: current_request_id,
+                        producer_regions: vec![workplace.region()],
+                    },
+                )]
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn apply_goods_export_grant(&mut self, grant: GoodsExportGrant) -> Vec<OutboundMessage> {
@@ -1887,12 +1902,13 @@ mod tick_state_tests {
     }
 
     #[test]
-    fn second_tick_is_deferred_while_waiting_for_job_exports() {
-        // Retire-tickstate, P-a: power no longer pauses, but jobs still do
-        // (P-c). The deferred-second-tick mechanic this test protects is
-        // unchanged production code; only the fixture that drives a runtime
-        // into a waiting state changes, from power to jobs.
-        let mut runtime = RegionRuntime::new(job_seeker_region(RegionId(1)));
+    fn second_tick_is_deferred_while_waiting_for_goods_exports() {
+        // Retire-tickstate, P-c: neither power nor jobs pauses anymore, but
+        // goods still does (P-d). The deferred-second-tick mechanic this
+        // test protects is unchanged production code; only the fixture
+        // that drives a runtime into a waiting state changes, from jobs to
+        // goods.
+        let mut runtime = RegionRuntime::new(goods_seeker_region(RegionId(1)));
         while runtime.pending_event_count() > 0 {
             runtime.process_next_event();
         }
@@ -1902,24 +1918,24 @@ mod tick_state_tests {
                 request_id: UiRequestId(request_id),
             });
             let outbound = runtime.process_next_event();
-            if matches!(runtime.tick_state, TickState::WaitingForJobExports(_)) {
+            if matches!(runtime.tick_state, TickState::WaitingForGoodsExports(_)) {
                 break outbound
                     .iter()
                     .filter_map(|message| match message {
-                        OutboundMessage::JobExportRequested(request) => Some(request.token),
+                        OutboundMessage::GoodsExportRequested(request) => Some(request.token),
                         _ => None,
                     })
                     .collect();
             }
             request_id += 1;
-            assert!(request_id <= 240, "never entered the job wait state");
+            assert!(request_id <= 24, "never entered the goods wait state");
         };
         assert!(
             !tokens.is_empty(),
-            "job wait state entered with a pending request"
+            "goods wait state entered with a pending request"
         );
 
-        // A second Tick queued while paused for job exports is not runnable.
+        // A second Tick queued while paused for goods exports is not runnable.
         runtime.push_event(RegionEvent::Tick {
             request_id: UiRequestId(request_id + 1),
         });
@@ -1927,29 +1943,27 @@ mod tick_state_tests {
         assert!(deferred.is_empty());
         assert!(matches!(
             runtime.tick_state,
-            TickState::WaitingForJobExports(_)
+            TickState::WaitingForGoodsExports(_)
         ));
         assert_eq!(runtime.pending_event_count(), 1);
 
         // Denying every outstanding demand finishes the first (paused) tick
         // and frees the runtime to run the deferred second one.
         for token in &tokens[..tokens.len() - 1] {
-            runtime.push_event(RegionEvent::ApplyJobExportGrant(JobExportGrant {
+            runtime.push_event(RegionEvent::ApplyGoodsExportGrant(GoodsExportGrant {
                 token: *token,
                 granted: false,
-                workplace: None,
-                location: None,
-                salary: 0,
+                source_region: None,
+                units: 0,
             }));
             let outbound = runtime.process_next_event();
             assert!(!has_tick_completed(&outbound));
         }
-        runtime.push_event(RegionEvent::ApplyJobExportGrant(JobExportGrant {
+        runtime.push_event(RegionEvent::ApplyGoodsExportGrant(GoodsExportGrant {
             token: tokens[tokens.len() - 1],
             granted: false,
-            workplace: None,
-            location: None,
-            salary: 0,
+            source_region: None,
+            units: 0,
         }));
         let finished_first = runtime.process_next_event();
         assert!(has_tick_completed(&finished_first));
@@ -1960,21 +1974,39 @@ mod tick_state_tests {
     }
 
     #[test]
-    fn job_grant_while_idle_is_ignored() {
+    fn job_grant_for_a_since_removed_citizen_is_a_no_op() {
+        // Retire-tickstate, P-c: same shape as power's
+        // `grant_for_a_since_removed_consumer_is_a_no_op` (P-a) -- a reply
+        // can echo a citizen that no longer exists (moved away, bulldozed
+        // home). request_id 0 matches a never-ticked runtime's current
+        // generation, so this is NOT dropped as stale; it reaches the ECS
+        // write, which must still no-op.
         let mut runtime = consumer_runtime(RegionId(1));
         assert!(!runtime.tick_state.is_waiting());
 
-        runtime.push_event(RegionEvent::ApplyJobExportGrant(JobExportGrant {
-            token: 0,
-            granted: true,
-            workplace: Some(crate::core::entity::Entity::new(RegionId(2), 0)),
-            location: Some(crate::core::city_refs::CityCellRef::local(
-                RegionId(2),
-                0,
-                0,
-            )),
-            salary: 4,
-        }));
+        runtime.push_event(RegionEvent::ApplyJobExportGrant {
+            request: JobExportRequest {
+                request_id: UiRequestId(0),
+                caller_region: RegionId(1),
+                caller_network: RegionRoadNetworkId {
+                    region: RegionId(1),
+                    road_network: 0,
+                },
+                token: 0,
+                citizen: crate::core::entity::Entity::new(RegionId(1), 999), // no such entity
+            },
+            grant: JobExportGrant {
+                token: 0,
+                granted: true,
+                workplace: Some(crate::core::entity::Entity::new(RegionId(2), 0)),
+                location: Some(crate::core::city_refs::CityCellRef::local(
+                    RegionId(2),
+                    0,
+                    0,
+                )),
+                salary: 4,
+            },
+        });
         let outbound = runtime.process_next_event();
 
         assert!(outbound.is_empty());
@@ -1982,10 +2014,83 @@ mod tick_state_tests {
     }
 
     #[test]
-    fn daily_tick_with_jobless_seeker_enters_job_wait_state() {
-        // A locally-powered residential whose only workplace sits on a separate,
-        // unreachable road network grows citizens that stay locally jobless. The
-        // first daily tick that produces such a seeker pauses for job exports.
+    fn stale_job_reply_is_dropped_and_releases_the_producer() {
+        // Retire-tickstate, P-c: same staleness protection as power (P-a)
+        // -- a reply for a batch this caller has already superseded must
+        // be dropped, and if it arrived GRANTED, the producer's
+        // reservation must be actively released (a future release may
+        // never reach it otherwise).
+        let mut region = RegionState::new(RegionId(1), 5, 5);
+        assert!(region.build(2, 2, BuildingKind::Commercial).success);
+        assert!(region.build(2, 1, BuildingKind::Road).success);
+        let mut runtime = RegionRuntime::new(region);
+
+        // Day 1: dirty from construction, stamps current_job_request_id = 24.
+        let mut day1_outbound = Vec::new();
+        for request_id in 1..=24 {
+            runtime.push_event(RegionEvent::Tick {
+                request_id: UiRequestId(request_id),
+            });
+            day1_outbound = runtime.process_next_event();
+        }
+        assert!(
+            day1_outbound
+                .iter()
+                .any(|message| matches!(message, OutboundMessage::JobExportAllocationsReleased(_))),
+            "day 1 must be dirty (construction) and stamp a generation"
+        );
+
+        // Force day 2 dirty too (nothing else would re-dirty a region with
+        // no ongoing remote employment -- same trick used elsewhere in this
+        // module to reopen a gate deterministically).
+        runtime.set_discovery_generation(1);
+        for request_id in 25..=48 {
+            runtime.push_event(RegionEvent::Tick {
+                request_id: UiRequestId(request_id),
+            });
+            runtime.process_next_event();
+        }
+
+        // A grant for DAY 1's now-superseded batch arrives late, GRANTED.
+        let producer = RegionId(9);
+        runtime.push_event(RegionEvent::ApplyJobExportGrant {
+            request: JobExportRequest {
+                request_id: UiRequestId(24),
+                caller_region: RegionId(1),
+                caller_network: RegionRoadNetworkId {
+                    region: RegionId(1),
+                    road_network: 0,
+                },
+                token: 0,
+                citizen: crate::core::entity::Entity::new(RegionId(1), 999),
+            },
+            grant: JobExportGrant {
+                token: 0,
+                granted: true,
+                workplace: Some(crate::core::entity::Entity::new(producer, 0)),
+                location: Some(crate::core::city_refs::CityCellRef::local(producer, 0, 0)),
+                salary: 4,
+            },
+        });
+        let outbound = runtime.process_next_event();
+
+        assert!(
+            matches!(
+                outbound.as_slice(),
+                [OutboundMessage::JobExportAllocationsReleased(release)]
+                    if release.producer_regions == vec![producer]
+            ),
+            "a stale but granted job reply must release the producer's reservation"
+        );
+    }
+
+    #[test]
+    fn daily_tick_with_jobless_seeker_completes_immediately_and_requests_export() {
+        // Retire-tickstate, P-c: a locally-powered residential whose only
+        // workplace sits on a separate, unreachable road network grows
+        // citizens that stay locally jobless. The first daily tick that
+        // produces such a seeker now completes immediately (jobs no longer
+        // pause), same cutover as power (P-a).
         let mut runtime = RegionRuntime::new(job_seeker_region(RegionId(1)));
         while runtime.pending_event_count() > 0 {
             runtime.process_next_event();
@@ -1997,6 +2102,7 @@ mod tick_state_tests {
                 request_id: UiRequestId(request_id),
             });
             let outbound = runtime.process_next_event();
+            assert!(!runtime.tick_state.is_waiting());
             if outbound
                 .iter()
                 .any(|message| matches!(message, OutboundMessage::JobExportRequested(_)))
@@ -2011,22 +2117,17 @@ mod tick_state_tests {
                     release < request,
                     "job reconciliation should release before requesting current demands"
                 );
-                assert!(matches!(
-                    runtime.tick_state,
-                    TickState::WaitingForJobExports(_)
-                ));
+                assert!(
+                    has_tick_completed(&outbound),
+                    "the tick completes in the same pass it asks for exported jobs"
+                );
                 requested = true;
                 break;
             }
-            // A completed (or power-only) tick must not be left paused for jobs.
-            assert!(!matches!(
-                runtime.tick_state,
-                TickState::WaitingForJobExports(_)
-            ));
         }
         assert!(
             requested,
-            "a daily tick should eventually pause to import a remote job"
+            "a daily tick should eventually request a remote job"
         );
     }
 
@@ -2145,6 +2246,7 @@ mod tick_state_tests {
                 // (producer) network and the (caller, gen, token) key matter here.
                 caller_network: producer_network,
                 token,
+                citizen: crate::core::entity::Entity::new(caller, token),
             },
             candidates: vec![producer_network],
             candidate_index: 0,
@@ -2196,6 +2298,21 @@ mod tick_state_tests {
         assert!(region.build(1, 0, BuildingKind::Road).success);
         assert!(region.build(0, 1, BuildingKind::PowerPlant).success);
         assert!(region.build(1, 1, BuildingKind::Industrial).success);
+        region
+    }
+
+    // A powered Commercial building with no local Industrial anywhere: its
+    // free storage capacity is never filled locally, so it has an ongoing
+    // exportable goods demand. Small grid (matching `goods_producer_region`)
+    // means every cell touches a border, so a real cross-region request can
+    // be sent -- unlike `daily_tick_without_goods_demands...`'s interior-road
+    // fixture, which deliberately has no border link at all.
+    fn goods_seeker_region(region_id: RegionId) -> RegionState {
+        let mut region = RegionState::new(region_id, 2, 2);
+        assert!(region.build(0, 0, BuildingKind::Road).success);
+        assert!(region.build(1, 0, BuildingKind::Road).success);
+        assert!(region.build(0, 1, BuildingKind::PowerPlant).success);
+        assert!(region.build(1, 1, BuildingKind::Commercial).success);
         region
     }
 

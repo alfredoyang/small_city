@@ -1268,8 +1268,8 @@ impl ExportResource for JobExport {
     fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent {
         RegionEvent::ProcessJobExportRequest(request)
     }
-    fn apply_grant_event(_request: Self::Request, grant: Self::Grant) -> RegionEvent {
-        RegionEvent::ApplyJobExportGrant(grant)
+    fn apply_grant_event(request: Self::Request, grant: Self::Grant) -> RegionEvent {
+        RegionEvent::ApplyJobExportGrant { request, grant }
     }
     fn release_event(release: ExportAllocationRelease) -> RegionEvent {
         RegionEvent::ReleaseJobExportAllocations(release)
