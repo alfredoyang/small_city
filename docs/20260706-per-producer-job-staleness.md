@@ -175,8 +175,15 @@ pub fn publish_region(&self, region, links, hints) -> bool {
         hints.iter().map(|h| (h.network, h.spare_job_slot_ids.clone()))
              .collect::<Vec<_>>();
     if current_links != links || job_offer(&current_hints) != job_offer(&hints) {
-        *state.jobs_generations.entry(region).or_insert(0) += 1; // ring B's bell
-        state.global_jobs_generation += 1;                       // and the city bell
+        // Ring the city bell first, then stamp THIS producer with that same
+        // global value. `jobs_generations[region]` is the global generation as
+        // of the region's last job-offer change (a timestamp), NOT a per-region
+        // change count — it must live in the same number space as the
+        // `seen_jobs_generation` it is later compared against. An independent
+        // `+= 1` per producer would fall behind the global count and make real
+        // changes read as "older than my last check" (missed re-verification).
+        state.global_jobs_generation += 1;                       // ring the city bell
+        state.jobs_generations.insert(region, state.global_jobs_generation); // stamp B with it
     }
 
     set_or_remove(&mut state.region_links, region, links);
