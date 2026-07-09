@@ -1,9 +1,10 @@
 # Retire TickState — settle each tick with whatever's already held
 
-Status: **P-a, P-b, P-c, P-d, and P-e implemented** (Power, the eager
-nudge, Jobs, Goods, and the now-dead `TickState` cleanup — see
-"P-a, implemented", "P-b, implemented", "P-c, implemented", and
-"P-d/P-e, implemented" at the end of this doc), P-f still plan-only. Reviewed three
+Status: **P-a through P-f complete** (Power, the eager nudge, Jobs, Goods,
+the now-dead `TickState` cleanup, and the starvation-fix dance re-evaluated
+and kept — see "P-a, implemented", "P-b, implemented", "P-c, implemented",
+"P-d/P-e, implemented", and "P-f, evaluated" at the end of this doc).
+Reviewed three
 times by codex before implementation. First pass (core tick-retirement;
 P-a/P-c/P-d/P-e): 2 High + 2 Medium. Second pass (eager nudge P-b +
 self-describing-reply redesign): 2 High — the denial-cleanup guard and the
@@ -666,7 +667,7 @@ pause-removal land together, one resource at a time.
 | **P-c** Jobs | same cutover, citizen echoed | hourly ticks still never touch jobs/goods |
 | **P-d** Goods | same cutover, commercial echoed | `apply_pending_goods_stock` + goods phase daily-only |
 | **P-e** Delete `TickState` | only `Idle` left → drop the enum; `pop_next_runnable_event` → plain FIFO | zero `Waiting*`/continuation refs left |
-| **P-f** Starvation-fix | *(exploratory)* can the capture/restore dance simplify now? | delete only if the guarded race is confirmed gone |
+| **P-f** Starvation-fix | *(exploratory, done)* traced by experiment: naive-vs-fixed hourly trace is identical in the flagship fixture, but the dance's own unit tests still fail without it — window not gone, kept | no code change; see "P-f, evaluated" |
 ```text
  P-a first (everything builds on the power cutover). P-c/P-d any order
  after it. P-e once nothing pauses. P-f optional — plan is done without it.
@@ -1177,3 +1178,192 @@ P-d, not a separate gameplay change.
   release for the producer reservation it would otherwise strand.
 - Existing goods quiet-path and worker routing tests were updated through
   the new self-describing request shape.
+
+## P-f, evaluated (2026-07-09) — kept, not deleted
+
+The question was narrow: now that P-a–P-e removed every pause, does the
+starvation-fix capture/clear/restore dance in
+`RegionState::begin_tick_power_demand_phase` (`src/core/regions/mod.rs`,
+`docs/20260703-bug-cross-region-export-starvation-fix.md`) still earn its
+keep? Traced by experiment, not by re-reading the code and guessing.
+
+### What was tried
+
+Temporarily stripped the dance down to its pre-fix, naive shape — raw
+`power::run` clear, collect fresh demand, no capture and no optimistic
+restore — and ran the flagship regression fixture
+(`power_importing_producer_region_eventually_gets_remote_workers`, a
+power-importing producer B racing a self-powered producer C for A's
+jobless residents) hour-by-hour for 3 in-game days, comparing against the
+real fix:
+
+```text
+ hour   0-22:  B=0 C=0     (A's population still growing; no seekers yet)
+ hour  23-46:  B=1 C=0     (day-1 job phase: B wins one)
+ hour  47-70:  B=2 C=1     (day-2 job phase: both gain one)
+ hour     71:  B=2 C=2     (day-3 job phase)
+```
+
+**Byte-identical, hour for hour, with and without the dance.** The
+specific "B denied every single cycle, forever" symptom the fix was built
+for does not reproduce in this fixture either way, under the current
+architecture.
+
+That is not the same thing as "the window is gone," so it was checked
+directly: the dance's own two dedicated regression tests —
+`begin_tick_power_demand_phase_still_requests_fresh_demand_for_an_imported_consumer`
+and
+`begin_tick_power_demand_phase_does_not_restore_a_disconnected_consumers_import`
+— **do** fail against the naive shape. The raw window `power::run`'s
+unconditional clear opens between a consumer's import being cleared and
+its fresh grant reply landing is exactly as exposed as it was when the bug
+was found; nothing about retiring `TickState` touched `power::run` itself
+or made the request/grant round trip synchronous.
+
+### Why the symptom still doesn't show up
+
+Jobs are gated to a daily boundary
+(`jobs_dirty = is_daily && (...)`, `src/core/simulation.rs:221`), while
+power reconciles on any dirty hourly tick. By the time the once-a-day job
+phase runs, a power-importing producer's own request has had up to 23
+quiet hours to round-trip and settle. The original bug's "every hour,
+forever" pattern needed the race to be re-lost on every cycle; today's
+architecture gives the race at most one chance per day against a producer
+that has almost always already settled. That daily gating is a P-c
+side effect (event-driven-architecture plan, unrelated to P-a/P-e's pause
+removal) — it shrank the *blast radius*, it didn't close the *window*.
+
+### Decision
+
+**Keep the dance.** The plan's own criterion was "delete only if the
+guarded race is confirmed gone" — it isn't gone, it's just rarely hit by
+this fixture's shape. Nothing rules out a pathological case reopening it:
+a longer producer chain (more round-trip hops before settling), a region
+whose power and job dirty flags both flip on the same hour, or any future
+reader of `powered` mid-round-trip that isn't a daily job check (a paused
+UI inspect, a goods/pollution/happiness read, a future resource that
+shares this consumer). The dance is cheap, already correct (round 4's
+disconnected-consumer guard still holds), and load-bearing for its own
+unit tests; there is no simplification left to make now that P-a–P-e
+landed — the "while waiting" deadlock-avoidance rule it was written
+alongside is already gone (`pop_next_runnable_event` is plain FIFO), and
+that removal is what P-f set out to check for knock-on cleanup. There
+was none: the dance was never coupled to the pause machinery, only to
+`power::run`'s raw clear and the asynchronous grant round trip, both of
+which are unchanged.
+
+No code changed. P-f is closed as *investigated, no deletion* — the plan
+is complete without it, per its own "P-f optional" note.
+
+### Review packet
+
+**Status:** closed — investigated, no deletion. Not "plan-only" anymore;
+not "implemented" either, since no source changed. Terminal state for
+this patch.
+
+**Scope:** P-f only, docs-only. No `src/` change survives (the naive
+capture/restore removal was a throwaway experiment, reverted before
+finishing — see "What was tried"). No other patch reopened.
+
+**What changed:**
+
+| file | why |
+|------|-----|
+| `docs/20260704-retire-tickstate.md` | status line (P-a–P-e → P-a–P-f); patch-split table row for P-f; this section |
+
+Nothing in `src/` or `tests/` differs from before this investigation
+started — confirmed via `git status`/`git diff --stat` showing only this
+doc modified.
+
+**Behavior changed:** none. `RegionState::begin_tick_power_demand_phase`
+(`src/core/regions/mod.rs`) is byte-for-byte what it was — same capture,
+clear, collect, restore sequence as the starvation fix left it.
+
+**Tests added:** none, permanently. A throwaway diagnostic test
+(`pf_trace_hourly_denial_pattern` in
+`tests/regional_multi_region_play_test.rs`) was added to produce the
+hour-by-hour trace quoted above, run against both the naive and real
+shapes, then deleted once its evidence was captured — it does not appear
+in the final diff.
+
+**Existing tests modified:** none.
+
+**Risks remaining:** the underlying race window in `power::run`'s raw
+clear is still open in principle — this investigation lowers confidence
+that it matters *today*, not that it's closed. Not exercised by any
+current test: a longer producer chain (more round-trip hops before power
+settles), a region whose power and job dirty flags flip on the same hour,
+or a future non-daily reader of `powered` mid-round-trip (a paused UI
+inspect, a goods/pollution/happiness computation, a new resource sharing
+this consumer). None of these are in the flagship fixture, so none would
+fail today even if the window were hit.
+
+**Assumptions:** traced against the default single-worker fixture and the
+scheduling every live gameplay path actually uses
+(`process_one_reply_pass`, one event per region per pass, via
+`wait_for_tick_replies`) — not the `usize::MAX`-budget path used only by
+`step_travel_city`. A multi-worker (`worker_count > 1`) or bulk-budget
+configuration was not separately traced; the daily-cadence argument in
+"Why the symptom still doesn't show up" doesn't depend on worker count,
+but this wasn't re-verified under one.
+
+**Commands run:**
+
+```text
+ cargo test --test regional_multi_region_play_test power_importing_producer_region_eventually_gets_remote_workers -q
+   → baseline pass (real fix in place)
+ (edit: strip capture/restore to naive shape)
+ cargo test --test regional_multi_region_play_test power_importing_producer_region_eventually_gets_remote_workers -q
+   → still passes, unmodified
+ cargo test --lib begin_tick_power_demand_phase_still_requests_fresh_demand_for_an_imported_consumer -q
+   → FAILS against the naive shape (proves the window is still real)
+ cargo test --lib begin_tick_power_demand_phase_does_not_restore_a_disconnected_consumers_import -q
+   → FAILS against the naive shape (same)
+ (add temp pf_trace_hourly_denial_pattern, run --nocapture against naive shape, then against restored fix)
+   → hour-by-hour traces identical
+ (revert mod.rs to original; remove temp test)
+ git diff --stat src/ tests/   → empty
+ cargo fmt --check             → clean
+ cargo clippy --all-targets -- -D warnings   → pre-existing unrelated warnings only, none from this work
+ cargo test -q --test regional_multi_region_play_test   → 20 passed
+```
+
+**Diagram — the problem this patch investigates:**
+
+```text
+ does retiring TickState's pause (P-a..P-e) make the starvation-fix's
+ capture/restore dance redundant, or just cosmetic-adjacent now?
+
+   power::run clears a consumer's import   ─┐
+                                             ├─ window: consumer reads as
+   fresh grant reply round-trips back      ─┘  unpowered in between
+
+   dance closes that window with an optimistic restore, scoped to
+   consumers with a fresh request in flight this tick
+
+   OLD justification for the dance: "while B is paused waiting on its
+   own power, it must still answer incoming requests — using
+   whatever state it has, mid-window"
+
+   P-a..P-e deleted the pause. Does the dance's justification go with it?
+```
+
+**Diagram — what the trace found:**
+
+```text
+                    WITH the dance         WITHOUT the dance (naive)
+                    ───────────────         ─────────────────────────
+ hour  0-22          B=0 C=0                 B=0 C=0
+ hour 23-46          B=1 C=0                 B=1 C=0
+ hour 47-70          B=2 C=1                 B=2 C=1
+ hour    71          B=2 C=2                 B=2 C=2
+                    ───────────────         ─────────────────────────
+                         identical in the flagship fixture
+
+ but:  begin_tick_power_demand_phase_still_requests_fresh_demand_for_
+       an_imported_consumer            → PASS with dance, FAIL without
+
+ conclusion: the window survived the pause's removal; only its odds of
+ being HIT on any given day dropped, because jobs (daily) now check the
+ window far less often than power (hourly) closes it. Dance kept.
+```
