@@ -803,12 +803,15 @@ impl RegionRuntime {
         }
     }
 
-    /// P3: pull whatever employment work the directory holds for this region.
+    /// P3/P4: pull whatever employment work the directory holds for this region.
     ///
-    /// The plan's handler also calls `employer_apply_releases`,
-    /// `home_apply_accepted_employment`, and `home_apply_losses` — those are
-    /// P4/P5 scope and are deliberately absent here. P3 wires only the
-    /// employer-side validation half.
+    /// One region can be both an employer and a home, so both halves run. The
+    /// plan's handler also calls `employer_apply_releases` and
+    /// `home_apply_losses` — those are P5 scope and are deliberately absent.
+    ///
+    /// Employer-side validation runs first, matching the plan's order: a claim
+    /// this region accepts in the same pass then lands in the accepted read
+    /// cache, ready for its *home* region's own wake to apply.
     ///
     /// A runtime with no directory installed (a bare `RegionRuntime::new`, or
     /// a worker that never set one) treats the wake as a no-op rather than
@@ -817,7 +820,9 @@ impl RegionRuntime {
         let Some(directory) = self.employment_directory.clone() else {
             return Vec::new();
         };
-        employer_validate_claims(self, &directory)
+        let outbound = employer_validate_claims(self, &directory);
+        home_apply_accepted_employment(self, &directory);
+        outbound
     }
 
     /// P3: the wake fan-out. One payload-free message per target region; the
@@ -1540,7 +1545,7 @@ impl RegionRuntime {
 /// `active_citizens_by_home_region` — are skipped before any lock is taken.
 /// The directory re-checks the same rule inside `submit_claims`, because this
 /// snapshot may be one pass stale.
-#[allow(dead_code)] // P3: staged; the daily job phase starts calling this in P4/P7.
+#[allow(dead_code)] // P3: staged; the daily job phase starts calling this in P7.
 pub(crate) fn home_region_daily_jobs(
     runtime: &mut RegionRuntime,
     directory: &EmploymentDirectory,
@@ -1637,6 +1642,43 @@ pub(crate) fn employer_validate_claims(
 
     let regions_to_wake = directory.apply_claim_decisions(runtime.region_id(), decisions);
     runtime.emit_employment_directory_ready(regions_to_wake)
+}
+
+/// P4, home side: write every accepted assignment for this region's citizens
+/// into their durable `Citizen.workplace_assignment`, then tell the directory
+/// which ones actually landed.
+///
+/// The directory's `accepted_by_home_region` is a **read cache**, not truth: it
+/// keeps re-offering an already-applied citizen on every wake, and
+/// `apply_workplace_assignment` answers `false` for those. So a repeated
+/// `EmploymentDirectoryReady` is idempotent, and only *newly* applied citizens
+/// are acknowledged.
+///
+/// Nothing is paid from a *pending* claim: a claim only reaches
+/// `accepted_by_home_region` once its employer has accepted it and recorded a
+/// contract. The economy then pays from the applied assignment on the next
+/// daily settlement, using the salary captured at accept time — the same path
+/// the old export grant already used.
+pub(crate) fn home_apply_accepted_employment(
+    runtime: &mut RegionRuntime,
+    directory: &EmploymentDirectory,
+) {
+    let snapshot = directory.snapshot(); // cheap Arc clone; no directory lock held below
+    let Some(accepted) = snapshot.accepted_by_home_region.get(&runtime.region_id()) else {
+        return;
+    };
+
+    let mut applied = Vec::new();
+    for (citizen, assignment) in accepted {
+        if runtime
+            .state_mut()
+            .apply_workplace_assignment(citizen.citizen, *assignment)
+        {
+            applied.push(*citizen);
+        }
+    }
+
+    directory.acknowledge_home_applied(applied);
 }
 
 #[cfg(test)]
@@ -2617,9 +2659,10 @@ mod employment_claim_flow_tests {
     //! round trip, driven directly (the daily tick does not call it yet).
 
     use super::*;
+    use crate::core::components::WorkplaceAssignment;
     use crate::core::regions::RegionRoadNetworkId;
     use crate::core::regions::RegionState;
-    use crate::core::regions::employment_directory::JobPool;
+    use crate::core::regions::employment_directory::{JobClaim, JobClaimId, JobPool};
     use crate::core::systems::citizens;
     use crate::interface::input::BuildingKind;
 
@@ -2929,6 +2972,227 @@ mod employment_claim_flow_tests {
             snapshot.accepted_by_home_region[&RegionId(1)].len(),
             2,
             "accepted employment survives the pool row disappearing"
+        );
+    }
+
+    // ---- P4: home apply ----
+
+    fn only_citizen(runtime: &RegionRuntime) -> Entity {
+        *runtime
+            .state()
+            .world
+            .citizens
+            .keys()
+            .next()
+            .expect("one citizen")
+    }
+
+    fn assignment_of(runtime: &RegionRuntime, citizen: Entity) -> Option<WorkplaceAssignment> {
+        runtime.state().world.citizens[&citizen].workplace_assignment
+    }
+
+    /// Runs the full P3 claim flow and leaves an accepted, un-applied claim in
+    /// the directory for home region 1's single citizen.
+    fn accepted_but_not_yet_applied() -> (Arc<EmploymentDirectory>, RegionRuntime, RegionRuntime) {
+        let directory = Arc::new(EmploymentDirectory::default());
+        let mut employer = employer_runtime();
+        let mut home = home_runtime(1);
+        let discovery = shared_component(&home, &employer);
+
+        assert!(directory.publish_pools(RegionId(9), employer.state().published_job_pools()));
+        home_region_daily_jobs(&mut home, &directory, &discovery);
+        employer_validate_claims(&mut employer, &directory);
+
+        let citizen = only_citizen(&home);
+        assert!(
+            assignment_of(&home, citizen).is_none(),
+            "accepted in the directory, but the home has not applied it yet"
+        );
+        (directory, employer, home)
+    }
+
+    #[test]
+    fn home_apply_writes_the_accepted_assignment_onto_the_citizen() {
+        let (directory, _employer, mut home) = accepted_but_not_yet_applied();
+        let citizen = only_citizen(&home);
+
+        home_apply_accepted_employment(&mut home, &directory);
+
+        let applied = assignment_of(&home, citizen).expect("assignment applied");
+        assert_eq!(
+            applied.workplace.region(),
+            RegionId(9),
+            "a remote workplace"
+        );
+        assert_eq!(
+            applied.salary,
+            directory.snapshot().accepted_by_home_region[&RegionId(1)][0]
+                .1
+                .salary,
+            "the home applies exactly the salary the employer accepted"
+        );
+    }
+
+    #[test]
+    fn the_home_wake_applies_accepted_employment_through_the_real_event_path() {
+        let (directory, _employer, mut home) = accepted_but_not_yet_applied();
+        let citizen = only_citizen(&home);
+
+        home.set_employment_directory(Arc::clone(&directory));
+        home.push_event(RegionEvent::EmploymentDirectoryReady);
+        home.process_next_event();
+
+        assert!(
+            assignment_of(&home, citizen).is_some(),
+            "the home's own wake is what applies its accepted employment"
+        );
+    }
+
+    #[test]
+    fn repeated_home_wakes_are_idempotent() {
+        // P4 review check: "repeated EmploymentDirectoryReady events are
+        // idempotent." The accepted read cache keeps re-offering the citizen.
+        let (directory, _employer, mut home) = accepted_but_not_yet_applied();
+        let citizen = only_citizen(&home);
+
+        home_apply_accepted_employment(&mut home, &directory);
+        let first = assignment_of(&home, citizen).expect("applied");
+
+        home_apply_accepted_employment(&mut home, &directory);
+        home_apply_accepted_employment(&mut home, &directory);
+
+        assert_eq!(
+            assignment_of(&home, citizen),
+            Some(first),
+            "re-applying the same accepted employment changes nothing"
+        );
+        assert_eq!(
+            directory.snapshot().accepted_by_home_region[&RegionId(1)].len(),
+            1,
+            "and the read cache still holds it -- acknowledge does not evict"
+        );
+    }
+
+    #[test]
+    fn a_pending_claim_is_never_applied_or_paid() {
+        // P4 behavior forbidden: "do not pay from pending claims."
+        let directory = Arc::new(EmploymentDirectory::default());
+        let employer = employer_runtime();
+        let mut home = home_runtime(1);
+        let discovery = shared_component(&home, &employer);
+        assert!(directory.publish_pools(RegionId(9), employer.state().published_job_pools()));
+
+        // Submit, but never let the employer validate.
+        home_region_daily_jobs(&mut home, &directory, &discovery);
+        let citizen = only_citizen(&home);
+        assert!(!directory.snapshot().pending_claims_by_employer.is_empty());
+
+        home_apply_accepted_employment(&mut home, &directory);
+        assert!(
+            assignment_of(&home, citizen).is_none(),
+            "a merely pending claim must never become an assignment"
+        );
+    }
+
+    #[test]
+    fn a_rejected_claim_never_becomes_an_assignment() {
+        // P4 review check: "rejected claims do not create assignments."
+        let directory = Arc::new(EmploymentDirectory::default());
+        let mut employer = employer_runtime();
+        let mut home = home_runtime(1);
+        let discovery = shared_component(&home, &employer);
+        let pools = employer.state().published_job_pools();
+        let workplace = pools[0].workplace;
+        assert!(directory.publish_pools(RegionId(9), pools));
+        home_region_daily_jobs(&mut home, &directory, &discovery);
+
+        // Fill every seat with local contracts so the claim is rejected for
+        // want of employer-owned capacity.
+        for local in 0..2u32 {
+            employer
+                .state_mut()
+                .accept_claim_and_create_assignment(&JobClaim {
+                    claim_id: JobClaimId(900 + local as u64),
+                    citizen: CitizenRef {
+                        region: RegionId(5),
+                        citizen: Entity::new(RegionId(5), local),
+                    },
+                    workplace,
+                    generation: 1,
+                });
+        }
+        employer_validate_claims(&mut employer, &directory);
+
+        let citizen = only_citizen(&home);
+        assert!(
+            directory
+                .snapshot()
+                .accepted_by_home_region
+                .get(&RegionId(1))
+                .is_none(),
+            "the claim was rejected, so nothing is accepted for this home"
+        );
+        home_apply_accepted_employment(&mut home, &directory);
+        assert!(
+            assignment_of(&home, citizen).is_none(),
+            "a rejected claim must not create an assignment"
+        );
+    }
+
+    #[test]
+    fn home_apply_does_not_overwrite_a_job_the_citizen_took_meanwhile() {
+        // P4 behavior forbidden: "do not clear an old assignment while merely
+        // checking for replacement work."
+        let (directory, _employer, mut home) = accepted_but_not_yet_applied();
+        let citizen = only_citizen(&home);
+
+        let local = WorkplaceAssignment {
+            workplace: Entity::new(RegionId(1), 7),
+            location: CityCellRef::local(RegionId(1), 2, 2),
+            salary: 5,
+        };
+        assert!(home.state_mut().apply_workplace_assignment(citizen, local));
+
+        home_apply_accepted_employment(&mut home, &directory);
+        assert_eq!(
+            assignment_of(&home, citizen),
+            Some(local),
+            "the local job the citizen already took survives the accepted remote one"
+        );
+    }
+
+    #[test]
+    fn the_directory_cache_is_not_the_durable_source_of_home_employment_truth() {
+        // P4 behavior forbidden: "do not make directory cache the durable source
+        // of home employment truth." Once applied, the assignment lives in the
+        // region. Losing the whole broker must not un-employ the citizen.
+        let (directory, _employer, mut home) = accepted_but_not_yet_applied();
+        let citizen = only_citizen(&home);
+        home_apply_accepted_employment(&mut home, &directory);
+        let applied = assignment_of(&home, citizen).expect("applied");
+
+        // Throw the entire directory away, cache and all.
+        drop(directory);
+        let rebuilt = Arc::new(EmploymentDirectory::default());
+        assert!(
+            rebuilt
+                .snapshot()
+                .accepted_by_home_region
+                .get(&RegionId(1))
+                .is_none(),
+            "the fresh broker knows nothing"
+        );
+
+        assert_eq!(
+            assignment_of(&home, citizen),
+            Some(applied),
+            "the citizen keeps its job: the region owns that truth, not the cache"
+        );
+        home_apply_accepted_employment(&mut home, &rebuilt);
+        assert_eq!(
+            assignment_of(&home, citizen),
+            Some(applied),
+            "and an empty cache does not clear it either"
         );
     }
 }

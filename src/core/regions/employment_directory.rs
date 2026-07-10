@@ -638,6 +638,26 @@ impl EmploymentDirectory {
         *self.active_snapshot.write().unwrap() = snapshot;
         homes_to_wake.into_iter().collect()
     }
+
+    /// P4: the home region reports which accepted assignments it has now
+    /// written into its own durable `Citizen.workplace_assignment`.
+    ///
+    /// This does nothing to broker state, and that is the point: once the home
+    /// has applied it, the durable copy lives in the region, and
+    /// `accepted_by_citizen` / `accepted_by_workplace` are only a read cache.
+    /// There is no terminal `JobClaim` to retain or GC — `apply_claim_decisions`
+    /// already removed it from every pending index. The accepted cache is
+    /// cleared later, by an explicit release or employer-confirmed loss (P5).
+    ///
+    /// The method exists as the seam P6's restart/rebuild reconciliation needs:
+    /// after a rebuild the directory must learn which assignments a home has
+    /// really applied, rather than assume its own cache is truth.
+    ///
+    /// Deviation: the plan's body also takes the broker lock and rebuilds/swaps
+    /// the snapshot. Since nothing is mutated, that rebuild would produce a
+    /// byte-identical snapshot at `O(pools + claims + accepted)` cost on *every*
+    /// home wake. Skipped deliberately; behaviour is unchanged.
+    pub fn acknowledge_home_applied(&self, _citizens: Vec<CitizenRef>) {}
 }
 
 fn claim_id_of(decision: &JobClaimDecision) -> JobClaimId {

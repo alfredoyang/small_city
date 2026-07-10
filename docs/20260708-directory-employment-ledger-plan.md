@@ -1,9 +1,10 @@
 # Directory employment ledger — stable cross-region jobs without daily wipes
 
-Status: **proposal, P1 + P2 + P3 implemented** (data model, employer pool
-publishing, and the claim flow — see the "P<n>, implemented" sections at
-the end of this doc; P4-P7 still plan-only. P3 is *staged*: the claim flow
-is built and tested but not yet called from the daily tick). This is an
+Status: **proposal, P1 + P2 + P3 + P4 implemented** (data model, employer
+pool publishing, the claim flow, and home apply — see the "P<n>,
+implemented" sections at the end of this doc; P5-P7 still plan-only. P3/P4
+are *staged*: the whole round trip is built and tested, but nothing calls
+it from the daily tick until P7). This is an
 alternative to pushing
 [20260706-per-producer-job-staleness.md](20260706-per-producer-job-staleness.md)
 further. It targets more precise citizen behavior: jobs should be
@@ -2175,4 +2176,213 @@ None.
      chosen from G1 facts │                  ⇒ contracts nobody    │
      (e.g. a network that │                                        │
       no longer reaches A)│                home retries next pass against G2
+```
+
+## P4, implemented (2026-07-10)
+
+Home apply. An accepted claim now becomes a durable
+`Citizen.workplace_assignment` in the home region, and the existing economy
+pays from it on the next daily settlement.
+
+### Status
+
+**Implemented, still staged.** P4 completes the round trip
+(claim → accept → contract → *apply* → paid), but nothing drives it from the
+daily tick: `home_region_daily_jobs` is still only called by tests. The old
+request/grant path remains the live allocator until P7. So P4 changes no tick
+behaviour on its own.
+
+### Scope
+
+| file | why |
+|------|-----|
+| `src/core/regions/mod.rs` | `RegionState::apply_workplace_assignment` |
+| `src/core/regions/employment_directory.rs` | `EmploymentDirectory::acknowledge_home_applied` |
+| `src/core/regions/runtime/mod.rs` | `home_apply_accepted_employment`, wired into `handle_employment_directory_ready` |
+
+Diff: 3 files, +448 / -12.
+
+**No economy change was needed.** `economy::run` already pays a remote
+assignment from the salary captured at accept time
+(`None => (assignment.salary, 0)` — a remote workplace pays the citizen but
+its tax accrues to the exporting region). P4's scope line *"economy reads
+applied WorkplaceAssignment for salary/payment"* was already satisfied; it
+only needed proving.
+
+### What changed
+
+| item | comes from |
+|------|-----------|
+| `home_apply_accepted_employment` | "Applying Accepted Employment" — transcribed |
+| `acknowledge_home_applied` | "Applying Accepted Employment" — see Deviations |
+| `apply_workplace_assignment` | never bodied in the doc; mirrors the old path's `apply_job_export_grant` |
+| handler now runs employer-then-home | the plan's `handle_employment_directory_ready` order, minus its two P5 calls |
+
+**Not included** (later patches): `employer_apply_releases`,
+`home_apply_losses`, `request_release`, `confirm_release`,
+`report_lost_employment` (P5); `EmploymentDirectoryRebuild`,
+`replace_broker_state` (P6); tick wiring and retiring the daily wipe (P7).
+
+### Deviations from the doc, and why
+
+- **`acknowledge_home_applied` is a true no-op.** The plan's body takes the
+  broker lock and rebuilds/swaps the snapshot — but it mutates nothing, so
+  that rebuild would produce a byte-identical snapshot at
+  `O(pools + claims + accepted)` cost on *every* home wake. (It also would not
+  compile clean: `let mut state` with no mutation trips clippy's `unused_mut`
+  under this project's `-D warnings` gate.) The method is kept as the seam P6's
+  restart/rebuild reconciliation needs. Behaviour is unchanged.
+- **`apply_workplace_assignment` returns `bool` and never overwrites.** The doc
+  never bodies it, only calls it and pushes the citizen onto `applied` when it
+  returns true. One guard — *refuse to overwrite any existing assignment* —
+  delivers two of P4's requirements at once:
+  - *"repeated EmploymentDirectoryReady events are idempotent"*: the accepted
+    read cache keeps re-offering an already-applied citizen; the second call
+    answers `false` and changes nothing.
+  - *"do not clear an old assignment while merely checking for replacement
+    work"*: a citizen who picked up a local job between claim and apply keeps it.
+- **`runtime.state()` → `runtime.state_mut()`** in the transcribed body; the doc
+  writes an immutable borrow for a call that must mutate.
+- **The snapshot's accepted list is read by reference**, not `.cloned()`. Same
+  behaviour, one fewer allocation per wake.
+
+### Why `refresh_jobs_cache_after_grant_applied`
+
+`apply_workplace_assignment` calls `World::refresh_jobs_cache_after_grant_applied`,
+**not** `invalidate_jobs_registry`. Re-flagging `jobs_exports_dirty` would make
+the next daily job phase's wipe (`assign_local_jobs_for_daily_tick`) destroy the
+very assignment just applied — the bug that method exists to close, documented
+in retire-tickstate P-c. Exactly the same call, for exactly the same reason, as
+the old path's `apply_job_export_grant`.
+
+### Tests added
+
+`regions/mod.rs` (+5):
+
+- `apply_workplace_assignment_writes_the_citizen_and_is_idempotent` — review check *"repeated EmploymentDirectoryReady events are idempotent"*.
+- `apply_workplace_assignment_never_clears_an_existing_assignment` — behavior forbidden *"do not clear an old assignment"*.
+- `apply_workplace_assignment_ignores_a_citizen_that_no_longer_exists`
+- `an_applied_remote_assignment_is_paid_by_the_next_daily_economy_phase` — review checks *"payment path uses home-region Citizen.workplace_assignment"* and *"accepted worker is paid on the next daily economy phase after apply"*. Drives `economy::run` directly and asserts the citizen's private money rises by exactly the captured salary. (The citizen starts solvent on purpose: a broke citizen skips rent, which would otherwise pollute the delta.)
+- `applying_an_assignment_does_not_re_dirty_the_daily_wipe_gate` — the `refresh_jobs_cache_after_grant_applied` reasoning above.
+
+`runtime/mod.rs` (+7):
+
+- `home_apply_writes_the_accepted_assignment_onto_the_citizen`
+- `the_home_wake_applies_accepted_employment_through_the_real_event_path` — through `RegionEvent::EmploymentDirectoryReady`, not the free function.
+- `repeated_home_wakes_are_idempotent`
+- `a_pending_claim_is_never_applied_or_paid` — behavior forbidden *"do not pay from pending claims"*.
+- `a_rejected_claim_never_becomes_an_assignment` — review check *"rejected claims do not create assignments"*.
+- `home_apply_does_not_overwrite_a_job_the_citizen_took_meanwhile`
+- `the_directory_cache_is_not_the_durable_source_of_home_employment_truth` — behavior forbidden. Drops the entire broker and proves the citizen keeps its job.
+
+### Existing tests modified
+
+None.
+
+### Housekeeping: three stale `#[allow(dead_code)]` removed
+
+`apply_workplace_assignment`, `job_pool_still_has_open_capacity`, and
+`accept_claim_and_create_assignment` are now genuinely reachable from non-test
+code, via `handle_employment_directory_ready`. Each annotation was verified
+stale by removing it and confirming no `dead_code` warning appears; the three
+survivors (`published_job_pools`, `unemployed_citizens`'s caller
+`home_region_daily_jobs`, and the broker-state fields) were verified *needed*
+the same way. Two comments that credited P4 with tick wiring were corrected to
+say P7.
+
+### Risks remaining
+
+- **The daily wipe still destroys an applied assignment on a *dirty* day.**
+  `assign_local_jobs_for_daily_tick` clears every `workplace_assignment` when
+  the jobs gate is dirty. `apply_workplace_assignment` deliberately does not
+  re-open that gate, so a *quiet* day leaves the assignment alone — which is
+  P4's "stable applied assignments remain across normal daily ticks". But a day
+  made dirty by anything else (a build, a bulldoze, a moved discovery
+  generation) still wipes it, and no wake would fire to re-apply. This is not a
+  live regression because nothing drives the flow from the tick yet; **P7 is
+  what must remove the wipe.**
+- **A citizen who takes a local job between claim and apply strands its
+  contract.** `apply_workplace_assignment` correctly refuses to overwrite, so
+  the accepted employment is never applied — but the employer still holds the
+  contract and the seat. P5's explicit release is what reclaims it. The
+  directory's `accepted_by_citizen` also keeps the citizen out of
+  `unemployed_citizens`' claim path via `active_citizens_by_home_region`.
+- **`accepted_by_citizen` is never evicted by `acknowledge_home_applied`**, by
+  design — it is a read cache, cleared only by release or employer-confirmed
+  loss (P5). So `home_apply_accepted_employment` re-scans every accepted
+  assignment for the region on every wake. Bounded by that region's employed
+  cross-region citizens; idempotent.
+- **Contracts and assignments are still not serialized.** P6.
+
+### Assumptions
+
+- The economy's remote-salary path (`assignment.salary`, no local workplace tax)
+  is the intended payment route for a directory-accepted job, identical to the
+  old export grant's. Confirmed by reading `economy::run`; unchanged by P4.
+- A region may be both an employer and a home. `handle_employment_directory_ready`
+  therefore runs both halves, employer first, so a claim accepted in one pass is
+  visible to its home's own wake.
+
+### Commands run
+
+```text
+ cargo fmt --check                        → clean
+ cargo clippy -- -D warnings              → error set byte-identical to the
+                                             pre-patch branch (git stash + diff
+                                             of sorted errors); zero new findings
+ cargo test --lib employment_claim_flow -q → 16 passed
+ cargo test -q                            → 375 lib tests passed, 0 failed
+                                             (363 before this patch, +12)
+ codex exec resume small_city             → 1 round, "No findings"
+```
+
+### Diagram — what P4 closes
+
+```text
+ BEFORE P4 (end of P3)                     AFTER P4
+
+ employer accepts a claim                  employer accepts a claim
+   contracts_by_workplace[W][A7]             contracts_by_workplace[W][A7]
+   ⇒ EMPLOYER TRUTH                          ⇒ EMPLOYER TRUTH
+        │                                         │
+        ▼                                         ▼
+ directory accepted_by_citizen[A7]         directory accepted_by_citizen[A7]
+   (read cache)                              (read cache)
+        │                                         │
+        │ home is woken...                        │ home is woken...
+        ▼                                         ▼
+   ...and does nothing.                      home_apply_accepted_employment
+   A7 stays jobless.                           apply_workplace_assignment(A7)
+   Nobody is paid.                               refuses if already employed
+                                                 refresh_jobs_cache_after_
+                                                   grant_applied  (NOT
+                                                   invalidate → no wipe)
+                                                    │
+                                                    ▼
+                                            Citizen.workplace_assignment
+                                              ⇒ HOME TRUTH (durable)
+                                                    │
+                                                    ▼
+                                            economy::run pays
+                                              salary captured at accept time
+                                              (no local workplace tax --
+                                               that accrued to the employer)
+
+ acknowledge_home_applied(applied) — a no-op today; the seam P6 uses to learn
+ which assignments a home has really applied after a rebuild.
+```
+
+### Diagram — the three truths after P4
+
+```text
+        HOME REGION A                 DIRECTORY                EMPLOYER REGION B
+        ─────────────                 ─────────                ─────────────────
+ durable:                        read cache only:          durable:
+   Citizen.workplace_assignment    accepted_by_citizen       contracts_by_workplace
+   ⇒ who A pays                    accepted_by_workplace     ⇒ who really holds a seat
+                                   (cleared only by P5's
+                                    release / loss)
+
+   drop the directory ─────────────────► both regions keep their truth
+   (tested: the_directory_cache_is_not_the_durable_source_of_home_employment_truth)
 ```

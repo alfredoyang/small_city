@@ -1411,7 +1411,7 @@ impl RegionState {
     /// next employer publish" — this republished count is that authoritative
     /// replacement, and must not resurrect a contracted seat. A workplace with
     /// nothing left to claim publishes no row at all.
-    #[allow(dead_code)] // P2/P3: staged; the daily tick starts publishing in P4/P7.
+    #[allow(dead_code)] // P2: staged; the daily tick starts publishing in P7.
     pub(crate) fn published_job_pools(&self) -> Vec<JobPool> {
         let mut seen = HashSet::new();
         let mut pools = Vec::new();
@@ -1454,7 +1454,6 @@ impl RegionState {
     /// P3, home side: this region's citizens with no workplace assignment,
     /// in deterministic entity order. `world.citizens` is a `HashMap`, so the
     /// sort is load-bearing — same pattern as `pending_job_demands`.
-    #[allow(dead_code)] // P3: staged; the daily tick starts calling this in P4/P7.
     pub(crate) fn unemployed_citizens(&self) -> Vec<Entity> {
         let mut citizens = self.world.citizens.keys().copied().collect::<Vec<_>>();
         citizens.sort_by_key(|citizen| citizen.0);
@@ -1482,7 +1481,6 @@ impl RegionState {
     /// "Employer-owned capacity" is the spare seats this workplace publishes
     /// (`spare_job_slots_on_network`, already net of *local* assignment) minus
     /// the seats this region has already contracted to remote citizens.
-    #[allow(dead_code)] // P3: staged; called by employer_validate_claims (not tick-wired yet).
     pub(crate) fn job_pool_still_has_open_capacity(&self, workplace: Entity) -> bool {
         self.spare_job_slots_for_workplace(workplace) > self.contracted_seats_at(workplace)
     }
@@ -1507,13 +1505,46 @@ impl RegionState {
             .map_or(0, BTreeMap::len)
     }
 
+    /// P4, home side: write the durable `Citizen.workplace_assignment` the
+    /// economy already pays from. Returns whether this call actually applied
+    /// it — the caller reports only *newly* applied citizens back to the
+    /// directory.
+    ///
+    /// Never overwrites an existing assignment. That single guard gives P4
+    /// both of its forbidden behaviours at once:
+    /// - *idempotent repeated wakes*: the directory's accepted read cache keeps
+    ///   re-offering an already-applied citizen on every wake; the second call
+    ///   is a no-op returning `false`.
+    /// - *"do not clear an old assignment while merely checking for replacement
+    ///   work"*: a citizen who picked up a local job between claim and apply
+    ///   keeps it.
+    ///
+    /// `refresh_jobs_cache_after_grant_applied`, not `invalidate_jobs_registry`
+    /// — re-flagging `jobs_exports_dirty` here would make the next daily wipe
+    /// destroy the very assignment just applied. Same reasoning, and the same
+    /// call, as the old path's `apply_job_export_grant`.
+    pub(crate) fn apply_workplace_assignment(
+        &mut self,
+        citizen: Entity,
+        assignment: WorkplaceAssignment,
+    ) -> bool {
+        let Some(citizen_data) = self.world.citizens.get_mut(&citizen) else {
+            return false; // citizen moved away or was removed
+        };
+        if citizen_data.workplace_assignment.is_some() {
+            return false;
+        }
+        citizen_data.workplace_assignment = Some(assignment);
+        self.world.refresh_jobs_cache_after_grant_applied();
+        true
+    }
+
     /// P3, employer side: record the contract in this region's own state and
     /// hand back the assignment the home region will later apply (P4).
     ///
     /// The employer is the authority for the seat; the returned
     /// `WorkplaceAssignment` is owned data (city-wide `Entity` + self-describing
     /// cell + salary), so the home never dereferences this region's ECS.
-    #[allow(dead_code)] // P3: staged; called by employer_validate_claims (not tick-wired yet).
     pub(crate) fn accept_claim_and_create_assignment(
         &mut self,
         claim: &JobClaim,
@@ -2403,6 +2434,127 @@ mod tests {
                 .accepted_generation,
             12,
             "the pool generation in effect at accept time is recorded on the contract"
+        );
+    }
+
+    /// A home region with one jobless citizen, and a remote assignment for it.
+    fn home_region_with_one_citizen() -> (RegionState, Entity, WorkplaceAssignment) {
+        let mut region = RegionState::new(RegionId(1), 3, 3);
+        assert!(region.build(0, 0, BuildingKind::Residential).success);
+        let home = region.world.grid.get(0, 0).expect("home");
+        citizens::spawn_for_home(&mut region.world, home, 1);
+        region.ensure_derived_state();
+        let citizen = *region.world.citizens.keys().next().expect("citizen");
+        let assignment = WorkplaceAssignment {
+            workplace: Entity::new(RegionId(9), 42),
+            location: CityCellRef::local(RegionId(9), 1, 0),
+            salary: 40,
+        };
+        (region, citizen, assignment)
+    }
+
+    #[test]
+    fn apply_workplace_assignment_writes_the_citizen_and_is_idempotent() {
+        // P4 review check: "repeated EmploymentDirectoryReady events are
+        // idempotent." The directory's accepted read cache re-offers an
+        // already-applied citizen on every wake.
+        let (mut region, citizen, assignment) = home_region_with_one_citizen();
+
+        assert!(
+            region.apply_workplace_assignment(citizen, assignment),
+            "the first apply lands"
+        );
+        assert_eq!(
+            region.world.citizens[&citizen].workplace_assignment,
+            Some(assignment)
+        );
+
+        assert!(
+            !region.apply_workplace_assignment(citizen, assignment),
+            "a repeated apply reports 'nothing newly applied'"
+        );
+        assert_eq!(
+            region.world.citizens[&citizen].workplace_assignment,
+            Some(assignment),
+            "and leaves the assignment exactly as it was"
+        );
+    }
+
+    #[test]
+    fn apply_workplace_assignment_never_clears_an_existing_assignment() {
+        // P4 behavior forbidden: "do not clear an old assignment while merely
+        // checking for replacement work." A citizen who picked up a local job
+        // between claim and apply keeps it.
+        let (mut region, citizen, remote) = home_region_with_one_citizen();
+        let local = WorkplaceAssignment {
+            workplace: Entity::new(RegionId(1), 7),
+            location: CityCellRef::local(RegionId(1), 2, 2),
+            salary: 5,
+        };
+        region
+            .world
+            .citizens
+            .get_mut(&citizen)
+            .unwrap()
+            .workplace_assignment = Some(local);
+
+        assert!(!region.apply_workplace_assignment(citizen, remote));
+        assert_eq!(
+            region.world.citizens[&citizen].workplace_assignment,
+            Some(local),
+            "the existing (local) job survives an incoming remote assignment"
+        );
+    }
+
+    #[test]
+    fn apply_workplace_assignment_ignores_a_citizen_that_no_longer_exists() {
+        let (mut region, _citizen, assignment) = home_region_with_one_citizen();
+        let ghost = Entity::new(RegionId(1), 9999);
+        assert!(!region.apply_workplace_assignment(ghost, assignment));
+    }
+
+    #[test]
+    fn an_applied_remote_assignment_is_paid_by_the_next_daily_economy_phase() {
+        // P4 review checks: "payment path uses home-region
+        // Citizen.workplace_assignment" and "accepted worker is paid on the next
+        // daily economy phase after apply."
+        // Salary is private citizen money (the city collects only workplace tax,
+        // and a remote workplace's tax accrues to the *exporting* region).
+        let (mut region, citizen, assignment) = home_region_with_one_citizen();
+        // Start solvent, so rent is paid on BOTH days and the only difference
+        // between them is the salary. (A broke citizen skips rent, which would
+        // otherwise show up in the delta.)
+        region.world.citizens.get_mut(&citizen).unwrap().money = 1_000;
+
+        let before = region.world.citizens[&citizen].money;
+        economy::run(&mut region.world, &[]);
+        let jobless_delta = region.world.citizens[&citizen].money - before;
+
+        // Now apply the remote assignment and settle another day.
+        assert!(region.apply_workplace_assignment(citizen, assignment));
+        let before = region.world.citizens[&citizen].money;
+        economy::run(&mut region.world, &[]);
+        let employed_delta = region.world.citizens[&citizen].money - before;
+
+        assert_eq!(
+            employed_delta - jobless_delta,
+            assignment.salary,
+            "the applied assignment's captured salary is what the citizen is paid"
+        );
+    }
+
+    #[test]
+    fn applying_an_assignment_does_not_re_dirty_the_daily_wipe_gate() {
+        // If apply re-flagged `jobs_exports_dirty`, the next daily job phase
+        // would wipe the very assignment just applied (the bug
+        // `refresh_jobs_cache_after_grant_applied` exists to close).
+        let (mut region, citizen, assignment) = home_region_with_one_citizen();
+        region.clear_jobs_exports_dirty();
+
+        assert!(region.apply_workplace_assignment(citizen, assignment));
+        assert!(
+            !region.world.is_jobs_exports_dirty(),
+            "applying an accepted assignment must not re-open the daily wipe gate"
         );
     }
 
