@@ -70,6 +70,7 @@
 //!                  West:offset 0
 //! ```
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::core::city_refs::CityCellRef;
@@ -81,7 +82,8 @@ use crate::core::regional_types::{
 };
 use crate::core::regions::directory::CrossRegionDiscovery;
 use crate::core::regions::employment_directory::{
-    CitizenRef, EmploymentDirectory, JobClaimDecision, choose_best_pool,
+    CitizenRef, EmploymentDirectory, EmploymentLeaseRef, JobClaimDecision, JobLoss, JobLossReason,
+    choose_best_pool,
 };
 use crate::core::regions::handle::{RegionEventReceiver, RegionHandle, mailbox};
 use crate::core::regions::{
@@ -803,15 +805,20 @@ impl RegionRuntime {
         }
     }
 
-    /// P3/P4: pull whatever employment work the directory holds for this region.
+    /// P3/P4/P5: pull whatever employment work the directory holds for this
+    /// region. This is now the plan's full four-call handler.
     ///
-    /// One region can be both an employer and a home, so both halves run. The
-    /// plan's handler also calls `employer_apply_releases` and
-    /// `home_apply_losses` — those are P5 scope and are deliberately absent.
+    /// One region can be both an employer and a home, so all four run. The order
+    /// is the plan's, and it matters: employer-side work settles this pass's
+    /// accepts and releases into the directory *before* the home-side work reads
+    /// the accepted cache and the loss queue.
     ///
-    /// Employer-side validation runs first, matching the plan's order: a claim
-    /// this region accepts in the same pass then lands in the accepted read
-    /// cache, ready for its *home* region's own wake to apply.
+    /// ```text
+    ///   employer_validate_claims        accept/reject pending claims
+    ///   employer_apply_releases         free seats the home gave back
+    ///   home_apply_accepted_employment  write Citizen.workplace_assignment
+    ///   home_apply_losses               clear assignments the employer lost
+    /// ```
     ///
     /// A runtime with no directory installed (a bare `RegionRuntime::new`, or
     /// a worker that never set one) treats the wake as a no-op rather than
@@ -821,7 +828,9 @@ impl RegionRuntime {
             return Vec::new();
         };
         let outbound = employer_validate_claims(self, &directory);
+        employer_apply_releases(self, &directory);
         home_apply_accepted_employment(self, &directory);
+        home_apply_losses(self, &directory);
         outbound
     }
 
@@ -1679,6 +1688,96 @@ pub(crate) fn home_apply_accepted_employment(
     }
 
     directory.acknowledge_home_applied(applied);
+}
+
+/// P5, home side: this citizen gives its job up.
+///
+/// The home clears its own truth first, then asks the employer to free the
+/// seat. Between the two, the directory still lists the citizen as accepted,
+/// which is what stops it claiming a second job before the first is confirmed
+/// released — and what stops the seat being advertised twice.
+#[allow(dead_code)] // P5: staged; no gameplay action releases a job yet.
+pub(crate) fn home_release_job(
+    runtime: &mut RegionRuntime,
+    directory: &EmploymentDirectory,
+    citizen: Entity,
+) -> Vec<OutboundMessage> {
+    let Some(assignment) = runtime.state_mut().clear_employment(citizen) else {
+        return Vec::new(); // nothing to release
+    };
+    let regions_to_wake = directory.request_release(EmploymentLeaseRef {
+        citizen: CitizenRef {
+            region: runtime.region_id(),
+            citizen,
+        },
+        workplace: assignment.workplace,
+    });
+    runtime.emit_employment_directory_ready(regions_to_wake)
+}
+
+/// P5, employer side: honour the release requests queued for this region.
+///
+/// Only a release the employer can actually match is confirmed. One it cannot
+/// (the contract is already gone — typically because the employer lost it first
+/// and reported that loss) is dropped: the accepted cache was already cleared
+/// by that loss, so there is nothing left to free.
+pub(crate) fn employer_apply_releases(
+    runtime: &mut RegionRuntime,
+    directory: &EmploymentDirectory,
+) {
+    for release in directory.take_releases_for_employer(runtime.region_id()) {
+        if runtime
+            .state_mut()
+            .release_contract_if_matches(release.workplace, release.citizen)
+        {
+            directory.confirm_release(runtime.region_id(), release);
+        }
+    }
+}
+
+/// P5, home side: apply the losses an employer has confirmed.
+///
+/// Clears the citizen's assignment only if it still names the lost workplace —
+/// a loss report can be one pass stale, and the citizen may already have moved
+/// to a different job.
+pub(crate) fn home_apply_losses(runtime: &mut RegionRuntime, directory: &EmploymentDirectory) {
+    for loss in directory.take_losses_for_home(runtime.region_id()) {
+        runtime
+            .state_mut()
+            .clear_employment_if_matches(loss.lease.citizen.citizen, loss.lease.workplace);
+    }
+}
+
+/// P5, employer side: republish this region's pools, and explicitly report
+/// every contract it can no longer honour.
+///
+/// Loss is never inferred from a pool vanishing out of a snapshot. The employer
+/// decides, drops the contract in its own state, and *tells* the home region.
+///
+/// Deviation: the plan passes the freshly computed `pools` into
+/// `release_contracts_no_longer_valid`; they cannot answer the question (see
+/// that method). The plan's ordering — pools computed *before* the release — is
+/// nonetheless preserved and harmless: dropping the excess leaves
+/// `contracted == spare`, so the affected workplace's `open_count` is zero
+/// either way.
+#[allow(dead_code)] // P5: staged; the daily tick starts publishing in P7.
+pub(crate) fn employer_publish_pools(
+    runtime: &mut RegionRuntime,
+    directory: &EmploymentDirectory,
+) -> Vec<OutboundMessage> {
+    let pools = runtime.state().published_job_pools();
+    let lost_contracts = runtime.state_mut().release_contracts_no_longer_valid();
+
+    directory.publish_pools(runtime.region_id(), pools);
+
+    let mut regions_to_wake = BTreeSet::new();
+    for (workplace, citizen, _contract) in lost_contracts {
+        regions_to_wake.extend(directory.report_lost_employment(JobLoss {
+            lease: EmploymentLeaseRef { citizen, workplace },
+            reason: JobLossReason::PoolInvalid,
+        }));
+    }
+    runtime.emit_employment_directory_ready(regions_to_wake.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -3193,6 +3292,297 @@ mod employment_claim_flow_tests {
             assignment_of(&home, citizen),
             Some(applied),
             "and an empty cache does not clear it either"
+        );
+    }
+
+    // ---- P5: release and invalidation ----
+
+    /// Runs the whole flow through P4: the citizen is accepted, contracted, and
+    /// has applied its assignment.
+    fn a_worker_employed_across_the_border() -> (
+        Arc<EmploymentDirectory>,
+        RegionRuntime,
+        RegionRuntime,
+        Entity,
+        Entity,
+    ) {
+        let (directory, employer, mut home) = accepted_but_not_yet_applied();
+        home_apply_accepted_employment(&mut home, &directory);
+        let citizen = only_citizen(&home);
+        let workplace = assignment_of(&home, citizen).expect("applied").workplace;
+        assert_eq!(employer.state().contract_holders_at(workplace).len(), 1);
+        (directory, employer, home, citizen, workplace)
+    }
+
+    #[test]
+    fn an_explicit_release_frees_the_seat_only_after_the_employer_confirms() {
+        // P5 behavior allowed: "explicit home release clears home assignment
+        // first, then employer confirms capacity."
+        let (directory, mut employer, mut home, citizen, workplace) =
+            a_worker_employed_across_the_border();
+
+        let outbound = home_release_job(&mut home, &directory, citizen);
+        assert_eq!(wake_targets(&outbound), vec![RegionId(9)]);
+        assert!(
+            assignment_of(&home, citizen).is_none(),
+            "the home clears its own truth first"
+        );
+        assert_eq!(
+            employer.state().contract_holders_at(workplace).len(),
+            1,
+            "but the employer still holds the seat until it confirms"
+        );
+        assert!(
+            directory
+                .snapshot()
+                .active_citizens_by_home_region
+                .get(&RegionId(1))
+                .is_some_and(|active| active.contains(&citizen)),
+            "and the citizen cannot claim a second job mid-release"
+        );
+
+        employer_apply_releases(&mut employer, &directory);
+
+        assert!(
+            employer.state().contract_holders_at(workplace).is_empty(),
+            "the employer dropped the contract"
+        );
+        assert!(
+            directory
+                .snapshot()
+                .active_citizens_by_home_region
+                .get(&RegionId(1))
+                .is_none_or(|active| !active.contains(&citizen)),
+            "and only now is the citizen free to claim again"
+        );
+    }
+
+    #[test]
+    fn republishing_after_a_confirmed_release_is_a_no_op() {
+        // The same convergence property P3/P4 rely on, now for the release path:
+        //   directory cached open_count = published + 1   (confirm_release)
+        //   employer's next published   = spare - contracted (one fewer contract)
+        // Those agree, so the republish is UNCHANGED -- no generation bump, and
+        // therefore no churn of any other pool's still-valid pending claims.
+        let (directory, mut employer, mut home, citizen, _workplace) =
+            a_worker_employed_across_the_border();
+
+        home_release_job(&mut home, &directory, citizen);
+        employer_apply_releases(&mut employer, &directory);
+
+        assert!(
+            !directory.publish_pools(RegionId(9), employer.state().published_job_pools()),
+            "the post-release republish must be a no-op, not a 'changed' pool"
+        );
+    }
+
+    #[test]
+    fn a_released_seat_can_be_claimed_again() {
+        // End to end: release, confirm, and the same citizen wins the seat back.
+        let (directory, mut employer, mut home, citizen, workplace) =
+            a_worker_employed_across_the_border();
+        let discovery = shared_component(&home, &employer);
+
+        home_release_job(&mut home, &directory, citizen);
+        employer_apply_releases(&mut employer, &directory);
+        assert!(employer.state().contract_holders_at(workplace).is_empty());
+
+        // The employer republishes its (now roomier) pools, and the citizen
+        // claims again.
+        employer_publish_pools(&mut employer, &directory);
+        assert!(!home_region_daily_jobs(&mut home, &directory, &discovery).is_empty());
+        employer_validate_claims(&mut employer, &directory);
+        home_apply_accepted_employment(&mut home, &directory);
+
+        assert_eq!(
+            employer.state().contract_holders_at(workplace).len(),
+            1,
+            "the freed seat is contracted again"
+        );
+        assert!(assignment_of(&home, citizen).is_some());
+    }
+
+    #[test]
+    fn a_release_racing_an_employer_loss_strands_nothing() {
+        // employer_apply_releases DROPS a release it cannot match. The only way
+        // the contract is already gone is that the employer lost it and reported
+        // that loss -- which already cleared the accepted cache. Prove the
+        // citizen is not left stranded as "active" and unable to re-claim.
+        let (directory, mut employer, mut home, citizen, workplace) =
+            a_worker_employed_across_the_border();
+
+        // Home asks to release...
+        home_release_job(&mut home, &directory, citizen);
+        // ...but the employer independently loses the whole workplace first.
+        assert!(employer.state_mut().bulldoze(1, 1).success);
+        employer.ensure_derived_state();
+        employer_publish_pools(&mut employer, &directory);
+        assert!(employer.state().contract_holders_at(workplace).is_empty());
+
+        // The queued release can no longer be matched, so it is dropped.
+        employer_apply_releases(&mut employer, &directory);
+
+        let snapshot = directory.snapshot();
+        assert!(
+            snapshot.accepted_by_home_region.is_empty(),
+            "the loss already cleared the accepted cache -- nothing is stranded"
+        );
+        assert!(
+            snapshot
+                .active_citizens_by_home_region
+                .get(&RegionId(1))
+                .is_none_or(|active| !active.contains(&citizen)),
+            "so the citizen is free to claim again"
+        );
+
+        // And the home's loss queue drains harmlessly: it already cleared itself.
+        home_apply_losses(&mut home, &directory);
+        assert!(assignment_of(&home, citizen).is_none());
+    }
+
+    #[test]
+    fn a_bulldozed_workplace_reports_an_explicit_loss_that_the_home_applies() {
+        // P5 scope: "employer loss reporting sends JobLoss to the home region",
+        // "home loss handling clears assignment only if it still matches".
+        let (directory, mut employer, mut home, citizen, workplace) =
+            a_worker_employed_across_the_border();
+
+        assert!(employer.state_mut().bulldoze(1, 1).success);
+        employer.ensure_derived_state();
+
+        let outbound = employer_publish_pools(&mut employer, &directory);
+        assert_eq!(
+            wake_targets(&outbound),
+            vec![RegionId(1)],
+            "the home region is woken with a loss"
+        );
+        assert!(
+            employer.state().contract_holders_at(workplace).is_empty(),
+            "the employer dropped the contract it can no longer honour"
+        );
+        assert!(
+            assignment_of(&home, citizen).is_some(),
+            "the home is not cleared until it applies the loss"
+        );
+
+        home_apply_losses(&mut home, &directory);
+        assert!(
+            assignment_of(&home, citizen).is_none(),
+            "the employer-confirmed loss clears the home assignment"
+        );
+    }
+
+    #[test]
+    fn a_stable_worker_keeps_the_job_across_unrelated_republishes() {
+        // P5 review check: "stable workers keep being paid until explicit release
+        // or employer-confirmed loss." P5 behavior forbidden: "do not infer
+        // accepted job loss from missing snapshot rows" -- note the workplace is
+        // fully contracted here, so it publishes NO pool row at all.
+        let (directory, mut employer, home, citizen, workplace) =
+            a_worker_employed_across_the_border();
+
+        for _ in 0..3 {
+            let outbound = employer_publish_pools(&mut employer, &directory);
+            assert!(
+                wake_targets(&outbound).is_empty(),
+                "a healthy republish reports no loss"
+            );
+        }
+
+        assert_eq!(
+            employer.state().contract_holders_at(workplace).len(),
+            1,
+            "the contract survives"
+        );
+        assert!(
+            assignment_of(&home, citizen).is_some(),
+            "and so does the home assignment it is paid from"
+        );
+        assert!(
+            directory
+                .snapshot()
+                .accepted_by_home_region
+                .contains_key(&RegionId(1)),
+            "the accepted lease is untouched"
+        );
+    }
+
+    #[test]
+    fn a_stale_loss_never_clears_a_job_the_citizen_moved_to() {
+        // P5 behavior forbidden: "do not clear a home assignment if the citizen
+        // already moved to a different workplace."
+        let (directory, mut employer, mut home, citizen, workplace) =
+            a_worker_employed_across_the_border();
+
+        // The employer loses the contract and reports it...
+        assert!(employer.state_mut().bulldoze(1, 1).success);
+        employer.ensure_derived_state();
+        employer_publish_pools(&mut employer, &directory);
+
+        // ...but before the home applies the loss, the citizen takes another job.
+        let elsewhere = WorkplaceAssignment {
+            workplace: Entity::new(RegionId(1), 7),
+            location: CityCellRef::local(RegionId(1), 2, 2),
+            salary: 5,
+        };
+        home.state_mut().clear_employment(citizen);
+        assert!(
+            home.state_mut()
+                .apply_workplace_assignment(citizen, elsewhere)
+        );
+
+        home_apply_losses(&mut home, &directory);
+        assert_eq!(
+            assignment_of(&home, citizen),
+            Some(elsewhere),
+            "the stale loss names the old workplace, so it must not clear the new job"
+        );
+        let _ = workplace;
+    }
+
+    #[test]
+    fn the_wake_handler_runs_release_and_loss_work_through_the_real_event_path() {
+        // P5 scope: "EmploymentDirectoryReady wakes both employer release work
+        // and home loss work."
+        let (directory, mut employer, mut home, citizen, workplace) =
+            a_worker_employed_across_the_border();
+        home_release_job(&mut home, &directory, citizen);
+
+        employer.set_employment_directory(Arc::clone(&directory));
+        employer.push_event(RegionEvent::EmploymentDirectoryReady);
+        employer.process_next_event();
+        assert!(
+            employer.state().contract_holders_at(workplace).is_empty(),
+            "the employer's wake confirmed the release"
+        );
+
+        // Now the employer loses a (re-created) contract and the home's own wake
+        // must apply the loss.
+        let assignment = employer
+            .state_mut()
+            .accept_claim_and_create_assignment(&JobClaim {
+                claim_id: JobClaimId(77),
+                citizen: CitizenRef {
+                    region: RegionId(1),
+                    citizen,
+                },
+                workplace,
+                generation: 1,
+            });
+        assert!(
+            home.state_mut()
+                .apply_workplace_assignment(citizen, assignment)
+        );
+        assert!(employer.state_mut().bulldoze(1, 1).success);
+        employer.ensure_derived_state();
+        employer_publish_pools(&mut employer, &directory);
+
+        home.set_employment_directory(Arc::clone(&directory));
+        home.push_event(RegionEvent::EmploymentDirectoryReady);
+        home.process_next_event();
+        assert!(
+            assignment_of(&home, citizen).is_none(),
+            "the home's wake applied the employer-confirmed loss"
         );
     }
 }

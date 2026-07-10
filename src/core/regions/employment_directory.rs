@@ -153,7 +153,6 @@ pub struct EmployerState {
 /// - `pending_by_employer` — which claims one employer region still needs
 ///   to validate, so `take_pending_claims_for_employer` (P3) can pull its
 ///   own batch without scanning every claim.
-#[allow(dead_code)] // P1: data model only; P2/P3 read and mutate these fields.
 struct EmploymentBrokerState {
     next_claim_id: u64,
     pools_by_workplace: BTreeMap<Entity, JobPool>,
@@ -658,6 +657,131 @@ impl EmploymentDirectory {
     /// byte-identical snapshot at `O(pools + claims + accepted)` cost on *every*
     /// home wake. Skipped deliberately; behaviour is unchanged.
     pub fn acknowledge_home_applied(&self, _citizens: Vec<CitizenRef>) {}
+
+    /// P5: a home region asks to give a seat back. Queues the lease for its
+    /// employer and returns that employer as the wake target.
+    ///
+    /// The accepted cache is **not** cleared here, deliberately. Until the
+    /// employer confirms, the seat stays booked: `accepted_by_workplace` keeps
+    /// it out of any snapshot's claimable count, and `accepted_by_citizen` keeps
+    /// the releasing citizen out of `active_citizens_by_home_region`, so it
+    /// cannot grab a second job mid-release. P5 forbids advertising released
+    /// capacity before the employer confirms.
+    pub fn request_release(&self, release: EmploymentLeaseRef) -> Vec<RegionId> {
+        let mut state = self.broker.lock().unwrap();
+        let employer = release.workplace.region();
+
+        state
+            .releases_by_employer
+            .entry(employer)
+            .or_default()
+            .push(release);
+
+        let snapshot = Arc::new(Self::rebuild_snapshot_locked(&state));
+        *self.active_snapshot.write().unwrap() = snapshot;
+        vec![employer]
+    }
+
+    /// P5: drain one employer's queued release requests. Unlike
+    /// `take_pending_claims_for_employer` this really does drain — a release the
+    /// employer cannot match is dropped, because the contract it names is
+    /// already gone.
+    pub fn take_releases_for_employer(&self, employer: RegionId) -> Vec<EmploymentLeaseRef> {
+        let mut state = self.broker.lock().unwrap();
+        state
+            .releases_by_employer
+            .remove(&employer)
+            .unwrap_or_default()
+    }
+
+    /// P5: the employer has dropped its contract, so the seat really is free.
+    /// Only now is the accepted cache cleared and the cached `open_count`
+    /// handed back.
+    ///
+    /// The seat is handed back **only if the lease actually matched**. The
+    /// plan's pseudocode clears the cache conditionally but increments
+    /// `open_count` unconditionally, which would advertise a phantom seat for a
+    /// confirmation naming the right employer and workplace but the wrong
+    /// citizen. Found in review.
+    ///
+    /// A miss is not an error: after a P6 rebuild the cache can be empty while
+    /// real contracts exist, and the employer's next authoritative publish
+    /// recomputes `open_count = spare - contracted` regardless.
+    pub fn confirm_release(&self, employer: RegionId, release: EmploymentLeaseRef) {
+        let mut state = self.broker.lock().unwrap();
+        // Same ownership rule publish_pools and apply_claim_decisions enforce.
+        if release.workplace.region() != employer {
+            return;
+        }
+        if !clear_accepted_cache_if_matches(&mut state, &release) {
+            return;
+        }
+
+        if let Some(pool) = state.pools_by_workplace.get_mut(&release.workplace) {
+            pool.open_count = pool.open_count.saturating_add(1);
+        }
+
+        let snapshot = Arc::new(Self::rebuild_snapshot_locked(&state));
+        *self.active_snapshot.write().unwrap() = snapshot;
+    }
+
+    /// P5: the employer confirms it can no longer honour a contract. Clears the
+    /// accepted cache and queues the loss for the *home* region, which is
+    /// returned as the wake target.
+    ///
+    /// This is the only way accepted employment ends besides an explicit
+    /// release. Loss is never inferred from a pool going missing from a
+    /// snapshot — that only invalidates *pending* claims.
+    pub fn report_lost_employment(&self, loss: JobLoss) -> Vec<RegionId> {
+        let mut state = self.broker.lock().unwrap();
+        let home = loss.lease.citizen.region;
+
+        let _matched = clear_accepted_cache_if_matches(&mut state, &loss.lease);
+        state.losses_by_home.entry(home).or_default().push(loss);
+
+        let snapshot = Arc::new(Self::rebuild_snapshot_locked(&state));
+        *self.active_snapshot.write().unwrap() = snapshot;
+        vec![home]
+    }
+
+    /// P5: drain one home region's queued losses, in the order they were
+    /// reported. `losses_by_home` is a `BTreeMap<RegionId, Vec<_>>`, and each
+    /// employer reports its lost contracts in `(workplace, citizen)` order, so
+    /// the drain is deterministic.
+    pub fn take_losses_for_home(&self, home: RegionId) -> Vec<JobLoss> {
+        let mut state = self.broker.lock().unwrap();
+        state.losses_by_home.remove(&home).unwrap_or_default()
+    }
+}
+
+/// Forget one accepted lease — but only if the citizen really does hold *that*
+/// workplace. A citizen re-hired elsewhere in the meantime keeps its new job.
+///
+/// Returns whether the lease matched. `confirm_release` gates the seat
+/// hand-back on that answer, so a mismatched confirmation cannot advertise a
+/// phantom seat. `report_lost_employment` ignores it: it queues the loss
+/// regardless, and the home re-checks the match before clearing its citizen.
+fn clear_accepted_cache_if_matches(
+    state: &mut EmploymentBrokerState,
+    release: &EmploymentLeaseRef,
+) -> bool {
+    let Some(assignment) = state.accepted_by_citizen.get(&release.citizen) else {
+        return false;
+    };
+    if assignment.workplace != release.workplace {
+        return false;
+    }
+
+    state.accepted_by_citizen.remove(&release.citizen);
+    let mut remove_pool_entry = false;
+    if let Some(workers) = state.accepted_by_workplace.get_mut(&release.workplace) {
+        workers.remove(&release.citizen);
+        remove_pool_entry = workers.is_empty();
+    }
+    if remove_pool_entry {
+        state.accepted_by_workplace.remove(&release.workplace);
+    }
+    true
 }
 
 fn claim_id_of(decision: &JobClaimDecision) -> JobClaimId {
@@ -1616,5 +1740,221 @@ mod tests {
             1,
             "a claim against the untouched pool must survive an unrelated pool's change"
         );
+    }
+
+    // ---- P5: release and invalidation ----
+
+    /// A pool with one accepted worker, as `apply_claim_decisions` would leave it.
+    fn directory_with_one_accepted_worker() -> (EmploymentDirectory, JobPool, CitizenRef) {
+        let (directory, job_pool) = directory_with_pool(2);
+        let worker = citizen(1, 50);
+        directory.submit_claims(vec![(worker, job_pool.workplace, job_pool.generation)]);
+        let claim = directory.take_pending_claims_for_employer(RegionId(9))[0];
+        directory.apply_claim_decisions(
+            RegionId(9),
+            vec![JobClaimDecision::Accepted {
+                claim_id: claim.claim_id,
+                assignment: assignment_for(job_pool),
+            }],
+        );
+        (directory, job_pool, worker)
+    }
+
+    fn lease(worker: CitizenRef, job_pool: JobPool) -> EmploymentLeaseRef {
+        EmploymentLeaseRef {
+            citizen: worker,
+            workplace: job_pool.workplace,
+        }
+    }
+
+    #[test]
+    fn request_release_keeps_the_seat_booked_until_the_employer_confirms() {
+        // P5 review check: "request_release keeps accepted_by_workplace populated
+        // until confirm_release." P5 behavior forbidden: "do not advertise
+        // released capacity before employer confirms release."
+        let (directory, job_pool, worker) = directory_with_one_accepted_worker();
+        let open_before =
+            directory.broker.lock().unwrap().pools_by_workplace[&job_pool.workplace].open_count;
+
+        let woken = directory.request_release(lease(worker, job_pool));
+        assert_eq!(woken, vec![RegionId(9)], "the employer is the wake target");
+
+        let state = directory.broker.lock().unwrap();
+        assert!(
+            state.accepted_by_workplace[&job_pool.workplace].contains(&worker),
+            "the seat stays booked until the employer confirms"
+        );
+        assert!(
+            state.accepted_by_citizen.contains_key(&worker),
+            "and the citizen cannot claim a second job mid-release"
+        );
+        assert_eq!(
+            state.pools_by_workplace[&job_pool.workplace].open_count, open_before,
+            "released capacity must not be advertised before confirmation"
+        );
+        assert_eq!(state.releases_by_employer[&RegionId(9)].len(), 1);
+    }
+
+    #[test]
+    fn confirm_release_frees_the_seat_and_clears_the_accepted_cache() {
+        let (directory, job_pool, worker) = directory_with_one_accepted_worker();
+        let open_before =
+            directory.broker.lock().unwrap().pools_by_workplace[&job_pool.workplace].open_count;
+        directory.request_release(lease(worker, job_pool));
+
+        directory.confirm_release(RegionId(9), lease(worker, job_pool));
+
+        let state = directory.broker.lock().unwrap();
+        assert!(!state.accepted_by_citizen.contains_key(&worker));
+        assert!(
+            !state
+                .accepted_by_workplace
+                .contains_key(&job_pool.workplace),
+            "the workplace's now-empty accepted set is removed outright"
+        );
+        assert_eq!(
+            state.pools_by_workplace[&job_pool.workplace].open_count,
+            open_before + 1,
+            "the seat is handed back only on confirmation"
+        );
+    }
+
+    #[test]
+    fn confirm_release_only_matches_the_right_employer_workplace_and_citizen() {
+        // P5 review check: "confirm_release clears accepted cache only for the
+        // matching employer/workplace/citizen."
+        //
+        // Found in review: it must also not hand the SEAT back on a mismatch.
+        // The plan's pseudocode clears the cache conditionally but increments
+        // open_count unconditionally, so a confirmation with the right
+        // employer+workplace but the wrong citizen advertised a phantom seat.
+        let (directory, job_pool, worker) = directory_with_one_accepted_worker();
+        let other_citizen = citizen(1, 51);
+        let other_workplace = Entity::new(RegionId(9), 77);
+        let open_before =
+            directory.broker.lock().unwrap().pools_by_workplace[&job_pool.workplace].open_count;
+
+        // Wrong employer.
+        directory.confirm_release(RegionId(4), lease(worker, job_pool));
+        // Wrong citizen -- right employer, right workplace.
+        directory.confirm_release(RegionId(9), lease(other_citizen, job_pool));
+        // Wrong workplace.
+        directory.confirm_release(
+            RegionId(9),
+            EmploymentLeaseRef {
+                citizen: worker,
+                workplace: other_workplace,
+            },
+        );
+
+        let state = directory.broker.lock().unwrap();
+        assert_eq!(
+            state.pools_by_workplace[&job_pool.workplace].open_count, open_before,
+            "a mismatched confirmation must not hand a seat back"
+        );
+        assert!(
+            state.accepted_by_citizen.contains_key(&worker),
+            "no mismatched confirmation may clear the accepted cache"
+        );
+        assert!(state.accepted_by_workplace[&job_pool.workplace].contains(&worker));
+    }
+
+    #[test]
+    fn report_lost_employment_clears_the_accepted_cache_and_wakes_the_home() {
+        // P5 review check, and the only way accepted employment ends besides an
+        // explicit release.
+        let (directory, job_pool, worker) = directory_with_one_accepted_worker();
+
+        let woken = directory.report_lost_employment(JobLoss {
+            lease: lease(worker, job_pool),
+            reason: JobLossReason::PoolInvalid,
+        });
+
+        assert_eq!(woken, vec![RegionId(1)], "the home is the wake target");
+        let state = directory.broker.lock().unwrap();
+        assert!(!state.accepted_by_citizen.contains_key(&worker));
+        assert!(
+            !state
+                .accepted_by_workplace
+                .contains_key(&job_pool.workplace)
+        );
+        assert_eq!(state.losses_by_home[&RegionId(1)].len(), 1);
+    }
+
+    #[test]
+    fn a_lost_lease_for_a_citizen_who_moved_on_leaves_the_new_job_alone() {
+        // P5 behavior forbidden: "do not clear a home assignment if the citizen
+        // already moved to a different workplace." The same guard protects the
+        // directory's own accepted cache.
+        let (directory, job_pool, worker) = directory_with_one_accepted_worker();
+        let elsewhere = Entity::new(RegionId(9), 77);
+
+        directory.report_lost_employment(JobLoss {
+            lease: EmploymentLeaseRef {
+                citizen: worker,
+                workplace: elsewhere, // a job the citizen does not hold
+            },
+            reason: JobLossReason::PoolInvalid,
+        });
+
+        let state = directory.broker.lock().unwrap();
+        assert!(
+            state.accepted_by_citizen.contains_key(&worker),
+            "a stale loss naming a different workplace must not evict the real job"
+        );
+        assert!(state.accepted_by_workplace[&job_pool.workplace].contains(&worker));
+    }
+
+    #[test]
+    fn take_losses_and_releases_drain_deterministically() {
+        // P5 review check: "take_losses_for_home drains loss queue
+        // deterministically."
+        let (directory, job_pool, worker) = directory_with_one_accepted_worker();
+        let second = citizen(1, 51);
+
+        directory.report_lost_employment(JobLoss {
+            lease: lease(worker, job_pool),
+            reason: JobLossReason::PoolInvalid,
+        });
+        directory.report_lost_employment(JobLoss {
+            lease: lease(second, job_pool),
+            reason: JobLossReason::EmployerMissing,
+        });
+
+        let losses = directory.take_losses_for_home(RegionId(1));
+        assert_eq!(losses.len(), 2, "reported order is preserved");
+        assert_eq!(losses[0].lease.citizen, worker);
+        assert_eq!(losses[1].lease.citizen, second);
+        assert!(
+            directory.take_losses_for_home(RegionId(1)).is_empty(),
+            "the queue really drains"
+        );
+
+        directory.request_release(lease(worker, job_pool));
+        assert_eq!(directory.take_releases_for_employer(RegionId(9)).len(), 1);
+        assert!(
+            directory.take_releases_for_employer(RegionId(9)).is_empty(),
+            "so does the release queue"
+        );
+    }
+
+    #[test]
+    fn a_pool_vanishing_from_a_republish_never_ends_accepted_employment() {
+        // P5 behavior forbidden: "do not infer accepted job loss from missing
+        // snapshot rows." Only report_lost_employment ends an accepted job.
+        let (directory, job_pool, worker) = directory_with_one_accepted_worker();
+
+        assert!(directory.publish_pools(RegionId(9), Vec::new()));
+
+        let state = directory.broker.lock().unwrap();
+        assert!(
+            !state.pools_by_workplace.contains_key(&job_pool.workplace),
+            "the pool row is gone"
+        );
+        assert!(
+            state.accepted_by_citizen.contains_key(&worker),
+            "but the accepted worker keeps the job until the employer says otherwise"
+        );
+        assert!(state.losses_by_home.is_empty(), "and no loss was inferred");
     }
 }

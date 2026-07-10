@@ -1,10 +1,10 @@
 # Directory employment ledger — stable cross-region jobs without daily wipes
 
-Status: **proposal, P1 + P2 + P3 + P4 implemented** (data model, employer
-pool publishing, the claim flow, and home apply — see the "P<n>,
-implemented" sections at the end of this doc; P5-P7 still plan-only. P3/P4
-are *staged*: the whole round trip is built and tested, but nothing calls
-it from the daily tick until P7). This is an
+Status: **proposal, P1 through P5 implemented** (data model, employer pool
+publishing, the claim flow, home apply, and release/loss — see the "P<n>,
+implemented" sections at the end of this doc; P6-P7 still plan-only. P3-P5
+are *staged*: the whole lifecycle is built and tested, but nothing calls it
+from the daily tick until P7). This is an
 alternative to pushing
 [20260706-per-producer-job-staleness.md](20260706-per-producer-job-staleness.md)
 further. It targets more precise citizen behavior: jobs should be
@@ -2385,4 +2385,263 @@ say P7.
 
    drop the directory ─────────────────► both regions keep their truth
    (tested: the_directory_cache_is_not_the_durable_source_of_home_employment_truth)
+```
+
+## P5, implemented (2026-07-10)
+
+Release and invalidation — the only two ways an accepted job ends. Loss is
+never inferred; an employer decides, drops its own contract, and *tells* the
+home region.
+
+### Status
+
+**Implemented, still staged.** The `EmploymentDirectoryReady` handler is now
+the plan's full four-call shape. `employer_publish_pools` and `home_release_job`
+are reachable and tested but not driven by the tick (P7).
+
+### Scope
+
+| file | why |
+|------|-----|
+| `src/core/regions/employment_directory.rs` | `request_release`, `take_releases_for_employer`, `confirm_release`, `report_lost_employment`, `take_losses_for_home`, `clear_accepted_cache_if_matches` |
+| `src/core/regions/mod.rs` | `clear_employment`, `clear_employment_if_matches`, `release_contract_if_matches`, `release_contracts_no_longer_valid` |
+| `src/core/regions/runtime/mod.rs` | `home_release_job`, `employer_apply_releases`, `home_apply_losses`, `employer_publish_pools`; handler completed to four calls |
+
+Diff: 3 files, +1016 / -14.
+
+### What changed
+
+Every directory-side function is transcribed from "Loss And Invalidation".
+The four `RegionState` methods it calls are never bodied in the doc.
+
+```text
+ handle_employment_directory_ready, now complete:
+   employer_validate_claims        (P3)
+   employer_apply_releases         (P5)  ← new
+   home_apply_accepted_employment  (P4)
+   home_apply_losses               (P5)  ← new
+```
+
+Employer-side work settles this pass's accepts and releases into the directory
+*before* the home-side work reads the accepted cache and the loss queue.
+
+**Not included**: `EmploymentDirectoryRebuild`, `replace_broker_state` (P6);
+tick wiring and retiring the daily wipe (P7).
+
+### Deviations from the doc, and why
+
+- **`release_contracts_no_longer_valid` takes no `pools` argument.** The plan
+  passes the freshly published pools, but they cannot answer the question:
+  P3's `published_job_pools` omits a workplace whose `open_count` is zero, and a
+  *fully contracted but perfectly healthy* workplace is exactly that. Absence
+  from `pools` therefore cannot mean "invalid". It reads the employer's own ECS
+  instead: a contract is valid iff `contracted <= spare_job_slots_for_workplace`.
+  The plan's call *order* (pools computed before the release) is preserved and
+  is harmless — after dropping the excess, `contracted == spare`, so the
+  affected workplace's `open_count` is zero either way.
+- **Eviction policy: seniority.** The plan delegates this outright ("the
+  employer chooses which contracts are lost using deterministic local policy").
+  Ours sorts by `(accepted_generation, citizen)` and evicts from the end, so the
+  most recently hired lose first. Total order, hence deterministic.
+- **`clear_employment_if_matches` / `release_contract_if_matches` drop the
+  plan's redundant region parameters.** An `Entity` already packs its owning
+  region, and `CitizenRef` already carries one; comparing the workplace alone is
+  strictly stronger.
+- **`employer_publish_pools` dedups its wake targets** through a `BTreeSet`.
+
+### Bug found in review
+
+**`confirm_release` handed back a seat it never freed (codex, High).** The
+plan's pseudocode clears the accepted cache *conditionally* but increments
+`open_count` *unconditionally*. A confirmation naming the right employer and
+workplace but the **wrong citizen** therefore left the lease intact and still
+advertised a phantom seat — violating P5's own review check, *"confirm_release
+clears accepted cache only for the matching employer/workplace/citizen"*.
+
+Fixed: `clear_accepted_cache_if_matches` now returns whether it matched, and
+`confirm_release` gates the hand-back on that answer. A miss is not an error —
+after a P6 rebuild the cache can be empty while real contracts exist, and the
+employer's next authoritative publish recomputes `open_count = spare −
+contracted` regardless. `report_lost_employment` deliberately ignores the
+answer: it queues the loss either way, and the home re-checks the exact
+workplace before clearing its citizen.
+
+Mutation-tested: with the unconditional increment restored, the extended
+`confirm_release_only_matches_...` test fails with `left: 2, right: 1`.
+
+### A process bug this patch exposed
+
+Codex also caught a test-only `unused_mut`. **`cargo clippy -- -D warnings` —
+the command `CLAUDE.md` mandates — does not compile test targets**, so warnings
+that live only in `#[cfg(test)]` code pass the required gate silently. Verified:
+the plain form reports 0 hits for that warning, `--all-targets` reports 1. The
+`claude-city-dev` skill now runs both forms and requires `cargo test` to be
+warning-free for touched code. (Pre-existing lint debt on this branch: ~23 for
+the lib, ~34 with `--all-targets`.)
+
+### Known gap: route invalidation (deferred to P7, by decision)
+
+The plan lists *"employer pool no longer reachable from the home region"* among
+its invalidation cases, but P5 does **not** implement it. A contract survives a
+workplace becoming unreachable from its worker's home region.
+
+This is deferred deliberately, not overlooked:
+
+- The plan itself files it under **Risks**, not as settled design: *"Route
+  invalidation needs a clear policy: conservative route changes may revalidate
+  more leases than strictly necessary, but must not silently keep unreachable
+  jobs forever."*
+- It appears in no P5 `Review check` and no `Behavior forbidden` line.
+- `RegionState` owns no topology. An employer cannot compute reachability
+  without new plumbing — `CrossRegionDiscovery` lives in the *other* directory.
+- Nothing is tick-wired, so there is no live bug today.
+
+**P7 must close this before it retires the old path.** The worker already holds
+the discovery snapshot at the point where publishing would be driven. Two
+shapes were considered: employer-side (pass discovery into
+`employer_publish_pools`; drop a contract whose citizen's home region shares no
+component with the workplace's network — the inverse of `choose_best_pool`'s
+rule), or home-side (`home_region_daily_jobs` already has discovery; let it
+detect an unreachable remote workplace and call `home_release_job`, reusing the
+plan's existing "home region explicitly releases the job" case).
+
+### Tests added
+
+`employment_directory.rs` (+7):
+
+- `request_release_keeps_the_seat_booked_until_the_employer_confirms` — review check, and forbidden *"do not advertise released capacity before employer confirms"*.
+- `confirm_release_frees_the_seat_and_clears_the_accepted_cache`
+- `confirm_release_only_matches_the_right_employer_workplace_and_citizen` — review check **and** the phantom-seat bug above.
+- `report_lost_employment_clears_the_accepted_cache_and_wakes_the_home` — review check.
+- `a_lost_lease_for_a_citizen_who_moved_on_leaves_the_new_job_alone`
+- `take_losses_and_releases_drain_deterministically` — review check.
+- `a_pool_vanishing_from_a_republish_never_ends_accepted_employment` — forbidden *"do not infer accepted job loss from missing snapshot rows"*.
+
+`regions/mod.rs` (+6):
+
+- `release_contracts_no_longer_valid_keeps_a_healthy_fully_contracted_workplace` — the exact reason the `pools` argument cannot drive the check.
+- `release_contracts_no_longer_valid_drops_every_contract_when_the_workplace_dies`
+- `release_contracts_evicts_the_most_recently_hired_first` — the seniority policy, driven by a local citizen taking a seat.
+- `release_contract_if_matches_only_drops_the_exact_contract`
+- `clear_employment_returns_the_assignment_it_gave_up`
+- `clear_employment_if_matches_leaves_a_citizen_who_moved_on_alone` — forbidden.
+
+`runtime/mod.rs` (+8):
+
+- `an_explicit_release_frees_the_seat_only_after_the_employer_confirms`
+- `republishing_after_a_confirmed_release_is_a_no_op` — the convergence invariant (below).
+- `a_released_seat_can_be_claimed_again` — end to end.
+- `a_release_racing_an_employer_loss_strands_nothing` — the drained-release hazard.
+- `a_bulldozed_workplace_reports_an_explicit_loss_that_the_home_applies`
+- `a_stable_worker_keeps_the_job_across_unrelated_republishes` — review check *"stable workers keep being paid until explicit release or employer-confirmed loss"*. (Asserts the assignment survives; P4 already proves the economy pays from it.)
+- `a_stale_loss_never_clears_a_job_the_citizen_moved_to` — forbidden.
+- `the_wake_handler_runs_release_and_loss_work_through_the_real_event_path` — scope line *"EmploymentDirectoryReady wakes both employer release work and home loss work"*.
+
+### The convergence invariant, now for release
+
+The same property P3 and P4 rely on, and the reason a release does not churn
+every other pool's pending claims:
+
+```text
+ after confirm_release:
+   directory cached open_count = published + 1        (confirm_release)
+   employer's next published    = spare − contracted   (one fewer contract)
+                               = the same number
+   ⇒ the republish is UNCHANGED: no generation bump.
+```
+
+### Existing tests modified
+
+None.
+
+### Risks remaining
+
+- **Route invalidation is not implemented.** See the named gap above. Mandatory
+  before P7.
+- **Local citizens preempt remote workers.** `assign_local_jobs` consumes
+  `remaining_workplaces`, which knows nothing about contracts, so a local
+  citizen can take a seat a remote worker holds. `release_contracts_no_longer_valid`
+  then evicts the most recently hired remote worker to reconcile. That is a real
+  gameplay/balance decision — locals win — and it is now the *only* thing making
+  the two allocators consistent. Worth revisiting when P7 retires the old path.
+- **`home_release_job` will happily release a *local* job.** It clears any
+  assignment and enqueues a release keyed by `workplace.region()`, which for a
+  local job is the region itself; `employer_apply_releases` then finds no
+  contract and drops it. Harmless, but the local assignment is gone. The caller
+  is responsible for only releasing cross-region jobs.
+- **`employer_apply_releases` drops a release it cannot match.** Traced and
+  tested: the only way the contract is already gone is that the employer lost it
+  and reported that loss, which already cleared the accepted cache. Nothing is
+  stranded. (`confirm_release`'s employer-mismatch guard is unreachable in
+  practice, since `request_release` keys the queue by `workplace.region()`.)
+- **Contracts and assignments are still not serialized.** P6.
+
+### Assumptions
+
+- `spare_job_slots_for_workplace` is current when `release_contracts_no_longer_valid`
+  runs. Callers must `ensure_derived_state()` after a build/bulldoze; the tests
+  do, and the tick will.
+- The employer is free to choose *any* deterministic eviction policy. Seniority
+  is a choice, not a requirement of the plan.
+
+### Commands run
+
+```text
+ cargo fmt --check                          → clean
+ cargo clippy -- -D warnings                → error set byte-identical to the
+                                               pre-patch branch (23 pre-existing)
+ cargo clippy --all-targets -- -D warnings  → byte-identical too (34 pre-existing)
+ cargo test -q                              → 396 lib tests passed, 0 failed
+                                               (375 before this patch, +21)
+ codex exec resume small_city               → 2 rounds. Round 1: 1 High (phantom
+                                               seat), 1 Medium (route invalidation,
+                                               deferred by decision), 1 Low (the
+                                               test-only unused_mut). Round 2:
+                                               "No code findings."
+```
+
+### Diagram — the two ways an accepted job ends
+
+```text
+ (A) HOME RELEASES                          (B) EMPLOYER LOSES IT
+
+ home_release_job(citizen)                  employer_publish_pools
+   clear_employment                           release_contracts_no_longer_valid
+   ⇒ HOME TRUTH cleared FIRST                   contracted > spare ?
+        │                                         evict newest-hired
+        │                                       ⇒ EMPLOYER TRUTH cleared FIRST
+        ▼                                            │
+   request_release(lease)                            ▼
+     queue for employer                        report_lost_employment(loss)
+     accepted cache UNTOUCHED ──┐                clear accepted cache
+     seat still booked          │                queue loss for home
+     citizen still "active"     │                     │
+     (cannot claim a 2nd job)   │                     ▼
+        │                       │              home_apply_losses
+        ▼                       │                clear_employment_if_matches
+   employer_apply_releases      │                  ONLY if it still names
+     release_contract_if_matches│                  that workplace
+        │ true                  │
+        ▼                       │
+   confirm_release ─────────────┘
+     lease matched ?  no → return (no phantom seat)   ← the review bug
+     yes → clear accepted cache
+           open_count += 1     ⇒ seat advertised ONLY now
+```
+
+### Diagram — why `pools` cannot drive the validity check
+
+```text
+ published_job_pools omits any workplace whose open_count is 0.
+
+   healthy, fully contracted        dead / shrunk
+   ─────────────────────────        ─────────────
+   spare 2, contracted 2            spare 0, contracted 2
+   open = 0  → NO ROW               open = 0  → NO ROW
+        ▲                                ▲
+        └──────── indistinguishable ─────┘
+
+ So release_contracts_no_longer_valid reads the employer's own ECS:
+
+   valid  iff  contracted <= spare_job_slots_for_workplace(W)
 ```

@@ -34,7 +34,7 @@ use crate::core::components::{
 };
 use crate::core::entity::Entity;
 use crate::core::regions::employment_directory::{
-    EmployerState as EmploymentEmployerState, EmploymentContract, JobClaim, JobPool,
+    CitizenRef, EmployerState as EmploymentEmployerState, EmploymentContract, JobClaim, JobPool,
 };
 use crate::core::resources::CityStats;
 use crate::core::simulation::{
@@ -1573,11 +1573,138 @@ impl RegionState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn contract_holders_at(
-        &self,
+    /// P5, home side: give up this citizen's job, returning the assignment it
+    /// held so the caller can name the lease to release. `None` if it had none.
+    ///
+    /// The home clears its own truth *first*; the employer's seat is only freed
+    /// once it confirms (`release_contract_if_matches` → `confirm_release`).
+    /// Until then the directory still lists the citizen as accepted, which is
+    /// what stops it claiming a second job mid-release.
+    #[allow(dead_code)] // P5: staged; no gameplay action releases a job yet.
+    pub(crate) fn clear_employment(&mut self, citizen: Entity) -> Option<WorkplaceAssignment> {
+        let assignment = self
+            .world
+            .citizens
+            .get_mut(&citizen)?
+            .workplace_assignment
+            .take()?;
+        self.world.refresh_jobs_cache_after_grant_applied();
+        Some(assignment)
+    }
+
+    /// P5, home side: clear this citizen's job only if it is still *the* job
+    /// that was lost.
+    ///
+    /// P5 forbids clearing "a home assignment if the citizen already moved to a
+    /// different workplace" — a loss report can be one pass stale, and the
+    /// citizen may have been re-hired somewhere else in between.
+    ///
+    /// The plan also passes the workplace's region; that is redundant, since an
+    /// `Entity` already packs its owning region, and comparing the workplace
+    /// alone is strictly stronger.
+    pub(crate) fn clear_employment_if_matches(
+        &mut self,
+        citizen: Entity,
         workplace: Entity,
-    ) -> Vec<crate::core::regions::employment_directory::CitizenRef> {
+    ) -> bool {
+        let Some(citizen_data) = self.world.citizens.get_mut(&citizen) else {
+            return false;
+        };
+        if citizen_data.workplace_assignment.map(|a| a.workplace) != Some(workplace) {
+            return false;
+        }
+        citizen_data.workplace_assignment = None;
+        self.world.refresh_jobs_cache_after_grant_applied();
+        true
+    }
+
+    /// P5, employer side: drop the contract for exactly this citizen at exactly
+    /// this workplace. Returns whether one was actually held — only then may the
+    /// directory confirm the release and hand the seat back.
+    pub(crate) fn release_contract_if_matches(
+        &mut self,
+        workplace: Entity,
+        citizen: CitizenRef,
+    ) -> bool {
+        let Some(holders) = self
+            .employer_state
+            .contracts_by_workplace
+            .get_mut(&workplace)
+        else {
+            return false;
+        };
+        if holders.remove(&citizen).is_none() {
+            return false;
+        }
+        if holders.is_empty() {
+            self.employer_state
+                .contracts_by_workplace
+                .remove(&workplace);
+        }
+        true
+    }
+
+    /// P5, employer side: drop every contract this region can no longer honour,
+    /// and hand them back so the caller can report each as an explicit
+    /// `JobLoss`. Loss is never *inferred* — this is what makes it explicit.
+    ///
+    /// A workplace can honour `spare_job_slots_for_workplace` contracts: the
+    /// effective seats left after *local* assignment. Fewer than it has
+    /// contracted means the workplace was bulldozed, lost power or road access,
+    /// was downgraded, or had seats taken by local citizens.
+    ///
+    /// The plan passes the freshly published `pools` here, but they cannot
+    /// answer the question: `published_job_pools` omits a workplace whose
+    /// `open_count` is zero, and a *fully contracted but perfectly healthy*
+    /// workplace is exactly that. So this reads the employer's own ECS instead.
+    /// (The plan's call order is still safe: after dropping the excess,
+    /// `contracted == spare`, so `open_count` is zero either way.)
+    ///
+    /// **Eviction policy** — the plan says only "the employer chooses which
+    /// contracts are lost using deterministic local policy". This one keeps the
+    /// longest-serving workers: sort by `(accepted_generation, citizen)` and
+    /// evict from the end. Seniority, with a total order for determinism.
+    #[allow(dead_code)] // P5: staged; the daily tick starts publishing in P7.
+    pub(crate) fn release_contracts_no_longer_valid(
+        &mut self,
+    ) -> Vec<(Entity, CitizenRef, EmploymentContract)> {
+        let workplaces = self
+            .employer_state
+            .contracts_by_workplace
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut lost = Vec::new();
+
+        for workplace in workplaces {
+            let honourable = self.spare_job_slots_for_workplace(workplace);
+            let holders = &self.employer_state.contracts_by_workplace[&workplace];
+            if holders.len() <= honourable {
+                continue;
+            }
+
+            let mut by_seniority = holders
+                .iter()
+                .map(|(citizen, contract)| (*citizen, *contract))
+                .collect::<Vec<_>>();
+            by_seniority
+                .sort_by_key(|(citizen, contract)| (contract.accepted_generation, *citizen));
+
+            let evicted = by_seniority.len() - honourable;
+            for (citizen, contract) in by_seniority.into_iter().rev().take(evicted) {
+                lost.push((workplace, citizen, contract));
+            }
+        }
+
+        lost.sort_by_key(|(workplace, citizen, _)| (*workplace, *citizen));
+        for (workplace, citizen, _) in &lost {
+            self.release_contract_if_matches(*workplace, *citizen);
+        }
+        lost
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contract_holders_at(&self, workplace: Entity) -> Vec<CitizenRef> {
         self.employer_state
             .contracts_by_workplace
             .get(&workplace)
@@ -2411,6 +2538,151 @@ mod tests {
         assert!(
             region.published_job_pools().is_empty(),
             "a fully contracted workplace advertises no pool at all"
+        );
+    }
+
+    fn contract_claim(local: u32, workplace: Entity, generation: u64) -> JobClaim {
+        JobClaim {
+            claim_id: crate::core::regions::employment_directory::JobClaimId(local as u64),
+            citizen: CitizenRef {
+                region: RegionId(1),
+                citizen: Entity::new(RegionId(1), local),
+            },
+            workplace,
+            generation,
+        }
+    }
+
+    #[test]
+    fn release_contracts_no_longer_valid_keeps_a_healthy_fully_contracted_workplace() {
+        // The reason this cannot be driven off `published_job_pools`: a fully
+        // contracted, perfectly healthy workplace publishes NO row (open_count
+        // 0), exactly like an invalid one. Contracts must be checked against the
+        // employer's own seats, not against its published pools.
+        let (mut region, workplace) = employer_region_with_one_workplace();
+        region.accept_claim_and_create_assignment(&contract_claim(50, workplace, 1));
+        region.accept_claim_and_create_assignment(&contract_claim(51, workplace, 1));
+        assert!(region.published_job_pools().is_empty(), "no row published");
+
+        assert!(
+            region.release_contracts_no_longer_valid().is_empty(),
+            "2 seats, 2 contracts: nothing is lost"
+        );
+        assert_eq!(region.contract_holders_at(workplace).len(), 2);
+    }
+
+    #[test]
+    fn release_contracts_no_longer_valid_drops_every_contract_when_the_workplace_dies() {
+        let (mut region, workplace) = employer_region_with_one_workplace();
+        region.accept_claim_and_create_assignment(&contract_claim(50, workplace, 1));
+        region.accept_claim_and_create_assignment(&contract_claim(51, workplace, 1));
+
+        // Bulldoze the workplace: no effective seats remain.
+        assert!(region.bulldoze(1, 0).success);
+        region.ensure_derived_state();
+
+        let lost = region.release_contracts_no_longer_valid();
+        assert_eq!(lost.len(), 2, "both contracts are lost");
+        assert!(lost.iter().all(|(w, _, _)| *w == workplace));
+        assert!(region.contract_holders_at(workplace).is_empty());
+    }
+
+    #[test]
+    fn release_contracts_evicts_the_most_recently_hired_first() {
+        // The plan leaves the eviction policy to "deterministic local policy".
+        // Ours is seniority: sort by (accepted_generation, citizen), evict from
+        // the end. Shrink 2 seats -> 1 by letting a LOCAL citizen take a seat.
+        let (mut region, workplace) = employer_region_with_one_workplace();
+        let senior = contract_claim(50, workplace, 1); // hired at generation 1
+        let junior = contract_claim(51, workplace, 9); // hired at generation 9
+        region.accept_claim_and_create_assignment(&senior);
+        region.accept_claim_and_create_assignment(&junior);
+
+        // A local resident moves in and takes one of the two seats.
+        assert!(region.build(0, 2, BuildingKind::Road).success);
+        assert!(region.build(1, 2, BuildingKind::Residential).success);
+        let home = region.world.grid.get(1, 2).expect("home");
+        citizens::spawn_for_home(&mut region.world, home, 1);
+        region.ensure_derived_state();
+        assert_eq!(
+            region.spare_job_slots_for_workplace(workplace),
+            1,
+            "the local citizen consumed one of the two seats"
+        );
+
+        let lost = region.release_contracts_no_longer_valid();
+        assert_eq!(lost.len(), 1, "exactly the overbooked seat is reclaimed");
+        assert_eq!(
+            lost[0].1, junior.citizen,
+            "the most recently hired worker is the one who loses the job"
+        );
+        assert_eq!(
+            region.contract_holders_at(workplace),
+            vec![senior.citizen],
+            "the longest-serving worker keeps it"
+        );
+    }
+
+    #[test]
+    fn release_contract_if_matches_only_drops_the_exact_contract() {
+        let (mut region, workplace) = employer_region_with_one_workplace();
+        let held = contract_claim(50, workplace, 1);
+        region.accept_claim_and_create_assignment(&held);
+
+        let stranger = CitizenRef {
+            region: RegionId(1),
+            citizen: Entity::new(RegionId(1), 99),
+        };
+        assert!(!region.release_contract_if_matches(workplace, stranger));
+        assert!(!region.release_contract_if_matches(Entity::new(RegionId(9), 77), held.citizen));
+        assert_eq!(region.contract_holders_at(workplace).len(), 1);
+
+        assert!(region.release_contract_if_matches(workplace, held.citizen));
+        assert!(region.contract_holders_at(workplace).is_empty());
+        assert!(
+            !region.release_contract_if_matches(workplace, held.citizen),
+            "releasing twice is not a second release"
+        );
+    }
+
+    #[test]
+    fn clear_employment_returns_the_assignment_it_gave_up() {
+        let (mut region, citizen, assignment) = home_region_with_one_citizen();
+        assert!(region.apply_workplace_assignment(citizen, assignment));
+
+        assert_eq!(region.clear_employment(citizen), Some(assignment));
+        assert!(
+            region.world.citizens[&citizen]
+                .workplace_assignment
+                .is_none()
+        );
+        assert_eq!(
+            region.clear_employment(citizen),
+            None,
+            "there is nothing left to release"
+        );
+    }
+
+    #[test]
+    fn clear_employment_if_matches_leaves_a_citizen_who_moved_on_alone() {
+        // P5 behavior forbidden: "do not clear a home assignment if the citizen
+        // already moved to a different workplace."
+        let (mut region, citizen, assignment) = home_region_with_one_citizen();
+        assert!(region.apply_workplace_assignment(citizen, assignment));
+
+        let elsewhere = Entity::new(RegionId(9), 77);
+        assert!(!region.clear_employment_if_matches(citizen, elsewhere));
+        assert_eq!(
+            region.world.citizens[&citizen].workplace_assignment,
+            Some(assignment),
+            "a stale loss for a different workplace changes nothing"
+        );
+
+        assert!(region.clear_employment_if_matches(citizen, assignment.workplace));
+        assert!(
+            region.world.citizens[&citizen]
+                .workplace_assignment
+                .is_none()
         );
     }
 
