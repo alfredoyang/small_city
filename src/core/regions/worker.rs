@@ -11,6 +11,7 @@ use crate::core::regional_types::{
 use crate::core::regions::RegionRoadReport;
 pub use crate::core::regions::directory::CrossRegionDiscovery;
 use crate::core::regions::directory::RegionDirectory;
+use crate::core::regions::employment_directory::EmploymentDirectory;
 use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::runtime::{
     ExportAllocationRelease, ExportAllocationRequest, GoodsExportRequest, JobExportRequest,
@@ -235,6 +236,10 @@ pub struct RegionWorker {
     regions: Vec<RegionRuntime>,
     directory: Arc<RegionDirectory>,
     owners: Arc<RegionOwnerDirectory>,
+    /// Directory employment ledger plan, P3: shared across every worker, just
+    /// like `directory`. Installed into each runtime at the start of its slice
+    /// so an `EmploymentDirectoryReady` event can pull the region's work.
+    employment_directory: Arc<EmploymentDirectory>,
     // Retire-tickstate, P-b: mints ids for the eager nudge, which isn't
     // triggered by any UI request so has no `UiRequestId` to borrow. See
     // `next_worker_request_id` for the disjoint-bit-range scheme.
@@ -257,11 +262,30 @@ impl RegionWorker {
         directory: Arc<RegionDirectory>,
         owners: Arc<RegionOwnerDirectory>,
     ) -> Self {
+        Self::with_directories_and_owners(
+            id,
+            directory,
+            Arc::new(EmploymentDirectory::default()),
+            owners,
+        )
+    }
+
+    /// P3: the multi-worker constructor. Every worker in a city must share one
+    /// `EmploymentDirectory` (exactly as they already share one
+    /// `RegionDirectory`), or two workers would broker claims against separate
+    /// broker states and both could hand out the same seat.
+    pub fn with_directories_and_owners(
+        id: WorkerId,
+        directory: Arc<RegionDirectory>,
+        employment_directory: Arc<EmploymentDirectory>,
+        owners: Arc<RegionOwnerDirectory>,
+    ) -> Self {
         Self {
             id,
             regions: Vec::new(),
             directory,
             owners,
+            employment_directory,
             recheck_counter: 0,
         }
     }
@@ -579,6 +603,9 @@ impl RegionWorker {
             // before processing events, so the power reconcile gate compares
             // against the same snapshot this slice's routing already used.
             runtime.set_discovery_generation(discovery.generation);
+            // P3: same per-slice install, so an `EmploymentDirectoryReady` event
+            // processed below can pull this region's employment work.
+            runtime.set_employment_directory(Arc::clone(&self.employment_directory));
             let source_region = runtime.region_id();
             // P-c: install the current Layer-1 route exits before processing events,
             // so `StepTravel` uses the latest published route snapshot. A post-event
@@ -780,11 +807,48 @@ impl RegionWorker {
             OutboundMessage::TravelerHandedOff(handoff) => {
                 self.route_traveler_handoff(handoff, routing_mode)
             }
+            OutboundMessage::EmploymentDirectoryReady {
+                target_region,
+                source_region: wake_source,
+            } => self.route_employment_directory_ready(target_region, wake_source, routing_mode),
             OutboundMessage::RuntimeError(error) => Err(WorkerRoutingError::RuntimeError {
                 source_region,
                 error,
             }),
         }
+    }
+
+    /// P3: route a payload-free employment wake through the same deterministic
+    /// barrier every other cross-region event uses.
+    ///
+    /// `resource_rank: 4` places employment after power(0)/jobs(1)/goods(2)/
+    /// travel(3). It is a rank of its own rather than reusing jobs(1) because
+    /// the old job-export path is still live until P7, and the two must not
+    /// interleave ambiguously. `request_id`/`token` are zero: the event carries
+    /// no payload, so two wakes for the same `(target, source)` pair in one
+    /// pass are genuinely identical and idempotent — the region simply pulls
+    /// its work once.
+    fn route_employment_directory_ready(
+        &mut self,
+        target_region: RegionId,
+        source_region: RegionId,
+        routing_mode: RegionRoutingMode,
+    ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
+        let order_key = ForwardedEventOrderKey {
+            target_region,
+            source_region,
+            request_id: UiRequestId(0),
+            token: 0,
+            resource_rank: 4,
+            event_rank: 0,
+        };
+        self.route_region_event(
+            target_region,
+            source_region,
+            RegionEvent::EmploymentDirectoryReady,
+            order_key,
+            routing_mode,
+        )
     }
 
     /// P5b: routes a travel token to its destination region's inbox as a

@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::core::components::WorkplaceAssignment;
 use crate::core::entity::Entity;
+use crate::core::regions::directory::CrossRegionDiscovery;
 use crate::core::regions::{RegionId, RegionRoadNetworkId};
 
 #[derive(Debug, Clone, Copy)]
@@ -249,7 +250,7 @@ impl PoolDelta {
 ///
 /// Ownership is decided by `workplace.region()` — the birth region packed
 /// into the workplace `Entity` id, which is the same authority
-/// `mark_pool_missing_for_validation` uses to find an employer. The
+/// `invalidate_pending_claims_for_pool` uses to find an employer. The
 /// `pool.region` field is a *self-declared* copy of that, so trusting it
 /// alone would let A name B's workplace under `region: A` and still
 /// overwrite `pools_by_workplace[B_workplace]`. Both must agree, which also
@@ -288,12 +289,25 @@ fn diff_pools_for_employer(
     delta
 }
 
-/// A pool that disappeared from an employer's republish can reject its
-/// pending claims immediately, because no home has applied one yet.
-/// Accepted employment stays active until the employer confirms loss with
-/// `report_lost_employment` (P5) — this only clears *pending* coordination
-/// state, never `accepted_by_citizen`/`accepted_by_workplace`.
-fn mark_pool_missing_for_validation(state: &mut EmploymentBrokerState, workplace: Entity) {
+/// Drop every pending claim against one workplace pool, because the facts it
+/// was chosen from no longer hold — the pool was removed, or republished with
+/// changed facts (and therefore a new generation).
+///
+/// The plan names this `mark_pool_missing_for_validation` and calls it only
+/// for removed pools. P3 generalizes it: a *changed* pool invalidates its
+/// pending claims for the same reason a removed one does, which is the direct
+/// contrapositive of the plan's own "pending claims against untouched pools
+/// stay valid". Keeping the generation authority here (rather than asking the
+/// employer to re-check it) is what lets employer-side validation be a pure
+/// capacity question.
+///
+/// Pending coordination state only. Accepted employment stays active until the
+/// employer confirms loss with `report_lost_employment` (P5): this never
+/// touches `accepted_by_citizen`/`accepted_by_workplace`.
+///
+/// No home is woken — the citizen is simply un-pended and retries on its next
+/// pass, exactly as it does for a removed pool.
+fn invalidate_pending_claims_for_pool(state: &mut EmploymentBrokerState, workplace: Entity) {
     let Some(claim_ids) = state.pending_by_workplace.remove(&workplace) else {
         return;
     };
@@ -448,7 +462,7 @@ impl EmploymentDirectory {
             state
                 .pool_generation_by_workplace
                 .insert(removed.workplace, next_generation);
-            mark_pool_missing_for_validation(&mut state, removed.workplace);
+            invalidate_pending_claims_for_pool(&mut state, removed.workplace);
         }
 
         for mut pool in delta.added {
@@ -465,6 +479,16 @@ impl EmploymentDirectory {
                 .pool_generation_by_workplace
                 .insert(pool.workplace, next_generation);
             state.pools_by_workplace.insert(pool.workplace, pool);
+            // A pending claim was chosen against this pool's OLD facts, and its
+            // `generation` no longer matches. The plan states the rule from the
+            // other side — "pending claims against untouched pools stay valid"
+            // — so a *touched* pool must drop them, exactly as a removed pool
+            // does. Without this, an employer would validate a claim whose
+            // salary/capacity/network it has since changed; the worst case is a
+            // citizen hired into a pool whose `network` moved out of the home's
+            // reachable component. The home retries on its next pass, against
+            // the fresh facts.
+            invalidate_pending_claims_for_pool(&mut state, pool.workplace);
         }
 
         state.global_generation = next_generation;
@@ -473,6 +497,221 @@ impl EmploymentDirectory {
         *self.active_snapshot.write().unwrap() = snapshot;
         true
     }
+
+    /// Reserve a batch of claims. Reserves **both** pool capacity and citizen
+    /// identity immediately, so two home regions reading the same snapshot
+    /// cannot overclaim one pool, and one citizen cannot end up holding two
+    /// pending cross-region claims. Returns the employer regions that now
+    /// have pending work — wake targets only, never claim payloads.
+    ///
+    /// Per "Bounded Nondeterminism" in the plan: *which* valid citizen wins a
+    /// contested pool may vary, but the invariants below hold exactly.
+    pub fn submit_claims(&self, requests: Vec<(CitizenRef, Entity, u64)>) -> Vec<RegionId> {
+        let mut state = self.broker.lock().unwrap();
+        let mut employers_to_wake = BTreeSet::new();
+
+        for (citizen, workplace, generation) in normalize_claim_requests(requests) {
+            let Some(pool) = state.pools_by_workplace.get(&workplace) else {
+                continue;
+            };
+            if pool.generation != generation {
+                continue; // snapshot was stale; try again on a later tick
+            }
+            let pending_count = state
+                .pending_by_workplace
+                .get(&workplace)
+                .map_or(0, BTreeSet::len) as u16;
+            if pending_count >= pool.open_count {
+                continue;
+            }
+            if state.accepted_by_citizen.contains_key(&citizen) {
+                continue;
+            }
+            if state.pending_by_citizen.contains_key(&citizen) {
+                continue;
+            }
+            let region = pool.region;
+
+            let claim_id = JobClaimId(state.next_claim_id);
+            state.next_claim_id += 1;
+
+            let claim = JobClaim {
+                claim_id,
+                citizen,
+                workplace,
+                generation,
+            };
+
+            state
+                .pending_by_workplace
+                .entry(workplace)
+                .or_default()
+                .insert(claim_id);
+            state.pending_by_citizen.insert(citizen, claim_id);
+            state
+                .pending_by_employer
+                .entry(region)
+                .or_default()
+                .insert(claim_id);
+            state.claims_by_id.insert(claim_id, claim);
+            employers_to_wake.insert(region);
+        }
+
+        let snapshot = Arc::new(Self::rebuild_snapshot_locked(&state));
+        *self.active_snapshot.write().unwrap() = snapshot;
+        employers_to_wake.into_iter().collect()
+    }
+
+    /// One employer's current pending claims. Reads, does not drain: the
+    /// claims are removed by `apply_claim_decisions` once the employer has
+    /// actually decided them, so a wake that arrives while the employer is
+    /// mid-validation cannot lose a claim.
+    pub fn take_pending_claims_for_employer(&self, employer: RegionId) -> Vec<JobClaim> {
+        let state = self.broker.lock().unwrap();
+        let claim_ids = state
+            .pending_by_employer
+            .get(&employer)
+            .cloned()
+            .unwrap_or_default();
+        claim_ids
+            .into_iter()
+            .filter_map(|claim_id| state.claims_by_id.get(&claim_id).copied())
+            .collect()
+    }
+
+    /// Apply one employer's decisions. Every decided claim leaves *all* four
+    /// pending indexes; an accepted one additionally decrements the cached
+    /// `open_count` and lands in the accepted read cache. Returns the home
+    /// regions to wake — for accepted **and** rejected claims alike, because a
+    /// rejection is what releases the home's citizen-side pending guard so it
+    /// can retry.
+    pub fn apply_claim_decisions(
+        &self,
+        employer: RegionId,
+        decisions: Vec<JobClaimDecision>,
+    ) -> Vec<RegionId> {
+        let mut state = self.broker.lock().unwrap();
+        let mut homes_to_wake = BTreeSet::new();
+
+        for decision in normalize_claim_decisions(decisions) {
+            let claim_id = claim_id_of(&decision);
+            let Some(claim) = state.claims_by_id.get(&claim_id).copied() else {
+                continue;
+            };
+            // Same ownership rule publish_pools enforces: an employer may only
+            // decide claims against workplaces it owns. Without this, employer A
+            // could accept a claim targeting employer B's workplace and corrupt
+            // B's pool `open_count` and accepted cache.
+            if claim.workplace.region() != employer {
+                continue;
+            }
+            state.claims_by_id.remove(&claim_id);
+
+            let mut remove_pending_pool_entry = false;
+            if let Some(ids) = state.pending_by_workplace.get_mut(&claim.workplace) {
+                ids.remove(&claim.claim_id);
+                remove_pending_pool_entry = ids.is_empty();
+            }
+            if remove_pending_pool_entry {
+                state.pending_by_workplace.remove(&claim.workplace);
+            }
+            state.pending_by_citizen.remove(&claim.citizen);
+            if let Some(ids) = state.pending_by_employer.get_mut(&employer) {
+                ids.remove(&claim.claim_id);
+            }
+            homes_to_wake.insert(claim.citizen.region);
+
+            if let JobClaimDecision::Accepted { assignment, .. } = decision {
+                if let Some(pool) = state.pools_by_workplace.get_mut(&claim.workplace) {
+                    pool.open_count = pool.open_count.saturating_sub(1);
+                }
+                state
+                    .accepted_by_workplace
+                    .entry(claim.workplace)
+                    .or_default()
+                    .insert(claim.citizen);
+                state.accepted_by_citizen.insert(claim.citizen, assignment);
+            }
+        }
+
+        let snapshot = Arc::new(Self::rebuild_snapshot_locked(&state));
+        *self.active_snapshot.write().unwrap() = snapshot;
+        homes_to_wake.into_iter().collect()
+    }
+}
+
+fn claim_id_of(decision: &JobClaimDecision) -> JobClaimId {
+    match decision {
+        JobClaimDecision::Accepted { claim_id, .. } | JobClaimDecision::Rejected { claim_id } => {
+            *claim_id
+        }
+    }
+}
+
+/// Deterministic order for one submit batch, and exact-duplicate removal.
+/// Same shape as [`normalize_pools`]: sort by identity, then dedup. The sort
+/// key is `(workplace, citizen, generation)` so the batch is processed in an
+/// order that does not depend on the caller's iteration order.
+///
+/// A citizen appearing twice against *different* workplaces is not removed
+/// here — `submit_claims`' `pending_by_citizen` guard rejects the second one
+/// once the first is reserved, which is the same rule applied to a citizen
+/// who already had a claim from an earlier batch.
+fn normalize_claim_requests(
+    mut requests: Vec<(CitizenRef, Entity, u64)>,
+) -> Vec<(CitizenRef, Entity, u64)> {
+    requests.sort_by_key(|(citizen, workplace, generation)| (*workplace, *citizen, *generation));
+    requests.dedup();
+    requests
+}
+
+/// Deterministic order for one employer's decision batch, and duplicate
+/// removal by `claim_id` (a claim can only be decided once).
+fn normalize_claim_decisions(mut decisions: Vec<JobClaimDecision>) -> Vec<JobClaimDecision> {
+    decisions.sort_by_key(claim_id_of);
+    decisions.dedup_by_key(|decision| claim_id_of(decision));
+    decisions
+}
+
+/// Pick one open pool for a home region's citizen.
+///
+/// The plan writes this as `choose_best_pool(&snapshot, citizen)`, but the
+/// snapshot alone cannot answer *reachability*: `open_pools_by_network` is
+/// keyed by `RegionRoadNetworkId` and carries no component graph. Jobs are
+/// network-scoped across regions exactly like power, so a pool is only a
+/// candidate when its network sits in the same `CrossRegionDiscovery`
+/// component as one of the home region's own border networks — the same
+/// reachability rule the old job-export path already uses. The caller
+/// therefore supplies the discovery snapshot and the home's networks.
+///
+/// Job *quality* matching is an explicit non-goal of the plan, so the pick is
+/// simply the lowest `(region, workplace)` among reachable open pools. That is
+/// deterministic; per "Bounded Nondeterminism" only the contested-winner
+/// identity is allowed to vary, and that is decided later in `submit_claims`.
+pub(crate) fn choose_best_pool(
+    snapshot: &EmploymentSnapshot,
+    discovery: &CrossRegionDiscovery,
+    home: RegionId,
+    home_networks: &[RegionRoadNetworkId],
+) -> Option<JobPool> {
+    let mut reachable = BTreeSet::new();
+    for home_network in home_networks {
+        let Some(component) = discovery.component_of(*home_network) else {
+            continue;
+        };
+        for network in component {
+            if network.region != home {
+                reachable.insert(*network);
+            }
+        }
+    }
+
+    reachable
+        .into_iter()
+        .filter_map(|network| snapshot.open_pools_by_network.get(&network))
+        .flatten()
+        .min_by_key(|pool| (pool.region, pool.workplace))
+        .copied()
 }
 
 #[cfg(test)]
@@ -483,7 +722,7 @@ mod tests {
     fn pool(region: u32, workplace: u32, open_count: u16, salary: i32, generation: u64) -> JobPool {
         JobPool {
             region: RegionId(region),
-            // Entity::new, not a bare Entity(..): mark_pool_missing_for_validation
+            // Entity::new, not a bare Entity(..): invalidate_pending_claims_for_pool
             // derives the employer from workplace.region() (the entity's packed
             // birth region), so a fixture whose workplace id doesn't actually
             // encode `region` would silently break that lookup.
@@ -750,7 +989,7 @@ mod tests {
         assert!(state.pools_by_workplace.get(&pool_a.workplace).is_none());
         assert!(
             state.claims_by_id.is_empty(),
-            "mark_pool_missing_for_validation must drop the pending claim"
+            "invalidate_pending_claims_for_pool must drop the pending claim"
         );
         assert!(state.pending_by_workplace.get(&pool_a.workplace).is_none());
         assert!(state.pending_by_citizen.is_empty());
@@ -967,6 +1206,395 @@ mod tests {
         assert!(
             !code.contains(&forbidden_type),
             "the employment directory must never name the private ECS storage type outside comments"
+        );
+    }
+
+    // ---- P3: claim flow ----
+
+    fn citizen(region: u32, local: u32) -> CitizenRef {
+        CitizenRef {
+            region: RegionId(region),
+            citizen: Entity::new(RegionId(region), local),
+        }
+    }
+
+    fn assignment_for(pool: JobPool) -> WorkplaceAssignment {
+        WorkplaceAssignment {
+            workplace: pool.workplace,
+            location: CityCellRef::local(pool.region, 1, 0),
+            salary: pool.salary,
+        }
+    }
+
+    /// One pool with `open_count` seats, published by its employer.
+    fn directory_with_pool(open_count: u16) -> (EmploymentDirectory, JobPool) {
+        let directory = EmploymentDirectory::default();
+        let job_pool = pool(9, 1, open_count, 50, 0);
+        assert!(directory.publish_pools(RegionId(9), vec![job_pool]));
+        let stamped = directory.broker.lock().unwrap().pools_by_workplace[&job_pool.workplace];
+        (directory, stamped)
+    }
+
+    #[test]
+    fn submit_claims_rejects_a_stale_generation() {
+        // P3 review check: "submit_claims checks pool.generation against the
+        // requested generation."
+        let (directory, job_pool) = directory_with_pool(3);
+
+        let woken = directory.submit_claims(vec![(
+            citizen(1, 50),
+            job_pool.workplace,
+            job_pool.generation + 1, // stale: the snapshot moved on
+        )]);
+
+        assert!(woken.is_empty(), "a stale claim wakes nobody");
+        let state = directory.broker.lock().unwrap();
+        assert!(state.claims_by_id.is_empty());
+        assert!(state.pending_by_citizen.is_empty());
+    }
+
+    #[test]
+    fn submit_claims_never_exceeds_open_count() {
+        // P3 behavior forbidden: "no workplace pool accepts more than open_count."
+        let (directory, job_pool) = directory_with_pool(2);
+
+        let requests = (0..5)
+            .map(|i| (citizen(1, 50 + i), job_pool.workplace, job_pool.generation))
+            .collect::<Vec<_>>();
+        let woken = directory.submit_claims(requests);
+
+        assert_eq!(woken, vec![RegionId(9)], "the employer is woken once");
+        let state = directory.broker.lock().unwrap();
+        assert_eq!(
+            state.pending_by_workplace[&job_pool.workplace].len(),
+            2,
+            "only open_count seats may be reserved, no matter how many citizens ask"
+        );
+        assert_eq!(state.claims_by_id.len(), 2);
+    }
+
+    #[test]
+    fn submit_claims_refuses_a_citizen_who_already_has_a_pending_or_accepted_job() {
+        // P3 review check: "submit_claims checks accepted_by_citizen and
+        // pending_by_citizen." P3 behavior forbidden: "no citizen can hold two
+        // pending or accepted cross-region jobs."
+        let (directory, job_pool) = directory_with_pool(3);
+        let pending_citizen = citizen(1, 50);
+        let accepted_citizen = citizen(1, 51);
+
+        directory.submit_claims(vec![(
+            pending_citizen,
+            job_pool.workplace,
+            job_pool.generation,
+        )]);
+        directory
+            .broker
+            .lock()
+            .unwrap()
+            .accepted_by_citizen
+            .insert(accepted_citizen, assignment_for(job_pool));
+
+        // Both citizens try again. Neither may take a second seat.
+        directory.submit_claims(vec![
+            (pending_citizen, job_pool.workplace, job_pool.generation),
+            (accepted_citizen, job_pool.workplace, job_pool.generation),
+        ]);
+
+        let state = directory.broker.lock().unwrap();
+        assert_eq!(
+            state.claims_by_id.len(),
+            1,
+            "the pending citizen keeps exactly one claim; the accepted one gets none"
+        );
+        assert!(!state.pending_by_citizen.contains_key(&accepted_citizen));
+    }
+
+    #[test]
+    fn apply_claim_decisions_clears_every_pending_index_and_wakes_the_home() {
+        // P3 review checks: "apply_claim_decisions removes claims from every
+        // pending index" and "... returns home regions to wake for accepted and
+        // rejected claims."
+        let (directory, job_pool) = directory_with_pool(2);
+        let accepted = citizen(1, 50);
+        let rejected = citizen(2, 60);
+
+        directory.submit_claims(vec![
+            (accepted, job_pool.workplace, job_pool.generation),
+            (rejected, job_pool.workplace, job_pool.generation),
+        ]);
+        let claims = directory.take_pending_claims_for_employer(RegionId(9));
+        assert_eq!(claims.len(), 2);
+
+        let decisions = claims
+            .iter()
+            .map(|claim| {
+                if claim.citizen == accepted {
+                    JobClaimDecision::Accepted {
+                        claim_id: claim.claim_id,
+                        assignment: assignment_for(job_pool),
+                    }
+                } else {
+                    JobClaimDecision::Rejected {
+                        claim_id: claim.claim_id,
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let homes = directory.apply_claim_decisions(RegionId(9), decisions);
+        assert_eq!(
+            homes,
+            vec![RegionId(1), RegionId(2)],
+            "both the accepted and the rejected home must be woken"
+        );
+
+        let state = directory.broker.lock().unwrap();
+        assert!(state.claims_by_id.is_empty(), "claims_by_id cleared");
+        assert!(
+            state.pending_by_workplace.is_empty(),
+            "pending_by_workplace cleared"
+        );
+        assert!(
+            state.pending_by_citizen.is_empty(),
+            "pending_by_citizen cleared -- the rejected citizen may retry"
+        );
+        assert!(
+            state.pending_by_employer[&RegionId(9)].is_empty(),
+            "pending_by_employer cleared"
+        );
+
+        assert!(state.accepted_by_citizen.contains_key(&accepted));
+        assert!(!state.accepted_by_citizen.contains_key(&rejected));
+        assert_eq!(
+            state.pools_by_workplace[&job_pool.workplace].open_count, 1,
+            "an accepted claim decrements the cached open_count"
+        );
+    }
+
+    #[test]
+    fn apply_claim_decisions_from_one_employer_cannot_decide_another_employers_claim() {
+        // Same ownership rule publish_pools enforces. Employer B must not be
+        // able to accept a claim against employer A's workplace.
+        let (directory, job_pool) = directory_with_pool(2);
+        let claimant = citizen(1, 50);
+        directory.submit_claims(vec![(claimant, job_pool.workplace, job_pool.generation)]);
+
+        let claim = directory.take_pending_claims_for_employer(RegionId(9))[0];
+        let homes = directory.apply_claim_decisions(
+            RegionId(4), // not the workplace's owner
+            vec![JobClaimDecision::Accepted {
+                claim_id: claim.claim_id,
+                assignment: assignment_for(job_pool),
+            }],
+        );
+
+        assert!(homes.is_empty(), "a foreign employer decides nothing");
+        let state = directory.broker.lock().unwrap();
+        assert!(
+            state.claims_by_id.contains_key(&claim.claim_id),
+            "the claim must survive a foreign employer's decision"
+        );
+        assert!(state.accepted_by_citizen.is_empty());
+        assert_eq!(
+            state.pools_by_workplace[&job_pool.workplace].open_count, 2,
+            "open_count must not be decremented by a foreign employer"
+        );
+    }
+
+    #[test]
+    fn take_pending_claims_for_employer_does_not_drain_the_claims() {
+        // The claims are removed by apply_claim_decisions, not by the read. A
+        // second wake landing mid-validation must still see them.
+        let (directory, job_pool) = directory_with_pool(1);
+        directory.submit_claims(vec![(
+            citizen(1, 50),
+            job_pool.workplace,
+            job_pool.generation,
+        )]);
+
+        assert_eq!(
+            directory
+                .take_pending_claims_for_employer(RegionId(9))
+                .len(),
+            1
+        );
+        assert_eq!(
+            directory
+                .take_pending_claims_for_employer(RegionId(9))
+                .len(),
+            1,
+            "reading the batch twice must not lose the claim"
+        );
+    }
+
+    #[test]
+    fn normalize_claim_requests_is_deterministic_and_dedups_exact_duplicates() {
+        let workplace_a = Entity::new(RegionId(9), 1);
+        let workplace_b = Entity::new(RegionId(9), 2);
+        let one = citizen(1, 50);
+        let two = citizen(1, 51);
+
+        let normalized = normalize_claim_requests(vec![
+            (two, workplace_b, 7),
+            (one, workplace_a, 7),
+            (two, workplace_b, 7), // exact duplicate
+            (two, workplace_a, 7),
+        ]);
+
+        assert_eq!(
+            normalized,
+            vec![
+                (one, workplace_a, 7),
+                (two, workplace_a, 7),
+                (two, workplace_b, 7)
+            ],
+            "sorted by (workplace, citizen, generation); exact duplicates removed"
+        );
+    }
+
+    #[test]
+    fn normalize_claim_decisions_sorts_by_claim_id_and_dedups() {
+        let decisions = normalize_claim_decisions(vec![
+            JobClaimDecision::Rejected {
+                claim_id: JobClaimId(3),
+            },
+            JobClaimDecision::Rejected {
+                claim_id: JobClaimId(1),
+            },
+            JobClaimDecision::Rejected {
+                claim_id: JobClaimId(3),
+            },
+        ]);
+
+        let ids = decisions.iter().map(claim_id_of).collect::<Vec<_>>();
+        assert_eq!(ids, vec![JobClaimId(1), JobClaimId(3)]);
+    }
+
+    #[test]
+    fn choose_best_pool_only_offers_pools_reachable_from_a_home_network() {
+        use crate::core::regions::directory::CrossRegionDiscovery;
+
+        let directory = EmploymentDirectory::default();
+        let reachable = pool(9, 1, 1, 50, 0);
+        let unreachable = pool(4, 1, 1, 90, 0); // richer, but in another component
+        assert!(directory.publish_pools(RegionId(9), vec![reachable]));
+        assert!(directory.publish_pools(RegionId(4), vec![unreachable]));
+        let snapshot = directory.snapshot();
+
+        let home_network = RegionRoadNetworkId {
+            region: RegionId(1),
+            road_network: 0,
+        };
+        let discovery = CrossRegionDiscovery {
+            // home shares a component with employer 9 only.
+            components: vec![
+                vec![home_network, reachable.network],
+                vec![unreachable.network],
+            ],
+            ..Default::default()
+        };
+
+        let chosen = choose_best_pool(&snapshot, &discovery, RegionId(1), &[home_network])
+            .expect("a reachable pool exists");
+        assert_eq!(
+            chosen.workplace, reachable.workplace,
+            "an unreachable pool must never be chosen, however good its salary"
+        );
+
+        // A home with no component at all reaches nothing.
+        let isolated = RegionRoadNetworkId {
+            region: RegionId(7),
+            road_network: 0,
+        };
+        assert!(choose_best_pool(&snapshot, &discovery, RegionId(7), &[isolated]).is_none());
+    }
+
+    #[test]
+    fn republishing_a_pool_with_changed_facts_invalidates_its_pending_claims() {
+        // Found in review. A claim is chosen against a pool's facts at
+        // generation G1. If the employer republishes those facts (G2) before
+        // validating, the claim is stale: it may have been picked for a salary,
+        // capacity, or *network* that no longer holds. The plan states the rule
+        // from the other side -- "pending claims against untouched pools stay
+        // valid" -- so a touched pool must drop them.
+        let (directory, job_pool) = directory_with_pool(3);
+        let claimant = citizen(1, 50);
+        directory.submit_claims(vec![(claimant, job_pool.workplace, job_pool.generation)]);
+        assert_eq!(directory.broker.lock().unwrap().claims_by_id.len(), 1);
+
+        // Same workplace, different facts -> changed, not removed.
+        let changed = JobPool {
+            salary: job_pool.salary + 25,
+            generation: 0,
+            ..job_pool
+        };
+        assert!(directory.publish_pools(RegionId(9), vec![changed]));
+
+        let state = directory.broker.lock().unwrap();
+        assert!(
+            state.pools_by_workplace.contains_key(&job_pool.workplace),
+            "the pool itself survives -- it changed, it was not removed"
+        );
+        assert!(
+            state.claims_by_id.is_empty(),
+            "the stale claim must be dropped, not handed to the employer"
+        );
+        assert!(state.pending_by_workplace.is_empty());
+        assert!(
+            !state.pending_by_citizen.contains_key(&claimant),
+            "the citizen is un-pended and free to retry against the fresh facts"
+        );
+        assert!(
+            !state.pending_by_employer.contains_key(&RegionId(9)),
+            "the employer's now-empty pending set is removed outright"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_pool_keeps_its_pending_claims_across_a_republish() {
+        // The other half of the same rule, and the reason publish_pools must
+        // not simply drop every claim on every republish.
+        let (directory, job_pool) = directory_with_pool(3);
+        let other = pool(9, 2, 1, 70, 0);
+        assert!(directory.publish_pools(
+            RegionId(9),
+            vec![
+                JobPool {
+                    generation: 0,
+                    ..job_pool
+                },
+                other
+            ]
+        ));
+
+        let stamped = directory.broker.lock().unwrap().pools_by_workplace[&job_pool.workplace];
+        directory.submit_claims(vec![(
+            citizen(1, 50),
+            stamped.workplace,
+            stamped.generation,
+        )]);
+
+        // Republish where only `other` changes.
+        assert!(directory.publish_pools(
+            RegionId(9),
+            vec![
+                JobPool {
+                    generation: 0,
+                    ..stamped
+                },
+                JobPool {
+                    salary: 999,
+                    generation: 0,
+                    ..other
+                },
+            ]
+        ));
+
+        let state = directory.broker.lock().unwrap();
+        assert_eq!(
+            state.claims_by_id.len(),
+            1,
+            "a claim against the untouched pool must survive an unrelated pool's change"
         );
     }
 }

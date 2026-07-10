@@ -33,7 +33,9 @@ use crate::core::components::{
     WorkplaceAssignment,
 };
 use crate::core::entity::Entity;
-use crate::core::regions::employment_directory::JobPool;
+use crate::core::regions::employment_directory::{
+    EmployerState as EmploymentEmployerState, EmploymentContract, JobClaim, JobPool,
+};
 use crate::core::resources::CityStats;
 use crate::core::simulation::{
     TickJobPhase, TickPowerPhase, begin_tick_power_phase, begin_tick_power_phase_quiet,
@@ -389,6 +391,14 @@ pub(crate) struct RegionStateSaveRecord {
 pub struct RegionState {
     id: RegionId,
     world: World,
+    /// Directory employment ledger plan, P3: this region's employer-side
+    /// truth — which citizens hold a contract at which of *its* workplaces.
+    /// The directory's `accepted_by_*` maps are only a read cache; this is
+    /// the authority for whether a seat is really reserved.
+    ///
+    /// Not serialized: `RegionState` itself is not `Serialize` (only `World`
+    /// is), so contracts are transient until P6 makes them durable.
+    employer_state: EmploymentEmployerState,
 }
 
 impl RegionState {
@@ -396,7 +406,11 @@ impl RegionState {
     pub fn new(id: RegionId, width: usize, height: usize) -> Self {
         let mut world = World::new(width, height);
         world.set_region_id(id);
-        Self { id, world }
+        Self {
+            id,
+            world,
+            employer_state: EmploymentEmployerState::default(),
+        }
     }
 
     pub fn id(&self) -> RegionId {
@@ -1390,7 +1404,14 @@ impl RegionState {
     /// published under its first (lowest-id) network only: `JobPool` names
     /// exactly one network, so listing the same pool under two would let
     /// both components see it as independently claimable.
-    #[allow(dead_code)] // P2: not wired into the tick loop yet (P3 starts calling this).
+    ///
+    /// P3: `open_count` is *claimable* capacity, so seats this region has
+    /// already contracted to remote citizens are subtracted. The directory
+    /// decrements its own cached `open_count` on an accepted claim only "until
+    /// next employer publish" — this republished count is that authoritative
+    /// replacement, and must not resurrect a contracted seat. A workplace with
+    /// nothing left to claim publishes no row at all.
+    #[allow(dead_code)] // P2/P3: staged; the daily tick starts publishing in P4/P7.
     pub(crate) fn published_job_pools(&self) -> Vec<JobPool> {
         let mut seen = HashSet::new();
         let mut pools = Vec::new();
@@ -1409,8 +1430,13 @@ impl RegionState {
                 *open_counts.entry(slot).or_insert(0) += 1;
             }
 
-            for (workplace, open_count) in open_counts {
+            for (workplace, spare_count) in open_counts {
                 seen.insert(workplace);
+                let contracted = self.contracted_seats_at(workplace) as u16;
+                let open_count = spare_count.saturating_sub(contracted);
+                if open_count == 0 {
+                    continue; // fully contracted: nothing left to claim
+                }
                 pools.push(JobPool {
                     region: self.id,
                     workplace,
@@ -1423,6 +1449,109 @@ impl RegionState {
         }
 
         pools
+    }
+
+    /// P3, home side: this region's citizens with no workplace assignment,
+    /// in deterministic entity order. `world.citizens` is a `HashMap`, so the
+    /// sort is load-bearing — same pattern as `pending_job_demands`.
+    #[allow(dead_code)] // P3: staged; the daily tick starts calling this in P4/P7.
+    pub(crate) fn unemployed_citizens(&self) -> Vec<Entity> {
+        let mut citizens = self.world.citizens.keys().copied().collect::<Vec<_>>();
+        citizens.sort_by_key(|citizen| citizen.0);
+        citizens.retain(|citizen| {
+            self.world
+                .citizens
+                .get(citizen)
+                .is_some_and(|data| data.workplace_assignment.is_none())
+        });
+        citizens
+    }
+
+    /// P3, employer side: does this region still have a free seat at
+    /// `workplace` that it could contract out?
+    ///
+    /// The plan's protocol step 4 defines the whole check as *"pool still
+    /// exists and has employer-owned capacity"* — so this is deliberately
+    /// **not** given the claim's `generation` or the claimant's home region,
+    /// which the plan's `job_pool_still_has_open_capacity` signature names but
+    /// never uses. Generation was already validated by the directory at submit
+    /// time (and is recorded onto the contract as `accepted_generation`);
+    /// reachability was already decided by `choose_best_pool`, and an employer
+    /// cannot re-check it anyway — it owns no topology.
+    ///
+    /// "Employer-owned capacity" is the spare seats this workplace publishes
+    /// (`spare_job_slots_on_network`, already net of *local* assignment) minus
+    /// the seats this region has already contracted to remote citizens.
+    #[allow(dead_code)] // P3: staged; called by employer_validate_claims (not tick-wired yet).
+    pub(crate) fn job_pool_still_has_open_capacity(&self, workplace: Entity) -> bool {
+        self.spare_job_slots_for_workplace(workplace) > self.contracted_seats_at(workplace)
+    }
+
+    /// Total spare (locally unassigned) seats at one workplace, across every
+    /// road network. Counts repeated entries: `remaining_workplaces` holds one
+    /// entry per open seat.
+    fn spare_job_slots_for_workplace(&self, workplace: Entity) -> usize {
+        self.world
+            .with_cached_remaining_job_workplaces(|remaining_workplaces| {
+                remaining_workplaces
+                    .iter()
+                    .filter(|slot| **slot == workplace)
+                    .count()
+            })
+    }
+
+    fn contracted_seats_at(&self, workplace: Entity) -> usize {
+        self.employer_state
+            .contracts_by_workplace
+            .get(&workplace)
+            .map_or(0, BTreeMap::len)
+    }
+
+    /// P3, employer side: record the contract in this region's own state and
+    /// hand back the assignment the home region will later apply (P4).
+    ///
+    /// The employer is the authority for the seat; the returned
+    /// `WorkplaceAssignment` is owned data (city-wide `Entity` + self-describing
+    /// cell + salary), so the home never dereferences this region's ECS.
+    #[allow(dead_code)] // P3: staged; called by employer_validate_claims (not tick-wired yet).
+    pub(crate) fn accept_claim_and_create_assignment(
+        &mut self,
+        claim: &JobClaim,
+    ) -> WorkplaceAssignment {
+        let workplace = claim.workplace;
+        let salary = self.workplace_salary(workplace);
+        self.employer_state
+            .contracts_by_workplace
+            .entry(workplace)
+            .or_default()
+            .insert(
+                claim.citizen,
+                EmploymentContract {
+                    salary,
+                    accepted_generation: claim.generation,
+                },
+            );
+
+        let position = self
+            .workplace_position(workplace)
+            .unwrap_or(Position { x: 0, y: 0 });
+        WorkplaceAssignment {
+            workplace,
+            location: CityCellRef::local(self.id, position.x, position.y),
+            salary,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contract_holders_at(
+        &self,
+        workplace: Entity,
+    ) -> Vec<crate::core::regions::employment_directory::CitizenRef> {
+        self.employer_state
+            .contracts_by_workplace
+            .get(&workplace)
+            .map(|holders| holders.keys().copied().collect())
+            .unwrap_or_default()
     }
 
     pub(crate) fn workplace_position(&self, slot: Entity) -> Option<Position> {
@@ -1477,7 +1606,13 @@ impl RegionState {
         // after load republishes this region's availability hints.
         world.mark_hints_dirty();
 
-        Self { id, world }
+        // P3: contracts are not serialized, so a loaded region starts with no
+        // employer-side employment. P6 makes this durable / reconciles it.
+        Self {
+            id,
+            world,
+            employer_state: EmploymentEmployerState::default(),
+        }
     }
 
     fn pending_power_demands(&self) -> Vec<PendingPowerDemand> {
@@ -2128,6 +2263,147 @@ mod tests {
             "a workplace touching two networks must publish exactly one pool row, not one per network"
         );
         assert_eq!(rows_for_workplace[0].open_count, 2);
+    }
+
+    /// A powered, road-connected Commercial workplace (2 seats at level 1) and
+    /// one jobless local citizen.
+    fn employer_region_with_one_workplace() -> (RegionState, Entity) {
+        let mut region = RegionState::new(RegionId(9), 4, 4);
+        assert!(region.build(0, 0, BuildingKind::PowerPlant).success);
+        assert!(region.build(0, 1, BuildingKind::Road).success);
+        assert!(region.build(1, 1, BuildingKind::Road).success);
+        assert!(region.build(1, 0, BuildingKind::Commercial).success);
+        region.ensure_derived_state();
+        let workplace = region.world.grid.get(1, 0).expect("commercial entity");
+        (region, workplace)
+    }
+
+    #[test]
+    fn unemployed_citizens_lists_only_jobless_citizens_in_entity_order() {
+        let mut region = RegionState::new(RegionId(1), 3, 3);
+        assert!(region.build(0, 0, BuildingKind::Residential).success);
+        let home = region.world.grid.get(0, 0).expect("home");
+        citizens::spawn_for_home(&mut region.world, home, 3);
+
+        let mut all = region.world.citizens.keys().copied().collect::<Vec<_>>();
+        all.sort_by_key(|citizen| citizen.0);
+        assert_eq!(
+            region.unemployed_citizens(),
+            all,
+            "every citizen starts jobless, in entity order"
+        );
+
+        // Give the middle citizen a job; it must drop out of the list.
+        let employed = all[1];
+        region
+            .world
+            .citizens
+            .get_mut(&employed)
+            .expect("citizen")
+            .workplace_assignment = Some(WorkplaceAssignment {
+            workplace: Entity::new(RegionId(2), 42),
+            location: CityCellRef::local(RegionId(2), 0, 0),
+            salary: 5,
+        });
+
+        assert_eq!(region.unemployed_citizens(), vec![all[0], all[2]]);
+    }
+
+    #[test]
+    fn job_pool_still_has_open_capacity_counts_down_as_contracts_are_created() {
+        // P3: "employer-owned capacity" = spare seats minus seats already
+        // contracted to remote citizens.
+        let (mut region, workplace) = employer_region_with_one_workplace();
+        assert!(region.job_pool_still_has_open_capacity(workplace));
+
+        let claim_for = |local: u32| JobClaim {
+            claim_id: crate::core::regions::employment_directory::JobClaimId(local as u64),
+            citizen: crate::core::regions::employment_directory::CitizenRef {
+                region: RegionId(1),
+                citizen: Entity::new(RegionId(1), local),
+            },
+            workplace,
+            generation: 7,
+        };
+
+        let first = region.accept_claim_and_create_assignment(&claim_for(50));
+        assert_eq!(first.workplace, workplace);
+        assert_eq!(first.location.region, RegionId(9), "self-describing cell");
+        assert_eq!(first.salary, region.workplace_salary(workplace));
+        assert!(
+            region.job_pool_still_has_open_capacity(workplace),
+            "2 seats, 1 contracted -> still open"
+        );
+
+        region.accept_claim_and_create_assignment(&claim_for(51));
+        assert!(
+            !region.job_pool_still_has_open_capacity(workplace),
+            "2 seats, 2 contracted -> full"
+        );
+        assert_eq!(region.contract_holders_at(workplace).len(), 2);
+    }
+
+    #[test]
+    fn published_job_pools_subtracts_seats_already_contracted_to_remote_citizens() {
+        // Found in self-review. The plan lets the directory decrement its cached
+        // `open_count` on an accepted claim only "until next employer publish"
+        // -- so the employer's republished count is the authoritative
+        // replacement. If it republished raw spare slots it would resurrect
+        // seats it has already contracted out.
+        let (mut region, workplace) = employer_region_with_one_workplace();
+        assert_eq!(region.published_job_pools()[0].open_count, 2);
+
+        region.accept_claim_and_create_assignment(&JobClaim {
+            claim_id: crate::core::regions::employment_directory::JobClaimId(1),
+            citizen: crate::core::regions::employment_directory::CitizenRef {
+                region: RegionId(1),
+                citizen: Entity::new(RegionId(1), 50),
+            },
+            workplace,
+            generation: 1,
+        });
+        assert_eq!(
+            region.published_job_pools()[0].open_count,
+            1,
+            "one of two seats is contracted; only one is still claimable"
+        );
+
+        region.accept_claim_and_create_assignment(&JobClaim {
+            claim_id: crate::core::regions::employment_directory::JobClaimId(2),
+            citizen: crate::core::regions::employment_directory::CitizenRef {
+                region: RegionId(1),
+                citizen: Entity::new(RegionId(1), 51),
+            },
+            workplace,
+            generation: 1,
+        });
+        assert!(
+            region.published_job_pools().is_empty(),
+            "a fully contracted workplace advertises no pool at all"
+        );
+    }
+
+    #[test]
+    fn accept_claim_records_the_claims_generation_on_the_contract() {
+        let (mut region, workplace) = employer_region_with_one_workplace();
+        region.accept_claim_and_create_assignment(&JobClaim {
+            claim_id: crate::core::regions::employment_directory::JobClaimId(1),
+            citizen: crate::core::regions::employment_directory::CitizenRef {
+                region: RegionId(1),
+                citizen: Entity::new(RegionId(1), 50),
+            },
+            workplace,
+            generation: 12,
+        });
+
+        let holders = region.contract_holders_at(workplace);
+        assert_eq!(holders.len(), 1);
+        assert_eq!(
+            region.employer_state.contracts_by_workplace[&workplace][&holders[0]]
+                .accepted_generation,
+            12,
+            "the pool generation in effect at accept time is recorded on the contract"
+        );
     }
 
     #[test]

@@ -70,12 +70,18 @@
 //!                  West:offset 0
 //! ```
 
+use std::sync::Arc;
+
 use crate::core::city_refs::CityCellRef;
 use crate::core::components::TravelerHandoff;
 use crate::core::entity::Entity;
 use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionCommandResponse, RegionSnapshotResponse,
     RegionTickResponse, RegionViewSnapshot, UiRequestId,
+};
+use crate::core::regions::directory::CrossRegionDiscovery;
+use crate::core::regions::employment_directory::{
+    CitizenRef, EmploymentDirectory, JobClaimDecision, choose_best_pool,
 };
 use crate::core::regions::handle::{RegionEventReceiver, RegionHandle, mailbox};
 use crate::core::regions::{
@@ -158,6 +164,13 @@ pub enum RegionEvent {
     /// every region by the runner's `step_travel_city`; emits the crossings it
     /// buffers as `TravelerHandedOff` for the barrier to route.
     StepTravel,
+    /// Directory employment ledger plan, P3: a payload-free wake.
+    ///
+    /// It carries no claims, contracts, or losses — it only tells the region
+    /// to *pull* whatever employment work the directory holds for it. That
+    /// keeps the directory the single coordination source and avoids polling
+    /// every region each tick.
+    EmploymentDirectoryReady,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,6 +332,13 @@ pub enum OutboundMessage {
     /// P5b: a travel token to route to `handoff.to_region` (worker delivers it as
     /// `RegionEvent::ReceiveTraveler`).
     TravelerHandedOff(TravelerHandoff),
+    /// Directory employment ledger plan, P3: wake `target_region` so it pulls
+    /// its employment work from the directory. Payload-free by design; the
+    /// worker delivers it as `RegionEvent::EmploymentDirectoryReady`.
+    EmploymentDirectoryReady {
+        target_region: RegionId,
+        source_region: RegionId,
+    },
     RuntimeError(RegionRuntimeError),
 }
 
@@ -361,6 +381,12 @@ pub struct RegionRuntime {
     seen_jobs_generation: u64,
     // Event-driven plan, P-5: same shape, for the goods reconcile gate.
     seen_goods_generation: u64,
+    // Directory employment ledger plan, P3: installed once per worker slice
+    // (`set_employment_directory`), mirroring how `set_discovery_generation`
+    // and `set_region_routes` hand this runtime the pass's shared data. `None`
+    // until a worker installs one, so a bare `RegionRuntime::new` still works
+    // and an `EmploymentDirectoryReady` without a directory is a no-op.
+    employment_directory: Option<Arc<EmploymentDirectory>>,
     handle: RegionHandle,
     receiver: RegionEventReceiver,
 }
@@ -542,6 +568,7 @@ impl RegionRuntime {
             seen_power_generation: 0,
             seen_jobs_generation: 0,
             seen_goods_generation: 0,
+            employment_directory: None,
             handle,
             receiver,
         }
@@ -553,6 +580,21 @@ impl RegionRuntime {
 
     pub fn state(&self) -> &RegionState {
         &self.state
+    }
+
+    /// P3: the employer side of claim validation must record a contract in its
+    /// own `RegionState`, so it needs mutable access. Still `pub(crate)` — the
+    /// UI never reaches a `RegionRuntime`.
+    pub(crate) fn state_mut(&mut self) -> &mut RegionState {
+        &mut self.state
+    }
+
+    /// Directory employment ledger plan, P3: install this pass's shared
+    /// employment directory, mirroring `set_discovery_generation`'s per-slice
+    /// install. The worker owns the `Arc`; every runtime it schedules gets a
+    /// clone before its events are processed.
+    pub(crate) fn set_employment_directory(&mut self, directory: Arc<EmploymentDirectory>) {
+        self.employment_directory = Some(directory);
     }
 
     pub(crate) fn set_importable_remote_jobs(&mut self, jobs: i32) {
@@ -757,7 +799,39 @@ impl RegionRuntime {
                 self.state.step_travel();
                 self.drained_traveler_handoff_messages()
             }
+            RegionEvent::EmploymentDirectoryReady => self.handle_employment_directory_ready(),
         }
+    }
+
+    /// P3: pull whatever employment work the directory holds for this region.
+    ///
+    /// The plan's handler also calls `employer_apply_releases`,
+    /// `home_apply_accepted_employment`, and `home_apply_losses` — those are
+    /// P4/P5 scope and are deliberately absent here. P3 wires only the
+    /// employer-side validation half.
+    ///
+    /// A runtime with no directory installed (a bare `RegionRuntime::new`, or
+    /// a worker that never set one) treats the wake as a no-op rather than
+    /// panicking.
+    fn handle_employment_directory_ready(&mut self) -> Vec<OutboundMessage> {
+        let Some(directory) = self.employment_directory.clone() else {
+            return Vec::new();
+        };
+        employer_validate_claims(self, &directory)
+    }
+
+    /// P3: the wake fan-out. One payload-free message per target region; the
+    /// worker routes them through the same deterministic barrier every other
+    /// cross-region event uses.
+    fn emit_employment_directory_ready(&self, regions: Vec<RegionId>) -> Vec<OutboundMessage> {
+        let source_region = self.region_id();
+        regions
+            .into_iter()
+            .map(|target_region| OutboundMessage::EmploymentDirectoryReady {
+                target_region,
+                source_region,
+            })
+            .collect()
     }
 
     /// P5b: this tick's buffered crossings, routed by the worker.
@@ -1452,6 +1526,117 @@ impl RegionRuntime {
             snapshot: RegionViewSnapshot::from_view(self.region_id(), view),
         }
     }
+}
+
+/// P3, home side: submit one claim batch for this region's unemployed citizens.
+///
+/// **Not called from the tick.** P3 stages the claim flow; the old
+/// request/grant path is still the live allocator until P7, and P4 is what
+/// teaches the home region to apply an accepted assignment. Wiring this into
+/// the daily job phase now would have two allocators drawing on the same spare
+/// workplace slots. Tests drive it directly.
+///
+/// Citizens already spoken for — pending or accepted, per the directory's
+/// `active_citizens_by_home_region` — are skipped before any lock is taken.
+/// The directory re-checks the same rule inside `submit_claims`, because this
+/// snapshot may be one pass stale.
+#[allow(dead_code)] // P3: staged; the daily job phase starts calling this in P4/P7.
+pub(crate) fn home_region_daily_jobs(
+    runtime: &mut RegionRuntime,
+    directory: &EmploymentDirectory,
+    discovery: &CrossRegionDiscovery,
+) -> Vec<OutboundMessage> {
+    let snapshot = directory.snapshot(); // cheap Arc clone; no directory lock held below
+    let home = runtime.region_id();
+    let active_citizens = snapshot
+        .active_citizens_by_home_region
+        .get(&home)
+        .cloned()
+        .unwrap_or_default();
+
+    let home_networks = runtime
+        .state()
+        .network_border_links()
+        .into_iter()
+        .map(|link| link.network)
+        .collect::<Vec<_>>();
+
+    // Hoisted out of the per-citizen loop: the plan writes
+    // `choose_best_pool(&snapshot, citizen)`, but reachability and ranking
+    // depend only on the *home region*, not on which of its citizens is
+    // asking. Every unemployed citizen would get the same answer, so compute
+    // it once. `submit_claims` caps the batch at the pool's `open_count`; the
+    // citizens it turns away retry next pass, when the snapshot no longer
+    // advertises the seats already reserved.
+    let Some(pool) = choose_best_pool(&snapshot, discovery, home, &home_networks) else {
+        return Vec::new(); // nothing reachable and open; nobody to wake
+    };
+
+    let claims = runtime
+        .state()
+        .unemployed_citizens()
+        .into_iter()
+        .filter(|citizen| !active_citizens.contains(citizen))
+        .map(|citizen| {
+            (
+                CitizenRef {
+                    region: home,
+                    citizen,
+                },
+                pool.workplace,
+                pool.generation,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    // One short lock to reserve pending claims. The returned regions are wake
+    // targets only; the claims themselves stay in the directory.
+    let regions_to_wake = directory.submit_claims(claims);
+    runtime.emit_employment_directory_ready(regions_to_wake)
+}
+
+/// P3, employer side: decide every pending claim against this region's own ECS.
+///
+/// Reads the batch, validates each claim against employer-owned capacity, and
+/// hands compact decisions back. Both accepted *and* rejected decisions wake
+/// the home region: an acceptance is ready to apply (P4), and a rejection is
+/// what releases the home's citizen-side pending guard so it can retry.
+///
+/// If several wakes land before this runs, the first call decides the pending
+/// claims and `apply_claim_decisions` clears them, so later wakes see an empty
+/// batch and return immediately.
+pub(crate) fn employer_validate_claims(
+    runtime: &mut RegionRuntime,
+    directory: &EmploymentDirectory,
+) -> Vec<OutboundMessage> {
+    let claims = directory.take_pending_claims_for_employer(runtime.region_id());
+    if claims.is_empty() {
+        return Vec::new();
+    }
+
+    let decisions = claims
+        .into_iter()
+        .map(|claim| {
+            if runtime
+                .state()
+                .job_pool_still_has_open_capacity(claim.workplace)
+            {
+                JobClaimDecision::Accepted {
+                    claim_id: claim.claim_id,
+                    assignment: runtime
+                        .state_mut()
+                        .accept_claim_and_create_assignment(&claim),
+                }
+            } else {
+                JobClaimDecision::Rejected {
+                    claim_id: claim.claim_id,
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let regions_to_wake = directory.apply_claim_decisions(runtime.region_id(), decisions);
+    runtime.emit_employment_directory_ready(regions_to_wake)
 }
 
 #[cfg(test)]
@@ -2423,5 +2608,327 @@ mod export_allocations_tests {
         // while caller 2's reservation is untouched.
         allocations.release_stale_for_caller(RegionId(1), UiRequestId(6));
         assert_eq!(allocations.units().collect::<Vec<_>>(), vec![4]);
+    }
+}
+
+#[cfg(test)]
+mod employment_claim_flow_tests {
+    //! Directory employment ledger plan, P3: the home -> directory -> employer
+    //! round trip, driven directly (the daily tick does not call it yet).
+
+    use super::*;
+    use crate::core::regions::RegionRoadNetworkId;
+    use crate::core::regions::RegionState;
+    use crate::core::regions::employment_directory::JobPool;
+    use crate::core::systems::citizens;
+    use crate::interface::input::BuildingKind;
+
+    /// Employer region 9: a powered Commercial workplace (2 seats) whose road
+    /// spine reaches the west border, facing home region 1.
+    fn employer_runtime() -> RegionRuntime {
+        let mut region = RegionState::new(RegionId(9), 3, 3);
+        assert!(region.build(0, 0, BuildingKind::Road).success);
+        assert!(region.build(1, 0, BuildingKind::Road).success);
+        assert!(region.build(0, 1, BuildingKind::PowerPlant).success);
+        assert!(region.build(1, 1, BuildingKind::Commercial).success);
+        region.ensure_derived_state();
+        RegionRuntime::new(region)
+    }
+
+    /// Home region 1: `count` jobless citizens and a road on its east border.
+    fn home_runtime(count: i32) -> RegionRuntime {
+        let mut region = RegionState::new(RegionId(1), 3, 3);
+        assert!(region.build(0, 0, BuildingKind::Residential).success);
+        assert!(region.build(1, 0, BuildingKind::Road).success);
+        assert!(region.build(2, 0, BuildingKind::Road).success);
+        let home = region.world.grid.get(0, 0).expect("home");
+        citizens::spawn_for_home(&mut region.world, home, count);
+        region.ensure_derived_state();
+        RegionRuntime::new(region)
+    }
+
+    /// A discovery snapshot that puts home 1 and employer 9 in one component.
+    fn shared_component(home: &RegionRuntime, employer: &RegionRuntime) -> CrossRegionDiscovery {
+        let mut networks = home
+            .state()
+            .network_border_links()
+            .into_iter()
+            .map(|link| link.network)
+            .collect::<Vec<_>>();
+        networks.extend(
+            employer
+                .state()
+                .network_border_links()
+                .into_iter()
+                .map(|link| link.network),
+        );
+        assert!(!networks.is_empty(), "fixture must have border networks");
+        CrossRegionDiscovery {
+            components: vec![networks],
+            ..Default::default()
+        }
+    }
+
+    fn wake_targets(outbound: &[OutboundMessage]) -> Vec<RegionId> {
+        outbound
+            .iter()
+            .filter_map(|message| match message {
+                OutboundMessage::EmploymentDirectoryReady { target_region, .. } => {
+                    Some(*target_region)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_claim_round_trip_contracts_the_seat_and_wakes_the_home() {
+        let directory = Arc::new(EmploymentDirectory::default());
+        let mut employer = employer_runtime();
+        let mut home = home_runtime(1);
+        let discovery = shared_component(&home, &employer);
+
+        let workplace = employer.state().published_job_pools()[0].workplace;
+        assert!(directory.publish_pools(RegionId(9), employer.state().published_job_pools()));
+
+        // Home submits; the employer is woken (payload-free).
+        let outbound = home_region_daily_jobs(&mut home, &directory, &discovery);
+        assert_eq!(wake_targets(&outbound), vec![RegionId(9)]);
+
+        // Employer validates; the home is woken back.
+        let outbound = employer_validate_claims(&mut employer, &directory);
+        assert_eq!(wake_targets(&outbound), vec![RegionId(1)]);
+
+        // Employer-side truth: a real contract exists.
+        assert_eq!(
+            employer.state().contract_holders_at(workplace).len(),
+            1,
+            "the employer owns the contract, not the directory"
+        );
+        // Directory read cache mirrors it, and the pending indexes are clear.
+        let snapshot = directory.snapshot();
+        assert_eq!(snapshot.accepted_by_home_region[&RegionId(1)].len(), 1);
+        assert!(snapshot.pending_claims_by_employer.is_empty());
+    }
+
+    #[test]
+    fn the_wake_event_carries_no_claim_payload_and_pulls_work_from_the_directory() {
+        // P3 review check: "EmploymentDirectoryReady carries no claim payload;
+        // regions pull work from the directory."
+        let directory = Arc::new(EmploymentDirectory::default());
+        let mut employer = employer_runtime();
+        let mut home = home_runtime(1);
+        let discovery = shared_component(&home, &employer);
+        assert!(directory.publish_pools(RegionId(9), employer.state().published_job_pools()));
+        home_region_daily_jobs(&mut home, &directory, &discovery);
+
+        // Deliver the wake through the real event path, with the directory
+        // installed exactly as a worker slice would.
+        employer.set_employment_directory(Arc::clone(&directory));
+        employer.push_event(RegionEvent::EmploymentDirectoryReady);
+        let outbound = employer.process_next_event();
+
+        assert_eq!(
+            wake_targets(&outbound),
+            vec![RegionId(1)],
+            "the employer pulled its pending claim from the directory and answered"
+        );
+        assert!(directory.snapshot().pending_claims_by_employer.is_empty());
+    }
+
+    #[test]
+    fn a_second_wake_is_a_cheap_no_op_once_the_claims_are_decided() {
+        let directory = Arc::new(EmploymentDirectory::default());
+        let mut employer = employer_runtime();
+        let mut home = home_runtime(1);
+        let discovery = shared_component(&home, &employer);
+        assert!(directory.publish_pools(RegionId(9), employer.state().published_job_pools()));
+        home_region_daily_jobs(&mut home, &directory, &discovery);
+
+        let workplace = employer.state().published_job_pools()[0].workplace;
+        assert!(!employer_validate_claims(&mut employer, &directory).is_empty());
+        assert_eq!(employer.state().contract_holders_at(workplace).len(), 1);
+
+        assert!(
+            employer_validate_claims(&mut employer, &directory).is_empty(),
+            "a repeat wake finds an empty batch and wakes nobody"
+        );
+        assert_eq!(
+            employer.state().contract_holders_at(workplace).len(),
+            1,
+            "the repeat wake must not create a second contract for the same citizen"
+        );
+    }
+
+    #[test]
+    fn a_wake_without_an_installed_directory_is_a_no_op() {
+        let mut employer = employer_runtime();
+        employer.push_event(RegionEvent::EmploymentDirectoryReady);
+        assert!(employer.process_next_event().is_empty());
+    }
+
+    #[test]
+    fn an_employer_never_contracts_more_seats_than_it_has() {
+        // P3 behavior forbidden: "no workplace pool accepts more than open_count."
+        // Two seats, four hopeful citizens.
+        let directory = Arc::new(EmploymentDirectory::default());
+        let mut employer = employer_runtime();
+        let mut home = home_runtime(4);
+        let discovery = shared_component(&home, &employer);
+        let pools = employer.state().published_job_pools();
+        let workplace = pools[0].workplace;
+        assert_eq!(pools[0].open_count, 2, "level-1 Commercial has 2 seats");
+        assert!(directory.publish_pools(RegionId(9), pools));
+
+        home_region_daily_jobs(&mut home, &directory, &discovery);
+        employer_validate_claims(&mut employer, &directory);
+
+        assert_eq!(
+            employer.state().contract_holders_at(workplace).len(),
+            2,
+            "exactly open_count citizens are hired, whichever two they are"
+        );
+        let snapshot = directory.snapshot();
+        assert_eq!(snapshot.accepted_by_home_region[&RegionId(1)].len(), 2);
+    }
+
+    #[test]
+    fn choose_best_pool_ignores_a_pool_in_another_component() {
+        let directory = Arc::new(EmploymentDirectory::default());
+        let employer = employer_runtime();
+        let mut home = home_runtime(1);
+        assert!(directory.publish_pools(RegionId(9), employer.state().published_job_pools()));
+
+        // Discovery where the home shares no component with the employer.
+        let isolated = CrossRegionDiscovery {
+            components: vec![vec![RegionRoadNetworkId {
+                region: RegionId(1),
+                road_network: 0,
+            }]],
+            ..Default::default()
+        };
+
+        let outbound = home_region_daily_jobs(&mut home, &directory, &isolated);
+        assert!(
+            outbound.is_empty(),
+            "no reachable pool -> no claim, no wake"
+        );
+        assert!(directory.snapshot().pending_claims_by_employer.is_empty());
+    }
+
+    #[test]
+    fn an_employer_never_validates_a_claim_chosen_from_stale_pool_facts() {
+        // Found in review. The employer's own check is capacity-only, which is
+        // only sound because the directory drops a pending claim the moment its
+        // target pool's facts (and therefore generation) change. Prove the
+        // employer never gets handed such a claim, and contracts nobody.
+        let directory = Arc::new(EmploymentDirectory::default());
+        let mut employer = employer_runtime();
+        let mut home = home_runtime(1);
+        let discovery = shared_component(&home, &employer);
+
+        let pools = employer.state().published_job_pools();
+        let workplace = pools[0].workplace;
+        assert!(directory.publish_pools(RegionId(9), pools.clone()));
+        home_region_daily_jobs(&mut home, &directory, &discovery);
+        assert_eq!(
+            directory
+                .take_pending_claims_for_employer(RegionId(9))
+                .len(),
+            1,
+            "the claim is pending before the pool changes"
+        );
+
+        // The employer republishes the same workplace with a changed salary,
+        // before it ever processes its wake.
+        let changed = pools
+            .into_iter()
+            .map(|pool| JobPool {
+                salary: pool.salary + 25,
+                generation: 0,
+                ..pool
+            })
+            .collect::<Vec<_>>();
+        assert!(directory.publish_pools(RegionId(9), changed));
+
+        assert!(
+            directory
+                .take_pending_claims_for_employer(RegionId(9))
+                .is_empty(),
+            "the stale claim must never reach the employer"
+        );
+        assert!(
+            employer_validate_claims(&mut employer, &directory).is_empty(),
+            "nothing to decide, so nobody is woken"
+        );
+        assert!(
+            employer.state().contract_holders_at(workplace).is_empty(),
+            "no contract may be created from stale facts"
+        );
+
+        // The citizen is free to claim again against the fresh facts.
+        assert!(!home_region_daily_jobs(&mut home, &directory, &discovery).is_empty());
+        assert!(!employer_validate_claims(&mut employer, &directory).is_empty());
+        assert_eq!(employer.state().contract_holders_at(workplace).len(), 1);
+    }
+
+    #[test]
+    fn republishing_after_an_accept_is_a_no_op_so_surviving_claims_are_not_churned() {
+        // The property that ties the two review fixes together. After an accept:
+        //   directory cached open_count  = published - 1   (apply_claim_decisions)
+        //   employer's next published    = spare - contracted
+        // Those converge on the same number, so the republish is UNCHANGED --
+        // no generation bump, and therefore no invalidation of any other pool's
+        // still-valid pending claims. Without published_job_pools subtracting
+        // contracts, the republish would resurrect the seat, look "changed", and
+        // churn pending claims every single pass.
+        let directory = Arc::new(EmploymentDirectory::default());
+        let mut employer = employer_runtime();
+        let mut home = home_runtime(1);
+        let discovery = shared_component(&home, &employer);
+
+        assert!(directory.publish_pools(RegionId(9), employer.state().published_job_pools()));
+        home_region_daily_jobs(&mut home, &directory, &discovery);
+        employer_validate_claims(&mut employer, &directory);
+
+        assert!(
+            !directory.publish_pools(RegionId(9), employer.state().published_job_pools()),
+            "the post-accept republish must be a no-op, not a 'changed' pool"
+        );
+    }
+
+    #[test]
+    fn a_fully_contracted_workplace_publishes_no_pool_but_keeps_its_accepted_workers() {
+        // open_count == 0 -> the row is omitted -> publish_pools sees it as
+        // `removed` -> invalidate_pending_claims_for_pool. That must clear only
+        // PENDING coordination state; the accepted workers keep their jobs until
+        // an explicit release/loss (P5).
+        let directory = Arc::new(EmploymentDirectory::default());
+        let mut employer = employer_runtime();
+        let mut home = home_runtime(2);
+        let discovery = shared_component(&home, &employer);
+        let workplace = employer.state().published_job_pools()[0].workplace;
+
+        assert!(directory.publish_pools(RegionId(9), employer.state().published_job_pools()));
+        home_region_daily_jobs(&mut home, &directory, &discovery);
+        employer_validate_claims(&mut employer, &directory);
+        assert_eq!(employer.state().contract_holders_at(workplace).len(), 2);
+
+        assert!(
+            employer.state().published_job_pools().is_empty(),
+            "both seats contracted -> nothing left to advertise"
+        );
+        assert!(directory.publish_pools(RegionId(9), employer.state().published_job_pools()));
+
+        let snapshot = directory.snapshot();
+        assert!(
+            snapshot.open_pools_by_network.is_empty(),
+            "the pool row is gone"
+        );
+        assert_eq!(
+            snapshot.accepted_by_home_region[&RegionId(1)].len(),
+            2,
+            "accepted employment survives the pool row disappearing"
+        );
     }
 }

@@ -11,6 +11,7 @@ use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionViewSnapshot, UiReply, UiRequestId,
 };
 use crate::core::regions::directory::RegionDirectory;
+use crate::core::regions::employment_directory::EmploymentDirectory;
 use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::runtime::RegionRuntime;
 use crate::core::regions::threaded::{
@@ -163,12 +164,17 @@ impl RegionalGameRunner {
 
         let owners = Arc::new(RegionOwnerDirectory::new());
         let directory = Arc::new(RegionDirectory::with_owners(topology, Arc::clone(&owners)));
+        // P3: one employment broker for the whole city, shared by every worker
+        // — exactly like `directory`. Per-worker brokers would each hand out
+        // the same workplace seat.
+        let employment_directory = Arc::new(EmploymentDirectory::default());
         let mut workers = (0..worker_count)
             .map(|index| {
                 let worker_id = WorkerId(INITIAL_WORKER_ID.0 + index as u32);
-                RegionWorker::with_directory_and_owners(
+                RegionWorker::with_directories_and_owners(
                     worker_id,
                     Arc::clone(&directory),
+                    Arc::clone(&employment_directory),
                     Arc::clone(&owners),
                 )
             })

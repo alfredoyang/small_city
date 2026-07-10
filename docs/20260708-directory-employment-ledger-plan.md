@@ -1,8 +1,9 @@
 # Directory employment ledger — stable cross-region jobs without daily wipes
 
-Status: **proposal, P1 + P2 implemented** (data model, and employer pool
-publishing — see "P1, implemented" and "P2, implemented" at the end of
-this doc; P3-P7 still plan-only). This is an
+Status: **proposal, P1 + P2 + P3 implemented** (data model, employer pool
+publishing, and the claim flow — see the "P<n>, implemented" sections at
+the end of this doc; P4-P7 still plan-only. P3 is *staged*: the claim flow
+is built and tested but not yet called from the daily tick). This is an
 alternative to pushing
 [20260706-per-producer-job-staleness.md](20260706-per-producer-job-staleness.md)
 further. It targets more precise citizen behavior: jobs should be
@@ -1878,4 +1879,300 @@ None.
 
    ownership authority = the region packed into the workplace Entity id,
    never the caller-declared `region` field.
+```
+
+## P3, implemented (2026-07-10)
+
+The claim flow: a home region submits claims against published pools, the
+directory reserves pool capacity and citizen identity, and the employer
+validates each claim against its own ECS and records a contract.
+
+### Status
+
+**Implemented, staged — deliberately not called from the daily tick.**
+
+The old cross-region request/grant path is still the live allocator until
+P7, and P4 is what teaches a home region to *apply* an accepted assignment.
+Wiring `home_region_daily_jobs` into the daily job phase now would put two
+allocators on the same spare workplace slots, and accepted claims would pile
+up in the directory with nobody applying them. Everything is reachable and
+tested; `home_region_daily_jobs` carries `#[allow(dead_code)]` until P4/P7
+call it.
+
+### Scope
+
+| file | why |
+|------|-----|
+| `src/core/regions/employment_directory.rs` | `submit_claims`, `take_pending_claims_for_employer`, `apply_claim_decisions`, `choose_best_pool`, `normalize_claim_requests`, `normalize_claim_decisions`, `claim_id_of`; `mark_pool_missing_for_validation` generalized to `invalidate_pending_claims_for_pool` |
+| `src/core/regions/mod.rs` | `RegionState` gains `employer_state`; `unemployed_citizens`, `job_pool_still_has_open_capacity`, `accept_claim_and_create_assignment` (+ two private helpers); `published_job_pools` now subtracts contracted seats |
+| `src/core/regions/runtime/mod.rs` | `RegionEvent::EmploymentDirectoryReady`, `OutboundMessage::EmploymentDirectoryReady`, `set_employment_directory`, `state_mut`, the event handler, and the free functions `home_region_daily_jobs` / `employer_validate_claims` |
+| `src/core/regions/worker.rs` | `RegionWorker` owns `Arc<EmploymentDirectory>`, installs it per slice, routes the wake through the deterministic barrier |
+| `src/core/regional_game_runner.rs` | one `EmploymentDirectory` shared by every worker |
+
+Diff: 5 files, +1497 / -16.
+
+### What changed
+
+| item | comes from |
+|------|-----------|
+| `submit_claims` | "Submitting Claims" — transcribed |
+| `take_pending_claims_for_employer`, `apply_claim_decisions` | "Employer Validation" — transcribed |
+| `home_region_daily_jobs`, `employer_validate_claims` | "Submitting Claims" / "Employer Validation" — transcribed, minus the P4/P5 calls |
+| `RegionEvent::EmploymentDirectoryReady` + worker routing | "Submitting Claims" — the doc sketches `push_region_event`; the `ForwardedEventOrderKey` is new (see Deviations) |
+| `normalize_claim_requests`, `normalize_claim_decisions` | never bodied in the doc; modeled on `normalize_pools`/`normalize_links` (sort by identity, then dedup) |
+| `choose_best_pool` | never bodied; reachability rule derived (see Deviations) |
+| `unemployed_citizens` | never bodied; mirrors the old path's `pending_job_demands` (sorted keys, `workplace_assignment.is_none()`) |
+| `job_pool_still_has_open_capacity`, `accept_claim_and_create_assignment` | never bodied; semantics taken from the protocol's step 4/5 |
+| `EmployerState` embedded in `RegionState` | "Stable Job Pool Identity" — P1 defined the type, P3 gives it a home |
+
+**Not included** (later patches): `home_apply_accepted_employment`,
+`acknowledge_home_applied` (P4); `request_release`, `confirm_release`,
+`report_lost_employment`, `take_losses_for_home`, `employer_apply_releases`,
+`home_apply_losses` (P5); `EmploymentDirectoryRebuild`,
+`replace_broker_state` (P6). The plan's `handle_employment_directory_ready`
+calls four functions; P3 wires only `employer_validate_claims`.
+
+### Deviations from the doc, and why
+
+- **`choose_best_pool(&snapshot, citizen)` → `(snapshot, discovery, home, home_networks)`.**
+  The snapshot cannot answer reachability: `open_pools_by_network` carries no
+  component graph. Jobs are network-scoped across regions exactly like power,
+  so a pool is a candidate only when its network shares a
+  `CrossRegionDiscovery` component with one of the home's border networks —
+  the same rule the old job-export path uses. Ranking is lowest
+  `(region, workplace)`; job-quality matching is an explicit plan non-goal.
+  The function does not depend on the citizen at all, so it is called **once**
+  per batch, not once per citizen.
+- **`job_pool_still_has_open_capacity(workplace, generation, home_region)` →
+  `(workplace)`.** The protocol's step 4 defines the whole check as *"pool
+  still exists and has employer-owned capacity"*. `generation` is validated by
+  the directory (see the review fix below) and recorded on the contract as
+  `accepted_generation`; reachability was already decided by
+  `choose_best_pool`, and an employer owns no topology to re-check it with.
+  Capacity is `spare_job_slots_for_workplace - contracted_seats_at`.
+- **`apply_claim_decisions` gained an ownership guard**
+  (`claim.workplace.region() != employer → skip`), mirroring P2's fix. Without
+  it, employer A could accept a claim against employer B's workplace and
+  corrupt B's `open_count` and accepted cache.
+- **`mark_pool_missing_for_validation` renamed to
+  `invalidate_pending_claims_for_pool`** and now also runs for *changed*
+  pools, not only removed ones. See the review fix below.
+- **`ForwardedEventOrderKey` for the wake** — the doc never assigns one.
+  `resource_rank: 4` (after power 0 / jobs 1 / goods 2 / travel 3), its own
+  rank rather than reusing jobs(1) because the old job path is live until P7
+  and the two must not interleave ambiguously. `request_id`/`token` are `0`:
+  the event is payload-free, so two wakes for the same `(target, source)` in
+  one pass are genuinely identical and idempotent.
+- **`RegionWorker` owns the `Arc<EmploymentDirectory>` and installs it into
+  each runtime per slice**, mirroring `set_discovery_generation`. The doc
+  never says who owns it. `regional_game_runner` shares exactly **one** across
+  all workers — per-worker brokers would each hand out the same seat.
+
+### Bugs found in review
+
+**1. Stale-generation claims reached the employer (codex, High).**
+`publish_pools` invalidated pending claims when a pool was *removed*, but not
+when its facts *changed*. A claim chosen at generation `G1` therefore survived
+into `G2` and — because employer validation is capacity-only — was accepted
+against facts that no longer held. The worst case is a citizen hired into a
+pool whose `network` had moved out of the home's reachable component.
+
+Fixed directory-side, where the generation authority lives: a *changed* pool
+now drops its pending claims exactly as a removed one does. This is the direct
+contrapositive of the plan's own sentence, *"Pending claims against untouched
+pools stay valid"* — so a **touched** pool must not keep them. With the
+directory guaranteeing every claim's generation is current, the capacity-only
+employer check becomes sound.
+
+**2. The employer resurrected contracted seats on republish (self-review).**
+`published_job_pools` (P2) derived `open_count` from spare slots, which are net
+of *local* assignment but know nothing about the `EmploymentContract`s P3
+introduced. The plan says the directory's cached decrement lasts only *"until
+next employer publish"* — so the republished count is the authoritative
+replacement, and it was re-advertising seats already contracted out.
+
+Fixed: `open_count = spare − contracted`, and a fully contracted workplace
+publishes no row at all. This makes the two counts converge:
+
+```text
+ after an accept:
+   directory cached open_count = published − 1     (apply_claim_decisions)
+   employer's next published    = spare − contracted
+                                = same number
+   ⇒ the republish is UNCHANGED: no generation bump,
+     and therefore no churn of other pools' valid pending claims.
+```
+
+Both bugs have mutation-tested regression tests (reverted the fix, confirmed
+the test fails, restored).
+
+### Tests added
+
+`employment_directory.rs` (+11):
+
+- `submit_claims_rejects_a_stale_generation` — review check *"submit_claims checks pool.generation"*.
+- `submit_claims_never_exceeds_open_count` — behavior forbidden *"no workplace pool accepts more than open_count"*.
+- `submit_claims_refuses_a_citizen_who_already_has_a_pending_or_accepted_job` — review check *"checks accepted_by_citizen and pending_by_citizen"*; behavior forbidden *"no citizen can hold two pending or accepted cross-region jobs"*.
+- `apply_claim_decisions_clears_every_pending_index_and_wakes_the_home` — review checks *"removes claims from every pending index"* and *"returns home regions to wake for accepted and rejected claims"*.
+- `apply_claim_decisions_from_one_employer_cannot_decide_another_employers_claim` — the ownership guard.
+- `take_pending_claims_for_employer_does_not_drain_the_claims` — a second wake mid-validation must not lose a claim.
+- `normalize_claim_requests_is_deterministic_and_dedups_exact_duplicates`, `normalize_claim_decisions_sorts_by_claim_id_and_dedups` — determinism.
+- `choose_best_pool_only_offers_pools_reachable_from_a_home_network` — an unreachable pool is never chosen, however good its salary.
+- `republishing_a_pool_with_changed_facts_invalidates_its_pending_claims` — review bug 1.
+- `an_unchanged_pool_keeps_its_pending_claims_across_a_republish` — the other half: an unrelated pool's change must not drop this pool's claims.
+
+`regions/mod.rs` (+4):
+
+- `unemployed_citizens_lists_only_jobless_citizens_in_entity_order`
+- `job_pool_still_has_open_capacity_counts_down_as_contracts_are_created`
+- `accept_claim_records_the_claims_generation_on_the_contract`
+- `published_job_pools_subtracts_seats_already_contracted_to_remote_citizens` — review bug 2.
+
+`runtime/mod.rs`, new `employment_claim_flow_tests` module (+9):
+
+- `a_claim_round_trip_contracts_the_seat_and_wakes_the_home`
+- `the_wake_event_carries_no_claim_payload_and_pulls_work_from_the_directory` — review check *"EmploymentDirectoryReady carries no claim payload; regions pull work from the directory"*.
+- `a_second_wake_is_a_cheap_no_op_once_the_claims_are_decided`
+- `a_wake_without_an_installed_directory_is_a_no_op`
+- `an_employer_never_contracts_more_seats_than_it_has`
+- `choose_best_pool_ignores_a_pool_in_another_component`
+- `an_employer_never_validates_a_claim_chosen_from_stale_pool_facts` — review bug 1, end-to-end.
+- `republishing_after_an_accept_is_a_no_op_so_surviving_claims_are_not_churned` — the convergence property above.
+- `a_fully_contracted_workplace_publishes_no_pool_but_keeps_its_accepted_workers`
+
+### Existing tests modified
+
+None.
+
+### Risks remaining
+
+- **Orphan contract on a dropped decision.** `employer_validate_claims` creates
+  the contract *before* `apply_claim_decisions` confirms the claim still
+  exists; if the claim had vanished, the decision is skipped but the contract
+  remains. Unreachable today (a region's publish and validation both run on its
+  own worker thread, so they cannot interleave), but it is an **unstated
+  invariant** doing load-bearing work. If P4+ ever moves validation off that
+  thread, this becomes a real orphan.
+- **Local-churn starvation.** A pending claim is dropped whenever its pool's
+  facts change. If an employer's *local* job assignment churns every pass, its
+  `open_count` moves every pass, and remote claims could be invalidated
+  repeatedly. Stable facts have no such path (confirmed in review); the
+  post-accept republish is provably a no-op. Only local churn can trigger it.
+- **All unemployed citizens claim the same pool.** `choose_best_pool` returns
+  one pool per home region, so a batch of N citizens all target it and
+  `submit_claims` admits only `open_count` of them. The rest retry next pass,
+  even if a *second* reachable pool had free seats. This is the doc's own
+  structure (`choose_best_pool(&snapshot, citizen)` ignores what other citizens
+  picked); improving it is job-quality matching, an explicit non-goal.
+- **Contracts are not serialized.** `RegionState` is not `Serialize`, so a
+  loaded region starts with none. P6 makes them durable.
+- **`pending_count as u16` / `contracted as u16`** truncate above 65535.
+  Matches the doc; unreachable in practice.
+
+### Assumptions
+
+- Buildings do not relocate across regions, so a workplace `Entity`'s birth
+  region is its owning region for the pool's lifetime. (Citizens relocate;
+  workplaces do not.)
+- `network_capacities` preserves `discover_road_networks`' ascending id order,
+  so "a bridge workplace publishes under its lowest-id network" is
+  deterministic.
+- Every worker in a city shares one `EmploymentDirectory`. Enforced in
+  `regional_game_runner`; the `#[cfg(test)]` `RegionWorker` constructors
+  default a private one, which is fine for single-worker tests but would be
+  wrong for a multi-worker fixture that exercised employment.
+
+### Commands run
+
+```text
+ cargo fmt --check                        → clean
+ cargo clippy -- -D warnings              → error set byte-identical to the
+                                             pre-patch branch (git stash + diff
+                                             of sorted errors); zero new findings
+ cargo test --lib employment -q           → 34 passed
+ cargo test -q                            → 363 lib tests passed, 0 failed
+                                             (357 before this patch)
+ codex exec resume small_city             → 3 rounds. Round 1: one High
+                                             (stale generation). Round 2 and 3:
+                                             "No findings."
+```
+
+### Diagram — the P3 round trip
+
+```text
+ HOME REGION A                DIRECTORY (owns no ECS)            EMPLOYER REGION B
+ ─────────────                ──────────────────────             ─────────────────
+ unemployed_citizens()
+ network_border_links()
+        │
+        │ snapshot()  ── Arc clone, no lock held ──►
+        │                open_pools_by_network
+        │                active_citizens_by_home_region
+        ▼
+ choose_best_pool(discovery)
+   reachable = same component as a home border network
+   pick lowest (region, workplace)
+        │
+        │ submit_claims([(citizen, workplace, generation)])
+        └──────────────────────►  reserve pool seat  (pending_by_workplace)
+                                  reserve citizen    (pending_by_citizen)
+                                  reject if: stale generation
+                                             pending_count >= open_count
+                                             citizen already pending/accepted
+                                          │
+                                          │ Vec<RegionId> = employers to wake
+                                          ▼
+                                  OutboundMessage::EmploymentDirectoryReady
+                                          │ (barrier, resource_rank 4,
+                                          │  payload-free)
+                                          ▼
+                                                        RegionEvent::
+                                                        EmploymentDirectoryReady
+                                                                │
+                              ◄── take_pending_claims_for_employer ──┘
+                                  (reads; does NOT drain)
+                                                                │
+                                                job_pool_still_has_open_capacity
+                                                  spare − contracted > 0 ?
+                                                                │
+                                                  accept_claim_and_create_assignment
+                                                    contracts_by_workplace[W][A7]
+                                                    ⇒ EMPLOYER TRUTH
+                                                                │
+                              ◄── apply_claim_decisions(decisions) ──┘
+                                  guard: workplace.region() == employer
+                                  clear all 4 pending indexes
+                                  accepted → open_count -= 1
+                                             accepted_by_citizen (read cache)
+                                          │
+                                          │ Vec<RegionId> = homes to wake
+                                          ▼
+                                  EmploymentDirectoryReady → home
+                                  (accepted AND rejected: a rejection is what
+                                   releases the citizen's pending guard)
+
+ P4 is what makes the home's wake do something: apply the assignment.
+ In P3 the home's wake is a no-op, and the tick never starts any of this.
+```
+
+### Diagram — review bug 1: the stale-generation window
+
+```text
+ BEFORE                                    AFTER
+
+ publish W @ G1                            publish W @ G1
+   home reads W @ G1                         home reads W @ G1
+   submit claim(W, G1)   ─┐                  submit claim(W, G1)   ─┐
+                          │ pending           pending               │
+ employer republishes W    │                employer republishes W  │
+   facts changed → G2      │                  facts changed → G2    │
+   pool row updated        │                  pool row updated      │
+   ✗ claim still pending  ─┘                  ✓ invalidate_pending_claims_for_pool
+                          │                     claim dropped, citizen un-pended
+ employer validates       │                                        │
+   capacity-only check ✓  │                employer validates      │
+   ⇒ ACCEPTS a claim      │                  batch is empty        │
+     chosen from G1 facts │                  ⇒ contracts nobody    │
+     (e.g. a network that │                                        │
+      no longer reaches A)│                home retries next pass against G2
 ```
