@@ -1,6 +1,8 @@
 # Directory employment ledger — stable cross-region jobs without daily wipes
 
-Status: **proposal**. This is an alternative to pushing
+Status: **proposal, P1 implemented** (data model only — see "P1,
+implemented" at the end of this doc; P2-P7 still plan-only). This is an
+alternative to pushing
 [20260706-per-producer-job-staleness.md](20260706-per-producer-job-staleness.md)
 further. It targets more precise citizen behavior: jobs should be
 stable assignments, not daily batch allocations that can briefly fire and
@@ -1494,3 +1496,162 @@ model, while this plan replaces the cross-region job authority model.
   models through the existing facade boundary.
 - Do not solve job quality/preference matching yet. First make cross-region
   employment stable and correct; ranking can improve later.
+
+## P1, implemented (2026-07-09)
+
+Landed the data model named in "P1: Data model only" above, verbatim to
+the pseudocode in this doc — no invented fields, no invented methods, no
+type renamed. Nothing outside the new module is touched; the existing job
+path is unaware these types exist.
+
+### Status
+
+**Implemented, compile-only.** Matches P1's own bar exactly: types exist
+and hold the shapes/derives their *later* pseudocode (P2-P7) requires to
+compile against them, but nothing constructs or reads them from the
+existing job path yet.
+
+### Scope
+
+One new file, one one-line registration edit. Nothing else.
+
+```text
+ src/core/regions/employment_directory.rs   (new)
+ src/core/regions/mod.rs                    (+ `pub mod employment_directory;`)
+```
+
+### What changed
+
+| type | matches |
+|------|---------|
+| `JobPool` | "## The model" — same 6 fields; `Debug, Clone, Copy`, deliberately no `PartialEq` (see below) |
+| `CitizenRef` | exact derive line as given in the doc |
+| `JobClaimId` | newtype, same shape as `RegionId`/`UiRequestId` elsewhere in this codebase (not shown as a standalone snippet in the doc, but named in P1's scope and required by every `JobClaim`/pending-index usage) |
+| `JobClaim` | "## The model" — same 4 fields |
+| `JobClaimDecision` | "## The model" — `Accepted`/`Rejected` variants, same payload |
+| `EmploymentLeaseRef` | "## The model" — same 2 fields |
+| `JobLoss` / `JobLossReason` | "## The model" — required by `EmploymentBrokerState.losses_by_home`, which P1's scope names directly ("EmploymentDirectory broker/snapshot storage shape") |
+| `EmploymentContract` | "Stable Job Pool Identity" section — same 2 fields |
+| `EmployerState` | "Stable Job Pool Identity" section — same 2 fields, not yet embedded in `RegionState` |
+| `EmploymentBrokerState` | "## Directory storage" — same 12 fields, private (no `pub`, matching the doc) |
+| `EmploymentSnapshot` | "## Directory storage" — same 5 fields |
+| `EmploymentDirectory` | "## Directory storage" — `Mutex<EmploymentBrokerState>` + `RwLock<Arc<EmploymentSnapshot>>`, matching the doc's locking split |
+| `same_pool_facts` | "## Publishing Pools" — copied verbatim; this is the one piece of *logic* P1 carries, because P1's own review checks name it explicitly ("`same_pool_facts` exists or equivalent comparison ignores generation") |
+
+**Not included** (explicitly out of scope per P1's "Behavior forbidden"
+and confirmed by re-reading which section each later snippet lives under):
+`publish_pools`, `submit_claims`, `apply_claim_decisions`,
+`take_pending_claims_for_employer`, `snapshot()`, `rebuild_snapshot_locked`,
+the three `group_*` snapshot helpers, `diff_pools_for_employer`, every
+`normalize_*` helper (their bodies are never given in the doc — writing
+them now would mean inventing behavior the doc doesn't specify), the
+release/loss/rebuild methods, `RegionEvent::EmploymentDirectoryReady`, and
+every free `fn employer_*`/`fn home_*` function. All of that is P2-P7.
+`EmployerState` is defined but not wired onto `RegionState`.
+
+### Deviations from the doc, and why
+
+None in shape. Two additions beyond the literal snippets, both structural
+rather than behavioral:
+
+- **`#[allow(dead_code)]` on `EmploymentBrokerState` and
+  `EmploymentDirectory`**, each with a `// P1: ...` comment naming the
+  patch that starts reading the field. Required because P1 is deliberately
+  unwired — under plain `cargo clippy -- -D warnings` (no `--all-targets`),
+  private fields never read outside `#[cfg(test)]` are flagged. Matches
+  existing precedent in this codebase for the same situation
+  (`src/core/systems/schedule.rs:79`, `road_network_analysis.rs:420`, both
+  `#[allow(dead_code)] // P1-of-X; patch Y wires this.`).
+- **Deliberately no `PartialEq`/`Eq` derive on `JobPool`.** The doc warns
+  in prose ("`generation` is directory-owned metadata... do not compare
+  the whole `JobPool`") but the struct shown in "## The model" doesn't
+  show any derive line at all, so there's no derive attribute to omit
+  literally — the doc simply never shows one. Reading the intent rather
+  than a literal absence: giving `JobPool` a derived `PartialEq` would
+  make `existing_pool == incoming_pool` compile and silently fold
+  `generation` into the comparison, which is exactly the bug the doc's
+  own prose warns against. Not deriving it turns that warning into a
+  compile error if anyone tries it later, rather than relying on every
+  future author remembering the comment. `same_pool_facts` is the
+  sanctioned comparison.
+
+### Tests added
+
+Five, all in `src/core/regions/employment_directory.rs::tests`, all
+compile-only/type-shape checks — P1 has no behavior to exercise yet:
+
+- `same_pool_facts_ignores_generation` — direct check of the P1 review
+  requirement.
+- `same_pool_facts_catches_a_real_change` — same requirement, negative
+  case (`open_count`, `salary`).
+- `employment_directory_default_is_empty` — `EmploymentDirectory::default()`
+  produces an empty broker and an empty, generation-0 snapshot.
+- `citizen_ref_ordering_is_deterministic` — `CitizenRef` sorts by
+  `(region, citizen)` in a `BTreeSet`, confirming the doc's "no HashMap
+  iteration order" requirement holds for this key type.
+- `job_claim_decision_and_lease_types_compile_and_hold_expected_fields` —
+  constructs one of each remaining type (`JobClaimDecision`,
+  `EmploymentLeaseRef`, `JobLoss`, `EmploymentContract`, `EmployerState`)
+  and checks field plumbing, since P1's job is exactly "these types exist
+  and hold together" and nothing else exercises them yet.
+
+### Existing tests modified
+
+None.
+
+### Risks remaining
+
+- None functional — no behavior shipped. The only carried-forward risk is
+  documentation drift: if P2+ changes a field shape, this file and its
+  tests need updating in lockstep, same as any staged data-model patch.
+- The `#[allow(dead_code)]` annotations are a marker, not a guarantee —
+  nothing stops a future patch from wiring in only *some* of the fields
+  and leaving others permanently dead. Each later patch's own review
+  checks (already written into this doc) are what catches that, not this
+  patch.
+
+### Assumptions
+
+- `WorkplaceAssignment`, `Entity`, `RegionId`, `RegionRoadNetworkId` are
+  reused as-is per "Reuse existing types where they already match the
+  meaning" — none were modified.
+- `EmployerState` is defined as its own standalone struct, matching the
+  doc's literal `pub struct EmployerState { ... }` snippet, even though
+  the doc's prose says "in this plan, 'employer' means the workplace-owning
+  region state" (i.e. it will likely be embedded into `RegionState` once
+  P2 wires it in). P1 does not decide that embedding — it only makes the
+  type exist, per "no runtime use by the existing job path yet."
+
+### Commands run
+
+```text
+ cargo build --lib                              → clean (only pre-existing
+                                                    unrelated travel.rs warnings)
+ cargo fmt
+ cargo clippy -- -D warnings                     → 22 pre-existing errors,
+                                                    confirmed via git stash
+                                                    to predate this patch;
+                                                    none reference the new file
+ cargo test --lib employment_directory -q        → 5 passed
+ cargo test -q                                   → 330 passed, 0 failed
+                                                    (325 lib tests before
+                                                    this patch, +5 new)
+```
+
+### Diagram — what P1 actually adds
+
+```text
+ BEFORE P1                          AFTER P1
+
+ src/core/regions/                  src/core/regions/
+   directory.rs   (RegionDirectory,   directory.rs        (unchanged)
+   mod.rs          jobs/power/goods   employment_directory.rs  <- NEW,
+                   export/grant,                               inert
+                   unchanged)
+                                      mod.rs   (+ pub mod employment_directory;)
+
+ existing job path: unaware new types exist, before AND after
+   home_region_daily_jobs / release_and_request_job / etc.
+     — none of it references employment_directory.rs
+     — same behavior, same tests, same daily wipe/gate as before this patch
+```

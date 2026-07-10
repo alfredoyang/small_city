@@ -56,6 +56,7 @@ use crate::interface::view::{
 use serde::{Deserialize, Serialize};
 
 pub mod directory;
+pub mod employment_directory;
 pub mod handle;
 pub mod runtime;
 pub mod threaded;
