@@ -1,7 +1,8 @@
 # Directory employment ledger — stable cross-region jobs without daily wipes
 
-Status: **proposal, P1 implemented** (data model only — see "P1,
-implemented" at the end of this doc; P2-P7 still plan-only). This is an
+Status: **proposal, P1 + P2 implemented** (data model, and employer pool
+publishing — see "P1, implemented" and "P2, implemented" at the end of
+this doc; P3-P7 still plan-only). This is an
 alternative to pushing
 [20260706-per-producer-job-staleness.md](20260706-per-producer-job-staleness.md)
 further. It targets more precise citizen behavior: jobs should be
@@ -1654,4 +1655,227 @@ None.
    home_region_daily_jobs / release_and_request_job / etc.
      — none of it references employment_directory.rs
      — same behavior, same tests, same daily wipe/gate as before this patch
+```
+
+## P2, implemented (2026-07-10)
+
+Employer pool publishing. The directory can now accept an employer's
+republished `JobPool` rows, diff them per-pool, and expose the claimable
+result through `EmploymentSnapshot`. Still not wired into any tick: nothing
+calls `published_job_pools` yet, and the old request/grant job path is
+completely untouched.
+
+### Status
+
+**Implemented, still unwired.** All P2 machinery exists and is tested, but
+`RegionState::published_job_pools` carries `#[allow(dead_code)]` because
+P3 is the patch that starts calling it. No daily-tick behavior changed, no
+save-format change, no UI change.
+
+### Scope
+
+| file | why |
+|------|-----|
+| `src/core/regions/employment_directory.rs` | `publish_pools`, `diff_pools_for_employer`, `normalize_pools`, `mark_pool_missing_for_validation`, `snapshot`, `rebuild_snapshot_locked`, the three `group_*` helpers, `PoolDelta` |
+| `src/core/regions/mod.rs` | `RegionState::published_job_pools` (derives `JobPool` rows from the region's own effective workplace slots) |
+
+Diff: 2 files, +723 / -6.
+
+### What changed
+
+| item | comes from |
+|------|-----------|
+| `publish_pools` | "Publishing Pools" — transcribed, including the removed/added/changed ordering and the `global_generation + 1` stamp |
+| `diff_pools_for_employer` | "Publishing Pools" — the doc gives only the `match` arm; the `added`/`changed`/`removed`/`unchanged` split and ownership filter are derived from its prose |
+| `same_pool_facts` | already landed in P1; now actually used |
+| `normalize_pools` | never bodied in the doc; modeled on the established `normalize_links`/`normalize_hints` pattern in `directory.rs` (sort + dedup by identity) |
+| `mark_pool_missing_for_validation` | "Loss And Invalidation" — transcribed verbatim, including the `pending_by_employer` cleanup |
+| `snapshot` / `rebuild_snapshot_locked` | "Directory storage" — transcribed |
+| `group_active_citizens_by_home` | "Directory storage" — transcribed |
+| `group_accepted_by_home` / `group_pending_claims_by_employer` | never bodied in the doc; mechanical grouping, required for `rebuild_snapshot_locked` to compile as written |
+| `RegionState::published_job_pools` | P2 scope line "employer regions compute published JobPool rows from current derived jobs"; reads the same `spare_job_slots_on_network` the old export path already uses |
+
+**Not included** (P3+): `submit_claims`, `apply_claim_decisions`,
+`take_pending_claims_for_employer`, `acknowledge_home_applied`, the
+release/loss/rebuild methods, `RegionEvent::EmploymentDirectoryReady`, and
+every `employer_*` / `home_*` free function. `EmployerState` remains
+defined-but-unembedded.
+
+### Deviations from the doc, and why
+
+- **`*pool` instead of `pool.clone()`** in `rebuild_snapshot_locked`.
+  `JobPool` is `Copy` (P1), so clippy's `clone_on_copy` is a hard error
+  under this project's required `cargo clippy -- -D warnings` gate. The
+  doc's pseudocode predates that constraint.
+- **Explicit `BTreeMap<RegionId, BTreeSet<Entity>>` annotation** in
+  `group_active_citizens_by_home`. The doc writes `BTreeMap::new()`, which
+  does not type-check: `.or_default()` needs the value type pinned first.
+- **Ownership filter in `diff_pools_for_employer`** (see "Bug found in
+  review" below). The doc's pseudocode passes `employer` into the function
+  but its `match` snippet never uses it. Filtering incoming rows to that
+  employer is what makes the doc's own rule — *"the directory updates only
+  that employer's pools"* — actually hold.
+- **`published_job_pools` publishes a bridge workplace once**, under its
+  lowest-id network. A workplace adjacent to two disconnected road networks
+  appears in `spare_job_slots_on_network` for both, but `JobPool` names
+  exactly one `network`; listing it twice would let two components each see
+  the same seats as independently claimable. The doc never addresses this
+  case. (`network_capacities` preserves `discover_road_networks`' ascending
+  id order, so "lowest-id" is deterministic.)
+
+### Bug found in review
+
+Codex review (session `small_city`) caught a real correctness bug across
+two rounds, both in `diff_pools_for_employer`:
+
+1. **Round 1** — incoming pools were classified as added/changed with no
+   check that the employer owns them. `publish_pools` is a public API, so
+   employer A could add or overwrite a row owned by employer B just by
+   naming B's workplace entity. (The *removal* pass was already scoped
+   correctly, which is what made the asymmetry visible: `employer` was used
+   in one loop and ignored in the other.)
+2. **Round 2** — the round-1 fix filtered on `pool.region == employer`, but
+   `pool.region` is a **self-declared field**. The real ownership authority
+   is `workplace.region()` — the birth region packed into the `Entity` id,
+   and the same authority `mark_pool_missing_for_validation` already uses to
+   locate an employer. A could still spoof `region: A` while naming B's
+   workplace and overwrite `pools_by_workplace[B_workplace]`.
+
+Final guard requires **both** `pool.region == employer` **and**
+`pool.workplace.region() == employer`, and the removal pass now scopes on
+`existing.workplace.region()` too. Both failure modes have a regression
+test, and both were confirmed to fail against the pre-fix code.
+
+### Tests added
+
+`src/core/regions/employment_directory.rs` (+7, 12 total in module):
+
+- `publish_pools_bumps_generation_only_for_changed_pools_leaves_unchanged_pools_alone`
+  — P2 review check *"unchanged pools keep their existing generation"*.
+- `publish_pools_returns_false_when_republish_is_identical` — the
+  idempotence fast-path actually fires.
+- `publish_pools_removed_pool_drops_from_snapshot_and_clears_its_pending_indexes`
+  — P2 review check *"mark_pool_missing_for_validation clears all pending
+  indexes, including pending_by_employer"*.
+- `rebuild_snapshot_subtracts_pending_capacity_and_hides_fully_pending_pools`
+  — snapshot subtracts pending seats; a fully-pending pool disappears.
+- `publish_pools_from_one_employer_cannot_touch_another_employers_pools`
+  — the review bug above: A cannot change/add/remove B's row, nor overwrite
+  it via a spoofed `pool.region`.
+- `publish_pools_removing_a_pool_does_not_clear_accepted_employment`
+  — P2 behavior-forbidden *"do not clear accepted employment when a pool
+  disappears"*.
+- `employment_directory_never_reads_private_world_storage` — P2 review
+  check *"snapshot rebuild does not read private World storage"*. Source-scan
+  contract test over the production half of the file; needles built with
+  `.concat()` so the file never contains the literals it forbids.
+
+`src/core/regions/mod.rs` (+2):
+
+- `published_job_pools_reports_open_count_and_salary_for_one_effective_workplace`
+- `published_job_pools_lists_a_bridge_workplace_once_not_once_per_network`
+
+Four of these were mutation-tested (reverted the fix, confirmed the test
+fails, restored).
+
+### Existing tests modified
+
+None.
+
+### Risks remaining
+
+- `pending_count as u16` in `rebuild_snapshot_locked` truncates above 65535
+  pending claims on one workplace. Matches the doc's pseudocode; unreachable
+  in practice since `open_count` is itself `u16` and P3's `submit_claims`
+  caps pending at `open_count`. Flagged rather than "fixed" so as not to
+  deviate.
+- `published_job_pools` derives `open_count` by counting repeated entries in
+  `spare_job_slots_on_network`, i.e. *remaining* (unassigned) local slots —
+  not total capacity. That is the correct meaning for "claimable by a remote
+  citizen," but it means a pool's `open_count` moves whenever local job
+  assignment moves, and every such move is a `changed` pool that bumps a
+  generation. Whether that churn matters only becomes visible in P3, when
+  pending claims start being invalidated by generation mismatch.
+- `EmployerState` is still not embedded in `RegionState`; P2 does not decide
+  where it lives.
+
+### Assumptions
+
+- `pool.region` and `pool.workplace.region()` agree for every legitimately
+  produced row. `published_job_pools` guarantees this (it sets
+  `region: self.id` and only ever names workplaces built in its own grid).
+  The directory no longer *trusts* it — it requires both to equal `employer`.
+- Buildings do not relocate across regions, so a workplace `Entity`'s birth
+  region is its owning region for the lifetime of the pool. (Citizens do
+  relocate; workplaces do not.)
+
+### Commands run
+
+```text
+ cargo fmt                                → clean
+ cargo clippy -- -D warnings              → error set byte-identical to the
+                                             pre-patch branch (verified by
+                                             `git stash` + `diff` of sorted
+                                             errors); zero new findings
+ cargo test --lib employment_directory -q → 12 passed
+ cargo test -q                            → 339 lib tests passed, 0 failed
+                                             (333 before this patch, +6 net)
+ codex exec resume small_city             → 3 rounds; 1 real bug across
+                                             rounds 1-2, "No findings" on
+                                             round 3
+```
+
+### Diagram — where P2 sits
+
+```text
+ EMPLOYER REGION (owns its World)            EMPLOYMENT DIRECTORY (owns no ECS)
+ ────────────────────────────────            ─────────────────────────────────
+ RegionState
+   spare_job_slots_on_network(N)
+        │  (already used by the OLD
+        │   export path — unchanged)
+        ▼
+   published_job_pools()          ── Vec<JobPool> ──►  publish_pools(employer, pools)
+     one row per workplace                                   │
+     open_count = spare seats                                │ filter: pool.region == employer
+     generation = 0 (directory stamps)                       │      && workplace.region() == employer
+     bridge workplace → lowest-id network only               ▼
+                                                       diff_pools_for_employer
+                                                         added / changed  → stamp new generation
+                                                         unchanged        → keep old generation
+                                                         removed          → drop row +
+                                                                            mark_pool_missing_for_validation
+                                                                            (pending claims only —
+                                                                             accepted employment survives)
+                                                              │
+                                                              ▼
+                                                       rebuild_snapshot_locked
+                                                         open_count -= pending_count
+                                                         zero-claimable pools omitted
+                                                              │
+                                                              ▼
+                                                       Arc<EmploymentSnapshot> swap
+                                                         open_pools_by_network
+```
+
+### Diagram — the bug review caught
+
+```text
+ BEFORE (round 1)                      publish_pools(employer = A, [row])
+   row { region: B, workplace: B_w } ──────► classified as added/changed
+                                              └► overwrote pools_by_workplace[B_w]   ✘
+
+ AFTER round-1 fix                     filter: row.region == A
+   row { region: B, workplace: B_w } ──────► filtered out                            ✔
+   row { region: A, workplace: B_w } ──────► PASSES the filter (region is
+                                              caller-supplied, i.e. spoofable)
+                                              └► still overwrote B's row            ✘
+
+ AFTER round-2 fix                     filter: row.region == A
+                                            && row.workplace.region() == A
+   row { region: A, workplace: B_w } ──────► B_w's Entity encodes birth region B
+                                              └► filtered out                        ✔
+
+   ownership authority = the region packed into the workplace Entity id,
+   never the caller-declared `region` field.
 ```

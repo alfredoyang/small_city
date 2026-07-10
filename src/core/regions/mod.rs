@@ -25,7 +25,7 @@
 //! region stores another region's generic exported-resource cache.
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::core::city_refs::CityCellRef;
 use crate::core::components::{
@@ -33,6 +33,7 @@ use crate::core::components::{
     WorkplaceAssignment,
 };
 use crate::core::entity::Entity;
+use crate::core::regions::employment_directory::JobPool;
 use crate::core::resources::CityStats;
 use crate::core::simulation::{
     TickJobPhase, TickPowerPhase, begin_tick_power_phase, begin_tick_power_phase_quiet,
@@ -1377,6 +1378,53 @@ impl RegionState {
         crate::core::systems::economy::salary_for_workplace(&self.world, slot).unwrap_or(0)
     }
 
+    /// Directory employment ledger plan, P2: this employer region's current
+    /// derived job pools, ready to publish. One `JobPool` row per workplace
+    /// with open local capacity, `open_count` aggregated from the same
+    /// effective-workplace slots the old export path already reads
+    /// (`spare_job_slots_on_network`) — mirrors that path into the new pool
+    /// shape, does not replace it. `generation` is left at `0`; the
+    /// directory stamps it on publish (`same_pool_facts` never compares it).
+    ///
+    /// A workplace adjacent to two disconnected networks (a bridge) is
+    /// published under its first (lowest-id) network only: `JobPool` names
+    /// exactly one network, so listing the same pool under two would let
+    /// both components see it as independently claimable.
+    #[allow(dead_code)] // P2: not wired into the tick loop yet (P3 starts calling this).
+    pub(crate) fn published_job_pools(&self) -> Vec<JobPool> {
+        let mut seen = HashSet::new();
+        let mut pools = Vec::new();
+
+        for capacity in self.world.cached_power_resolution().network_capacities {
+            let network = RegionRoadNetworkId {
+                region: self.id,
+                road_network: capacity.road_network,
+            };
+
+            let mut open_counts: BTreeMap<Entity, u16> = BTreeMap::new();
+            for slot in self.spare_job_slots_on_network(network) {
+                if seen.contains(&slot) {
+                    continue;
+                }
+                *open_counts.entry(slot).or_insert(0) += 1;
+            }
+
+            for (workplace, open_count) in open_counts {
+                seen.insert(workplace);
+                pools.push(JobPool {
+                    region: self.id,
+                    workplace,
+                    open_count,
+                    network,
+                    salary: self.workplace_salary(workplace),
+                    generation: 0,
+                });
+            }
+        }
+
+        pools
+    }
+
     pub(crate) fn workplace_position(&self, slot: Entity) -> Option<Position> {
         self.world.positions.get(&slot).copied()
     }
@@ -2030,6 +2078,56 @@ mod tests {
             .and_then(|cell| cell.powered);
         assert_eq!(powered, Some(true), "paused build is visible after ensure");
         assert_eq!(region.view().status.turn, 0, "no tick advanced time");
+    }
+
+    #[test]
+    fn published_job_pools_reports_open_count_and_salary_for_one_effective_workplace() {
+        let mut region = RegionState::new(RegionId(1), 4, 4);
+        assert!(region.build(0, 0, BuildingKind::PowerPlant).success);
+        assert!(region.build(0, 1, BuildingKind::Road).success);
+        assert!(region.build(1, 1, BuildingKind::Road).success);
+        assert!(region.build(1, 0, BuildingKind::Commercial).success);
+        region.ensure_derived_state();
+
+        let workplace = region.world.grid.get(1, 0).expect("commercial entity");
+        let pools = region.published_job_pools();
+
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].region, RegionId(1));
+        assert_eq!(pools[0].workplace, workplace);
+        assert_eq!(
+            pools[0].open_count, 2,
+            "level-1 Commercial capacity_for is 2"
+        );
+        assert_eq!(pools[0].salary, region.workplace_salary(workplace));
+        assert_eq!(
+            pools[0].generation, 0,
+            "directory stamps this on publish, not here"
+        );
+    }
+
+    #[test]
+    fn published_job_pools_lists_a_bridge_workplace_once_not_once_per_network() {
+        let mut region = RegionState::new(RegionId(1), 4, 4);
+        assert!(region.build(0, 0, BuildingKind::PowerPlant).success);
+        assert!(region.build(0, 1, BuildingKind::Road).success); // network A, powered
+        assert!(region.build(1, 2, BuildingKind::Road).success); // network B, disconnected from A
+        assert!(region.build(1, 1, BuildingKind::Commercial).success); // adjacent to both roads
+        region.ensure_derived_state();
+
+        let workplace = region.world.grid.get(1, 1).expect("commercial entity");
+        let pools = region.published_job_pools();
+
+        let rows_for_workplace: Vec<_> = pools
+            .iter()
+            .filter(|pool| pool.workplace == workplace)
+            .collect();
+        assert_eq!(
+            rows_for_workplace.len(),
+            1,
+            "a workplace touching two networks must publish exactly one pool row, not one per network"
+        );
+        assert_eq!(rows_for_workplace[0].open_count, 2);
     }
 
     #[test]
