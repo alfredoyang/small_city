@@ -15,7 +15,7 @@ use small_city::core::regions::{
 };
 use small_city::interface::events::{EconomyBreakdownView, GameEventView};
 use small_city::interface::input::BuildingKind;
-use small_city::interface::view::InspectDetailsView;
+use small_city::interface::view::{CitizenRelation, InspectDetailsView};
 use std::sync::Arc;
 
 #[test]
@@ -1202,6 +1202,75 @@ fn cross_region_job_export_employs_jobless_citizen() {
 }
 
 #[test]
+fn fired_remote_worker_finds_another_remote_job() {
+    let consumer = RegionId(80);
+    let first_producer = RegionId(81);
+    let second_producer = RegionId(82);
+    let mut worker = worker_with_region_states(
+        WorkerId(65),
+        vec![
+            job_seeker_region(consumer),
+            job_slot_producer_region(first_producer),
+            job_slot_producer_region(second_producer),
+        ],
+    );
+    worker.set_region_topology(vec![
+        neighbor(80, BorderEdge::East, 81),
+        neighbor(81, BorderEdge::East, 82),
+    ]);
+
+    for hour in 1..=(10 * 24) {
+        worker.push_event(consumer, tick(hour)).unwrap();
+        worker
+            .push_event(first_producer, tick(100_000 + hour))
+            .unwrap();
+        worker
+            .push_event(second_producer, tick(200_000 + hour))
+            .unwrap();
+        drain_worker(&mut worker);
+        if first_resident_job_region(&worker, consumer) == Some(first_producer) {
+            break;
+        }
+    }
+    assert_eq!(
+        first_resident_job_region(&worker, consumer),
+        Some(first_producer),
+        "the lower-id reachable producer should employ the first resident"
+    );
+
+    worker
+        .push_event(
+            first_producer,
+            RegionEvent::RunCommand {
+                request_id: UiRequestId(900_000),
+                command: RegionCommand::Bulldoze { x: 0, y: 1 },
+            },
+        )
+        .unwrap();
+    drain_worker(&mut worker);
+
+    for hour in (10 * 24 + 1)..=(20 * 24) {
+        worker.push_event(consumer, tick(hour)).unwrap();
+        worker
+            .push_event(first_producer, tick(100_000 + hour))
+            .unwrap();
+        worker
+            .push_event(second_producer, tick(200_000 + hour))
+            .unwrap();
+        drain_worker(&mut worker);
+        if first_resident_job_region(&worker, consumer) == Some(second_producer) {
+            break;
+        }
+    }
+
+    assert_eq!(
+        first_resident_job_region(&worker, consumer),
+        Some(second_producer),
+        "after losing producer A's job, the same resident should find producer B"
+    );
+}
+
+#[test]
 fn cross_region_job_export_is_visible_as_producer_workplace_tile() {
     let consumer = job_seeker_region(RegionId(60));
     let producer = job_slot_producer_region(RegionId(61));
@@ -1736,6 +1805,21 @@ fn imported_job_count(worker: &RegionWorker, region_id: RegionId) -> usize {
         .expect("region")
         .state()
         .imported_job_count()
+}
+
+fn first_resident_job_region(worker: &RegionWorker, region_id: RegionId) -> Option<RegionId> {
+    let resident = worker
+        .region(region_id)
+        .expect("consumer region")
+        .state()
+        .inspect(0, 0)
+        .roster
+        .into_iter()
+        .next()?;
+    match resident.relation {
+        CitizenRelation::WorksAt { cell, .. } => Some(cell.region),
+        CitizenRelation::Unemployed | CitizenRelation::LivesAt { .. } => None,
+    }
 }
 
 fn region_money(worker: &RegionWorker, region_id: RegionId) -> i32 {
