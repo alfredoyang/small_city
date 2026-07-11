@@ -160,12 +160,14 @@ pub struct Citizen {
     /// to the owning region. On disk it is just the bare entity (the packed u64 already
     /// carries its region), so no custom serde is needed.
     pub home: Entity,
-    /// Derived local-or-remote workplace assignment used by simulation and views.
+    /// Local-or-remote workplace assignment used by simulation and views.
     ///
-    /// This is rebuilt by the daily job phase. It is skipped on save for the same
-    /// reason as imported power/job state: assignments are derived from local
-    /// buildings, citizens, road components, and producer export allocations.
-    #[serde(default, skip)]
+    /// Durable home-side truth (P6). Under the employment ledger a cross-region
+    /// assignment is a stable lease, not a daily re-derivation, so it must survive
+    /// save/load; local assignments persist alongside it. `#[serde(default)]` (no
+    /// `skip`) migrates pre-P6 saves, which carry no field, to `None` — an
+    /// unemployed citizen that re-claims on the first daily employment phase.
+    #[serde(default)]
     pub workplace_assignment: Option<WorkplaceAssignment>,
     #[serde(default)]
     pub morale: Morale,

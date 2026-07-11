@@ -1452,7 +1452,7 @@ fn save_restart_drops_in_flight_goods_stock_without_double_counting() {
 }
 
 #[test]
-#[ignore = "P7-d: this restarts both workers from a mid-run save (day 7). The employment ledger (contracts/published pools/directory) is not yet persisted (P6), so both configs drop the cross-region assignment on load and re-handshake at sharding-dependent rates. Re-enable once P6 restores ledger state on load."]
+#[ignore = "P7/P6: asserts EXACT single-worker vs two-worker parity of every cell, including remote job_assignments, tick by tick. The ledger's async cross-region handshake converges at sharding-dependent ticks, so this diverges even with the mid-run save/load restart removed (verified) -- it is the cross-region job-admission relaxation in CLAUDE.md (employment may vary with worker_count), not a save/load durability gap. P6 makes the FULL load path durable (see save_load_rebuilds_cross_region_* which now pass). Re-enable only if rewritten to assert power/status parity + occupancy invariants rather than exact remote-assignment parity."]
 fn two_worker_barrier_matches_single_worker_for_power_and_jobs_script() {
     let consumer = RegionId(90);
     let producer = RegionId(91);

@@ -383,6 +383,14 @@ pub struct GoodsExportGrant {
 pub(crate) struct RegionStateSaveRecord {
     id: RegionId,
     world: World,
+    /// P6: durable employer-side truth — the contracts this region holds at its
+    /// own workplaces, as a flat `(workplace, holder, contract)` list. A flat list
+    /// (not the nested `contracts_by_workplace` map) because a `CitizenRef` map key
+    /// is not JSON-serializable. `#[serde(default)]` migrates pre-P6 saves (no
+    /// field) to an empty list: a loaded region with no contracts, reconciled on
+    /// load.
+    #[serde(default)]
+    employer_contracts: Vec<(Entity, CitizenRef, EmploymentContract)>,
 }
 
 #[derive(Debug)]
@@ -503,6 +511,16 @@ impl RegionState {
     /// current first; the worker does this before publishing summaries.
     pub fn ensure_derived_state(&mut self) {
         ensure_derived_state(&mut self.world, self.id);
+    }
+
+    /// P6: force the derived pass (which includes `assign_local_jobs`) to re-run
+    /// after a rebuild correction. A `release_contract`/`clear_employment` only
+    /// invalidates the jobs *cache*, not the derived-dirty flag, so a freed local
+    /// seat would otherwise be published to remote claimants before a local
+    /// unemployed citizen gets its normal first chance at it.
+    pub(crate) fn resettle_derived_state(&mut self) {
+        self.world.mark_derived_dirty();
+        self.ensure_derived_state();
     }
 
     pub(crate) fn is_road_topology_dirty(&self) -> bool {
@@ -1500,6 +1518,38 @@ impl RegionState {
         slots
     }
 
+    /// P6: this region's employer-side truth, flattened for the load-time
+    /// directory rebuild — every `(workplace, holder, contract)` it holds, in
+    /// deterministic `(workplace, citizen)` order (both maps are `BTreeMap`s).
+    pub(crate) fn employer_contracts(&self) -> Vec<(Entity, CitizenRef, EmploymentContract)> {
+        let mut contracts = Vec::new();
+        for (workplace, holders) in &self.employer_state.contracts_by_workplace {
+            for (citizen, contract) in holders {
+                contracts.push((*workplace, *citizen, *contract));
+            }
+        }
+        contracts
+    }
+
+    /// P6: this region's home-side truth for the load-time rebuild — its citizens'
+    /// applied **cross-region** assignments, in deterministic entity order. Local
+    /// assignments are deliberately excluded: they carry no `EmploymentContract`
+    /// and are not directory-coordinated, so the reconciliation (which clears an
+    /// assignment that has no matching contract) must never see them.
+    pub(crate) fn home_assignments(&self) -> Vec<(Entity, WorkplaceAssignment)> {
+        let mut assignments = self
+            .world
+            .citizens
+            .iter()
+            .filter_map(|(citizen, data)| {
+                let assignment = data.workplace_assignment?;
+                (assignment.workplace.region() != self.id).then_some((*citizen, assignment))
+            })
+            .collect::<Vec<_>>();
+        assignments.sort_by_key(|(citizen, _)| citizen.0);
+        assignments
+    }
+
     /// P3, employer side: does this region still have a free seat at
     /// `workplace` that it could contract out?
     ///
@@ -1891,13 +1941,36 @@ impl RegionState {
     }
 
     pub(crate) fn into_save_record(self) -> RegionStateSaveRecord {
+        let employer_contracts = self.employer_contracts();
         let mut world = self.world;
         scrub_transient_import_state_for_save(&mut world);
-        RegionStateSaveRecord { id: self.id, world }
+        RegionStateSaveRecord {
+            id: self.id,
+            world,
+            employer_contracts,
+        }
     }
 
     pub(crate) fn from_save_record(record: RegionStateSaveRecord) -> Self {
-        Self::from_world(record.id, record.world)
+        let mut contracts_by_workplace: BTreeMap<Entity, BTreeMap<CitizenRef, EmploymentContract>> =
+            BTreeMap::new();
+        for (workplace, citizen, contract) in record.employer_contracts {
+            // Drop any contract for a workplace this region does not own (a
+            // hand-edited/corrupt save): keeping it would leave stale employer
+            // truth that the rebuild filters out yet the region would re-save.
+            if workplace.region() != record.id {
+                continue;
+            }
+            contracts_by_workplace
+                .entry(workplace)
+                .or_default()
+                .insert(citizen, contract);
+        }
+        let employer_state = EmploymentEmployerState {
+            contracts_by_workplace,
+            ..EmploymentEmployerState::default()
+        };
+        Self::from_world_with_employer_state(record.id, record.world, employer_state)
     }
 
     pub(crate) fn from_legacy_world_bytes(
@@ -1908,25 +1981,39 @@ impl RegionState {
         Ok(Self::from_world(id, world))
     }
 
-    pub(crate) fn from_world(id: RegionId, mut world: World) -> Self {
+    pub(crate) fn from_world(id: RegionId, world: World) -> Self {
+        Self::from_world_with_employer_state(id, world, EmploymentEmployerState::default())
+    }
+
+    /// Load boundary shared by fresh-world and save-record construction.
+    ///
+    /// P6: employer contracts are restored *before* `refresh_derived_state_for_world`
+    /// derives local jobs, because `assign_local_jobs` reads the jobs registry's
+    /// retained reservation (P7-a). Sync the reservation from the restored
+    /// contracts first, or local matching would seat a local citizen into a slot
+    /// a remote contract already holds — double-booking the pool on load.
+    fn from_world_with_employer_state(
+        id: RegionId,
+        mut world: World,
+        employer_state: EmploymentEmployerState,
+    ) -> Self {
         world.rebuild_entity_records();
         // Stamp the owning region onto the world (and rebuild each citizen's `id`
         // from its map key) before derived state reads it. Homes need no stamping:
         // the `home` Entity already packs its birth region.
         world.set_region_id(id);
-        refresh_derived_state_for_world(&mut world, id);
+        let mut state = Self {
+            id,
+            world,
+            employer_state,
+        };
+        state.sync_job_reservations();
+        refresh_derived_state_for_world(&mut state.world, id);
         // Event-driven plan, P-1: force hints_dirty true on load (runtime state,
         // including this flag, is never serialized) so the first worker pass
         // after load republishes this region's availability hints.
-        world.mark_hints_dirty();
-
-        // P3: contracts are not serialized, so a loaded region starts with no
-        // employer-side employment. P6 makes this durable / reconciles it.
-        Self {
-            id,
-            world,
-            employer_state: EmploymentEmployerState::default(),
-        }
+        state.world.mark_hints_dirty();
+        state
     }
 
     fn pending_power_demands(&self) -> Vec<PendingPowerDemand> {
@@ -2108,9 +2195,8 @@ fn scrub_transient_import_state_for_save(world: &mut World) {
         // the same "derived state must be rebuilt" boundary.
         consumer.source = None;
     }
-    for citizen in world.citizens.values_mut() {
-        citizen.workplace_assignment = None;
-    }
+    // P6: `workplace_assignment` is durable home-side truth now, not derived
+    // state, so it is NOT scrubbed — it is persisted and reconciled on load.
 }
 
 fn border_links_for_cell(
@@ -2707,6 +2793,229 @@ mod tests {
             workplace,
             generation,
         }
+    }
+
+    #[test]
+    fn save_record_round_trip_preserves_employer_contracts() {
+        // P6: employer-side truth is durable. A contract survives
+        // into_save_record -> from_save_record, and its reserved seat is
+        // re-synced (from_world_with_employer_state) so it is still held out.
+        let (mut region, workplace) = employer_region_with_one_workplace();
+        region.accept_claim_and_create_assignment(&contract_claim(50, workplace, 1));
+        let before = region.employer_contracts();
+        assert_eq!(before.len(), 1, "one contract before save");
+
+        let restored = RegionState::from_save_record(region.into_save_record());
+
+        assert_eq!(
+            restored.employer_contracts(),
+            before,
+            "the employer contract survives save/load"
+        );
+        assert_eq!(
+            restored.contracted_workplace_tax_slots(),
+            vec![workplace],
+            "and its reserved seat is re-synced into the jobs registry"
+        );
+    }
+
+    #[test]
+    fn save_record_round_trip_preserves_a_remote_workplace_assignment() {
+        // P6: home-side truth is durable. Pre-P6 the scrub cleared every
+        // workplace_assignment on save; now a cross-region assignment survives.
+        let mut region = RegionState::new(RegionId(1), 3, 3);
+        assert!(region.build(0, 0, BuildingKind::Residential).success);
+        let home = region.world.grid.get(0, 0).expect("home entity");
+        crate::core::systems::citizens::spawn_for_home(&mut region.world, home, 1);
+        region.ensure_derived_state();
+        let citizen = *region.world.citizens.keys().next().expect("one citizen");
+
+        let remote_workplace = Entity::new(RegionId(9), 1);
+        let assignment = WorkplaceAssignment {
+            workplace: remote_workplace,
+            location: CityCellRef::local(RegionId(9), 1, 0),
+            salary: 5,
+        };
+        assert!(region.apply_workplace_assignment(citizen, assignment));
+
+        let restored = RegionState::from_save_record(region.into_save_record());
+
+        assert_eq!(
+            restored.home_assignments(),
+            vec![(citizen, assignment)],
+            "the remote assignment survives save/load instead of being scrubbed"
+        );
+    }
+
+    #[test]
+    fn rebuild_releases_a_lone_contract_and_frees_its_seat() {
+        // P6 codex Medium: a contract with no matching home assignment is a
+        // half-torn lease. The rebuild releases it from employer truth and, since
+        // its seat is no longer reserved, republishes that seat as open.
+        use crate::core::regions::employment_directory::rebuild_employment_broker_state;
+
+        let open_at = |employer: &RegionState, workplace: Entity| -> u16 {
+            employer
+                .published_job_pools()
+                .iter()
+                .find(|pool| pool.workplace == workplace)
+                .map_or(0, |pool| pool.open_count)
+        };
+
+        let (mut employer, workplace) = employer_region_with_one_workplace();
+        let open_before = open_at(&employer, workplace);
+        employer.accept_claim_and_create_assignment(&contract_claim(50, workplace, 1));
+        assert_eq!(employer.employer_contracts().len(), 1);
+        assert_eq!(
+            open_at(&employer, workplace),
+            open_before - 1,
+            "the contract reserves one seat, so one fewer is published open"
+        );
+
+        let _ = rebuild_employment_broker_state(std::slice::from_mut(&mut employer));
+
+        assert!(
+            employer.employer_contracts().is_empty(),
+            "the lone contract is released on rebuild"
+        );
+        assert_eq!(
+            open_at(&employer, workplace),
+            open_before,
+            "and its freed seat is published open again"
+        );
+    }
+
+    #[test]
+    fn rebuild_re_fills_a_freed_seat_with_a_local_seeker() {
+        // P6 codex Medium: releasing a lone contract must let a blocked LOCAL
+        // seeker take the freed seat DURING the rebuild (resettle_derived_state),
+        // not leave it advertised to remote regions until the first tick. Without
+        // the resettle the citizen would still be unemployed here.
+        use crate::core::regions::employment_directory::{
+            JobClaimId, rebuild_employment_broker_state,
+        };
+
+        let mut region = RegionState::new(RegionId(1), 4, 3);
+        assert!(region.build(0, 0, BuildingKind::Residential).success);
+        assert!(region.build(1, 0, BuildingKind::Commercial).success);
+        assert!(region.build(0, 1, BuildingKind::Road).success);
+        assert!(region.build(1, 1, BuildingKind::Road).success);
+        assert!(region.build(2, 1, BuildingKind::PowerPlant).success);
+        region.ensure_derived_state();
+        let workplace = region.world.grid.get(1, 0).expect("commercial");
+        assert!(
+            region
+                .published_job_pools()
+                .iter()
+                .any(|pool| pool.workplace == workplace),
+            "the commercial must be a powered, connected workplace with open seats"
+        );
+
+        // Reserve every seat with lone remote contracts (no home assignment).
+        let mut next = 0u32;
+        while region
+            .published_job_pools()
+            .iter()
+            .any(|pool| pool.workplace == workplace)
+        {
+            region.accept_claim_and_create_assignment(&JobClaim {
+                claim_id: JobClaimId(next as u64),
+                citizen: CitizenRef {
+                    region: RegionId(2),
+                    citizen: Entity::new(RegionId(2), next),
+                },
+                workplace,
+                generation: 1,
+            });
+            next += 1;
+            assert!(next < 100, "the workplace should saturate well before this");
+        }
+
+        // The local seeker is blocked while every seat is reserved.
+        let home = region.world.grid.get(0, 0).expect("home entity");
+        crate::core::systems::citizens::spawn_for_home(&mut region.world, home, 1);
+        region.resettle_derived_state();
+        let citizen = *region.world.citizens.keys().next().expect("one citizen");
+        assert!(
+            region.world.citizens[&citizen]
+                .workplace_assignment
+                .is_none(),
+            "the local seeker cannot work while every seat is reserved"
+        );
+
+        let _ = rebuild_employment_broker_state(std::slice::from_mut(&mut region));
+
+        assert_eq!(
+            region.world.citizens[&citizen]
+                .workplace_assignment
+                .map(|a| a.workplace),
+            Some(workplace),
+            "the freed seat goes to the local seeker during the rebuild, not to a remote"
+        );
+    }
+
+    #[test]
+    fn rebuild_clears_a_lone_remote_assignment() {
+        // P6 codex Medium: a cross-region home assignment with no matching
+        // employer contract is a half-torn lease from the home side. The rebuild
+        // marks the citizen unemployed so it re-claims on the first daily phase.
+        use crate::core::regions::employment_directory::rebuild_employment_broker_state;
+
+        let mut home = RegionState::new(RegionId(1), 3, 3);
+        assert!(home.build(0, 0, BuildingKind::Residential).success);
+        let home_building = home.world.grid.get(0, 0).expect("home entity");
+        crate::core::systems::citizens::spawn_for_home(&mut home.world, home_building, 1);
+        home.ensure_derived_state();
+        let citizen = *home.world.citizens.keys().next().expect("one citizen");
+        assert!(home.apply_workplace_assignment(
+            citizen,
+            WorkplaceAssignment {
+                workplace: Entity::new(RegionId(9), 1),
+                location: CityCellRef::local(RegionId(9), 1, 0),
+                salary: 5,
+            }
+        ));
+        assert_eq!(home.home_assignments().len(), 1);
+
+        let _ = rebuild_employment_broker_state(std::slice::from_mut(&mut home));
+
+        assert!(
+            home.home_assignments().is_empty(),
+            "the unbacked remote assignment is cleared -- the citizen re-claims later"
+        );
+    }
+
+    #[test]
+    fn rebuild_keeps_a_local_assignment_untouched() {
+        // P6 codex Medium: local jobs carry no contract and are not
+        // directory-coordinated, so the reconciliation must never clear them.
+        use crate::core::regions::employment_directory::rebuild_employment_broker_state;
+
+        let mut region = RegionState::new(RegionId(1), 3, 3);
+        assert!(region.build(0, 0, BuildingKind::Residential).success);
+        let home_building = region.world.grid.get(0, 0).expect("home entity");
+        crate::core::systems::citizens::spawn_for_home(&mut region.world, home_building, 1);
+        region.ensure_derived_state();
+        let citizen = *region.world.citizens.keys().next().expect("one citizen");
+        let local_workplace = Entity::new(RegionId(1), 42);
+        assert!(region.apply_workplace_assignment(
+            citizen,
+            WorkplaceAssignment {
+                workplace: local_workplace,
+                location: CityCellRef::local(RegionId(1), 1, 0),
+                salary: 4,
+            }
+        ));
+
+        let _ = rebuild_employment_broker_state(std::slice::from_mut(&mut region));
+
+        assert_eq!(
+            region.world.citizens[&citizen]
+                .workplace_assignment
+                .map(|a| a.workplace),
+            Some(local_workplace),
+            "a local assignment is never touched by the cross-region reconciliation"
+        );
     }
 
     #[test]

@@ -232,7 +232,6 @@ fn save_load_keeps_local_power_available_immediately() {
 }
 
 #[test]
-#[ignore = "P7-d: the employment ledger (contracts/published pools/directory) is not yet persisted (P6). After load the daily employment phase releases the un-restored contract. Re-enable once P6 restores ledger state on load."]
 fn save_load_rebuilds_cross_region_remote_jobs_after_daily_tick() {
     let path = save_path("regional-remote-job-rebuild");
     let game = RegionalGame::two_region_default(6, 3).unwrap();
@@ -275,7 +274,6 @@ fn save_load_rebuilds_cross_region_remote_jobs_after_daily_tick() {
 }
 
 #[test]
-#[ignore = "P7-d: the employment ledger (contracts/published pools/directory) is not yet persisted (P6). After load, the first daily employment phase releases the un-restored contract and cannot re-handshake within the test window, so the remote assignment is missing. Re-enable once P6 restores ledger state on load."]
 fn save_load_rebuilds_cross_region_travel_routes() {
     let path = save_path("regional-remote-travel-routes");
     let game = RegionalGame::two_region_default(6, 3).unwrap();

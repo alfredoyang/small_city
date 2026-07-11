@@ -11,7 +11,9 @@ use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionViewSnapshot, UiReply, UiRequestId,
 };
 use crate::core::regions::directory::RegionDirectory;
-use crate::core::regions::employment_directory::EmploymentDirectory;
+use crate::core::regions::employment_directory::{
+    EmploymentDirectory, rebuild_employment_broker_state,
+};
 use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::runtime::RegionRuntime;
 use crate::core::regions::threaded::{
@@ -151,7 +153,7 @@ impl RegionalGameRunner {
     }
 
     fn start_with_topology_and_optional_worker_assignments(
-        regions: Vec<RegionState>,
+        mut regions: Vec<RegionState>,
         topology: Vec<RegionNeighborLink>,
         worker_count: usize,
         region_worker_indexes: Option<Vec<usize>>,
@@ -167,7 +169,14 @@ impl RegionalGameRunner {
         // P3: one employment broker for the whole city, shared by every worker
         // — exactly like `directory`. Per-worker brokers would each hand out
         // the same workplace seat.
+        //
+        // P6: seed that broker from the regions' durable employment truth and
+        // reconcile any half-torn lease *before* the regions move into workers
+        // and their threads start — so the very first tick sees a consistent
+        // directory, never a partially rebuilt one. On a fresh city this is a
+        // no-op: no contracts, no assignments, an empty broker.
         let employment_directory = Arc::new(EmploymentDirectory::default());
+        employment_directory.replace_broker_state(rebuild_employment_broker_state(&mut regions));
         let mut workers = (0..worker_count)
             .map(|index| {
                 let worker_id = WorkerId(INITIAL_WORKER_ID.0 + index as u32);

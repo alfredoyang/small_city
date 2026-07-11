@@ -1,6 +1,6 @@
 # Directory employment ledger — stable cross-region jobs without daily wipes
 
-Status: **proposal, P1-P5 done; P7 done (P7-a, P7-b, P7-c, P7-d done)** (data model,
+Status: **proposal, P1-P5 done; P7 done (P7-a..P7-d); P6 done** (data model,
 employer pool publishing, the claim flow, home apply, release/loss, and the
 contract-seat reservation foundation — see the "P<n>, implemented" sections
 at the end of this doc. P3-P5 are *staged*: built and tested, but nothing
@@ -9,9 +9,9 @@ into P7-a..P7-d** (it is too large for one reviewable diff and flips the
 live allocator): P7-a retained reservations, P7-b connectivity
 fingerprint, P7-c discovery install + route invalidation, and P7-d the
 cutover (all done).
-**Remaining order is P6 → P8** — P6 (save/load durability) is deferred
-until after P7 activates the flow and removes the daily wipe; see the note
-at the P6 section head. This is an
+**Remaining: P8** (delete the inactive legacy `JobExport*` types/path). P6
+(save/load durability) ran after P7 as planned and is now done — see its
+"P6, implemented" section at the end of this doc. This is an
 alternative to pushing
 [20260706-per-producer-job-staleness.md](20260706-per-producer-job-staleness.md)
 further. It targets more precise citizen behavior: jobs should be
@@ -3660,4 +3660,159 @@ left dead-code (`#[allow(dead_code)]`) for P8 to delete.
         ▼
    request_release(C@W)  ->  wake employer  ->  employer frees the seat
         (no more reserved-and-taxed phantom seat)
+```
+
+## P6, implemented (2026-07-12)
+
+**Status:** implemented, live behavior. Cross-region employment now survives
+save/load: the home-side `WorkplaceAssignment` and the employer-side
+`EmploymentContract` maps are durable, and the shared `EmploymentDirectory` is
+rebuilt from that regional truth on load, before the first tick. Ran after P7
+(as the ordering note at the P6 section head requires). The two save/load
+integration tests it targeted are un-ignored and pass.
+
+### Scope — files changed and why
+
+- `src/core/components.rs` — `Citizen.workplace_assignment` un-skipped (kept
+  `#[serde(default)]`) so it persists; the doc comment now says it is durable
+  home-side truth, not derived state.
+- `src/core/regions/mod.rs` — `scrub_transient_import_state_for_save` no longer
+  clears `workplace_assignment`; `RegionStateSaveRecord` gains a flat
+  `employer_contracts` list; `into_save_record`/`from_save_record` persist and
+  restore it; `from_world_with_employer_state` (new shared load boundary) syncs
+  the reservation *before* deriving local jobs; accessors `employer_contracts()`
+  / `home_assignments()` (remote-only); `resettle_derived_state()` for the
+  rebuild's local re-fill.
+- `src/core/regions/employment_directory.rs` — `EmploymentDirectoryRebuild` +
+  `reconcile`, `rebuild_employment_broker_state(&mut [RegionState])`,
+  `EmploymentDirectory::replace_broker_state`; `accepted_by_workplace` reverse
+  index removed; `CitizenRef`/`EmploymentContract` gain serde (and
+  `EmploymentContract` gains `PartialEq/Eq` for tests).
+- `src/core/regional_game_runner.rs` — seeds the shared directory via
+  `replace_broker_state(rebuild_employment_broker_state(&mut regions))` in
+  `start_with_topology_...`, before workers/threads start.
+
+### What changed — mapping to the doc
+
+| Doc item | Implementation |
+| --- | --- |
+| "persist or reconstruct home applied `WorkplaceAssignment`" | un-skip the field; stop scrubbing it |
+| "persist employer `EmploymentContract` maps" | `RegionStateSaveRecord.employer_contracts` (flat `Vec`) |
+| `EmploymentDirectoryRebuild` + `publish_*` + reconcile | implemented; reconcile returns accepted cache **plus** the two correction lists |
+| `replace_broker_state` (atomic swap) | implemented verbatim |
+| "rebuild before first economy settlement" | seeded at runner construction, before threads |
+| "remove redundant `accepted_by_workplace`" | removed field + its two maintenance sites |
+| migration: old saves start unemployed | `#[serde(default)]` on both fields |
+
+Deliberately left out: nothing from P6's scope. P8 (delete legacy `JobExport*`)
+is unchanged and still pending.
+
+### Deviations from the doc, and why
+
+- **`rebuild_employment_directory(&mut [RegionRuntime])` → `rebuild_employment_broker_state(&mut [RegionState])`.** The doc's signature assumes synchronous
+  access to every runtime; this codebase runs runtimes behind threads. The
+  reconcile runs at load on the `Vec<RegionState>` *before* they move into
+  workers, and seeds the directory. (User-confirmed: "synchronously at load".)
+- **`reconcile_republished_truth` returns corrections, not just a broker state.**
+  The doc's body is unshown; its rules ("release employer contract" / "mark
+  citizen unemployed") are regional mutations. `reconcile` returns
+  `contracts_to_release` / `assignments_to_clear`, which the orchestrator applies
+  to the regions so employer contracts == home assignments exactly.
+- **Pools read *after* corrections, then a `resettle_derived_state` on corrected
+  regions.** A freed seat must be filled by a local seeker before it is published
+  to remote regions (codex Medium); release/clear only invalidate the jobs cache,
+  not the derived-dirty flag, so the rebuild forces the derived pass to re-run.
+- **`employer_contracts` persisted as a flat `Vec`, not the nested map.** A
+  `CitizenRef` map key is not JSON-serializable ("key must be a string").
+- **`home_assignments()` returns only cross-region assignments.** Local jobs
+  carry no contract and are not directory-coordinated; including them would make
+  the "assignment without contract → clear" rule wipe every local job on load.
+
+### Tests added
+
+- `reconcile_*` (4): matching lease → accepted cache; lone contract → release;
+  lone remote assignment → clear; workplace disagreement → both unmatched. (P6
+  Review checks, one-to-one.)
+- `replace_broker_state_drops_pending_claims_and_swaps_atomically` — pending
+  claims dropped on rebuild (Behavior allowed).
+- `save_record_round_trip_preserves_employer_contracts` /
+  `..._a_remote_workplace_assignment` — the two durable truths survive save/load.
+- `rebuild_releases_a_lone_contract_and_frees_its_seat`,
+  `rebuild_clears_a_lone_remote_assignment`,
+  `rebuild_keeps_a_local_assignment_untouched` — the correction paths' region
+  side effects.
+- `rebuild_re_fills_a_freed_seat_with_a_local_seeker` — proves the resettle
+  fix; verified it fails if `resettle_derived_state` is neutered.
+- Integration: `save_load_rebuilds_cross_region_remote_jobs_after_daily_tick`
+  and `..._travel_routes` un-ignored (now pass).
+
+### Existing tests modified
+
+- Removed `accepted_by_workplace` assertions from the P5 directory tests (the
+  reverse index is gone; the sibling `accepted_by_citizen` assertion beside each
+  already covers the same truth). Reordered nothing else.
+- `two_worker_barrier_matches_single_worker_for_power_and_jobs_script` **stays
+  `#[ignore]`** with an updated note: it fails even with the mid-run restart
+  removed (verified), so its exact single-vs-two-worker remote-assignment parity
+  is the cross-region job-admission relaxation in CLAUDE.md, not a save/load gap.
+
+### Risks remaining
+
+- Per-region `restart_region_from_save_record` restores regional truth but does
+  **not** run the whole-city directory rebuild (it has one region, not all). The
+  directory cache it leaves is still self-consistent for that region's own
+  citizens; a full cross-region reconcile only happens through `load_from_file`.
+- A hand-corrupted save with a genuinely contradictory contract/assignment is
+  reconciled (contract released / citizen unemployed), never trusted blindly.
+
+### Assumptions
+
+- Contracts are created only for a region's own workplaces (true: only
+  `accept_claim_and_create_assignment` makes them, always for a local workplace);
+  the foreign-workplace filters are defensive against edited saves.
+- A clean save has employer contracts == home assignments, so reconciliation is a
+  no-op on it and only mismatched/migrated saves trigger corrections.
+
+### Commands run
+
+```text
+ cargo fmt                                   → clean
+ cargo clippy -- -D warnings                 → 0 errors
+ cargo clippy --all-targets -- -D warnings   → 0 errors
+ cargo test -q                               → all binaries green; 3 ignored
+                                               (bridged P7-d, job_grant P8,
+                                               two_worker_barrier parity)
+ codex exec resume small_city (×3)           → "No findings. The P6 patch is
+                                               clean." (2 Mediums + 1 Low fixed
+                                               and re-verified)
+```
+
+### Diagram — save/load with durable employment + rebuild
+
+```text
+ SAVE (per region)                     LOAD (whole city, before tick 1)
+ ─────────────────                     ────────────────────────────────
+ Citizen.workplace_assignment  ─┐      from_save_record: restore contracts,
+   (durable, no longer scrubbed) │       sync reservation BEFORE assign_local_jobs
+ employer_state.contracts       ─┤                    │
+   (flat Vec in save record)     │                    ▼
+                                 │      rebuild_employment_broker_state(&mut regions):
+ directory: NOT saved  ──────────┘        gather contracts + remote assignments
+   (rebuilt from the two truths)          reconcile → accepted cache + corrections
+                                          apply corrections + resettle local jobs
+                                          read pools (net of surviving reservations)
+                                                       │
+                                                       ▼
+                                          replace_broker_state(fully-consistent)
+                                          → threads start; tick 1 sees stable jobs
+```
+
+### Diagram — reconciliation of the two durable truths
+
+```text
+ employer contract  ∧  matching home assignment   →  accepted read cache (lease)
+ employer contract  ∧  no / wrong home assignment  →  release contract   (correction)
+ remote assignment  ∧  no matching contract        →  mark unemployed    (correction)
+ pending claim (directory-only)                     →  dropped, re-claimed later
+ local assignment (no contract, not cross-region)   →  untouched
 ```

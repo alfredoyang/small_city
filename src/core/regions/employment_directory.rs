@@ -19,10 +19,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 
+use serde::{Deserialize, Serialize};
+
 use crate::core::components::WorkplaceAssignment;
 use crate::core::entity::Entity;
 use crate::core::regions::directory::CrossRegionDiscovery;
-use crate::core::regions::{RegionId, RegionRoadNetworkId};
+use crate::core::regions::{RegionId, RegionRoadNetworkId, RegionState};
 
 #[derive(Debug, Clone, Copy)]
 /// One employer-published workplace pool, as the directory sees it.
@@ -47,7 +49,7 @@ pub struct JobPool {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 /// A citizen, named by its home region and its home-local entity id.
 ///
 /// The directory coordinates citizens across regions, so a bare `Entity`
@@ -115,7 +117,7 @@ pub struct JobLoss {
     pub reason: JobLossReason,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// The employer's own record of one accepted seat. `accepted_generation` is
 /// the pool generation in effect when the contract was created — kept for
 /// the employer's own bookkeeping, not compared by the directory.
@@ -153,7 +155,7 @@ pub struct EmployerState {
 /// - `pending_by_employer` — which claims one employer region still needs
 ///   to validate, so `take_pending_claims_for_employer` (P3) can pull its
 ///   own batch without scanning every claim.
-struct EmploymentBrokerState {
+pub(crate) struct EmploymentBrokerState {
     next_claim_id: u64,
     pools_by_workplace: BTreeMap<Entity, JobPool>,
     // Pending claims only. Accepted/rejected decisions remove the claim.
@@ -167,7 +169,6 @@ struct EmploymentBrokerState {
     // home regions can discover accepted employment cheaply; it is not the
     // authority for whether the employer contract actually exists.
     accepted_by_citizen: BTreeMap<CitizenRef, WorkplaceAssignment>,
-    accepted_by_workplace: BTreeMap<Entity, BTreeSet<CitizenRef>>,
     pool_generation_by_workplace: BTreeMap<Entity, u64>,
     global_generation: u64,
 }
@@ -302,7 +303,7 @@ fn diff_pools_for_employer(
 ///
 /// Pending coordination state only. Accepted employment stays active until the
 /// employer confirms loss with `report_lost_employment` (P5): this never
-/// touches `accepted_by_citizen`/`accepted_by_workplace`.
+/// touches `accepted_by_citizen`.
 ///
 /// No home is woken — the citizen is simply un-pended and retries on its next
 /// pass, exactly as it does for a removed pool.
@@ -404,6 +405,19 @@ impl EmploymentDirectory {
     /// lock. See "Fast Snapshot Exchange" in the plan.
     pub fn snapshot(&self) -> Arc<EmploymentSnapshot> {
         Arc::clone(&self.active_snapshot.read().unwrap())
+    }
+
+    /// P6: atomically install a broker state rebuilt from regional truth.
+    ///
+    /// The plan forbids exposing a partially rebuilt directory: the scratch
+    /// `rebuilt_state` is fully reconciled *before* it reaches here, so this is
+    /// one short lock that swaps the whole state and republishes the snapshot in
+    /// the same critical section — no reader ever sees a half-built broker.
+    pub(crate) fn replace_broker_state(&self, rebuilt_state: EmploymentBrokerState) {
+        let mut state = self.broker.lock().unwrap();
+        *state = rebuilt_state;
+        let snapshot = Arc::new(Self::rebuild_snapshot_locked(&state));
+        *self.active_snapshot.write().unwrap() = snapshot;
     }
 
     fn rebuild_snapshot_locked(state: &EmploymentBrokerState) -> EmploymentSnapshot {
@@ -624,11 +638,6 @@ impl EmploymentDirectory {
                 if let Some(pool) = state.pools_by_workplace.get_mut(&claim.workplace) {
                     pool.open_count = pool.open_count.saturating_sub(1);
                 }
-                state
-                    .accepted_by_workplace
-                    .entry(claim.workplace)
-                    .or_default()
-                    .insert(claim.citizen);
                 state.accepted_by_citizen.insert(claim.citizen, assignment);
             }
         }
@@ -643,7 +652,7 @@ impl EmploymentDirectory {
     ///
     /// This does nothing to broker state, and that is the point: once the home
     /// has applied it, the durable copy lives in the region, and
-    /// `accepted_by_citizen` / `accepted_by_workplace` are only a read cache.
+    /// `accepted_by_citizen` is only a read cache.
     /// There is no terminal `JobClaim` to retain or GC — `apply_claim_decisions`
     /// already removed it from every pending index. The accepted cache is
     /// cleared later, by an explicit release or employer-confirmed loss (P5).
@@ -806,14 +815,6 @@ fn clear_accepted_cache_if_matches(
     }
 
     state.accepted_by_citizen.remove(&release.citizen);
-    let mut remove_pool_entry = false;
-    if let Some(workers) = state.accepted_by_workplace.get_mut(&release.workplace) {
-        workers.remove(&release.citizen);
-        remove_pool_entry = workers.is_empty();
-    }
-    if remove_pool_entry {
-        state.accepted_by_workplace.remove(&release.workplace);
-    }
     true
 }
 
@@ -891,6 +892,181 @@ pub(crate) fn choose_best_pool(
         .copied()
 }
 
+/// The generation every pool and the broker itself carries after a rebuild.
+/// There are no in-flight claims to compare against on load, so any consistent
+/// value works; the first live `publish_pools` bumps it from here.
+const REBUILD_GENERATION: u64 = 1;
+
+/// P6: home-side and employer-side truth gathered from every region, ready to
+/// reconcile into one fresh broker state. Built only from durable regional truth
+/// (`RegionState::employer_contracts` / `home_assignments`) — never from the old
+/// directory cache, which is not the save truth.
+#[derive(Debug, Default)]
+struct EmploymentDirectoryRebuild {
+    employer_contracts: BTreeMap<Entity, BTreeMap<CitizenRef, EmploymentContract>>,
+    home_assignments: BTreeMap<CitizenRef, WorkplaceAssignment>,
+}
+
+/// P6: the accepted read cache the agreeing lease-pairs rebuild into, plus the
+/// corrections that make each region's two truths agree exactly.
+#[derive(Debug, Default)]
+struct ReconciledEmployment {
+    accepted_by_citizen: BTreeMap<CitizenRef, WorkplaceAssignment>,
+    /// Employer contract with no agreeing home assignment → release the contract.
+    contracts_to_release: Vec<(Entity, CitizenRef)>,
+    /// Cross-region home assignment with no agreeing contract → mark unemployed.
+    assignments_to_clear: Vec<CitizenRef>,
+}
+
+impl EmploymentDirectoryRebuild {
+    fn publish_employer_contracts(
+        &mut self,
+        employer: RegionId,
+        contracts: Vec<(Entity, CitizenRef, EmploymentContract)>,
+    ) {
+        for (workplace, citizen, contract) in contracts {
+            // A workplace `Entity` packs its owning region; keep only the ones
+            // this employer really owns (defensive against a hand-edited save).
+            if workplace.region() != employer {
+                continue;
+            }
+            self.employer_contracts
+                .entry(workplace)
+                .or_default()
+                .insert(citizen, contract);
+        }
+    }
+
+    fn publish_home_assignments(
+        &mut self,
+        home: RegionId,
+        assignments: Vec<(Entity, WorkplaceAssignment)>,
+    ) {
+        for (citizen, assignment) in assignments {
+            self.home_assignments.insert(
+                CitizenRef {
+                    region: home,
+                    citizen,
+                },
+                assignment,
+            );
+        }
+    }
+
+    /// Reconcile employer contracts against home assignments (both durable). A
+    /// contract and an assignment naming the same workplace for the same citizen
+    /// are a live lease → accepted read cache. A contract with no agreeing
+    /// assignment, or an assignment with no agreeing contract, is a half-torn
+    /// lease (crash/edit) → corrected so the two truths agree exactly.
+    fn reconcile(&self) -> ReconciledEmployment {
+        let mut result = ReconciledEmployment::default();
+        let mut matched = BTreeSet::new();
+
+        for (workplace, holders) in &self.employer_contracts {
+            for citizen in holders.keys() {
+                match self.home_assignments.get(citizen) {
+                    Some(assignment) if assignment.workplace == *workplace => {
+                        result.accepted_by_citizen.insert(*citizen, *assignment);
+                        matched.insert(*citizen);
+                    }
+                    _ => result.contracts_to_release.push((*workplace, *citizen)),
+                }
+            }
+        }
+
+        for citizen in self.home_assignments.keys() {
+            if !matched.contains(citizen) {
+                result.assignments_to_clear.push(*citizen);
+            }
+        }
+
+        result
+    }
+}
+
+/// P6: rebuild the employment broker from every region's durable truth, on load
+/// and before the first tick sees the directory.
+///
+/// ```text
+///  gather contracts + assignments  (per region, durable truth)
+///        │
+///        ▼   reconcile: agreeing pairs → accepted cache
+///        │             lone contract   → release
+///        │             lone assignment → mark unemployed
+///        ▼
+///  apply corrections to regions  (contracts == assignments now)
+///        │
+///        ▼   read pools AFTER corrections (open_count reflects reservations)
+///        ▼
+///  one fully-consistent EmploymentBrokerState  → replace_broker_state
+/// ```
+pub(crate) fn rebuild_employment_broker_state(
+    regions: &mut [RegionState],
+) -> EmploymentBrokerState {
+    let mut rebuild = EmploymentDirectoryRebuild::default();
+    for region in regions.iter_mut() {
+        region.ensure_derived_state();
+        rebuild.publish_employer_contracts(region.id(), region.employer_contracts());
+        rebuild.publish_home_assignments(region.id(), region.home_assignments());
+    }
+
+    let reconciled = rebuild.reconcile();
+
+    let mut corrected_regions = BTreeSet::new();
+    for (workplace, citizen) in reconciled.contracts_to_release {
+        if let Some(region) = regions
+            .iter_mut()
+            .find(|region| region.id() == workplace.region())
+        {
+            region.release_contract_if_matches(workplace, citizen);
+            corrected_regions.insert(workplace.region());
+        }
+    }
+    for citizen in reconciled.assignments_to_clear {
+        if let Some(region) = regions
+            .iter_mut()
+            .find(|region| region.id() == citizen.region)
+        {
+            region.clear_employment(citizen.citizen);
+            corrected_regions.insert(citizen.region);
+        }
+    }
+    // Re-settle local jobs on any region a correction touched, so a freed seat is
+    // filled locally before the pool pass below can publish it to remote claimants
+    // — the same local-before-remote ordering a normal daily tick keeps.
+    for region in regions.iter_mut() {
+        if corrected_regions.contains(&region.id()) {
+            region.resettle_derived_state();
+        }
+    }
+
+    // Pools are read only now, so `open_count` already nets out every surviving
+    // contract's reserved seat (P7-a) and none of the released ones.
+    let mut pools_by_workplace = BTreeMap::new();
+    let mut pool_generation_by_workplace = BTreeMap::new();
+    for region in regions.iter_mut() {
+        for mut pool in region.published_job_pools() {
+            pool.generation = REBUILD_GENERATION;
+            pool_generation_by_workplace.insert(pool.workplace, REBUILD_GENERATION);
+            pools_by_workplace.insert(pool.workplace, pool);
+        }
+    }
+
+    EmploymentBrokerState {
+        next_claim_id: 0,
+        pools_by_workplace,
+        claims_by_id: BTreeMap::new(),
+        pending_by_workplace: BTreeMap::new(),
+        pending_by_citizen: BTreeMap::new(),
+        pending_by_employer: BTreeMap::new(),
+        releases_by_employer: BTreeMap::new(),
+        losses_by_home: BTreeMap::new(),
+        accepted_by_citizen: reconciled.accepted_by_citizen,
+        pool_generation_by_workplace,
+        global_generation: REBUILD_GENERATION,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,6 +1088,123 @@ mod tests {
             salary,
             generation,
         }
+    }
+
+    fn remote_contract() -> EmploymentContract {
+        EmploymentContract {
+            salary: 7,
+            accepted_generation: 1,
+        }
+    }
+
+    fn remote_assignment_at(workplace: Entity) -> WorkplaceAssignment {
+        WorkplaceAssignment {
+            workplace,
+            location: CityCellRef::local(workplace.region(), 1, 0),
+            salary: 7,
+        }
+    }
+
+    #[test]
+    fn reconcile_matches_a_contract_to_its_home_assignment_into_the_accepted_cache() {
+        // P6 Review check: matching employer contract + home assignment.
+        let workplace = Entity::new(RegionId(9), 1);
+        let worker = citizen(1, 50);
+
+        let mut rebuild = EmploymentDirectoryRebuild::default();
+        rebuild
+            .publish_employer_contracts(RegionId(9), vec![(workplace, worker, remote_contract())]);
+        rebuild.publish_home_assignments(
+            RegionId(1),
+            vec![(worker.citizen, remote_assignment_at(workplace))],
+        );
+
+        let reconciled = rebuild.reconcile();
+        assert_eq!(
+            reconciled
+                .accepted_by_citizen
+                .get(&worker)
+                .map(|a| a.workplace),
+            Some(workplace),
+            "the agreeing lease-pair rebuilds into the accepted read cache"
+        );
+        assert!(reconciled.contracts_to_release.is_empty());
+        assert!(reconciled.assignments_to_clear.is_empty());
+    }
+
+    #[test]
+    fn reconcile_releases_a_contract_with_no_home_assignment() {
+        // P6 Review check: employer contract without home assignment.
+        let workplace = Entity::new(RegionId(9), 1);
+        let worker = citizen(1, 50);
+
+        let mut rebuild = EmploymentDirectoryRebuild::default();
+        rebuild
+            .publish_employer_contracts(RegionId(9), vec![(workplace, worker, remote_contract())]);
+
+        let reconciled = rebuild.reconcile();
+        assert!(reconciled.accepted_by_citizen.is_empty());
+        assert_eq!(reconciled.contracts_to_release, vec![(workplace, worker)]);
+        assert!(reconciled.assignments_to_clear.is_empty());
+    }
+
+    #[test]
+    fn reconcile_clears_a_home_assignment_with_no_contract() {
+        // P6 Review check: home assignment without employer contract.
+        let workplace = Entity::new(RegionId(9), 1);
+        let worker = citizen(1, 50);
+
+        let mut rebuild = EmploymentDirectoryRebuild::default();
+        rebuild.publish_home_assignments(
+            RegionId(1),
+            vec![(worker.citizen, remote_assignment_at(workplace))],
+        );
+
+        let reconciled = rebuild.reconcile();
+        assert!(reconciled.accepted_by_citizen.is_empty());
+        assert!(reconciled.contracts_to_release.is_empty());
+        assert_eq!(reconciled.assignments_to_clear, vec![worker]);
+    }
+
+    #[test]
+    fn reconcile_treats_a_workplace_disagreement_as_both_unmatched() {
+        // A contract and an assignment for the same citizen but DIFFERENT
+        // workplaces is not a lease: release the contract AND clear the
+        // assignment, so neither half survives to double-book a seat.
+        let contracted = Entity::new(RegionId(9), 1);
+        let assigned = Entity::new(RegionId(9), 2);
+        let worker = citizen(1, 50);
+
+        let mut rebuild = EmploymentDirectoryRebuild::default();
+        rebuild
+            .publish_employer_contracts(RegionId(9), vec![(contracted, worker, remote_contract())]);
+        rebuild.publish_home_assignments(
+            RegionId(1),
+            vec![(worker.citizen, remote_assignment_at(assigned))],
+        );
+
+        let reconciled = rebuild.reconcile();
+        assert!(reconciled.accepted_by_citizen.is_empty());
+        assert_eq!(reconciled.contracts_to_release, vec![(contracted, worker)]);
+        assert_eq!(reconciled.assignments_to_clear, vec![worker]);
+    }
+
+    #[test]
+    fn replace_broker_state_drops_pending_claims_and_swaps_atomically() {
+        // P6 behavior allowed: "pending claims may be dropped on rebuild and
+        // retried later." A rebuild is built from regional truth, which has no
+        // pending claims, so replacing the broker drops any that were in flight.
+        let (directory, job_pool) = directory_with_pool(2);
+        let worker = citizen(1, 50);
+        directory.submit_claims(vec![(worker, job_pool.workplace, job_pool.generation)]);
+        assert!(!directory.snapshot().pending_claims_by_employer.is_empty());
+
+        directory.replace_broker_state(EmploymentBrokerState::default());
+
+        let snapshot = directory.snapshot();
+        assert!(snapshot.pending_claims_by_employer.is_empty());
+        assert!(snapshot.accepted_by_home_region.is_empty());
+        assert!(snapshot.open_pools_by_network.is_empty());
     }
 
     #[test]
@@ -1323,11 +1616,6 @@ mod tests {
         {
             let mut state = directory.broker.lock().unwrap();
             state.accepted_by_citizen.insert(citizen, assignment);
-            state
-                .accepted_by_workplace
-                .entry(pool_a.workplace)
-                .or_default()
-                .insert(citizen);
         }
 
         // The workplace disappears from the employer's republish.
@@ -1342,13 +1630,6 @@ mod tests {
             state.accepted_by_citizen.get(&citizen).map(|a| a.workplace),
             Some(pool_a.workplace),
             "accepted employment must survive the pool disappearing"
-        );
-        assert!(
-            state
-                .accepted_by_workplace
-                .get(&pool_a.workplace)
-                .is_some_and(|workers| workers.contains(&citizen)),
-            "accepted_by_workplace must survive the pool disappearing"
         );
     }
 
@@ -1879,10 +2160,6 @@ mod tests {
 
         let state = directory.broker.lock().unwrap();
         assert!(
-            state.accepted_by_workplace[&job_pool.workplace].contains(&worker),
-            "the reverse accepted cache remains synchronized"
-        );
-        assert!(
             state.accepted_by_citizen.contains_key(&worker),
             "and the citizen cannot claim a second job mid-release"
         );
@@ -1904,12 +2181,6 @@ mod tests {
 
         let state = directory.broker.lock().unwrap();
         assert!(!state.accepted_by_citizen.contains_key(&worker));
-        assert!(
-            !state
-                .accepted_by_workplace
-                .contains_key(&job_pool.workplace),
-            "the workplace's now-empty accepted set is removed outright"
-        );
         assert_eq!(
             state.pools_by_workplace[&job_pool.workplace].open_count,
             open_before + 1,
@@ -1954,7 +2225,6 @@ mod tests {
             state.accepted_by_citizen.contains_key(&worker),
             "no mismatched confirmation may clear the accepted cache"
         );
-        assert!(state.accepted_by_workplace[&job_pool.workplace].contains(&worker));
     }
 
     #[test]
@@ -1971,11 +2241,6 @@ mod tests {
         assert_eq!(woken, vec![RegionId(1)], "the home is the wake target");
         let state = directory.broker.lock().unwrap();
         assert!(!state.accepted_by_citizen.contains_key(&worker));
-        assert!(
-            !state
-                .accepted_by_workplace
-                .contains_key(&job_pool.workplace)
-        );
         assert_eq!(state.losses_by_home[&RegionId(1)].len(), 1);
     }
 
@@ -1984,7 +2249,7 @@ mod tests {
         // P5 behavior forbidden: "do not clear a home assignment if the citizen
         // already moved to a different workplace." The same guard protects the
         // directory's own accepted cache.
-        let (directory, job_pool, worker) = directory_with_one_accepted_worker();
+        let (directory, _job_pool, worker) = directory_with_one_accepted_worker();
         let elsewhere = Entity::new(RegionId(9), 77);
 
         directory.report_lost_employment(JobLoss {
@@ -2000,7 +2265,6 @@ mod tests {
             state.accepted_by_citizen.contains_key(&worker),
             "a stale loss naming a different workplace must not evict the real job"
         );
-        assert!(state.accepted_by_workplace[&job_pool.workplace].contains(&worker));
     }
 
     #[test]
