@@ -1354,8 +1354,9 @@ impl RegionState {
 
     /// Returns spare local workplace slot entities reachable from one road network.
     ///
-    /// These are the slots left unassigned after local job resolution whose
-    /// building connects to `network`. The producer exports from this set; jobs are
+    /// These are the slots in `remaining_workplaces` whose building connects to
+    /// `network` — i.e. left over after both local job resolution **and** (P7-a)
+    /// employer-contract reservation. The producer exports from this set; jobs are
     /// network-scoped across regions exactly like power, so a slot on a different
     /// local network (a different component) is never offered.
     pub(crate) fn spare_job_slots_on_network(&self, network: RegionRoadNetworkId) -> Vec<Entity> {
@@ -1430,13 +1431,13 @@ impl RegionState {
                 *open_counts.entry(slot).or_insert(0) += 1;
             }
 
-            for (workplace, spare_count) in open_counts {
+            for (workplace, open_count) in open_counts {
                 seen.insert(workplace);
-                let contracted = self.contracted_seats_at(workplace) as u16;
-                let open_count = spare_count.saturating_sub(contracted);
-                if open_count == 0 {
-                    continue; // fully contracted: nothing left to claim
-                }
+                // P7-a: `spare_job_slots_on_network` reads `remaining_workplaces`,
+                // which the registry already netted of reserved seats — so
+                // `open_count` is the claimable count as-is (and always >= 1,
+                // since a fully-reserved workplace contributes no slots to count).
+                // Subtracting `contracted_seats_at` here too would double-count.
                 pools.push(JobPool {
                     region: self.id,
                     workplace,
@@ -1479,15 +1480,21 @@ impl RegionState {
     /// cannot re-check it anyway — it owns no topology.
     ///
     /// "Employer-owned capacity" is the spare seats this workplace publishes
-    /// (`spare_job_slots_on_network`, already net of *local* assignment) minus
-    /// the seats this region has already contracted to remote citizens.
+    /// (`spare_job_slots_for_workplace`, from `remaining_workplaces`).
+    ///
+    /// P7-a: `remaining_workplaces` is already net of *both* local assignment
+    /// and reserved contract seats, so a free seat is simply `remaining > 0` —
+    /// no separate `contracted_seats_at` subtraction (that would double-count).
+    /// The claim under validation is still *pending*, not yet a contract, so it
+    /// is not among the reserved seats; `> 0` correctly asks "is there a seat
+    /// not already taken locally or by an existing contract?".
     pub(crate) fn job_pool_still_has_open_capacity(&self, workplace: Entity) -> bool {
-        self.spare_job_slots_for_workplace(workplace) > self.contracted_seats_at(workplace)
+        self.spare_job_slots_for_workplace(workplace) > 0
     }
 
-    /// Total spare (locally unassigned) seats at one workplace, across every
-    /// road network. Counts repeated entries: `remaining_workplaces` holds one
-    /// entry per open seat.
+    /// Claimable seats at one workplace: entries in `remaining_workplaces`,
+    /// which (P7-a) excludes both locally-assigned and employer-contracted
+    /// seats. Counts repeated entries — one per open seat.
     fn spare_job_slots_for_workplace(&self, workplace: Entity) -> usize {
         self.world
             .with_cached_remaining_job_workplaces(|remaining_workplaces| {
@@ -1496,13 +1503,6 @@ impl RegionState {
                     .filter(|slot| **slot == workplace)
                     .count()
             })
-    }
-
-    fn contracted_seats_at(&self, workplace: Entity) -> usize {
-        self.employer_state
-            .contracts_by_workplace
-            .get(&workplace)
-            .map_or(0, BTreeMap::len)
     }
 
     /// P4, home side: write the durable `Citizen.workplace_assignment` the
@@ -1562,6 +1562,7 @@ impl RegionState {
                     accepted_generation: claim.generation,
                 },
             );
+        self.sync_job_reservations();
 
         let position = self
             .workplace_position(workplace)
@@ -1641,33 +1642,55 @@ impl RegionState {
                 .contracts_by_workplace
                 .remove(&workplace);
         }
+        self.sync_job_reservations();
         true
+    }
+
+    /// P7-a: push the current per-workplace contract counts into the jobs
+    /// registry's retained reservation input, so local matching (and every
+    /// downstream `remaining_workplaces` consumer) holds those seats out. Called
+    /// after any contract mutation; `World::set_job_reservations` no-ops and
+    /// skips the cache invalidation when the set is unchanged.
+    fn sync_job_reservations(&mut self) {
+        let reservations = self
+            .employer_state
+            .contracts_by_workplace
+            .iter()
+            .map(|(workplace, holders)| (*workplace, holders.len() as u16))
+            .collect();
+        self.world.set_job_reservations(reservations);
     }
 
     /// P5, employer side: drop every contract this region can no longer honour,
     /// and hand them back so the caller can report each as an explicit
     /// `JobLoss`. Loss is never *inferred* — this is what makes it explicit.
     ///
-    /// A workplace can honour `spare_job_slots_for_workplace` contracts: the
-    /// effective seats left after *local* assignment. Fewer than it has
-    /// contracted means the workplace was bulldozed, lost power or road access,
-    /// was downgraded, or had seats taken by local citizens.
+    /// A workplace can honour `min(contract_count, physical seats)` contracts.
+    /// Contracts beyond its physical seat count mean it was bulldozed, lost
+    /// power or road access, or was downgraded — those are evicted.
     ///
-    /// The plan passes the freshly published `pools` here, but they cannot
-    /// answer the question: `published_job_pools` omits a workplace whose
-    /// `open_count` is zero, and a *fully contracted but perfectly healthy*
-    /// workplace is exactly that. So this reads the employer's own ECS instead.
-    /// (The plan's call order is still safe: after dropping the excess,
-    /// `contracted == spare`, so `open_count` is zero either way.)
+    /// P7-a: the honourable count is read from the registry's
+    /// `reserved_seats_by_workplace` (= `min(contracts, physical)`), NOT from
+    /// `spare_job_slots_for_workplace`. `spare_job_slots_for_workplace` is now
+    /// *remaining after reservation*, which already subtracted these very
+    /// contracts — using it would be the circular double-subtraction the plan
+    /// warns against. Syncing first guarantees the reservation reflects the
+    /// current contracts, so `evict = contracts - reserved = max(0, contracts -
+    /// physical)`.
     ///
     /// **Eviction policy** — the plan says only "the employer chooses which
     /// contracts are lost using deterministic local policy". This one keeps the
     /// longest-serving workers: sort by `(accepted_generation, citizen)` and
     /// evict from the end. Seniority, with a total order for determinism.
-    #[allow(dead_code)] // P5: staged; the daily tick starts publishing in P7.
-    pub(crate) fn release_contracts_no_longer_valid(
+    #[allow(dead_code)] // P7-a: staged; the daily tick starts calling this in P7-d.
+    pub(crate) fn release_contracts_over_current_capacity(
         &mut self,
     ) -> Vec<(Entity, CitizenRef, EmploymentContract)> {
+        self.sync_job_reservations();
+        let reserved = self
+            .world
+            .cached_job_resolution()
+            .reserved_seats_by_workplace;
         let workplaces = self
             .employer_state
             .contracts_by_workplace
@@ -1677,7 +1700,7 @@ impl RegionState {
         let mut lost = Vec::new();
 
         for workplace in workplaces {
-            let honourable = self.spare_job_slots_for_workplace(workplace);
+            let honourable = reserved.get(&workplace).copied().unwrap_or(0) as usize;
             let holders = &self.employer_state.contracts_by_workplace[&workplace];
             if holders.len() <= honourable {
                 continue;
@@ -2502,12 +2525,11 @@ mod tests {
     }
 
     #[test]
-    fn published_job_pools_subtracts_seats_already_contracted_to_remote_citizens() {
-        // Found in self-review. The plan lets the directory decrement its cached
-        // `open_count` on an accepted claim only "until next employer publish"
-        // -- so the employer's republished count is the authoritative
-        // replacement. If it republished raw spare slots it would resurrect
-        // seats it has already contracted out.
+    fn published_job_pools_excludes_seats_already_contracted_to_remote_citizens() {
+        // The employer's republished open_count must not resurrect a contracted
+        // seat. P7-a: the subtraction now lives in the registry (reserved seats
+        // are held out of `remaining_workplaces`), so `published_job_pools`
+        // reads an already-net count rather than subtracting contracts itself.
         let (mut region, workplace) = employer_region_with_one_workplace();
         assert_eq!(region.published_job_pools()[0].open_count, 2);
 
@@ -2554,7 +2576,7 @@ mod tests {
     }
 
     #[test]
-    fn release_contracts_no_longer_valid_keeps_a_healthy_fully_contracted_workplace() {
+    fn release_contracts_over_current_capacity_keeps_a_healthy_fully_contracted_workplace() {
         // The reason this cannot be driven off `published_job_pools`: a fully
         // contracted, perfectly healthy workplace publishes NO row (open_count
         // 0), exactly like an invalid one. Contracts must be checked against the
@@ -2565,14 +2587,14 @@ mod tests {
         assert!(region.published_job_pools().is_empty(), "no row published");
 
         assert!(
-            region.release_contracts_no_longer_valid().is_empty(),
+            region.release_contracts_over_current_capacity().is_empty(),
             "2 seats, 2 contracts: nothing is lost"
         );
         assert_eq!(region.contract_holders_at(workplace).len(), 2);
     }
 
     #[test]
-    fn release_contracts_no_longer_valid_drops_every_contract_when_the_workplace_dies() {
+    fn release_contracts_over_current_capacity_drops_every_contract_when_the_workplace_dies() {
         let (mut region, workplace) = employer_region_with_one_workplace();
         region.accept_claim_and_create_assignment(&contract_claim(50, workplace, 1));
         region.accept_claim_and_create_assignment(&contract_claim(51, workplace, 1));
@@ -2581,7 +2603,7 @@ mod tests {
         assert!(region.bulldoze(1, 0).success);
         region.ensure_derived_state();
 
-        let lost = region.release_contracts_no_longer_valid();
+        let lost = region.release_contracts_over_current_capacity();
         assert_eq!(lost.len(), 2, "both contracts are lost");
         assert!(lost.iter().all(|(w, _, _)| *w == workplace));
         assert!(region.contract_holders_at(workplace).is_empty());
@@ -2591,35 +2613,74 @@ mod tests {
     fn release_contracts_evicts_the_most_recently_hired_first() {
         // The plan leaves the eviction policy to "deterministic local policy".
         // Ours is seniority: sort by (accepted_generation, citizen), evict from
-        // the end. Shrink 2 seats -> 1 by letting a LOCAL citizen take a seat.
-        let (mut region, workplace) = employer_region_with_one_workplace();
-        let senior = contract_claim(50, workplace, 1); // hired at generation 1
-        let junior = contract_claim(51, workplace, 9); // hired at generation 9
+        // the end.
+        //
+        // P7-a: eviction fires only on genuine PHYSICAL capacity loss (a local
+        // citizen can no longer shrink contract capacity -- contracts are
+        // reserved before local matching). Simulate a workplace that held 3
+        // contracts and then lost a seat: 2 physical seats, 3 contracts ->
+        // evict the newest, keep the two most senior.
+        let (mut region, workplace) = employer_region_with_one_workplace(); // 2 seats
+        let senior = contract_claim(50, workplace, 1);
+        let middle = contract_claim(51, workplace, 5);
+        let junior = contract_claim(52, workplace, 9);
         region.accept_claim_and_create_assignment(&senior);
+        region.accept_claim_and_create_assignment(&middle);
         region.accept_claim_and_create_assignment(&junior);
 
-        // A local resident moves in and takes one of the two seats.
-        assert!(region.build(0, 2, BuildingKind::Road).success);
-        assert!(region.build(1, 2, BuildingKind::Residential).success);
-        let home = region.world.grid.get(1, 2).expect("home");
-        citizens::spawn_for_home(&mut region.world, home, 1);
-        region.ensure_derived_state();
-        assert_eq!(
-            region.spare_job_slots_for_workplace(workplace),
-            1,
-            "the local citizen consumed one of the two seats"
-        );
-
-        let lost = region.release_contracts_no_longer_valid();
-        assert_eq!(lost.len(), 1, "exactly the overbooked seat is reclaimed");
+        let lost = region.release_contracts_over_current_capacity();
+        assert_eq!(lost.len(), 1, "one contract exceeds the two physical seats");
         assert_eq!(
             lost[0].1, junior.citizen,
             "the most recently hired worker is the one who loses the job"
         );
         assert_eq!(
             region.contract_holders_at(workplace),
-            vec![senior.citizen],
-            "the longest-serving worker keeps it"
+            vec![senior.citizen, middle.citizen],
+            "the two longest-serving workers keep their seats"
+        );
+    }
+
+    #[test]
+    fn contracted_seats_are_reserved_before_local_matching() {
+        // P7-a: a fully contracted workplace leaves a local job seeker
+        // unmatched, and evicts nobody. Contracts win.
+        let (mut region, workplace) = employer_region_with_one_workplace(); // 2 seats
+        region.accept_claim_and_create_assignment(&contract_claim(50, workplace, 1));
+        region.accept_claim_and_create_assignment(&contract_claim(51, workplace, 2));
+
+        // A local resident moves in, wanting work.
+        assert!(region.build(0, 2, BuildingKind::Road).success);
+        assert!(region.build(1, 2, BuildingKind::Residential).success);
+        let home = region.world.grid.get(1, 2).expect("home");
+        citizens::spawn_for_home(&mut region.world, home, 1);
+        region.ensure_derived_state();
+        let local = *region
+            .world
+            .citizens
+            .keys()
+            .find(|c| region.world.citizens[c].home == home)
+            .expect("local citizen");
+
+        assert_eq!(
+            region.spare_job_slots_for_workplace(workplace),
+            0,
+            "both physical seats are reserved for the contracts"
+        );
+        region.ensure_derived_state();
+        assert!(
+            region.world.citizens[&local].workplace_assignment.is_none(),
+            "the local citizen cannot take a contracted seat"
+        );
+        assert!(
+            region.release_contracts_over_current_capacity().is_empty(),
+            "the local seeker does not shrink contract capacity: nobody is evicted"
+        );
+        assert_eq!(region.contract_holders_at(workplace).len(), 2);
+        assert_eq!(
+            region.world.cached_job_counts().unemployment,
+            1,
+            "the unmatched local counts as unemployed: reserved seats are not local jobs"
         );
     }
 

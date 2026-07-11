@@ -1,10 +1,16 @@
 # Directory employment ledger — stable cross-region jobs without daily wipes
 
-Status: **proposal, P1 through P5 implemented** (data model, employer pool
-publishing, the claim flow, home apply, and release/loss — see the "P<n>,
-implemented" sections at the end of this doc; P6-P8 still plan-only. P3-P5
-are *staged*: the whole lifecycle is built and tested, but nothing calls it
-from the daily tick until P7). This is an
+Status: **proposal, P1-P5 done; P7 in progress (P7-a done)** (data model,
+employer pool publishing, the claim flow, home apply, release/loss, and the
+contract-seat reservation foundation — see the "P<n>, implemented" sections
+at the end of this doc. P3-P5 are *staged*: built and tested, but nothing
+calls the ledger from the daily tick until P7-d's cutover). **P7 is split
+into P7-a..P7-d** (it is too large for one reviewable diff and flips the
+live allocator): P7-a retained reservations (done); P7-b connectivity
+fingerprint; P7-c discovery install + route invalidation; P7-d the cutover.
+**Remaining order is P7 → P6 → P8** — P6 (save/load durability) is deferred
+until after P7 activates the flow and removes the daily wipe; see the note
+at the P6 section head. This is an
 alternative to pushing
 [20260706-per-producer-job-staleness.md](20260706-per-producer-job-staleness.md)
 further. It targets more precise citizen behavior: jobs should be
@@ -1694,6 +1700,17 @@ Review checks:
 
 ### P6: Save/load and directory rebuild
 
+**Ordering: P6 runs AFTER P7, despite the number.** (Decided 2026-07-11;
+sections not renumbered to avoid churning the many "P7 must…"/"P8…"
+cross-references.) Persisting employment durability before P7 would be both
+inert and fragile: nothing tick-drives the directory until P7, so there is no
+live employment to persist, and the daily wipe (which P7 removes) still clears
+`Citizen.workplace_assignment` every day — it would erase a persisted *remote*
+assignment on the first tick after load. Once P7 makes the ledger the live
+allocator and deletes the wipe, durable `workplace_assignment` becomes both
+meaningful and safe, and the rebuild reconciliation has real regional truth to
+reconcile. So: P1–P5 (done) → P7 → P6 → P8.
+
 Scope:
 
 ```text
@@ -3093,4 +3110,169 @@ None.
  So release_contracts_no_longer_valid reads the employer's own ECS:
 
    valid  iff  contracted <= spare_job_slots_for_workplace(W)
+```
+
+## P7-a, implemented (2026-07-11)
+
+The contract-seat reservation foundation. Employer-contracted seats are now
+held out of local job matching by a **retained** registry input, and the three
+call sites that used to subtract contracts themselves are dedup'd to the single
+registry layer. No allocator cutover, no tick wiring, no route invalidation —
+those are P7-b/c/d.
+
+### Status
+
+**Implemented, still staged.** P7-a changes *how* seats are reserved, but the
+ledger is still not tick-driven — the reservation input is populated only by the
+staged `accept_claim` / `release` paths (i.e. by tests) until P7-d flips the
+allocator. Live local job behaviour is unchanged (a contract-free region has an
+empty reservation set).
+
+### Why P7 is split
+
+P7 as written touches ~7 files, rewires the daily tick, and flips the live
+cross-region job allocator — far past this repo's "propose a split beyond ~5
+files / ~400 lines" rule, and exactly the kind of behavioural cutover
+`retire-tickstate` split into P-a..P-e. Split, dependency-ordered, each green:
+
+```text
+ P7-a  retained contract reservations + dedup the three subtractions  (DONE)
+ P7-b  connectivity-only fingerprint on the directory
+ P7-c  discovery Arc install on RegionRuntime + route invalidation
+ P7-d  the cutover: daily_employment_phase into the tick, drop the wipe,
+         stop the old path, employer tax from contracts
+```
+
+### Scope
+
+| file | why |
+|------|-----|
+| `src/core/world.rs` | `job_reservations` retained input + `set_job_reservations` |
+| `src/core/resource_registry.rs` | `reserve_contracted_seats`, `JobResolution.reserved_seats_by_workplace`, reservation-aware `unemployment` |
+| `src/core/regions/mod.rs` | `sync_job_reservations`, dedup in `published_job_pools` / `job_pool_still_has_open_capacity`, rename+rework the eviction fn, delete dead `contracted_seats_at` |
+| `src/core/regions/runtime/mod.rs` | update the one caller of the renamed eviction fn (staged) |
+
+### Deviation: the input lives on `World`, not `ResourceRegistryCache`
+
+The plan says "ResourceRegistryCache gains a retained reservation input". It's
+on `World` instead. The parity guard
+(`cached_registry_matches_forced_recompute_script`) compares a cached
+`JobResolution` against a fresh `for_jobs(world)` recompute; both read `World`,
+so a `World` field is seen by both and parity holds. A cache-only field would
+make the fresh recompute diverge. It still satisfies the plan's *intent* —
+retained, survives `invalidate_jobs`, feeds resolve — verified by
+`reservations_survive_a_jobs_cache_invalidation`. Codex confirmed the placement
+sound.
+
+### The two traps, and how P7-a avoids each
+
+- **Retained, not injected (trap 1).** `ensure_jobs` rebuilds `JobResolution`
+  from `World` on any `invalidate_jobs_registry`. Because `job_reservations` is
+  a `World` field (not a per-call argument), the rebuild re-reads it — the
+  reserved seat is never re-exposed. `set_job_reservations` has a no-op fast
+  path so a contract-free region doesn't churn its registry.
+- **No `remaining + contracts` reconstruction (trap 2).**
+  `reserve_contracted_seats` caps at physical seats
+  (`min(contract_count, physical)`) by removing at most `contract_count` copies
+  of a workplace and stopping when none remain. A bulldozed workplace (0
+  physical) reserves 0, so `evict = contracts - 0 = contracts` — all of them,
+  which is correct. Eviction reads `reserved_seats_by_workplace` from the
+  resolution, never `spare_job_slots_for_workplace` (which is *post*-reservation
+  and would be circular).
+
+### The single subtraction layer
+
+Three call sites used to each subtract contracts from a `remaining_workplaces`
+that did *not* reserve them. P7-a moves the subtraction into the registry and
+removes all three:
+
+| call site | before | after |
+|-----------|--------|-------|
+| `published_job_pools` | `open = spare - contracted` | `open = spare` (registry already net) |
+| `job_pool_still_has_open_capacity` | `spare > contracted` | `spare > 0` |
+| eviction (`release_contracts_over_current_capacity`) | `holders <= spare` (circular) | `holders <= reserved`, evict `holders - reserved` |
+
+`availability_hints` → `importable_remote_jobs` reads the same
+`remaining_workplaces`, so it inherits the reservation and stops over-counting
+seats already contracted to another region — the free win the plan noted, and
+confirmed by codex to introduce no fourth double-subtraction.
+
+### Bugs found in review
+
+- **Unemployment under-reported (codex, Medium).** `unemployment =
+  job_seekers - total_jobs`, but `total_jobs` counts physical seats including
+  those reserved for remote contracts — so a 2-seat / 2-contract workplace with
+  one unmatched local reported **zero** unemployment (and, downstream, spurious
+  happiness). Fixed: `unemployment = max(0, job_seekers - (total_jobs -
+  reserved_total))`. With no contracts `reserved_total` is 0, byte-identical to
+  the old formula, so the existing contract-free `unemployment` assertions are
+  untouched. Chose "subtract reserved from total" over "count unmatched
+  assignments" to leave the pre-existing unreachable-seat approximation alone —
+  codex agreed that's the right conservative call for P7-a.
+- **Stale comments/name (codex, Low).** `spare_job_slots_on_network` /
+  `spare_job_slots_for_workplace` described only local assignment; updated to
+  note they now also exclude reservations. Renamed
+  `published_job_pools_subtracts_...` → `..._excludes_...`.
+
+### Tests added
+
+`resource_registry.rs` (+4):
+
+- `reserve_contracted_seats_caps_at_physical_and_reports_the_reservation` — trap 2 (the cap).
+- `reserved_seats_are_held_out_of_remaining_workplaces` — the core behaviour.
+- `reservations_survive_a_jobs_cache_invalidation` — trap 1 (the retained-input property).
+- `set_job_reservations_is_a_no_op_when_unchanged` — the fast path doesn't churn the cache.
+
+`regions/mod.rs` (+1, and 1 rewrite):
+
+- `contracted_seats_are_reserved_before_local_matching` — contracts win over a local seeker; nobody evicted; **unemployment == 1** (the Medium regression).
+- `release_contracts_evicts_the_most_recently_hired_first` — rewritten: eviction now fires on physical capacity loss (3 contracts on 2 seats → evict newest), not on a local citizen taking a seat (which P7-a forbids).
+
+### Existing tests modified
+
+Two P5 eviction tests renamed for the function rename; one
+(`release_contracts_evicts_the_most_recently_hired_first`) had its premise
+rewritten because P7-a inverts it (a local citizen can no longer displace a
+contract). No assertion weakened.
+
+### Risks remaining
+
+- **Reservation sync is per-mutation, not batched.** Evicting N contracts calls
+  `release_contract_if_matches` N times, each re-syncing (N cache
+  invalidations). Correct, mildly wasteful; a daily-frequency op. Left as-is to
+  keep `release_contract_if_matches` self-consistent for its P5 callers.
+- **Not yet load-bearing.** Nothing tick-drives the reservation until P7-d.
+  The staged accept/release paths keep it correct; P7-d is where it goes live.
+
+### Commands run
+
+```text
+ cargo fmt --check                          → clean
+ cargo clippy -- -D warnings                → no new findings vs pre-patch
+ cargo clippy --all-targets -- -D warnings  → no new findings vs pre-patch
+ cargo test -q                              → 401 lib tests pass (was ~397), +7 net
+ codex exec resume small_city               → 2 rounds: 1 Medium + 1 Low, then
+                                               "No findings"
+```
+
+### Diagram — one subtraction layer
+
+```text
+ BEFORE P7-a                            AFTER P7-a
+
+ workplace_slots (physical, repeated)   workplace_slots (physical, repeated)
+        │                                      │  reserve_contracted_seats:
+        │                                      │  remove min(contracts, physical)
+        ▼                                      ▼
+ remaining_workplaces                   remaining_workplaces (net of RESERVATION)
+   = physical - locals                    = physical - reserved - locals
+        │                                      │
+   read by:                               read by (all already net):
+     published_job_pools  - contracts       published_job_pools     (no subtract)
+     job_pool_has_cap     - contracts       job_pool_has_cap        (> 0)
+     eviction             vs spare          eviction  vs reserved_seats_by_workplace
+     availability_hints   (over-counts!)    availability_hints      (correct)
+        ▲                                      ▲
+   three separate subtractions,           ONE subtraction, in the registry,
+   availability_hints forgotten           fed by a retained World input
 ```

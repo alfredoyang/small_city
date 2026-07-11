@@ -60,6 +60,22 @@ pub(crate) struct World {
     pub road_analysis: RoadNetworkAnalysis,
     #[serde(skip, default)]
     registry_cache: RefCell<ResourceRegistryCache>,
+    // Directory employment ledger plan, P7-a: employer-contracted seats to hold
+    // out of local job matching, keyed by workplace, valued by contract count.
+    // A RETAINED input to the jobs registry: `JobsRegistry::from_world` reads it
+    // and removes `min(contracts, physical seats)` copies of each workplace
+    // *before* nearest-slot matching, so a local citizen can never be assigned a
+    // seat a remote `EmploymentContract` holds.
+    //
+    // It lives on `World` (not the cache) so BOTH the cached build and a fresh
+    // `for_jobs(world)` recompute read the same value — the parity guard
+    // (`cached_registry_matches_forced_recompute_script`) would otherwise
+    // diverge. Being a real input, `invalidate_jobs_registry` cannot drop it;
+    // only `set_job_reservations` changes it. `#[serde(skip)]` for now: it is a
+    // projection of the region's `EmploymentContract` state, and durability of
+    // that state is P6's job.
+    #[serde(skip, default)]
+    pub(crate) job_reservations: std::collections::BTreeMap<Entity, u16>,
     #[serde(skip, default)]
     pub(crate) importable_remote_jobs: i32,
     #[serde(skip, default)]
@@ -215,6 +231,7 @@ impl World {
             local_effects: LocalEffectsMap::new(width, height),
             road_analysis: RoadNetworkAnalysis::default(),
             registry_cache: RefCell::default(),
+            job_reservations: std::collections::BTreeMap::new(),
             importable_remote_jobs: 0,
             cross_region_goods_routes: CrossRegionGoodsRoutes::default(),
             route_cache: RefCell::default(),
@@ -366,6 +383,23 @@ impl World {
         self.registry_cache.borrow_mut().invalidate_jobs();
         self.hints_dirty.set(true);
         self.jobs_exports_dirty.set(true);
+    }
+
+    /// P7-a: replace the employer-contracted-seat reservation input and rebuild
+    /// the jobs registry against it. Called by the region whenever an
+    /// `EmploymentContract` is created, released, or lost. A no-op fast path
+    /// avoids invalidating the jobs cache (and re-flagging job hints) when the
+    /// reservation set is unchanged — a quiet contract-free region must not
+    /// churn its registry every reconcile.
+    pub(crate) fn set_job_reservations(
+        &mut self,
+        reservations: std::collections::BTreeMap<Entity, u16>,
+    ) {
+        if self.job_reservations == reservations {
+            return;
+        }
+        self.job_reservations = reservations;
+        self.invalidate_jobs_registry();
     }
 
     /// Retire-tickstate, P-c: refreshes the job cache after applying an

@@ -1755,18 +1755,19 @@ pub(crate) fn home_apply_losses(runtime: &mut RegionRuntime, directory: &Employm
 /// decides, drops the contract in its own state, and *tells* the home region.
 ///
 /// Deviation: the plan passes the freshly computed `pools` into
-/// `release_contracts_no_longer_valid`; they cannot answer the question (see
-/// that method). The plan's ordering — pools computed *before* the release — is
-/// nonetheless preserved and harmless: dropping the excess leaves
-/// `contracted == spare`, so the affected workplace's `open_count` is zero
-/// either way.
-#[allow(dead_code)] // P5: staged; the daily tick starts publishing in P7.
+/// `release_contracts_over_current_capacity`; they cannot answer the question
+/// (see that method, which reads the registry's reservation instead). The
+/// pool/eviction *ordering* is revisited by P7-d's cutover; this staged
+/// version keeps the plan's "pools before release" order.
+#[allow(dead_code)] // P7-a: staged; the daily tick starts publishing in P7-d.
 pub(crate) fn employer_publish_pools(
     runtime: &mut RegionRuntime,
     directory: &EmploymentDirectory,
 ) -> Vec<OutboundMessage> {
     let pools = runtime.state().published_job_pools();
-    let lost_contracts = runtime.state_mut().release_contracts_no_longer_valid();
+    let lost_contracts = runtime
+        .state_mut()
+        .release_contracts_over_current_capacity();
 
     directory.publish_pools(runtime.region_id(), pools);
 

@@ -63,7 +63,7 @@
 //!   remaining_slots  -> later regional spare-capacity queries
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::core::components::PowerSource;
 use crate::core::entity::Entity;
@@ -130,6 +130,13 @@ pub(crate) struct JobResolution {
     pub job_seekers: i32,
     pub unemployment: i32,
     pub remaining_slots: i32,
+    /// P7-a: seats this region has reserved for remote `EmploymentContract`s,
+    /// per workplace, capped at the workplace's physical seat count:
+    /// `reserved = min(contract_count, physical_seats)`. Held out of
+    /// `remaining_workplaces` before local matching, and read by
+    /// `release_contracts_over_current_capacity` to size evictions
+    /// (`evict = contracts - reserved`) without recomputing physical capacity.
+    pub reserved_seats_by_workplace: BTreeMap<Entity, u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +301,7 @@ struct JobsRegistry {
     assignments: Vec<JobAssignment>,
     remaining_workplaces: Vec<Entity>,
     remaining_slots: i32,
+    reserved_seats_by_workplace: BTreeMap<Entity, u16>,
 }
 
 /// Pooled per-network power capacity (the R1 parity invariant).
@@ -398,8 +406,17 @@ impl JobsRegistry {
         let workplace_slots = workplace_slots_from_world(world);
         let requests = job_requests_from_world(world);
 
+        // P7-a: hold employer-contracted seats out of local matching. One
+        // repeated `Entity` in `workplace_slots` is one physical seat, so the
+        // reservation is capped at how many the workplace actually has:
+        // `reserved = min(contract_count, physical_seats)`. `claimable_slots`
+        // is what local citizens (and, downstream, cross-region publication)
+        // may draw from.
+        let (claimable_slots, reserved_seats_by_workplace) =
+            reserve_contracted_seats(&workplace_slots, &world.job_reservations);
+
         let (assignments, remaining_workplaces) =
-            resolve_job_assignments(world, &requests, &workplace_slots);
+            resolve_job_assignments(world, &requests, &claimable_slots);
         let remaining_slots = remaining_workplaces.len() as i32;
 
         Self {
@@ -408,22 +425,68 @@ impl JobsRegistry {
             assignments,
             remaining_workplaces,
             remaining_slots,
+            reserved_seats_by_workplace,
         }
     }
 
     fn resolve(&self) -> JobResolution {
         let total_jobs = self.workplace_slots.len() as i32;
         let job_seekers = self.requests.len() as i32;
+        // P7-a: seats reserved for remote contracts are not available to local
+        // seekers, so they must not count against local unemployment. Subtract
+        // the reserved total from the seat count local citizens compete for.
+        // With no contracts the reserved total is 0, so this is identical to the
+        // pre-P7-a `job_seekers - total_jobs`.
+        let reserved_total: i32 = self
+            .reserved_seats_by_workplace
+            .values()
+            .map(|&count| count as i32)
+            .sum();
+        let local_seats = total_jobs - reserved_total;
         JobResolution {
             assignments: self.assignments.clone(),
             workplace_slots: self.workplace_slots.clone(),
             remaining_workplaces: self.remaining_workplaces.clone(),
             total_jobs,
             job_seekers,
-            unemployment: (job_seekers - total_jobs).max(0),
+            unemployment: (job_seekers - local_seats).max(0),
             remaining_slots: self.remaining_slots,
+            reserved_seats_by_workplace: self.reserved_seats_by_workplace.clone(),
         }
     }
+}
+
+/// P7-a: remove up to `contract_count` physical seats per workplace from the
+/// claimable pool, returning the reduced pool plus the actual reservation
+/// (`min(contract_count, physical_seats)`) per workplace.
+///
+/// Physical seat count is how many times a workplace repeats in
+/// `workplace_slots`; a reservation naming more contracts than the workplace
+/// physically has (a bulldozed or downgraded workplace) reserves only what
+/// exists — the excess is what `release_contracts_over_current_capacity` later
+/// evicts.
+fn reserve_contracted_seats(
+    workplace_slots: &[Entity],
+    reservations: &BTreeMap<Entity, u16>,
+) -> (Vec<Entity>, BTreeMap<Entity, u16>) {
+    let mut claimable = workplace_slots.to_vec();
+    let mut reserved_seats_by_workplace = BTreeMap::new();
+
+    for (&workplace, &contract_count) in reservations {
+        let mut reserved = 0u16;
+        while reserved < contract_count {
+            let Some(index) = claimable.iter().position(|slot| *slot == workplace) else {
+                break; // no more physical seats: reservation caps at what exists
+            };
+            claimable.remove(index);
+            reserved += 1;
+        }
+        if reserved > 0 {
+            reserved_seats_by_workplace.insert(workplace, reserved);
+        }
+    }
+
+    (claimable, reserved_seats_by_workplace)
 }
 
 fn workplace_slots_from_world(world: &World) -> Vec<Entity> {
@@ -977,5 +1040,97 @@ mod tests {
             .collect::<Vec<_>>();
         powered.sort_by_key(|(entity, _powered, _source)| entity.0);
         powered
+    }
+
+    // ---- P7-a: contract-seat reservations ----
+
+    /// A powered, road-connected Commercial workplace (2 seats at level 1) plus
+    /// one jobless local resident.
+    fn world_with_two_seat_workplace() -> (World, Entity) {
+        let mut world = World::new(4, 4);
+        placement::place_building(&mut world, 0, 0, BuildingKind::PowerPlant);
+        placement::place_building(&mut world, 0, 1, BuildingKind::Road);
+        placement::place_building(&mut world, 1, 1, BuildingKind::Road);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Commercial);
+        let workplace = world.grid.get(1, 0).expect("commercial");
+        power::run(&mut world);
+        (world, workplace)
+    }
+
+    #[test]
+    fn reserve_contracted_seats_caps_at_physical_and_reports_the_reservation() {
+        let slots = vec![Entity(1), Entity(1), Entity(2)]; // wp1 has 2 seats, wp2 has 1
+        let reservations = BTreeMap::from([(Entity(1), 1u16), (Entity(2), 5u16)]);
+
+        let (claimable, reserved) = reserve_contracted_seats(&slots, &reservations);
+
+        assert_eq!(
+            claimable,
+            vec![Entity(1)],
+            "one wp1 seat and no wp2 seat remain"
+        );
+        assert_eq!(
+            reserved,
+            BTreeMap::from([(Entity(1), 1), (Entity(2), 1)]),
+            "wp2's reservation is capped at its single physical seat"
+        );
+    }
+
+    #[test]
+    fn reserved_seats_are_held_out_of_remaining_workplaces() {
+        let (mut world, workplace) = world_with_two_seat_workplace();
+        assert_eq!(
+            world.with_cached_remaining_job_workplaces(|slots| slots.len()),
+            2,
+            "two seats, none reserved"
+        );
+
+        world.set_job_reservations(BTreeMap::from([(workplace, 1)]));
+        assert_eq!(
+            world.with_cached_remaining_job_workplaces(|slots| slots.len()),
+            1,
+            "one seat is reserved for a contract"
+        );
+        let resolution = world.cached_job_resolution();
+        assert_eq!(resolution.reserved_seats_by_workplace[&workplace], 1);
+    }
+
+    #[test]
+    fn reservations_survive_a_jobs_cache_invalidation() {
+        // Finding 1's whole point: the reservation is a RETAINED input, not a
+        // one-off injection. A later invalidate_jobs_registry must NOT rebuild a
+        // registry that re-exposes the reserved seat.
+        let (mut world, workplace) = world_with_two_seat_workplace();
+        world.set_job_reservations(BTreeMap::from([(workplace, 1)]));
+        assert_eq!(
+            world.with_cached_remaining_job_workplaces(|slots| slots.len()),
+            1
+        );
+
+        // Any unrelated jobs invalidation forces a full rebuild from World.
+        world.invalidate_jobs_registry();
+
+        assert_eq!(
+            world.with_cached_remaining_job_workplaces(|slots| slots.len()),
+            1,
+            "the rebuilt registry still reserves the contracted seat"
+        );
+    }
+
+    #[test]
+    fn set_job_reservations_is_a_no_op_when_unchanged() {
+        let (mut world, workplace) = world_with_two_seat_workplace();
+        world.set_job_reservations(BTreeMap::from([(workplace, 1)]));
+        let recomputes_before = world.registry_cache_recompute_counts().1;
+        world.with_cached_remaining_job_workplaces(|_| ()); // warm the cache
+
+        world.set_job_reservations(BTreeMap::from([(workplace, 1)])); // identical
+        world.with_cached_remaining_job_workplaces(|_| ());
+
+        assert_eq!(
+            world.registry_cache_recompute_counts().1,
+            recomputes_before + 1,
+            "an identical reservation set must not invalidate or recompute the registry"
+        );
     }
 }
