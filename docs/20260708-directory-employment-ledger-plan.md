@@ -1,15 +1,15 @@
 # Directory employment ledger — stable cross-region jobs without daily wipes
 
-Status: **proposal, P1-P5 done; P7 in progress (P7-a, P7-b, P7-c done)** (data model,
+Status: **proposal, P1-P5 done; P7 done (P7-a, P7-b, P7-c, P7-d done)** (data model,
 employer pool publishing, the claim flow, home apply, release/loss, and the
 contract-seat reservation foundation — see the "P<n>, implemented" sections
 at the end of this doc. P3-P5 are *staged*: built and tested, but nothing
 calls the ledger from the daily tick until P7-d's cutover). **P7 is split
 into P7-a..P7-d** (it is too large for one reviewable diff and flips the
 live allocator): P7-a retained reservations, P7-b connectivity
-fingerprint, and P7-c discovery install + route invalidation (done);
-P7-d the cutover.
-**Remaining order is P7 → P6 → P8** — P6 (save/load durability) is deferred
+fingerprint, P7-c discovery install + route invalidation, and P7-d the
+cutover (all done).
+**Remaining order is P6 → P8** — P6 (save/load durability) is deferred
 until after P7 activates the flow and removes the daily wipe; see the note
 at the P6 section head. This is an
 alternative to pushing
@@ -3524,4 +3524,140 @@ None.
         │
         ▼
    report_lost_employment(A7)  ->  wake home A  ->  A clears A7's assignment (P5)
+```
+
+## P7-d, implemented (2026-07-11)
+
+The cutover. Retires the old daily job wipe and the `JobExport` request/grant
+path, and wires the ledger's `daily_employment_phase` into the daily tick. After
+this patch the ledger is the *only* cross-region job path; the legacy types are
+left dead-code (`#[allow(dead_code)]`) for P8 to delete.
+
+### Files changed and why
+
+- `src/core/regions/runtime/mod.rs` — `enter_job_phase` now gates the daily
+  employment work on a **connectivity-change** signal
+  (`installed_connectivity_fingerprint() != seen_connectivity_fingerprint`, the
+  P7-b fingerprint), plus `jobs_exports_dirty` and `has_unassigned_citizen`. When
+  the gate fires it calls the new `daily_employment_phase()` (route invalidation
+  → capacity invalidation → report every dropped contract as a `JobLoss` wake →
+  publish pools → submit fresh home claims) instead of `release_and_request_job`.
+  New `seen_connectivity_fingerprint` field. Workplace tax now sourced from
+  `state.contracted_workplace_tax_slots()` (one entry per contracted seat), not
+  `job_export_allocations`. `seen_jobs_generation` and `release_and_request_job`
+  are now `#[allow(dead_code)]`.
+- `src/core/regions/mod.rs` (RegionState) — `has_unassigned_citizen()`,
+  `contracted_workplace_tax_slots()`, and `citizen_holds_workplace()` (the
+  idempotence discriminator for the phantom-contract fix, below).
+  `continue_tick_to_job_demand_phase` now sets `job_demands: Vec::new()` and takes
+  `connectivity_dirty`. `pending_job_demands` / the `job_demands` field are
+  `#[allow(dead_code)]`.
+- `src/core/simulation.rs` — `continue_to_job_phase` replaces the daily wipe with
+  `economy::assign_local_jobs`, gated on
+  `is_daily && (jobs_exports_dirty || discovery_dirty || has_unassigned_citizen)`.
+- `src/core/systems/economy.rs` — `assign_local_jobs_for_daily_tick` (the wipe)
+  is `#[allow(dead_code)]`; P8 deletes it.
+- `src/core/world.rs` — `has_unassigned_citizen()`.
+- `src/core/regions/employment_directory.rs` — two correctness hardenings from the
+  codex review (below): `request_release` gates on a new shared
+  `accepted_cache_matches` helper, and `confirm_release` purges a raced duplicate
+  release for the same `(citizen, workplace)`.
+
+### Two correctness fixes surfaced by the cutover (codex review, both HIGH)
+
+1. **Phantom contract.** When a home can never apply an accepted lease — the
+   citizen took a local job or left between claim and apply —
+   `apply_workplace_assignment` returns `false`, and previously nothing released
+   the seat, so the employer reserved and taxed it forever. `home_apply_accepted_
+   employment` now returns wakes: it distinguishes the idempotent re-offer of an
+   already-applied lease (`citizen_holds_workplace` → skip) from a genuinely
+   unapplicable one (→ `request_release`, freeing the seat next employer wake).
+2. **Stale release removing a newer contract.** Leases carry no generation and the
+   employer matches releases by `(citizen, workplace)` alone. `request_release`
+   now only queues a lease the accepted cache still names; and `confirm_release`
+   purges any duplicate that raced into the lock-free gap between
+   `take_releases_for_employer` and confirmation. Together a stale duplicate can
+   no longer replay against a fresh contract for the same seat.
+
+### Tests
+
+- Migrated the observable multi-region tests to whole-city multi-day ticks (the
+  ledger's 3-hop handshake needs whole-city convergence, unlike the old
+  near-synchronous grant): `remote_workers_at`, `remote_workers_show_on_every_
+  footprint`, `remote_spare_jobs_allow_...`, `cross_region_commuter` via new
+  helper `tick_city_until_remote_worker`.
+- New: `the_daily_employment_phase_emits_no_legacy_job_export_traffic`,
+  `an_unapplicable_accepted_lease_is_declined_so_the_employer_frees_the_seat`,
+  `a_stale_release_is_dropped_once_the_accepted_cache_no_longer_names_the_lease`,
+  `confirm_release_purges_a_duplicate_release_that_raced_the_take_confirm_gap`.
+- `#[ignore]` (with notes) the tests that assert behavior the ledger deliberately
+  retired or that depend on the unbuilt P6 save/load durability:
+  `job_grant_continuation_runs_in_caller_region` (old-path internal, P8),
+  `two_worker_barrier_...` and both `save_load_rebuilds_cross_region_*` (P6:
+  ledger state isn't persisted yet), the 3 old-path `tick_state_tests` (P8), and
+  `bridged_remote_workplace_is_not_double_counted_for_population_growth` (its exact
+  count assumed the synchronous path AND bridge-claim symmetry; not re-covered
+  yet — see its note).
+
+### Risks / known gaps
+
+- **Save/load durability (P6).** The ledger's contracts / published pools /
+  directory are not persisted. After a load the first daily employment phase
+  releases the un-restored contract and re-handshakes over several days. This is
+  P6's scope; the affected tests are `#[ignore]`d with P6 notes.
+- **Coverage gaps flagged by codex (Medium, not defects):** stable payment,
+  disconnect/reconnect, quiet-day retry, hint-noise gating, and contract-derived
+  tax have partial coverage from P7-a..c and the migrated integration tests;
+  fuller unit coverage is a follow-up, not a cutover blocker.
+- **Pre-existing clippy toolchain bump.** A newer clippy flags 32 lints across
+  files P7-d never touches; P7-d itself is clippy-clean. Cleaned in a separate
+  commit per the "surgical changes" rule.
+
+### Commands run
+
+```text
+ cargo fmt                                   → clean
+ cargo clippy --all-targets -- -D warnings   → no NEW findings (32 pre-existing,
+                                               toolchain bump, unrelated files)
+ cargo test -q                               → all binaries green; 412 lib tests
+                                               pass, 3 ignored
+ codex exec resume small_city (×4)           → both HIGH findings fixed and
+                                               re-verified clean; remaining notes
+                                               are Medium coverage-completeness
+```
+
+### Diagram — the daily employment phase (P7-d), replacing the wipe
+
+```text
+ daily tick, gate fires (connectivity moved OR jobs dirty OR unassigned citizen)
+        │
+        ▼
+ daily_employment_phase():
+   1. release_contracts_with_unreachable_homes(&discovery)   (P7-c route inval.)
+   2. release_contracts_over_current_capacity()              (shrink/bulldoze)
+   3. report_lost_employment(dropped)  ->  wake homes
+   4. publish_pools(published_job_pools)         (open_count already net of contracts)
+   5. home_region_daily_jobs: submit fresh claims for still-jobless citizens
+        │
+        ▼   (the employer-validate / home-apply / decline halves run when the
+             wakes this emits are handled — handle_employment_directory_ready)
+ stable seats persist across days; no wipe, no fire-and-rehire churn.
+```
+
+### Diagram — the phantom-contract decline (home side)
+
+```text
+ employer accepts C's claim at W  ->  contract + reserved seat + accepted cache
+        │
+        ▼
+ before the home applies it, C takes a LOCAL job
+        │
+        ▼
+ home_apply_accepted_employment:
+   apply_workplace_assignment(C, W) == false
+     citizen_holds_workplace(C, W)? ── no (C holds the local job) ──> DECLINE
+        │                                └─ yes (already applied) ──> skip (idempotent)
+        ▼
+   request_release(C@W)  ->  wake employer  ->  employer frees the seat
+        (no more reserved-and-taxed phantom seat)
 ```

@@ -74,6 +74,12 @@ pub(crate) fn assign_local_jobs(world: &mut World, local_region: RegionId) {
 ///
 /// Daily ticks clear all prior assignments first so remote jobs can be requested
 /// again from producer regions after local matching has taken its current slots.
+///
+/// P7-d retired this: the ledger owns remote assignments (claim/apply/release/
+/// loss), so wiping them daily and re-requesting is exactly the churn the ledger
+/// replaces. `continue_to_job_phase` now calls `assign_local_jobs` directly. P8
+/// removes this function.
+#[allow(dead_code)] // P7-d: the daily wipe is retired; P8 deletes this.
 pub(crate) fn assign_local_jobs_for_daily_tick(world: &mut World, local_region: RegionId) {
     for citizen in world.citizens.values_mut() {
         citizen.workplace_assignment = None;

@@ -218,9 +218,20 @@ pub(crate) fn continue_to_job_phase(
     citizens::update_happiness_targets(world);
     citizens::update_happiness(world);
     local_effects::run(world);
-    let jobs_dirty = is_daily && (world.is_jobs_exports_dirty() || discovery_dirty);
+    // Directory employment ledger plan, P7-d: the daily-employment gate. Fires
+    // on a local job-relevant change, on a connectivity change (`discovery_dirty`
+    // now means "the component graph moved", not the raw generation), or when a
+    // citizen still wants work (a loss clears an assignment without dirtying the
+    // gate). `has_unassigned_citizen` is read here, AFTER population growth, so a
+    // citizen spawned this tick is noticed the same day.
+    let jobs_dirty = is_daily
+        && (world.is_jobs_exports_dirty() || discovery_dirty || world.has_unassigned_citizen());
     if jobs_dirty {
-        economy::assign_local_jobs_for_daily_tick(world, local_region);
+        // P7-d: no more daily wipe. `assign_local_jobs` re-matches local seekers
+        // from scratch (equivalent to the old wipe-and-reassign for locals) while
+        // its two guards preserve every remote assignment the ledger owns, and
+        // the registry holds employer-contracted seats out of local reach (P7-a).
+        economy::assign_local_jobs(world, local_region);
     }
 
     TickJobPhase {

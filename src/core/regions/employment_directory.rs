@@ -670,6 +670,16 @@ impl EmploymentDirectory {
         let mut state = self.broker.lock().unwrap();
         let employer = release.workplace.region();
 
+        // Only enqueue a release the accepted cache still names for this exact
+        // (citizen, workplace). Leases carry no generation and the employer
+        // matches releases by (citizen, workplace) alone, so a stale duplicate
+        // release -- submitted after the seat was already freed and re-contracted
+        // -- could otherwise strip the *newer* contract. If the cache no longer
+        // lists this lease there is nothing to give back. (P7-d review.)
+        if !accepted_cache_matches(&state, &release) {
+            return Vec::new();
+        }
+
         state
             .releases_by_employer
             .entry(employer)
@@ -716,6 +726,22 @@ impl EmploymentDirectory {
             return;
         }
 
+        // The confirmed contract is gone, so any release STILL queued for the
+        // same (citizen, workplace) can only be a stale duplicate of this one --
+        // a second `request_release` that raced in after this seat's release was
+        // drained but before this confirmation cleared the accepted cache (that
+        // gap holds no directory lock, so `request_release`'s cache guard cannot
+        // see the pending release). Drop them, or a later employer wake could
+        // replay one against a fresh contract for the same seat. (P7-d review.)
+        if let Some(queued) = state.releases_by_employer.get_mut(&employer) {
+            queued.retain(|pending| {
+                pending.citizen != release.citizen || pending.workplace != release.workplace
+            });
+            if queued.is_empty() {
+                state.releases_by_employer.remove(&employer);
+            }
+        }
+
         if let Some(pool) = state.pools_by_workplace.get_mut(&release.workplace) {
             pool.open_count = pool.open_count.saturating_add(1);
         }
@@ -760,14 +786,22 @@ impl EmploymentDirectory {
 /// hand-back on that answer, so a mismatched confirmation cannot advertise a
 /// phantom seat. `report_lost_employment` ignores it: it queues the loss
 /// regardless, and the home re-checks the match before clearing its citizen.
+/// The one match rule for a lease against the accepted cache: the citizen is
+/// still listed *and* still against this exact workplace. The bug both callers
+/// guard against is a `(citizen, workplace)`-only match hitting a newer contract
+/// after the old one was freed, so this rule lives in exactly one place.
+fn accepted_cache_matches(state: &EmploymentBrokerState, release: &EmploymentLeaseRef) -> bool {
+    state
+        .accepted_by_citizen
+        .get(&release.citizen)
+        .is_some_and(|assignment| assignment.workplace == release.workplace)
+}
+
 fn clear_accepted_cache_if_matches(
     state: &mut EmploymentBrokerState,
     release: &EmploymentLeaseRef,
 ) -> bool {
-    let Some(assignment) = state.accepted_by_citizen.get(&release.citizen) else {
-        return false;
-    };
-    if assignment.workplace != release.workplace {
+    if !accepted_cache_matches(state, release) {
         return false;
     }
 
@@ -1767,6 +1801,72 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_release_is_dropped_once_the_accepted_cache_no_longer_names_the_lease() {
+        // P7-d review (High): leases carry no generation and the employer matches
+        // releases by (citizen, workplace) alone. A duplicate/stale release
+        // submitted after the seat was already freed must NOT be queued, or it
+        // could strip a later contract for the same (citizen, workplace).
+        let (directory, job_pool, worker) = directory_with_one_accepted_worker();
+
+        // A real release lands, the employer drains and confirms it: the accepted
+        // cache no longer names the lease.
+        assert_eq!(
+            directory.request_release(lease(worker, job_pool)),
+            vec![RegionId(9)]
+        );
+        assert_eq!(directory.take_releases_for_employer(RegionId(9)).len(), 1);
+        directory.confirm_release(RegionId(9), lease(worker, job_pool));
+        assert!(
+            !directory
+                .broker
+                .lock()
+                .unwrap()
+                .accepted_by_citizen
+                .contains_key(&worker)
+        );
+
+        // A stale duplicate release for the same lease now finds nothing to give
+        // back: no wake, and nothing queued for the employer to act on.
+        assert!(
+            directory
+                .request_release(lease(worker, job_pool))
+                .is_empty()
+        );
+        assert!(
+            directory.take_releases_for_employer(RegionId(9)).is_empty(),
+            "the stale release must not be queued against the employer"
+        );
+    }
+
+    #[test]
+    fn confirm_release_purges_a_duplicate_release_that_raced_the_take_confirm_gap() {
+        // P7-d review (High): the employer drains releases (take_releases_for_
+        // employer) and confirms them in separate lock acquisitions. A duplicate
+        // request_release can slip into that gap while the accepted cache still
+        // matches; confirmation must purge it, or a later wake could replay it
+        // against a fresh contract for the same (citizen, workplace).
+        let (directory, job_pool, worker) = directory_with_one_accepted_worker();
+
+        // Employer picks up the real release (drains the queue) but has not
+        // confirmed yet -- the accepted cache still names the lease.
+        directory.request_release(lease(worker, job_pool));
+        assert_eq!(directory.take_releases_for_employer(RegionId(9)).len(), 1);
+
+        // A second home wake races in during the gap: still matches, so queued.
+        assert_eq!(
+            directory.request_release(lease(worker, job_pool)),
+            vec![RegionId(9)]
+        );
+
+        // Confirmation of the real release purges the stale duplicate.
+        directory.confirm_release(RegionId(9), lease(worker, job_pool));
+        assert!(
+            directory.take_releases_for_employer(RegionId(9)).is_empty(),
+            "the raced duplicate must not survive confirmation"
+        );
+    }
+
+    #[test]
     fn request_release_keeps_the_seat_booked_until_the_employer_confirms() {
         // P5 review check: request_release leaves open_count unchanged and keeps
         // the citizen active until confirm_release.
@@ -1910,6 +2010,16 @@ mod tests {
         let (directory, job_pool, worker) = directory_with_one_accepted_worker();
         let second = citizen(1, 51);
 
+        // Release drains. Done first, while `worker` is still accepted:
+        // `request_release` now only queues a lease the accepted cache still
+        // names, and the loss reports below clear it.
+        directory.request_release(lease(worker, job_pool));
+        assert_eq!(directory.take_releases_for_employer(RegionId(9)).len(), 1);
+        assert!(
+            directory.take_releases_for_employer(RegionId(9)).is_empty(),
+            "the release queue really drains"
+        );
+
         directory.report_lost_employment(JobLoss {
             lease: lease(worker, job_pool),
             reason: JobLossReason::PoolInvalid,
@@ -1925,14 +2035,7 @@ mod tests {
         assert_eq!(losses[1].lease.citizen, second);
         assert!(
             directory.take_losses_for_home(RegionId(1)).is_empty(),
-            "the queue really drains"
-        );
-
-        directory.request_release(lease(worker, job_pool));
-        assert_eq!(directory.take_releases_for_employer(RegionId(9)).len(), 1);
-        assert!(
-            directory.take_releases_for_employer(RegionId(9)).is_empty(),
-            "so does the release queue"
+            "the loss queue really drains"
         );
     }
 

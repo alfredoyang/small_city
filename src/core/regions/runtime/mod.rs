@@ -380,7 +380,17 @@ pub struct RegionRuntime {
     // the job reconcile gate — a separate marker so the hourly power gate
     // (which updates its own marker every hour) can never absorb a bump or
     // local change destined for the daily job gate.
+    // P7-d: superseded by `seen_connectivity_fingerprint` for the job gate; kept
+    // (unread) until P8 removes the old-path bookkeeping.
+    #[allow(dead_code)]
     seen_jobs_generation: u64,
+    // Directory employment ledger plan, P7-d: the connectivity fingerprint this
+    // region last reconciled cross-region employment against. The daily gate
+    // fires when the installed discovery's fingerprint differs from this — a
+    // connectivity change (road/link/topology), NOT hint-value noise. Replaces
+    // the raw `discovery_generation` comparison for the job gate (P7-b). Starts
+    // at 0 so a fresh/loaded runtime reconciles once.
+    seen_connectivity_fingerprint: u64,
     // Event-driven plan, P-5: same shape, for the goods reconcile gate.
     seen_goods_generation: u64,
     // Directory employment ledger plan, P3: installed once per worker slice
@@ -576,6 +586,7 @@ impl RegionRuntime {
             discovery_generation: 0,
             seen_power_generation: 0,
             seen_jobs_generation: 0,
+            seen_connectivity_fingerprint: 0,
             seen_goods_generation: 0,
             employment_directory: None,
             discovery: None,
@@ -849,9 +860,9 @@ impl RegionRuntime {
         let Some(directory) = self.employment_directory.clone() else {
             return Vec::new();
         };
-        let outbound = employer_validate_claims(self, &directory);
+        let mut outbound = employer_validate_claims(self, &directory);
         employer_apply_releases(self, &directory);
-        home_apply_accepted_employment(self, &directory);
+        outbound.extend(home_apply_accepted_employment(self, &directory));
         home_apply_losses(self, &directory);
         outbound
     }
@@ -1018,41 +1029,112 @@ impl RegionRuntime {
     /// them of salary (economy also only runs on the daily boundary, right
     /// after the wipe).
     ///
-    /// Only the discovery-generation half of the gate is read here, before
-    /// `continue_tick_to_job_demand_phase` runs: the OTHER half
-    /// (`jobs_exports_dirty`) is checked fresh, inside that call, AFTER
-    /// population growth — a citizen population growth spawns THIS tick
-    /// must not wait an extra day to be noticed (caught in review). The
-    /// effective, combined answer comes back via `phase.jobs_dirty()`.
+    /// Directory employment ledger plan, P7-d: the cutover. The daily gate's
+    /// connectivity half is read here (the installed discovery's fingerprint vs
+    /// `seen_connectivity_fingerprint` — a connectivity change, not hint-value
+    /// noise, P7-b); the other halves (`jobs_exports_dirty`,
+    /// `has_unassigned_citizen`) are checked fresh inside
+    /// `continue_tick_to_job_demand_phase`, AFTER population growth, so a citizen
+    /// spawned this tick is noticed the same day. The combined answer is
+    /// `phase.jobs_dirty()`.
+    ///
+    /// On a dirty daily tick the ledger runs (`daily_employment_phase`), not the
+    /// old `release_and_request_job` — that path is retired here (P8 deletes its
+    /// types). Local assignment already ran inside
+    /// `continue_tick_to_job_demand_phase` (no wipe), so the ledger sees an
+    /// accurate jobless set for its claims.
     fn enter_job_phase(
         &mut self,
         request_id: UiRequestId,
         power_phase: RegionalTickPowerPhase,
     ) -> Vec<OutboundMessage> {
-        let discovery_dirty = self.discovery_generation > self.seen_jobs_generation;
+        let connectivity_dirty =
+            self.installed_connectivity_fingerprint() != Some(self.seen_connectivity_fingerprint);
         let phase = self
             .state
-            .continue_tick_to_job_demand_phase(power_phase, discovery_dirty);
+            .continue_tick_to_job_demand_phase(power_phase, connectivity_dirty);
         if !phase.is_daily() {
             // Jobs resolve only on a daily boundary; an hourly tick neither makes
-            // nor invalidates job reservations, so it sends no release or requests.
+            // nor invalidates employment, so it runs no ledger reconciliation.
             let response = self.finish_job_phase(request_id, phase);
             let mut outbound = vec![OutboundMessage::RegionTickCompleted(response)];
             outbound.extend(self.drained_traveler_handoff_messages());
             return outbound;
         }
         let mut outbound = if phase.jobs_dirty() {
-            self.seen_jobs_generation = self.discovery_generation;
+            if let Some(fingerprint) = self.installed_connectivity_fingerprint() {
+                self.seen_connectivity_fingerprint = fingerprint;
+            }
             self.state.clear_jobs_exports_dirty();
-            self.release_and_request_job(request_id, &phase.job_demands)
+            self.daily_employment_phase()
         } else {
-            // Quiet daily: existing assignments (local AND remote) and the
-            // producer's ledger all persist untouched -- no wipe, no
-            // release, no requests. Mirrors power's quiet path (P-6):
-            // trust the gate, skip the recompute entirely.
+            // Quiet daily: existing assignments (local AND remote) and every
+            // contract persist untouched -- no reconciliation. Mirrors power's
+            // quiet path (P-6): trust the gate, skip the recompute entirely.
             Vec::new()
         };
         outbound.extend(self.enter_goods_phase(request_id, phase));
+        outbound
+    }
+
+    /// P7-d: the connectivity fingerprint of the installed discovery snapshot,
+    /// or `None` if no worker slice has installed one. `None != Some(seen)`, so
+    /// a runtime with no discovery installed treats the connectivity gate as
+    /// dirty once and reconciles (harmless: its route pass finds nothing).
+    fn installed_connectivity_fingerprint(&self) -> Option<u64> {
+        self.discovery
+            .as_ref()
+            .map(|discovery| discovery.connectivity_fingerprint)
+    }
+
+    /// P7-d: one region's daily cross-region employment reconciliation, run on a
+    /// dirty daily tick. Local assignment already happened (no wipe); this owns
+    /// the ledger side.
+    ///
+    /// Order (deviates from the plan pseudocode, which predates P7-a's retained
+    /// reservations and its own double resolve/apply is now automatic):
+    ///   1. route invalidation — drop contracts whose home no longer reaches the
+    ///      workplace (frees their reserved seats via the P7-a sync).
+    ///   2. capacity invalidation — drop contracts a shrunk/bulldozed workplace
+    ///      can no longer physically hold.
+    ///   3. report every dropped contract as an explicit `JobLoss` (wakes homes).
+    ///   4. publish this region's pools (open_count already net of contracts).
+    ///   5. submit fresh claims for this region's still-jobless citizens.
+    ///
+    /// The employer-validate / home-apply / release halves run when the wakes
+    /// this emits are processed (`handle_employment_directory_ready`).
+    ///
+    /// A runtime with no directory installed does only local work (steps 1-5 are
+    /// skipped): a single-region game has no cross-region employment.
+    fn daily_employment_phase(&mut self) -> Vec<OutboundMessage> {
+        let Some(directory) = self.employment_directory.clone() else {
+            return Vec::new();
+        };
+        let discovery = self.discovery.clone();
+
+        let mut lost = Vec::new();
+        if let Some(discovery) = discovery.as_deref() {
+            lost.extend(
+                self.state
+                    .release_contracts_with_unreachable_homes(discovery),
+            );
+        }
+        lost.extend(self.state.release_contracts_over_current_capacity());
+
+        let mut wake = std::collections::BTreeSet::new();
+        for (workplace, citizen, _contract) in lost {
+            wake.extend(directory.report_lost_employment(JobLoss {
+                lease: EmploymentLeaseRef { citizen, workplace },
+                reason: JobLossReason::PoolInvalid,
+            }));
+        }
+
+        directory.publish_pools(self.region_id(), self.state.published_job_pools());
+
+        let mut outbound = self.emit_employment_directory_ready(wake.into_iter().collect());
+        if let Some(discovery) = discovery.as_deref() {
+            outbound.extend(home_region_daily_jobs(self, &directory, discovery));
+        }
         outbound
     }
 
@@ -1062,6 +1144,10 @@ impl RegionRuntime {
     /// `current_job_request_id` so a later reply can tell "my current
     /// batch" from "a superseded one" (see `apply_job_export_grant`), and
     /// returns immediately without waiting for any reply.
+    ///
+    /// P7-d retired this: the ledger's `daily_employment_phase` replaced the old
+    /// cross-region job path. P8 deletes it and the `JobExport*` types.
+    #[allow(dead_code)]
     fn release_and_request_job(
         &mut self,
         request_id: UiRequestId,
@@ -1176,7 +1262,9 @@ impl RegionRuntime {
         // self-correcting in steady state; pairing salary and tax on the same day
         // would require a global "all exports resolved" barrier before any economy
         // runs, which is far more synchronization for little gain.
-        let exported_job_slots = self.job_export_allocations.units().collect::<Vec<_>>();
+        // P7-d: producer-owned workplace tax now comes from EmploymentContract
+        // state, not the retired JobExport allocation ledger.
+        let exported_job_slots = self.state.contracted_workplace_tax_slots();
         RegionTickResponse {
             request_id,
             region_id: self.region_id(),
@@ -1191,7 +1279,9 @@ impl RegionRuntime {
         request_id: UiRequestId,
         phase: RegionalTickGoodsPhase,
     ) -> RegionTickResponse {
-        let exported_job_slots = self.job_export_allocations.units().collect::<Vec<_>>();
+        // P7-d: producer-owned workplace tax now comes from EmploymentContract
+        // state, not the retired JobExport allocation ledger.
+        let exported_job_slots = self.state.contracted_workplace_tax_slots();
         let exported_goods_units = self.goods_export_allocations.units().sum();
         RegionTickResponse {
             request_id,
@@ -1693,23 +1783,44 @@ pub(crate) fn employer_validate_claims(
 pub(crate) fn home_apply_accepted_employment(
     runtime: &mut RegionRuntime,
     directory: &EmploymentDirectory,
-) {
+) -> Vec<OutboundMessage> {
     let snapshot = directory.snapshot(); // cheap Arc clone; no directory lock held below
     let Some(accepted) = snapshot.accepted_by_home_region.get(&runtime.region_id()) else {
-        return;
+        return Vec::new();
     };
 
     let mut applied = Vec::new();
+    let mut declined = Vec::new();
     for (citizen, assignment) in accepted {
         if runtime
             .state_mut()
             .apply_workplace_assignment(citizen.citizen, *assignment)
         {
             applied.push(*citizen);
+        } else if !runtime
+            .state()
+            .citizen_holds_workplace(citizen.citizen, assignment.workplace)
+        {
+            // The employer accepted this claim and is reserving+taxing the seat,
+            // but this home can never apply it: the citizen took a local job or
+            // left between claim and apply. Decline so the employer frees the
+            // seat, otherwise the contract is a phantom that reserves and taxes a
+            // seat nobody works. (An already-applied lease answers `false` too,
+            // but `citizen_holds_workplace` keeps it out of this branch.)
+            declined.push(EmploymentLeaseRef {
+                citizen: *citizen,
+                workplace: assignment.workplace,
+            });
         }
     }
 
     directory.acknowledge_home_applied(applied);
+
+    let mut wake = std::collections::BTreeSet::new();
+    for lease in declined {
+        wake.extend(directory.request_release(lease));
+    }
+    runtime.emit_employment_directory_ready(wake.into_iter().collect())
 }
 
 /// P5, home side: this citizen gives its job up.
@@ -1935,6 +2046,7 @@ mod tick_state_tests {
     }
 
     #[test]
+    #[ignore = "old JobExport path retired in P7-d; removed in P8"]
     fn daily_tick_without_job_demands_releases_job_allocations_before_finishing() {
         // Event-driven plan, P-2: this region's power gate goes quiet after
         // its first tick (nothing ever dirties it or moves its generation
@@ -2336,6 +2448,7 @@ mod tick_state_tests {
     }
 
     #[test]
+    #[ignore = "old JobExport path retired in P7-d; removed in P8"]
     fn stale_job_reply_is_dropped_and_releases_the_producer() {
         // Retire-tickstate, P-c: same staleness protection as power (P-a)
         // -- a reply for a batch this caller has already superseded must
@@ -2456,6 +2569,7 @@ mod tick_state_tests {
     }
 
     #[test]
+    #[ignore = "old JobExport path retired in P7-d; removed in P8"]
     fn daily_tick_with_jobless_seeker_completes_immediately_and_requests_export() {
         // Retire-tickstate, P-c: a locally-powered residential whose only
         // workplace sits on a separate, unreachable road network grows
@@ -3212,6 +3326,102 @@ mod employment_claim_flow_tests {
             directory.snapshot().accepted_by_home_region[&RegionId(1)].len(),
             1,
             "and the read cache still holds it -- acknowledge does not evict"
+        );
+    }
+
+    #[test]
+    fn the_daily_employment_phase_emits_no_legacy_job_export_traffic() {
+        // P7-d cutover claim (codex): the ledger's daily employment phase
+        // replaces the old JobExport request/grant path outright. Drive a region
+        // whose citizens stay jobless (no local jobs, no directory installed) so
+        // its daily employment reconcile is genuinely live every day, and prove
+        // it emits zero `JobExport*` traffic -- the old path's only wire signal.
+        let mut runtime = home_runtime(2);
+        assert!(
+            runtime.state().has_unassigned_citizen(),
+            "the fixture keeps a live, jobless daily employment phase"
+        );
+
+        for request_id in 1..=(2 * 24) {
+            runtime.push_event(RegionEvent::Tick {
+                request_id: UiRequestId(request_id),
+            });
+            let outbound = runtime.process_next_event();
+            assert!(
+                !outbound.iter().any(|message| matches!(
+                    message,
+                    OutboundMessage::JobExportRequested(_)
+                        | OutboundMessage::JobExportAllocationsReleased(_)
+                )),
+                "the ledger cutover must not emit any legacy JobExport traffic"
+            );
+        }
+
+        assert!(
+            runtime.state().has_unassigned_citizen(),
+            "still jobless: the phase ran live throughout, not vacuously quiet"
+        );
+    }
+
+    #[test]
+    fn an_unapplicable_accepted_lease_is_declined_so_the_employer_frees_the_seat() {
+        // P7-d High (codex): if the home can never apply an accepted lease -- the
+        // citizen took a local job (or left) between claim and apply -- the
+        // employer must not keep reserving and taxing a seat nobody works. The
+        // home declines it, and the employer frees the seat.
+        let (directory, mut employer, mut home) = accepted_but_not_yet_applied();
+        let citizen = only_citizen(&home);
+        assert_eq!(
+            employer.state().contracted_workplace_tax_slots().len(),
+            1,
+            "the employer holds one contract for the accepted claim"
+        );
+
+        // The citizen grabs a *local* job before the home applies the remote one.
+        let local_workplace = Entity::new(RegionId(1), 7);
+        assert!(home.state_mut().apply_workplace_assignment(
+            citizen,
+            WorkplaceAssignment {
+                workplace: local_workplace,
+                location: CityCellRef {
+                    region: RegionId(1),
+                    x: 0,
+                    y: 0,
+                },
+                salary: 3,
+            }
+        ));
+
+        // Home wake: cannot apply the remote lease, so it declines it and wakes
+        // the employer.
+        let wake = home_apply_accepted_employment(&mut home, &directory);
+        assert!(
+            wake.iter().any(|msg| matches!(
+                msg,
+                OutboundMessage::EmploymentDirectoryReady { target_region, .. }
+                    if *target_region == RegionId(9)
+            )),
+            "declining the stale lease wakes its employer"
+        );
+
+        // Employer wake: it honours the release and frees the seat.
+        employer_apply_releases(&mut employer, &directory);
+        assert!(
+            employer.state().contracted_workplace_tax_slots().is_empty(),
+            "the phantom contract is gone -- no seat reserved or taxed"
+        );
+        assert!(
+            directory
+                .snapshot()
+                .accepted_by_home_region
+                .get(&RegionId(1))
+                .is_none_or(|accepted| accepted.is_empty()),
+            "and the accepted cache no longer lists the declined lease"
+        );
+        // The citizen keeps its local job untouched.
+        assert_eq!(
+            assignment_of(&home, citizen).map(|a| a.workplace),
+            Some(local_workplace)
         );
     }
 

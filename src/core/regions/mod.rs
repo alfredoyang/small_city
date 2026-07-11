@@ -320,6 +320,8 @@ pub(crate) struct RegionalTickPowerPhase {
 /// Paused tick state after local job assignment and before the daily economy.
 pub(crate) struct RegionalTickJobPhase {
     phase: TickJobPhase,
+    // P7-d: always empty now (the ledger replaced demand collection); P8 removes it.
+    #[allow(dead_code)]
     pub job_demands: Vec<PendingJobDemand>,
 }
 
@@ -1185,19 +1187,21 @@ impl RegionState {
     pub(crate) fn continue_tick_to_job_demand_phase(
         &mut self,
         power_phase: RegionalTickPowerPhase,
-        discovery_dirty: bool,
+        connectivity_dirty: bool,
     ) -> RegionalTickJobPhase {
-        let phase =
-            continue_to_job_phase(&mut self.world, self.id, power_phase.phase, discovery_dirty);
-        // Jobs (and the economy) resolve only on a daily boundary, so cross-region
-        // job export is sought only then; hourly ticks carry no job demands.
-        // A quiet daily tick skipped the wipe, so nothing changed to collect either.
-        let job_demands = if phase.jobs_dirty() {
-            self.pending_job_demands()
-        } else {
-            Vec::new()
-        };
-        RegionalTickJobPhase { phase, job_demands }
+        let phase = continue_to_job_phase(
+            &mut self.world,
+            self.id,
+            power_phase.phase,
+            connectivity_dirty,
+        );
+        // P7-d: the ledger replaced the old cross-region job demand collection.
+        // `job_demands` is retained (empty) on the phase until P8 removes it; the
+        // runtime now reconciles via `daily_employment_phase`, not these demands.
+        RegionalTickJobPhase {
+            phase,
+            job_demands: Vec::new(),
+        }
     }
 
     /// Finishes the tick after job exports resolve.
@@ -1468,6 +1472,34 @@ impl RegionState {
         citizens
     }
 
+    /// P7-d: does any citizen still want work? Half of the daily-employment
+    /// gate. A loss clears an assignment without re-flagging `jobs_exports_dirty`
+    /// (P-c's `refresh_jobs_cache_after_grant_applied`), so without this a
+    /// laid-off citizen would never retry on an otherwise-quiet day.
+    #[allow(dead_code)] // P7-d: staged until the daily phase is tick-wired below.
+    pub(crate) fn has_unassigned_citizen(&self) -> bool {
+        self.world
+            .citizens
+            .values()
+            .any(|data| data.workplace_assignment.is_none())
+    }
+
+    /// P7-d: this region's workplace entities reserved for remote contract
+    /// holders, one entry per contract, in `(workplace, citizen)` order. Feeds
+    /// the daily economy's producer-owned workplace tax — replacing the old
+    /// `job_export_allocations.units()` source. A workplace with N contracts
+    /// contributes N entries, matching the old ledger's per-reserved-slot shape.
+    #[allow(dead_code)] // P7-d: wired into finish_job_phase's tax source below.
+    pub(crate) fn contracted_workplace_tax_slots(&self) -> Vec<Entity> {
+        let mut slots = Vec::new();
+        for (workplace, holders) in &self.employer_state.contracts_by_workplace {
+            for _ in 0..holders.len() {
+                slots.push(*workplace);
+            }
+        }
+        slots
+    }
+
     /// P3, employer side: does this region still have a free seat at
     /// `workplace` that it could contract out?
     ///
@@ -1538,6 +1570,21 @@ impl RegionState {
         citizen_data.workplace_assignment = Some(assignment);
         self.world.refresh_jobs_cache_after_grant_applied();
         true
+    }
+
+    /// Does this citizen already hold an assignment naming `workplace`?
+    ///
+    /// P7-d: `apply_workplace_assignment` answers `false` both for the idempotent
+    /// re-offer of an already-applied lease *and* for a stale accepted lease the
+    /// home can no longer take (the citizen grabbed a local job or left). Only the
+    /// latter is a phantom contract to decline, so the home tells them apart with
+    /// this check before requesting a release.
+    pub(crate) fn citizen_holds_workplace(&self, citizen: Entity, workplace: Entity) -> bool {
+        self.world
+            .citizens
+            .get(&citizen)
+            .and_then(|data| data.workplace_assignment)
+            .is_some_and(|assignment| assignment.workplace == workplace)
     }
 
     /// P3, employer side: record the contract in this region's own state and
@@ -1939,6 +1986,7 @@ impl RegionState {
         demands
     }
 
+    #[allow(dead_code)] // P7-d: old cross-region demand collection, retired; P8 deletes it.
     fn pending_job_demands(&self) -> Vec<PendingJobDemand> {
         let border_networks = self
             .network_border_links()

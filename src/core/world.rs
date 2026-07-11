@@ -385,6 +385,15 @@ impl World {
         self.jobs_exports_dirty.set(true);
     }
 
+    /// P7-d: does any citizen still want work? Part of the daily-employment
+    /// gate — a laid-off citizen re-enters the claim pool without re-flagging
+    /// `jobs_exports_dirty`, so the gate must also fire when one exists.
+    pub(crate) fn has_unassigned_citizen(&self) -> bool {
+        self.citizens
+            .values()
+            .any(|citizen| citizen.workplace_assignment.is_none())
+    }
+
     /// P7-a: replace the employer-contracted-seat reservation input and rebuild
     /// the jobs registry against it. Called by the region whenever an
     /// `EmploymentContract` is created, released, or lost. A no-op fast path
