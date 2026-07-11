@@ -1,13 +1,13 @@
 # Directory employment ledger — stable cross-region jobs without daily wipes
 
-Status: **proposal, P1-P5 done; P7 in progress (P7-a done)** (data model,
+Status: **proposal, P1-P5 done; P7 in progress (P7-a, P7-b done)** (data model,
 employer pool publishing, the claim flow, home apply, release/loss, and the
 contract-seat reservation foundation — see the "P<n>, implemented" sections
 at the end of this doc. P3-P5 are *staged*: built and tested, but nothing
 calls the ledger from the daily tick until P7-d's cutover). **P7 is split
 into P7-a..P7-d** (it is too large for one reviewable diff and flips the
-live allocator): P7-a retained reservations (done); P7-b connectivity
-fingerprint; P7-c discovery install + route invalidation; P7-d the cutover.
+live allocator): P7-a retained reservations and P7-b connectivity
+fingerprint (done); P7-c discovery install + route invalidation; P7-d the cutover.
 **Remaining order is P7 → P6 → P8** — P6 (save/load durability) is deferred
 until after P7 activates the flow and removes the daily wipe; see the note
 at the P6 section head. This is an
@@ -3275,4 +3275,128 @@ contract). No assertion weakened.
         ▲                                      ▲
    three separate subtractions,           ONE subtraction, in the registry,
    availability_hints forgotten           fed by a retained World input
+```
+
+## P7-b, implemented (2026-07-11)
+
+The connectivity-only signal. `CrossRegionDiscovery` now carries a
+`connectivity_fingerprint` that moves *only* when the component graph changes,
+never when a hint value (goods/power/spare-capacity number) changes. Nothing
+consumes it yet — P7-c wires route invalidation, P7-d gates on it.
+
+### Status
+
+**Implemented, no consumer.** Populated on every `rebuild_discovery`; read by
+nobody until P7-c/d. Zero behaviour change.
+
+### Why it exists (the finding-2 trap)
+
+P7 chose employer-side route invalidation, so when home A bulldozes the only
+road to employer B, B has no local change and must learn through the shared
+directory. But `RegionDirectory::publish_region` bumps a single `generation`
+whenever links **or hints** change, and hints carry spare goods/power/job-slot
+*numbers*. Gating employer route reconciliation on the raw generation would fire
+on exactly the "unrelated resource noise" P7 forbids. The fix: a signal that
+moves on connectivity but ignores hint values.
+
+### What it is
+
+`connectivity_fingerprint = DefaultHasher(components)`, where `components` is
+the union-find component graph. Because `UnionFind::components` already sorts
+each component and then the outer list, the graph is canonically ordered, so
+hashing it is deterministic without a re-sort. `DefaultHasher::new()` has fixed
+keys, and the fingerprint is only ever compared against an earlier value from
+the same process (never persisted), so cross-build hash stability is irrelevant.
+Codex confirmed the placement, determinism, and shared-directory observation are
+sound.
+
+### The key property, stronger than the plan assumed
+
+The plan worried a hint appearing/disappearing (a node-set change, not a value
+change) could move the fingerprint. Checking `availability_hints()` settled it:
+it emits **one hint per road network** (from `power.network_capacities`), and
+`build_component_graph` reads only `hint.network`. So the hint *node set* equals
+the set of road networks — a function of **road topology**, not of any value.
+Therefore:
+
+```text
+ goods stock / spare power / spare-job-slot NUMBER changes
+    -> hint VALUE changes, hint.network unchanged
+    -> component graph unchanged
+    -> fingerprint STABLE            (the P7 forbidden case: never fires)
+
+ road built/bulldozed (network partition changes), border link, topology edge
+    -> hint node SET and/or links change
+    -> component graph changes
+    -> fingerprint MOVES             (genuine connectivity: correctly fires)
+```
+
+The only way the hint node-set changes is a road-network-set change, which *is*
+connectivity. So the fingerprint has no value-noise false positives at all.
+
+### Scope
+
+One file: `src/core/regions/directory.rs` — the `connectivity_fingerprint`
+field, the `connectivity_fingerprint()` helper, its computation in
+`rebuild_discovery`.
+
+### Tests added (4)
+
+- `connectivity_fingerprint_is_stable_across_hint_value_changes` — varies **all
+  three** hint value fields (`has_spare_power`, `spare_job_slot_ids`,
+  `spare_goods_units`) with `hint.network` fixed; the generation moves, the
+  fingerprint does not. Mutation-tested: folding any hint value into the hash
+  fails it.
+- `connectivity_fingerprint_moves_when_a_border_link_appears` — two singletons
+  merge into one component; the fingerprint moves.
+- `connectivity_fingerprint_moves_when_the_hint_network_set_changes` — codifies
+  the deliberate node-set behaviour (a new hint network is a road-network-set
+  change, and correctly moves the fingerprint).
+- `connectivity_fingerprint_is_deterministic_for_the_same_graph` — same graph,
+  same fingerprint.
+
+### Existing tests modified
+
+None.
+
+### Risks remaining
+
+- **`DefaultHasher` may change across Rust versions.** Harmless here — the
+  fingerprint is a within-process change detector, never persisted or compared
+  across builds. If a save ever stores it (it should not), switch to an explicit
+  stable hash.
+- **Node-set false positives are conservative, not incorrect.** A new road
+  network with spare capacity moves the fingerprint even if it strands no
+  contract; P7-c/d's re-check simply finds all contracts still reachable. Bounded
+  and rare.
+
+### Commands run
+
+```text
+ cargo fmt --check                          → clean
+ cargo clippy -- -D warnings                → no new findings
+ cargo clippy --all-targets -- -D warnings  → no new findings
+ cargo test -q                              → 405 lib tests pass (was 401), +4
+ codex exec resume small_city               → no correctness/scope findings;
+                                               2 Low test-strengthening notes,
+                                               both applied
+```
+
+### Diagram — one publish, two signals
+
+```text
+ publish_region(links, hints)   (hints = one per road network, value + network)
+        │
+        ▼
+ rebuild_discovery
+   generation += 1  ───────────────►  moves on ANY publish (links OR hint values)
+   components = union_find(links,           consumed by the existing hourly gates
+                           hint.network set)
+   fingerprint = hash(components) ──►  moves ONLY on connectivity
+        │                                  (road-net set / links / topology);
+        ▼                                  stable across all hint VALUE noise
+ CrossRegionDiscovery { generation, connectivity_fingerprint, components, … }
+        │
+        └── P7-c reads fingerprint for contract reachability re-checks;
+            P7-d gates the employer route pass on it. (nobody reads it in P7-b)
 ```

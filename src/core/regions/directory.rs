@@ -46,6 +46,19 @@ pub struct CrossRegionDiscovery {
     /// and compare against their own `seen_*_generation` to decide whether a
     /// cross-region change happened since their last reconcile.
     pub generation: u64,
+    /// Directory employment ledger plan, P7-b: a stable hash of the component
+    /// graph below, bumped only when *connectivity* changes (a road, border
+    /// link, or topology edge) — never when a hint *value* changes.
+    ///
+    /// `generation` moves on every publish, including hint-value churn
+    /// (goods/power/spare-capacity numbers), so it cannot gate employer route
+    /// reconciliation without firing on exactly the "unrelated resource noise"
+    /// P7 forbids. The component graph is a function of links + topology + the
+    /// hint node *set* only — hint values never touch it — so a hash of it is a
+    /// connectivity-only signal. P7-c/d compare it against a per-region
+    /// `seen_connectivity_fingerprint` to decide whether to re-check contract
+    /// reachability. Nothing reads it yet (P7-b just populates it).
+    pub connectivity_fingerprint: u64,
     pub components: Vec<Vec<RegionRoadNetworkId>>,
     pub availability_hints: Vec<RegionalAvailabilityHint>,
     /// P-a: per-region INPUT for the Layer-1 Dijkstra. Each region prices its
@@ -253,9 +266,12 @@ impl RegionDirectory {
             .collect();
         let region_routes = build_region_routes(&road_reports, &self.owners);
         state.generation += 1;
+        let components = build_component_graph(&links, &availability_hints, &state.topology);
+        let connectivity_fingerprint = connectivity_fingerprint(&components);
         let discovery = CrossRegionDiscovery {
             generation: state.generation,
-            components: build_component_graph(&links, &availability_hints, &state.topology),
+            connectivity_fingerprint,
+            components,
             availability_hints,
             road_reports,
             region_routes,
@@ -718,6 +734,25 @@ fn dedup_exits(exits: Vec<ExitLink>) -> Vec<ExitLink> {
         }
     }
     out
+}
+
+/// P7-b: a stable, connectivity-only hash of the component graph.
+///
+/// `components` is canonically ordered (`UnionFind::components` sorts each
+/// component and then the outer list), so hashing it directly is deterministic
+/// — no re-sort needed. `DefaultHasher::new()` uses fixed keys, so the same
+/// graph always hashes to the same value within a build; the fingerprint is
+/// only ever compared against an earlier value from the same process, never
+/// persisted, so cross-build hash stability is irrelevant.
+///
+/// Because the graph depends on links + topology + the hint node *set* (never
+/// hint values), this hash does not move when a goods/power/spare-capacity
+/// number changes — which is the whole point.
+fn connectivity_fingerprint(components: &[Vec<RegionRoadNetworkId>]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    components.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn build_component_graph(
@@ -2138,5 +2173,137 @@ mod tests {
             region: RegionId(region),
             road_network,
         }
+    }
+
+    // ---- P7-b: connectivity fingerprint ----
+
+    fn hint_on(network: RegionRoadNetworkId, spare_goods: u32) -> RegionalAvailabilityHint {
+        RegionalAvailabilityHint {
+            network,
+            has_spare_power: true,
+            spare_job_slot_ids: Vec::new(),
+            spare_goods_units: spare_goods,
+        }
+    }
+
+    #[test]
+    fn connectivity_fingerprint_is_stable_across_hint_value_changes() {
+        // The whole point of P7-b: a goods/power/capacity number moving bumps the
+        // generation (there IS a change) but must NOT move the connectivity
+        // fingerprint, so it cannot fire employer route reconciliation.
+        //
+        // Vary EVERY hint value field while keeping `hint.network` fixed, so a
+        // regression that folded any of them into the fingerprint is caught.
+        let directory = RegionDirectory::new(Vec::new());
+        let net = network(1, 0);
+        let low = RegionalAvailabilityHint {
+            network: net,
+            has_spare_power: true,
+            spare_job_slot_ids: Vec::new(),
+            spare_goods_units: 0,
+        };
+        let high = RegionalAvailabilityHint {
+            network: net,
+            has_spare_power: false,         // value change
+            spare_job_slot_ids: vec![1, 2], // value change
+            spare_goods_units: 99,          // value change
+        };
+
+        assert!(directory.publish_region(RegionId(1), Vec::new(), vec![low]));
+        let first = directory.discovery_snapshot();
+
+        assert!(directory.publish_region(RegionId(1), Vec::new(), vec![high]));
+        let second = directory.discovery_snapshot();
+
+        assert!(
+            second.generation > first.generation,
+            "a hint-value change is still a publish: the generation moves"
+        );
+        assert_eq!(
+            second.connectivity_fingerprint, first.connectivity_fingerprint,
+            "but the connectivity fingerprint must not move on hint-value noise"
+        );
+    }
+
+    #[test]
+    fn connectivity_fingerprint_moves_when_the_hint_network_set_changes() {
+        // Deliberate, and acceptable. `build_component_graph` seeds a node from
+        // every hint network, so a hint appearing for a NEW network adds a
+        // singleton to the component graph and moves the fingerprint. That is a
+        // road-network *set* change (a new local network gained spare capacity),
+        // not goods/power value noise -- and it only causes a harmless
+        // conservative re-check downstream, never a false "unrelated noise" fire,
+        // because a value change keeps the same network id (previous test).
+        let directory = RegionDirectory::new(Vec::new());
+        assert!(directory.publish_region(RegionId(1), Vec::new(), vec![hint_on(network(1, 0), 0)]));
+        let before = directory.discovery_snapshot().connectivity_fingerprint;
+
+        assert!(directory.publish_region(
+            RegionId(1),
+            Vec::new(),
+            vec![hint_on(network(1, 0), 0), hint_on(network(1, 1), 0)],
+        ));
+        let after = directory.discovery_snapshot().connectivity_fingerprint;
+
+        assert_ne!(
+            after, before,
+            "a new hint network is a node-set change: the fingerprint moves"
+        );
+    }
+
+    #[test]
+    fn connectivity_fingerprint_moves_when_a_border_link_appears() {
+        // Two regions become connected: the component graph merges two singletons
+        // into one component. The fingerprint must move.
+        let directory = RegionDirectory::new(vec![RegionNeighborLink::new(
+            RegionId(1),
+            BorderEdge::East,
+            RegionId(2),
+        )]);
+        let left = NetworkBorderLink {
+            network: network(1, 0),
+            link: crate::core::regions::BorderLinkId {
+                edge: BorderEdge::East,
+                offset: 0,
+            },
+        };
+        let right = NetworkBorderLink {
+            network: network(2, 0),
+            link: crate::core::regions::BorderLinkId {
+                edge: BorderEdge::West,
+                offset: 0,
+            },
+        };
+
+        // Both regions present but not yet linked to each other.
+        assert!(directory.publish_region(RegionId(1), vec![left], Vec::new()));
+        let before = directory.discovery_snapshot().connectivity_fingerprint;
+
+        // Region 2 publishes the matching border link: the two networks join.
+        assert!(directory.publish_region(RegionId(2), vec![right], Vec::new()));
+        let after = directory.discovery_snapshot();
+
+        assert_ne!(
+            after.connectivity_fingerprint, before,
+            "a new cross-region connection must move the connectivity fingerprint"
+        );
+        assert!(
+            after
+                .components
+                .iter()
+                .any(|component| component.len() == 2),
+            "the two networks now share one component"
+        );
+    }
+
+    #[test]
+    fn connectivity_fingerprint_is_deterministic_for_the_same_graph() {
+        let build = || {
+            let directory = RegionDirectory::new(Vec::new());
+            directory.publish_region(RegionId(1), Vec::new(), vec![hint_on(network(1, 0), 7)]);
+            directory.publish_region(RegionId(2), Vec::new(), vec![hint_on(network(2, 0), 3)]);
+            directory.discovery_snapshot().connectivity_fingerprint
+        };
+        assert_eq!(build(), build(), "same graph -> same fingerprint");
     }
 }
