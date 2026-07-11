@@ -1163,15 +1163,15 @@ mod tests {
         );
 
         let state = directory.broker.lock().unwrap();
-        assert!(state.pools_by_workplace.get(&pool_a.workplace).is_none());
+        assert!(!state.pools_by_workplace.contains_key(&pool_a.workplace));
         assert!(
             state.claims_by_id.is_empty(),
             "invalidate_pending_claims_for_pool must drop the pending claim"
         );
-        assert!(state.pending_by_workplace.get(&pool_a.workplace).is_none());
+        assert!(!state.pending_by_workplace.contains_key(&pool_a.workplace));
         assert!(state.pending_by_citizen.is_empty());
         assert!(
-            state.pending_by_employer.get(&employer).is_none(),
+            !state.pending_by_employer.contains_key(&employer),
             "P2 review check: pending_by_employer must be cleared too"
         );
     }

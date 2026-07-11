@@ -81,7 +81,9 @@ fn default_building_level() -> u8 {
 ///
 /// This avoids a separate component map for state that only makes sense for one building kind,
 /// while leaving room for later variants such as warehouse, office, or civic building data.
+#[derive(Default)]
 pub enum BuildingData {
+    #[default]
     None,
     /// Commercial inventory for goods made by local industrial buildings.
     ///
@@ -98,12 +100,6 @@ pub enum BuildingData {
         #[serde(default)]
         business: BusinessFinance,
     },
-}
-
-impl Default for BuildingData {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

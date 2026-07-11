@@ -891,10 +891,10 @@ impl RegionRuntime {
     }
 
     fn remember_power_export_producer(&mut self, grant: &PowerExportGrant) {
-        if grant.granted {
-            if let Some(source_region) = grant.source_region {
-                insert_sorted_unique(&mut self.power_export_producers, source_region);
-            }
+        if grant.granted
+            && let Some(source_region) = grant.source_region
+        {
+            insert_sorted_unique(&mut self.power_export_producers, source_region);
         }
     }
 
@@ -908,10 +908,10 @@ impl RegionRuntime {
     }
 
     fn remember_goods_export_producer(&mut self, grant: &GoodsExportGrant) {
-        if grant.granted {
-            if let Some(source_region) = grant.source_region {
-                insert_sorted_unique(&mut self.goods_export_producers, source_region);
-            }
+        if grant.granted
+            && let Some(source_region) = grant.source_region
+        {
+            insert_sorted_unique(&mut self.goods_export_producers, source_region);
         }
     }
 
@@ -3477,11 +3477,10 @@ mod employment_claim_flow_tests {
 
         let citizen = only_citizen(&home);
         assert!(
-            directory
+            !directory
                 .snapshot()
                 .accepted_by_home_region
-                .get(&RegionId(1))
-                .is_none(),
+                .contains_key(&RegionId(1)),
             "the claim was rejected, so nothing is accepted for this home"
         );
         home_apply_accepted_employment(&mut home, &directory);
@@ -3527,11 +3526,10 @@ mod employment_claim_flow_tests {
         drop(directory);
         let rebuilt = Arc::new(EmploymentDirectory::default());
         assert!(
-            rebuilt
+            !rebuilt
                 .snapshot()
                 .accepted_by_home_region
-                .get(&RegionId(1))
-                .is_none(),
+                .contains_key(&RegionId(1)),
             "the fresh broker knows nothing"
         );
 

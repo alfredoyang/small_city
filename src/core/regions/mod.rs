@@ -1271,17 +1271,17 @@ impl RegionState {
             // same consumer locally before this now-late denial arrives;
             // clearing unconditionally would wipe real local power and
             // subtract it from the supplied stat.
-            if let Some(consumer) = self.world.power_consumers.get_mut(&demand.consumer) {
-                if consumer.powered && matches!(consumer.source, Some(PowerSource::Imported { .. }))
-                {
-                    consumer.powered = false;
-                    consumer.source = None;
-                    self.world.stats.power.total_power_supplied -= demand.demand;
-                    self.world.stats.power.total_power_shortage =
-                        (self.world.stats.power.total_power_demand
-                            - self.world.stats.power.total_power_supplied)
-                            .max(0);
-                }
+            if let Some(consumer) = self.world.power_consumers.get_mut(&demand.consumer)
+                && consumer.powered
+                && matches!(consumer.source, Some(PowerSource::Imported { .. }))
+            {
+                consumer.powered = false;
+                consumer.source = None;
+                self.world.stats.power.total_power_supplied -= demand.demand;
+                self.world.stats.power.total_power_shortage =
+                    (self.world.stats.power.total_power_demand
+                        - self.world.stats.power.total_power_supplied)
+                        .max(0);
             }
             return;
         }

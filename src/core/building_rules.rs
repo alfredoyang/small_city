@@ -160,7 +160,7 @@ fn area_reachable_in_one_step(from: u32, to: u32) -> bool {
         return false;
     }
     (1..=from)
-        .filter(|w| from % w == 0)
+        .filter(|w| from.is_multiple_of(*w))
         .any(|w| to == from + w || to == from + from / w)
 }
 

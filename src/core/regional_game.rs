@@ -810,10 +810,10 @@ impl RegionalGame {
     }
 
     fn selected_region_or_first(&self) -> Result<RegionId, RegionalGameError> {
-        if let Some(region_id) = self.selected_region {
-            if self.region_ids.contains(&region_id) {
-                return Ok(region_id);
-            }
+        if let Some(region_id) = self.selected_region
+            && self.region_ids.contains(&region_id)
+        {
+            return Ok(region_id);
         }
 
         self.region_ids

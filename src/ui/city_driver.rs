@@ -148,14 +148,14 @@ impl CityDriver {
             _ => None,
         };
 
-        if let Some((edge, next_x, next_y)) = crossing {
-            if self.select_neighbor(edge) {
-                let neighbor_view = self.view();
-                return (
-                    next_x.min(neighbor_view.map.width.saturating_sub(1)),
-                    next_y.min(neighbor_view.map.height.saturating_sub(1)),
-                );
-            }
+        if let Some((edge, next_x, next_y)) = crossing
+            && self.select_neighbor(edge)
+        {
+            let neighbor_view = self.view();
+            return (
+                next_x.min(neighbor_view.map.width.saturating_sub(1)),
+                next_y.min(neighbor_view.map.height.saturating_sub(1)),
+            );
         }
 
         (

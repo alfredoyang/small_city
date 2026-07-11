@@ -178,18 +178,26 @@ pub(crate) fn inspect_world(world: &World, x: usize, y: usize) -> InspectView {
         cell: in_bounds.then(|| cell_view(world, x, y)),
         details: in_bounds.then(|| inspect_details(world, x, y)),
         local_effects: in_bounds.then(|| local_effects_view(world, x, y)),
-        flags: in_bounds
-            .then(|| inspect_flags(world, x, y))
-            .unwrap_or_default(),
-        explanations: in_bounds
-            .then(|| inspect_explanations(world, x, y))
-            .unwrap_or_default(),
-        roster: in_bounds
-            .then(|| citizen_roster(world, x, y))
-            .unwrap_or_default(),
-        road_traveler_count: in_bounds
-            .then(|| road_traveler_count(world, x, y))
-            .unwrap_or_default(),
+        flags: if in_bounds {
+            inspect_flags(world, x, y)
+        } else {
+            Default::default()
+        },
+        explanations: if in_bounds {
+            inspect_explanations(world, x, y)
+        } else {
+            Default::default()
+        },
+        roster: if in_bounds {
+            citizen_roster(world, x, y)
+        } else {
+            Default::default()
+        },
+        road_traveler_count: if in_bounds {
+            road_traveler_count(world, x, y)
+        } else {
+            Default::default()
+        },
     }
 }
 
@@ -597,11 +605,10 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
             // access already affects simulation through regional job exports; teaching
             // this display helper about neighbor regions is a separate UI mission.
             explain_road_access(world, entity, building.kind, &mut explanations);
-            if let Some(population) = world.populations.get(&entity) {
-                if population.current >= population.max {
-                    explanations
-                        .push("This residential building is at max population.".to_string());
-                }
+            if let Some(population) = world.populations.get(&entity)
+                && population.current >= population.max
+            {
+                explanations.push("This residential building is at max population.".to_string());
             }
             if world.stats.pollution > 0 {
                 explanations.push(format!(

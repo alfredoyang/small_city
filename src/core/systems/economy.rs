@@ -763,15 +763,13 @@ fn margin_per_good(base: i32, distance: Option<u32>) -> i32 {
 }
 
 fn consume_local_good(world: &mut World, commercial: Entity) {
-    if let Some(building) = world.buildings.get_mut(&commercial) {
-        if let BuildingData::Commercial {
+    if let Some(building) = world.buildings.get_mut(&commercial)
+        && let BuildingData::Commercial {
             local_goods_stored, ..
         } = &mut building.data
-        {
-            if *local_goods_stored > 0 {
-                *local_goods_stored -= 1;
-            }
-        }
+        && *local_goods_stored > 0
+    {
+        *local_goods_stored -= 1;
     }
 }
 

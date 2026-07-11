@@ -632,10 +632,8 @@ fn advance_to_exit(
             moved.state = travelling(entry, exit_cell);
             RemoteStep::Walking(moved.state)
         } else {
-            // No reachable entry → stay put.
-            moved.state.building = Some(origin);
-            moved.state.current_cell = None;
-            moved.state.dwell = 0;
+            // No reachable entry → stay put. `RemoteStep::Stay` carries no state,
+            // so `moved` is dropped unread here.
             RemoteStep::Stay
         }
     }
@@ -793,10 +791,10 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..4 {
             step_tokens(&mut world);
-            if let Some(t) = world.tokens.get(&id) {
-                if let Some(c) = t.state.current_cell {
-                    seen.push(c);
-                }
+            if let Some(t) = world.tokens.get(&id)
+                && let Some(c) = t.state.current_cell
+            {
+                seen.push(c);
             }
         }
         assert_eq!(seen, roads.to_vec(), "exact route cells r0..r3");
@@ -1456,15 +1454,15 @@ mod tests {
         let mut on_x = 0;
         for _ in 0..12 {
             step_tokens(&mut world);
-            if let Some(t) = world.tokens.get(&id) {
-                if t.state.current_cell == Some(x_cell) {
-                    on_x += 1;
-                }
+            if let Some(t) = world.tokens.get(&id)
+                && t.state.current_cell == Some(x_cell)
+            {
+                on_x += 1;
             }
-            if let Some(t) = world.tokens.get(&id) {
-                if t.state.status == TravelStatus::AtWork {
-                    break;
-                }
+            if let Some(t) = world.tokens.get(&id)
+                && t.state.status == TravelStatus::AtWork
+            {
+                break;
             }
         }
         assert_eq!(on_x, 4, "the 4-way X holds the traveller for 4 sub-ticks");
@@ -1533,10 +1531,10 @@ mod tests {
         let mut walked = Vec::new();
         for _ in 0..6 {
             step_tokens(&mut world);
-            if let Some(t) = world.tokens.get(&key) {
-                if let Some(c) = t.state.current_cell {
-                    walked.push(c);
-                }
+            if let Some(t) = world.tokens.get(&key)
+                && let Some(c) = t.state.current_cell
+            {
+                walked.push(c);
             }
         }
         // The token walked at least one cell (r3 → r2). The full path is
@@ -1643,10 +1641,10 @@ mod tests {
         let mut on_x = 0;
         for _ in 0..12 {
             step_tokens(&mut world);
-            if let Some(t) = world.tokens.get(&key) {
-                if t.state.current_cell == Some(x_cell) {
-                    on_x += 1;
-                }
+            if let Some(t) = world.tokens.get(&key)
+                && t.state.current_cell == Some(x_cell)
+            {
+                on_x += 1;
             }
         }
         assert_eq!(

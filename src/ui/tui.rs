@@ -673,10 +673,10 @@ impl TuiRuntime {
     fn poll_timeout(&self, now: Instant) -> Duration {
         let mut timeout = poll_timeout(self.state.is_running, self.next_auto_tick, now);
         // While a build flash is showing, wake at its expiry so the redraw can clear it.
-        if let Some(flash) = &self.state.build_flash {
-            if flash.is_active(now) {
-                timeout = timeout.min(flash.expires_at.saturating_duration_since(now));
-            }
+        if let Some(flash) = &self.state.build_flash
+            && flash.is_active(now)
+        {
+            timeout = timeout.min(flash.expires_at.saturating_duration_since(now));
         }
         // While animating, wake on the (speed-scaled) animation cadence so the next frame can paint.
         if self.animation_active() {
@@ -687,11 +687,11 @@ impl TuiRuntime {
 
     /// Drops an expired build flash and asks for a repaint so it disappears on time.
     fn expire_build_flash(&mut self, now: Instant) {
-        if let Some(flash) = &self.state.build_flash {
-            if !flash.is_active(now) {
-                self.state.build_flash = None;
-                self.dirty = true;
-            }
+        if let Some(flash) = &self.state.build_flash
+            && !flash.is_active(now)
+        {
+            self.state.build_flash = None;
+            self.dirty = true;
         }
     }
 
@@ -3129,15 +3129,16 @@ fn animate_city_tile(
     animating: bool,
 ) {
     // Day/night only tints plain cells (leave the bright cursor/preview highlight at full strength).
-    if !is_cursor && preview == PreviewState::None {
-        if let Some(Color::Rgb(r, g, b)) = glyph.style.bg {
-            let f = day_night_factor(hour);
-            glyph.style = glyph.style.bg(Color::Rgb(
-                dim_channel(r, f),
-                dim_channel(g, f),
-                dim_channel(b, f),
-            ));
-        }
+    if !is_cursor
+        && preview == PreviewState::None
+        && let Some(Color::Rgb(r, g, b)) = glyph.style.bg
+    {
+        let f = day_night_factor(hour);
+        glyph.style = glyph.style.bg(Color::Rgb(
+            dim_channel(r, f),
+            dim_channel(g, f),
+            dim_channel(b, f),
+        ));
     }
 
     // Cursor pulse: alternate the bright highlight so the selected lot blinks.

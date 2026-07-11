@@ -240,13 +240,12 @@ fn add_business_cash(world: &mut World, entity: Entity, amount: i32) {
 /// Adds `amount` goods to a commercial building's local stock, capped at its (level-based) storage.
 fn add_commercial_goods_capped(world: &mut World, entity: Entity, amount: i32) {
     let capacity = economy::commercial_goods_capacity_for_entity(world, entity);
-    if let Some(building) = world.buildings.get_mut(&entity) {
-        if let BuildingData::Commercial {
+    if let Some(building) = world.buildings.get_mut(&entity)
+        && let BuildingData::Commercial {
             local_goods_stored, ..
         } = &mut building.data
-        {
-            *local_goods_stored = (*local_goods_stored + amount).min(capacity);
-        }
+    {
+        *local_goods_stored = (*local_goods_stored + amount).min(capacity);
     }
 }
 
@@ -504,10 +503,11 @@ fn claim_kind(
 fn same_type_entities_in(world: &World, self_entity: Entity, rect: Rect) -> Vec<Entity> {
     let mut neighbours = Vec::new();
     for (cx, cy) in rect.cells() {
-        if let Some(other) = world.grid.get(cx, cy) {
-            if other != self_entity && !neighbours.contains(&other) {
-                neighbours.push(other);
-            }
+        if let Some(other) = world.grid.get(cx, cy)
+            && other != self_entity
+            && !neighbours.contains(&other)
+        {
+            neighbours.push(other);
         }
     }
     neighbours
