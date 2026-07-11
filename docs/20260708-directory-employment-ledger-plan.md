@@ -2,7 +2,7 @@
 
 Status: **proposal, P1 through P5 implemented** (data model, employer pool
 publishing, the claim flow, home apply, and release/loss — see the "P<n>,
-implemented" sections at the end of this doc; P6-P7 still plan-only. P3-P5
+implemented" sections at the end of this doc; P6-P8 still plan-only. P3-P5
 are *staged*: the whole lifecycle is built and tested, but nothing calls it
 from the daily tick until P7). This is an
 alternative to pushing
@@ -252,11 +252,9 @@ struct EmploymentBrokerState {
     pending_by_employer: BTreeMap<RegionId, BTreeSet<JobClaimId>>,
     releases_by_employer: BTreeMap<RegionId, Vec<EmploymentLeaseRef>>,
     losses_by_home: BTreeMap<RegionId, Vec<JobLoss>>,
-    // Optional read cache of accepted claims. This mirrors region truth so
-    // home regions can discover accepted employment cheaply; it is not the
-    // authority for whether the employer contract actually exists.
+    // Read cache of accepted claims. This mirrors region truth so home regions
+    // can discover accepted employment cheaply; it is not contract authority.
     accepted_by_citizen: BTreeMap<CitizenRef, WorkplaceAssignment>,
-    accepted_by_workplace: BTreeMap<Entity, BTreeSet<CitizenRef>>,
     pool_generation_by_workplace: BTreeMap<Entity, u64>,
     global_generation: u64,
 }
@@ -323,6 +321,11 @@ workplace pool currently advertises.
 unemployed list without a per-citizen directory lock. The directory still
 checks the same rule inside `submit_claims` because the snapshot may be
 stale.
+
+`accepted_by_citizen` is the only accepted read cache. Capacity decisions use
+the employer's contracts and the directory's cached `JobPool::open_count`;
+they never use accepted-cache membership. A workplace grouping can be derived
+from `accepted_by_citizen` if a real read consumer appears later.
 
 ```rust
 fn group_active_citizens_by_home(
@@ -677,11 +680,6 @@ impl EmploymentDirectory {
                 if let Some(pool) = state.pools_by_workplace.get_mut(&claim.workplace) {
                     pool.open_count = pool.open_count.saturating_sub(1);
                 }
-                state
-                    .accepted_by_workplace
-                    .entry(claim.workplace)
-                    .or_default()
-                    .insert(claim.citizen);
                 state.accepted_by_citizen.insert(claim.citizen, assignment);
             }
         }
@@ -867,8 +865,9 @@ impl EmploymentDirectory {
         let mut state = self.broker.lock().unwrap();
         let employer = release.workplace.region();
 
-        // Keep accepted_by_workplace populated until the employer confirms. That
-        // prevents this capacity from being advertised as open during release.
+        // Keep accepted_by_citizen populated until the employer confirms, so
+        // this citizen cannot claim a second job. Capacity stays unavailable
+        // because open_count is unchanged until confirm_release.
         state
             .releases_by_employer
             .entry(employer)
@@ -964,17 +963,6 @@ fn clear_accepted_cache_if_matches(
     }
 
     state.accepted_by_citizen.remove(&release.citizen);
-    let mut remove_pool_entry = false;
-    if let Some(workers) = state
-        .accepted_by_workplace
-        .get_mut(&release.workplace)
-    {
-        workers.remove(&release.citizen);
-        remove_pool_entry = workers.is_empty();
-    }
-    if remove_pool_entry {
-        state.accepted_by_workplace.remove(&release.workplace);
-    }
 }
 ```
 
@@ -984,6 +972,314 @@ This is the part that enforces the user-facing rule:
  worker keeps being paid until:
    employer confirms the pool contract is invalid, or
    home explicitly releases the assignment
+```
+
+## Live Cutover And Route Reconciliation
+
+Per-slice snapshot install:
+
+```rust
+struct RegionRuntime {
+    discovery_snapshot: Arc<CrossRegionDiscovery>,
+    // ...
+}
+
+impl RegionRuntime {
+    fn set_discovery_snapshot(&mut self, snapshot: Arc<CrossRegionDiscovery>) {
+        self.discovery_generation = snapshot.generation;
+        self.discovery_snapshot = snapshot;
+    }
+
+    fn discovery_snapshot(&self) -> Arc<CrossRegionDiscovery> {
+        Arc::clone(&self.discovery_snapshot)
+    }
+}
+
+fn process_worker_slice(worker: &mut RegionWorker) {
+    let discovery = worker.directory.discovery_snapshot();
+    for runtime in &mut worker.regions {
+        runtime.set_discovery_snapshot(Arc::clone(&discovery));
+        runtime.set_employment_directory(Arc::clone(&worker.employment_directory));
+        runtime.process_some_events(MAX_EVENTS_PER_REGION);
+    }
+}
+```
+
+Contract-aware registry resolution:
+
+```rust
+fn resolve_job_assignments(
+    world: &World,
+    requests: &[JobRequest],
+    workplace_slots: &[Entity],
+    reserved_by_workplace: &BTreeMap<Entity, u16>,
+) -> (Vec<JobAssignment>, Vec<Entity>) {
+    let mut remaining_workplaces = workplace_slots.to_vec();
+
+    // One repeated Entity is one physical seat. Remove contracted seats before
+    // nearest_slot_index can offer them to local citizens.
+    for (&workplace, &reserved) in reserved_by_workplace {
+        for _ in 0..reserved {
+            let Some(index) = remaining_workplaces
+                .iter()
+                .position(|slot| *slot == workplace)
+            else {
+                break;
+            };
+            remaining_workplaces.remove(index);
+        }
+    }
+
+    let mut assignments = Vec::new();
+    for request in requests {
+        let index = nearest_slot_index(world, request.home, &remaining_workplaces);
+        let workplace = index.map(|index| remaining_workplaces.remove(index));
+        assignments.push(JobAssignment {
+            citizen: request.citizen,
+            workplace,
+        });
+    }
+
+    (assignments, remaining_workplaces)
+}
+```
+
+```text
+ physical workplace seats:  [W, W, W]
+ employer contracts:        [W, W]
+                              └──┴── remove inside JobsRegistry
+ local matching sees:       [W]
+ published open pool sees:  [W]
+
+ one reservation-aware JobResolution feeds both decisions
+```
+
+Daily employment:
+
+```rust
+fn daily_employment_phase(
+    runtime: &mut RegionRuntime,
+    directory: &EmploymentDirectory,
+) -> Vec<OutboundMessage> {
+    let discovery = runtime.discovery_snapshot();
+    runtime.ensure_derived_state();
+
+    // Employer truth first: a disconnected lease no longer reserves a seat.
+    let mut lost = runtime
+        .state_mut()
+        .release_contracts_with_unreachable_homes(&discovery);
+
+    // Rebuild the JobsRegistry with contracts removed from local availability.
+    let reserved = runtime.state().contracted_seats_by_workplace();
+    runtime
+        .state_mut()
+        .resolve_and_cache_jobs_with_contract_reservations(&reserved);
+    runtime.state_mut().apply_cached_local_job_assignments();
+
+    // Local changes may have removed or reduced a workplace.
+    lost.extend(
+        runtime
+            .state_mut()
+            .release_contracts_over_current_capacity(),
+    );
+
+    // Keep every jobs consumer on the final contract-aware resolution.
+    let reserved = runtime.state().contracted_seats_by_workplace();
+    runtime
+        .state_mut()
+        .resolve_and_cache_jobs_with_contract_reservations(&reserved);
+    runtime.state_mut().apply_cached_local_job_assignments();
+
+    // Report each dropped contract, then publish open_count recomputed from the
+    // employer's final contracts.
+    let mut wake = BTreeSet::new();
+    for (workplace, citizen, _contract) in lost {
+        wake.extend(directory.report_lost_employment(JobLoss {
+            lease: EmploymentLeaseRef { citizen, workplace },
+            reason: JobLossReason::PoolInvalid,
+        }));
+    }
+
+    directory.publish_pools(
+        runtime.region_id(),
+        runtime.state().published_job_pools(),
+    );
+
+    let mut outbound = runtime.emit_employment_directory_ready(
+        wake.into_iter().collect(),
+    );
+    outbound.extend(home_region_daily_jobs(runtime, directory, &discovery));
+    outbound
+}
+```
+
+`release_contracts_over_current_capacity` is P5's existing
+`release_contracts_no_longer_valid`, renamed for clarity — not a new function.
+Once local matching can no longer take a contracted seat (the reservation
+above), its trigger narrows to genuine capacity loss (bulldoze / downgrade /
+power-off), which also changes what its existing tests exercise.
+
+When the daily employment phase runs (the trigger gate):
+
+```text
+ run on a daily boundary when ANY of:
+   world.is_jobs_exports_dirty()   local change: building create/replace/
+                                    upgrade/bulldoze (player OR sim, e.g.
+                                    business auto-upgrade), road connectivity,
+                                    power on/off, or citizen born/removed
+   connectivity_dirty               a NEIGHBOUR's roads/topology moved
+     (component-graph fingerprint    (NOT the raw discovery generation --
+      changed since last check)       see below)
+   state.has_unassigned_citizen()   a jobless citizen still wants work
+```
+
+Three deliberate points about this gate:
+
+- **Power belongs with road connectivity, not as a separate case.** Every
+  power flip already funnels into `jobs_exports_dirty`: an imported grant or
+  denial through `apply_power_export_grant`'s `invalidate_jobs_registry()`, and
+  a local flip only ever through the building/road change that caused it. Do not
+  strip that invalidation out of the power-grant path — it is what makes a
+  workplace losing power invalidate its own pool (its `salary` becomes `None`,
+  a published fact, not just a seat count).
+
+- **Route reconciliation keys off *connectivity*, not the raw discovery
+  generation.** P7 chose employer-side validation, so when home A bulldozes the
+  only road to employer B, B has no local change at all and must learn through
+  the shared directory. But `RegionDirectory::publish_region` bumps a single
+  `generation` whenever links **or hints** change
+  (`directory.rs:200`, `:255`), and hints carry spare-power / spare-goods /
+  spare-job-slot *numbers*. So the raw generation moving means "some
+  availability number, anywhere in the component, changed" — exactly the
+  unrelated goods/power noise P7 forbids from firing workers. The component
+  graph itself (`build_component_graph`) is a function of links + topology only;
+  hint values never change it. So P7 must gate employer route reconciliation on
+  a **connectivity signal that ignores hint values** — a separate
+  connectivity-only generation on the directory, or a fingerprint of the
+  component graph (e.g. a hash of the sorted components) compared against the
+  region's last-seen value. `has_unassigned_citizen()` below still lets a
+  jobless citizen retry when a *reconnection* opens a new pool, so this
+  connectivity gate only needs to catch *disconnections* that strand an
+  existing contract.
+
+- **`has_unassigned_citizen()` is load-bearing, not belt-and-braces.** A loss
+  clears the citizen's assignment through `refresh_jobs_cache_after_grant_applied`,
+  which deliberately does **not** set `jobs_exports_dirty` (P-c's choice, so the
+  old wipe never ate its own output). So a laid-off citizen leaves the gate
+  clean. Gating on `is_jobs_exports_dirty() || discovery_dirty` alone would
+  strand it on an otherwise-quiet day. Gating the claim-submission half on
+  "this region still has a jobless citizen" is what makes the allowed behaviour
+  "an unemployed citizen may retry on later daily employment phases" true.
+
+Route validation:
+
+```rust
+fn contract_route_is_reachable(
+    state: &RegionState,
+    discovery: &CrossRegionDiscovery,
+    workplace: Entity,
+    home: RegionId,
+) -> bool {
+    state.workplace_networks(workplace).iter().any(|network| {
+        discovery
+            .component_of(*network)
+            .is_some_and(|component| {
+                component.iter().any(|member| member.region == home)
+            })
+    })
+}
+```
+
+Use current workplace networks, not `JobPool` rows:
+
+```text
+ healthy + fully contracted                 bridge workplace
+
+ spare=2, contracts=2                       network B1 ── workplace ── network B2
+ open=0 => no JobPool row                         │                         │
+ contract still route-valid                       X                         │
+                                                                            │
+ home A ────────────────────────────────────────────────────────────────────┘
+                                             reachable through B2 => KEEP
+```
+
+Bridge asymmetry — validity and claimability use different rules, on purpose.
+`contract_route_is_reachable` keeps a contract valid while **any** of the
+workplace's networks reaches the home (`.any()` above). But
+`published_job_pools` advertises a bridge workplace under only its **lowest-id**
+network (P2's dedup, so two components can't each treat the same seats as
+claimable), and `choose_best_pool` filters on that one network's component. So
+a home reachable **only** via the second network keeps an existing contract but
+can never win a **new** claim there:
+
+```text
+ B1 (id 0) ── workplace ── B2 (id 1)
+     X                         │            existing contract via B2: KEPT
+                               │            new claim via B2:         NOT OFFERED
+ home A ────────────────────────┘           (pool is published under B1 only)
+```
+
+This is conservative, not unsound — it never keeps an unreachable job, and it
+never double-offers a bridged seat. Making a bridge claimable from every
+network is a job-quality refinement, an explicit non-goal.
+
+Connection lifecycle:
+
+```text
+ CONNECTED
+ contract + assignment
+       │
+       │ road disconnect
+       ▼
+ employer removes contract
+       │ report_lost_employment
+       ▼
+ directory clears accepted cache ──wake──> home clears matching assignment
+       │
+       │ road reconnect
+       ▼
+ unemployed citizen sees reachable pool
+       │ submit_claims
+       ▼
+ NEW contract + NEW assignment
+
+ old contract is never resurrected
+```
+
+Seat handoff:
+
+```text
+ BEFORE LOSS              DROP + REPORT               PUBLISH RECOMPUTED
+
+ employer contract=yes    employer contract=no        employer contract=no
+ directory accepted=yes   directory accepted=no       directory accepted=no
+ published open=0         published open=0             published open=1
+
+ booked once              old open_count unchanged    claimable once
+```
+
+P7/P8 boundary:
+
+```text
+ P7: behavioral cutover                 P8: deletion
+
+ daily tick ──> directory ledger        remove JobExport* types/events
+             X old allocator            remove old routing/bookkeeping
+
+ old code still compiles                behavior stays identical to P7
+ old code gets no production traffic
+```
+
+Legacy removal:
+
+```text
+ RegionRuntime                 RegionWorker                 RegionState
+ ─────────────                 ────────────                 ───────────
+ JobExport events       ─┐     JobExport routing     ─┐     old allocation ledger ─┐
+ release_and_request_job ├──>  DELETE                 ├──>  DELETE                  ├──> gone
+ stale-grant handling   ─┘                             │     old tax input          ─┘
+                                                       │
+ directory claim/contract path ───────────────────────┴──> unchanged
 ```
 
 ## Rebuild And Save/Load
@@ -1113,8 +1409,8 @@ Old saves need migration:
 Accepted and rejected decisions remove the pending claim immediately after
 all secondary indexes are cleared. Accepted employment is represented by
 the existing `WorkplaceAssignment` in the home region and by the employer's
-`EmploymentContract`; the directory's `accepted_by_citizen` /
-`accepted_by_workplace` maps are only read caches.
+`EmploymentContract`; the directory's `accepted_by_citizen` map is only a
+read cache.
 
 This avoids unbounded claim growth without adding a separate terminal-claim
 GC path.
@@ -1389,7 +1685,7 @@ Behavior forbidden:
 Review checks:
 
 ```text
- request_release keeps accepted_by_workplace populated until confirm_release
+ request_release leaves open_count unchanged and keeps accepted_by_citizen active
  confirm_release clears accepted cache only for the matching employer/workplace/citizen
  report_lost_employment clears accepted cache and wakes the home region
  take_losses_for_home drains loss queue deterministically
@@ -1406,6 +1702,7 @@ Scope:
  rebuild directory from regional truth before first economy settlement
  publish pools, employer contracts, and home assignments into a scratch rebuild state
  atomically replace broker state and snapshot after reconciliation
+ remove the redundant accepted_by_workplace reverse index
 ```
 
 Behavior allowed:
@@ -1429,6 +1726,7 @@ Review checks:
 ```text
  home-side republish path exists
  employer-side contract republish path exists
+ accepted cache is rebuilt into accepted_by_citizen only
  reconciliation handles:
    matching employer contract + home assignment
    employer contract without home assignment
@@ -1436,40 +1734,186 @@ Review checks:
    pending claim
 ```
 
-### P7: Remove old cross-region wipe/re-request path
+### P7: Activate the employment ledger
 
 Scope:
 
 ```text
- remove cross-region job dependence on jobs_exports_dirty daily wipes
+ make the directory claim/contract path the live cross-region job allocator
+ RegionWorker installs Arc<CrossRegionDiscovery> into RegionRuntime each slice
+ employment reconciliation reads the installed discovery snapshot
+ run the daily employment phase when jobs_exports_dirty OR connectivity changed
+   OR the region still has an unassigned citizen
+ add a connectivity-only signal (a component-graph fingerprint, or a separate
+   directory generation bumped only on link/topology change) -- the raw
+   discovery generation also bumps on hint-value changes (goods/power/capacity),
+   which must NOT fire employer route reconciliation
+ an employer runs route invalidation whenever connectivity changed, so a
+   neighbour's road change (which never dirties the employer locally) still lands
+ invalidate employer contracts whose home region is no longer reachable
+ let unemployed homes discover newly reachable pools and submit fresh claims
+ remove cross-region job dependence on jobs_exports_dirty assignment wipes
  keep local-only job assignment path working
- remove or retire old cross-region request/grant cleanup that conflicts with leases
- route new cross-region job behavior through applied assignments and explicit releases/losses
+ rename release_contracts_no_longer_valid -> release_contracts_over_current_capacity
+   (same function; its trigger narrows to real capacity loss once seats are reserved)
+ ResourceRegistryCache gains a RETAINED reservation input: reservations_by_workplace,
+   set from EmploymentContract state, NOT recomputed from World on cache rebuild
+ contract accept/release/loss updates that input and invalidates the jobs cache
+ resource_registry.rs subtracts the retained reservation before local matching
+ JobResolution carries reserved_seats_by_workplace, its consumers read it from there
+ reserved_seats(workplace) = min(contract_count, physical_seat_count)
+   (reservation happens BEFORE locals, so it cannot depend on "seats left after locals")
+ published_job_pools stops subtracting contracts: open_count is remaining, as-is
+ job_pool_still_has_open_capacity becomes a remaining > 0 check
+ release_contracts_over_current_capacity evicts contract_count - reserved_seats(workplace)
+   = max(0, contract_count - physical_seat_count)
+ availability_hints inherit the reservation, so importable_remote_jobs stops
+   counting seats already contracted to another region's citizen
+ source employer workplace-tax accounting from EmploymentContract state
+ stop calling or emitting the old cross-region request/grant path
+ leave the inactive legacy types/functions/events in place for P8 to remove
 ```
+
+Exactly one layer subtracts contracts. Today three call sites each subtract
+them from a `remaining_workplaces` that does **not** reserve them. Once the
+registry does the reserving, every one of those subtractions must go, or it
+double-counts:
+
+```text
+ today                              after reservation, if left unchanged
+ ─────                              ───────────────────────────────────
+ open = remaining - contracts       remaining - 2*contracts
+                                      -> healthy pools vanish, and
+                                         publish_pools treats them as removed
+ remaining > contracts              0 > 1  -> employer rejects every claim
+ holders <= remaining               2 <= 0 -> evicts EVERY contract, silently,
+                                              on every reconciliation
+```
+
+`reserved_seats` exists because capacity cannot be reconstructed as
+`remaining + contracts`: a bulldozed workplace has zero slots, so `remaining`
+is 0 and that sum reports `contracts` — evicting nobody, exactly when
+everybody should be evicted. The reservation is capped at the seats that
+really exist and is computed *before* locals, so it depends only on physical
+seat count, never on how many locals are seeking:
+
+```text
+ reserved = min(contract_count, physical_seat_count)
+ remaining (offered to locals) = physical_seat_count - reserved
+ evict    = contract_count - reserved = max(0, contract_count - physical_seat_count)
+
+ seats=2 contracts=1   reserved=1  remaining=1  open=1   evict=0
+ seats=2 contracts=2   reserved=2  remaining=0  open=0   evict=0
+                       (a local seeker gets 0 remaining: contracts win)
+ seats=1 contracts=2   reserved=1  remaining=0  open=0   evict=1  (downgrade)
+ seats=0 contracts=2   reserved=0  remaining=0  no row   evict=2  (bulldozed)
+```
+
+The reservation is a **retained** registry input, not a per-tick injection.
+`ResourceRegistryCache::ensure_jobs` rebuilds `JobResolution` from `World`
+alone on any `invalidate_jobs_registry`, so a one-off
+`resolve_with_reservations` call would be silently undone by the very next
+build — re-exposing the reserved seats. The cache must hold
+`reservations_by_workplace` as an input alongside the `World`-derived data;
+contract accept / release / loss updates it and marks the jobs cache dirty,
+exactly as building/road/citizen mutations already do. `JobResolution` then
+carries `reserved_seats_by_workplace`, and
+`release_contracts_over_current_capacity` reads eviction counts from there
+rather than recomputing them.
 
 Behavior allowed:
 
 ```text
  local daily assignment can still fill local jobs
  cross-region workers keep stable assignments across unrelated goods/power changes
+ road disconnection may end a contract through explicit employer-confirmed JobLoss
+ road reconnection lets an unemployed citizen compete for a new claim
+ an unemployed citizen may retry on later daily employment phases
  explicit rematch policy may release/reclaim jobs later, but not in this patch
 ```
 
 Behavior forbidden:
 
 ```text
+ do not run the old allocator and the directory allocator together
  do not wipe all cross-region workplace assignments as a validation proxy
  do not leave old stale-grant cleanup clearing stable workers
+ do not automatically resurrect a contract that was already lost
+ do not let local assignment consume employer-contracted capacity
+ do not publish newly freed capacity before dropping the employer contract
+ do not compute local jobs from a registry that omitted contract reservations
+ do not subtract employer contracts twice: exactly one layer reserves them
+ do not reconstruct contract capacity as remaining + contracts (a bulldozed
+   workplace has remaining 0 and would then evict nobody)
  do not let unrelated resource noise fire workers
 ```
 
 Review checks:
 
 ```text
- unrelated goods/power changes do not fire cross-region workers
+ a daily tick emits no JobExportRequested, JobExportAllocationsReleased, or JobExportRequestCompleted
+ RegionRuntime reads the same discovery Arc the slice installed for reachability
+ route reconciliation keys off a connectivity fingerprint, not the raw generation
+ a neighbour's goods/power/capacity-hint change bumps the discovery generation
+   but does NOT trigger employer route reconciliation (connectivity fingerprint unchanged)
  stable worker remains paid across normal ticks
- job loss still happens when employer reports invalidation
+ disconnecting the only route reports loss and clears only the matching home assignment
+ a neighbour-side road bulldoze (no local change on the employer) still ends the contract
+ a fired cross-region worker re-enters the claim pool on a quiet day (no local dirty flag)
+ reconnecting a route lets an unemployed citizen claim without resurrecting the old contract
+ a bridge workplace stays valid while either workplace network reaches the home,
+   but a new claim is only offered on its lowest-id network's component
+ remaining_workplaces excludes one repeated workplace Entity per contract
+ reservations survive a jobs-cache invalidation: after invalidate_jobs_registry
+   the rebuilt JobResolution still excludes contracted seats (retained input, not
+   a per-tick injection)
+ local assignment, published pools, and employer capacity checks agree on reserved seats
+ a 2-seat workplace with 1 contract still publishes open_count 1 (no double subtraction)
+ a 2-seat workplace with 2 contracts leaves a local job seeker unmatched, evicting nobody
+ a bulldozed workplace evicts every contract, not zero of them
+ importable_remote_jobs never counts a seat already held by an EmploymentContract
+ newly freed capacity is advertised exactly once after the contract is removed
+ employer workplace tax reads current EmploymentContract state, not the old export ledger
  local job behavior remains covered by existing tests
+```
+
+### P8: Remove the inactive legacy job-export path
+
+Scope:
+
+```text
+ remove JobExportRequest, JobExportGrant, and their allocation aliases
+ remove ProcessJobExportRequest, ApplyJobExportGrant, and ReleaseJobExportAllocations
+ remove the corresponding OutboundMessage variants and worker routing implementation
+ remove release_and_request_job and old producer-allocation bookkeeping
+ remove current_job_request_id and job_export_producers when no longer referenced
+ remove assign_local_jobs_for_daily_tick and stale daily-rebuild comments
+ remove legacy-only tests
+ rename or simplify jobs_exports_dirty only if its remaining local meaning requires it
+```
+
+Behavior allowed:
+
+```text
+ compile-time cleanup of code made unreachable by P7
+ mechanical simplification of imports, enums, dispatch, and tests
+```
+
+Behavior forbidden:
+
+```text
+ do not change claim, contract, release, loss, payment, or route behavior
+ do not change local job allocation policy established by P7
+ do not introduce another allocator or compatibility state machine
+```
+
+Review checks:
+
+```text
+ no legacy JobExport request/grant/release traffic types remain
+ no old producer job-allocation ledger contributes capacity or tax
+ all P7 connection, disconnection, stable-payment, and local-job tests pass unchanged
+ source search finds no stale comments describing daily remote-job reconstruction
 ```
 
 Each patch should stay green. Do not mix this with per-producer staleness;
@@ -1483,9 +1927,12 @@ model, while this plan replaces the cross-region job authority model.
 - The directory becomes authoritative for pending claim coordination. That
   is intentional, but it should not become authoritative for employer
   contract truth or citizen assignment truth.
-- Route invalidation needs a clear policy: conservative route changes may
-  revalidate more leases than strictly necessary, but must not silently keep
-  unreachable jobs forever.
+- P7's route policy may revalidate more leases than strictly necessary when a
+  discovery snapshot changes, but it must not silently keep unreachable jobs
+  forever or react to unrelated goods/power availability noise. Discovery is
+  one pass stale by design, so a road bulldozed this tick keeps its contract
+  one extra day and a road built this tick is claimable next day — consistent
+  with "may revalidate more than strictly necessary", not a bug.
 - Save/load is a first-class patch, not a footnote. Accepted assignments
   and employer contracts must become durable, or load must reconcile
   before the first economy settlement.
@@ -2379,9 +2826,9 @@ say P7.
         ─────────────                 ─────────                ─────────────────
  durable:                        read cache only:          durable:
    Citizen.workplace_assignment    accepted_by_citizen       contracts_by_workplace
-   ⇒ who A pays                    accepted_by_workplace     ⇒ who really holds a seat
-                                   (cleared only by P5's
-                                    release / loss)
+   ⇒ who A pays                    accepted_by_workplace*    ⇒ who really holds a seat
+                                   *redundant reverse index;
+                                    P6 removes it
 
    drop the directory ─────────────────► both regions keep their truth
    (tested: the_directory_cache_is_not_the_durable_source_of_home_employment_truth)
@@ -2496,14 +2943,15 @@ This is deferred deliberately, not overlooked:
   without new plumbing — `CrossRegionDiscovery` lives in the *other* directory.
 - Nothing is tick-wired, so there is no live bug today.
 
-**P7 must close this before it retires the old path.** The worker already holds
-the discovery snapshot at the point where publishing would be driven. Two
-shapes were considered: employer-side (pass discovery into
-`employer_publish_pools`; drop a contract whose citizen's home region shares no
-component with the workplace's network — the inverse of `choose_best_pool`'s
-rule), or home-side (`home_region_daily_jobs` already has discovery; let it
-detect an unreachable remote workplace and call `home_release_job`, reusing the
-plan's existing "home region explicitly releases the job" case).
+**P7 must close this as part of its behavioral cutover.** The chosen policy is
+employer-side validation. The worker already holds the discovery snapshot at
+the point where publishing is driven, so it passes that snapshot into employer
+reconciliation. A contract is lost when none of the workplace's current road
+networks shares a discovery component with a network in the citizen's home
+region. The employer removes the contract and reports `JobLoss`; the home does
+not infer loss from directory cache state. A later reconnection creates a new
+claim opportunity for unemployed citizens and never resurrects the old
+contract. P8 only removes the legacy code after this behavior is active.
 
 ### Tests added
 
@@ -2557,13 +3005,14 @@ None.
 ### Risks remaining
 
 - **Route invalidation is not implemented.** See the named gap above. Mandatory
-  before P7.
+  in P7 before the directory path becomes live.
 - **Local citizens preempt remote workers.** `assign_local_jobs` consumes
   `remaining_workplaces`, which knows nothing about contracts, so a local
   citizen can take a seat a remote worker holds. `release_contracts_no_longer_valid`
   then evicts the most recently hired remote worker to reconcile. That is a real
   gameplay/balance decision — locals win — and it is now the *only* thing making
-  the two allocators consistent. Worth revisiting when P7 retires the old path.
+  the two allocators consistent. P7 closes this by reserving contracted seats
+  before local matching; P8 later removes the inactive old allocator.
 - **`home_release_job` will happily release a *local* job.** It clears any
   assignment and enqueues a release keyed by `workplace.region()`, which for a
   local job is the region itself; `employer_apply_releases` then finds no

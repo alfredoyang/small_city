@@ -662,11 +662,10 @@ impl EmploymentDirectory {
     /// employer and returns that employer as the wake target.
     ///
     /// The accepted cache is **not** cleared here, deliberately. Until the
-    /// employer confirms, the seat stays booked: `accepted_by_workplace` keeps
-    /// it out of any snapshot's claimable count, and `accepted_by_citizen` keeps
-    /// the releasing citizen out of `active_citizens_by_home_region`, so it
-    /// cannot grab a second job mid-release. P5 forbids advertising released
-    /// capacity before the employer confirms.
+    /// employer confirms, cached `open_count` stays unchanged, so the seat is
+    /// not advertised again. `accepted_by_citizen` also keeps the releasing
+    /// citizen out of `active_citizens_by_home_region`, so it cannot grab a
+    /// second job mid-release.
     pub fn request_release(&self, release: EmploymentLeaseRef) -> Vec<RegionId> {
         let mut state = self.broker.lock().unwrap();
         let employer = release.workplace.region();
@@ -1769,9 +1768,8 @@ mod tests {
 
     #[test]
     fn request_release_keeps_the_seat_booked_until_the_employer_confirms() {
-        // P5 review check: "request_release keeps accepted_by_workplace populated
-        // until confirm_release." P5 behavior forbidden: "do not advertise
-        // released capacity before employer confirms release."
+        // P5 review check: request_release leaves open_count unchanged and keeps
+        // the citizen active until confirm_release.
         let (directory, job_pool, worker) = directory_with_one_accepted_worker();
         let open_before =
             directory.broker.lock().unwrap().pools_by_workplace[&job_pool.workplace].open_count;
@@ -1782,7 +1780,7 @@ mod tests {
         let state = directory.broker.lock().unwrap();
         assert!(
             state.accepted_by_workplace[&job_pool.workplace].contains(&worker),
-            "the seat stays booked until the employer confirms"
+            "the reverse accepted cache remains synchronized"
         );
         assert!(
             state.accepted_by_citizen.contains_key(&worker),
