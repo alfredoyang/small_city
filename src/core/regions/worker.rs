@@ -603,6 +603,9 @@ impl RegionWorker {
             // before processing events, so the power reconcile gate compares
             // against the same snapshot this slice's routing already used.
             runtime.set_discovery_generation(discovery.generation);
+            // P7-c: install the full snapshot too, so the daily employment phase
+            // (P7-d) can re-check contract reachability against the component graph.
+            runtime.set_discovery_snapshot(Arc::clone(&discovery));
             // P3: same per-slice install, so an `EmploymentDirectoryReady` event
             // processed below can pull this region's employment work.
             runtime.set_employment_directory(Arc::clone(&self.employment_directory));

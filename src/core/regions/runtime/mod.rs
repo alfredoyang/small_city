@@ -389,6 +389,13 @@ pub struct RegionRuntime {
     // until a worker installs one, so a bare `RegionRuntime::new` still works
     // and an `EmploymentDirectoryReady` without a directory is a no-op.
     employment_directory: Option<Arc<EmploymentDirectory>>,
+    // Directory employment ledger plan, P7-c: the full discovery snapshot for
+    // this slice, installed alongside `discovery_generation`
+    // (`set_discovery_snapshot`). `discovery_generation` alone answers "did
+    // anything change"; the daily employment phase (P7-d) needs the component
+    // graph itself to re-check contract reachability. `None` until a worker
+    // installs one.
+    discovery: Option<Arc<CrossRegionDiscovery>>,
     handle: RegionHandle,
     receiver: RegionEventReceiver,
 }
@@ -571,6 +578,7 @@ impl RegionRuntime {
             seen_jobs_generation: 0,
             seen_goods_generation: 0,
             employment_directory: None,
+            discovery: None,
             handle,
             receiver,
         }
@@ -609,6 +617,20 @@ impl RegionRuntime {
     /// a cross-region change happened since this region's last reconcile.
     pub(crate) fn set_discovery_generation(&mut self, generation: u64) {
         self.discovery_generation = generation;
+    }
+
+    /// P7-c: install this pass's full discovery snapshot (the component graph),
+    /// installed by the worker alongside `set_discovery_generation`. The daily
+    /// employment phase (P7-d) reads it to re-check contract reachability.
+    pub(crate) fn set_discovery_snapshot(&mut self, discovery: Arc<CrossRegionDiscovery>) {
+        self.discovery = Some(discovery);
+    }
+
+    /// P7-c: the installed discovery snapshot, if any. `None` on a bare
+    /// `RegionRuntime::new` or before a worker slice has run.
+    #[allow(dead_code)] // P7-c: installed here; P7-d's daily phase reads it.
+    pub(crate) fn discovery_snapshot(&self) -> Option<&CrossRegionDiscovery> {
+        self.discovery.as_deref()
     }
 
     /// P-c: install this region's slice of the directory's `region_routes`
@@ -2908,6 +2930,26 @@ mod employment_claim_flow_tests {
         let mut employer = employer_runtime();
         employer.push_event(RegionEvent::EmploymentDirectoryReady);
         assert!(employer.process_next_event().is_empty());
+    }
+
+    #[test]
+    fn the_discovery_snapshot_install_roundtrips() {
+        // P7-c: a bare runtime has no snapshot; the worker installs one per slice
+        // (same site as set_employment_directory). P7-d reads it for reachability.
+        let mut employer = employer_runtime();
+        assert!(employer.discovery_snapshot().is_none());
+
+        let installed = Arc::new(CrossRegionDiscovery {
+            connectivity_fingerprint: 7,
+            ..Default::default()
+        });
+        employer.set_discovery_snapshot(Arc::clone(&installed));
+        assert_eq!(
+            employer
+                .discovery_snapshot()
+                .map(|d| d.connectivity_fingerprint),
+            Some(7)
+        );
     }
 
     #[test]

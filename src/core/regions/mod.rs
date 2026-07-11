@@ -33,6 +33,7 @@ use crate::core::components::{
     WorkplaceAssignment,
 };
 use crate::core::entity::Entity;
+use crate::core::regions::directory::CrossRegionDiscovery;
 use crate::core::regions::employment_directory::{
     CitizenRef, EmployerState as EmploymentEmployerState, EmploymentContract, JobClaim, JobPool,
 };
@@ -1726,6 +1727,91 @@ impl RegionState {
         lost
     }
 
+    /// P7-c: the road networks this workplace touches, as region-tagged
+    /// `RegionRoadNetworkId`s. A workplace touches a network iff one of its
+    /// orthogonally-adjacent road tiles belongs to that network's component.
+    /// Mirrors the reachability side of `spare_job_slots_on_network`.
+    pub(crate) fn workplace_networks(&self, workplace: Entity) -> Vec<RegionRoadNetworkId> {
+        road_connectivity::discover_road_networks(&self.world)
+            .into_iter()
+            .filter(|network| {
+                road_connectivity::adjacent_road_entities(&self.world, workplace)
+                    .any(|road| network.roads.contains(&road))
+            })
+            .map(|network| RegionRoadNetworkId {
+                region: self.id,
+                road_network: network.id,
+            })
+            .collect()
+    }
+
+    /// P7-c: does the home region still reach this workplace? True iff any of
+    /// the workplace's current road networks sits in a discovery component that
+    /// also contains a network in `home`. Uses live workplace networks, not the
+    /// stale `JobPool` rows — see "Use current workplace networks" in the plan.
+    ///
+    /// A workplace with no road networks at all (bulldozed, or lost road access)
+    /// is unreachable from everywhere, which is the correct answer.
+    pub(crate) fn contract_route_is_reachable(
+        &self,
+        discovery: &CrossRegionDiscovery,
+        workplace: Entity,
+        home: RegionId,
+    ) -> bool {
+        self.workplace_networks(workplace).iter().any(|network| {
+            discovery
+                .component_of(*network)
+                .is_some_and(|component| component.iter().any(|member| member.region == home))
+        })
+    }
+
+    /// P7-c, employer side: drop every contract whose home region can no longer
+    /// reach the workplace, and hand them back so the caller reports each as an
+    /// explicit `JobLoss`. This is the employer-side route invalidation the
+    /// plan requires: a neighbour's road change never dirties the employer
+    /// locally, so the employer learns of a disconnection only by re-checking
+    /// reachability against the current discovery snapshot.
+    ///
+    /// Deterministic: contracts are visited in `(workplace, citizen)` order.
+    #[allow(dead_code)] // P7-c: staged; the daily employment phase calls it in P7-d.
+    pub(crate) fn release_contracts_with_unreachable_homes(
+        &mut self,
+        discovery: &CrossRegionDiscovery,
+    ) -> Vec<(Entity, CitizenRef, EmploymentContract)> {
+        let mut lost = Vec::new();
+        let workplaces = self
+            .employer_state
+            .contracts_by_workplace
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+
+        for workplace in workplaces {
+            let holders = self
+                .employer_state
+                .contracts_by_workplace
+                .get(&workplace)
+                .map(|holders| {
+                    holders
+                        .iter()
+                        .map(|(citizen, contract)| (*citizen, *contract))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for (citizen, contract) in holders {
+                if !self.contract_route_is_reachable(discovery, workplace, citizen.region) {
+                    lost.push((workplace, citizen, contract));
+                }
+            }
+        }
+
+        lost.sort_by_key(|(workplace, citizen, _)| (*workplace, *citizen));
+        for (workplace, citizen, _) in &lost {
+            self.release_contract_if_matches(*workplace, *citizen);
+        }
+        lost
+    }
+
     #[cfg(test)]
     pub(crate) fn contract_holders_at(&self, workplace: Entity) -> Vec<CitizenRef> {
         self.employer_state
@@ -2745,6 +2831,171 @@ mod tests {
                 .workplace_assignment
                 .is_none()
         );
+    }
+
+    // ---- P7-c: route invalidation ----
+
+    /// A discovery snapshot whose single component contains `nets`.
+    fn discovery_with_component(nets: Vec<RegionRoadNetworkId>) -> CrossRegionDiscovery {
+        CrossRegionDiscovery {
+            components: vec![nets],
+            ..Default::default()
+        }
+    }
+
+    fn contract_from(home: u32, local: u32, workplace: Entity) -> JobClaim {
+        JobClaim {
+            claim_id: crate::core::regions::employment_directory::JobClaimId(local as u64),
+            citizen: CitizenRef {
+                region: RegionId(home),
+                citizen: Entity::new(RegionId(home), local),
+            },
+            workplace,
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn workplace_networks_returns_the_road_networks_the_workplace_touches() {
+        let (region, workplace) = employer_region_with_one_workplace();
+        let nets = region.workplace_networks(workplace);
+        assert_eq!(
+            nets,
+            vec![RegionRoadNetworkId {
+                region: RegionId(9),
+                road_network: 0,
+            }],
+            "the commercial touches its single road network"
+        );
+    }
+
+    #[test]
+    fn contract_route_is_reachable_only_when_home_shares_the_component() {
+        let (region, workplace) = employer_region_with_one_workplace();
+        let workplace_net = region.workplace_networks(workplace)[0];
+        let home_net = RegionRoadNetworkId {
+            region: RegionId(1),
+            road_network: 0,
+        };
+
+        // Home 1 and the workplace's network are in one component -> reachable.
+        let shared = discovery_with_component(vec![workplace_net, home_net]);
+        assert!(region.contract_route_is_reachable(&shared, workplace, RegionId(1)));
+
+        // The workplace's network is in a component with no region-1 network.
+        let split = discovery_with_component(vec![workplace_net]);
+        assert!(!region.contract_route_is_reachable(&split, workplace, RegionId(1)));
+
+        // An empty discovery reaches nobody.
+        assert!(!region.contract_route_is_reachable(
+            &CrossRegionDiscovery::default(),
+            workplace,
+            RegionId(1)
+        ));
+    }
+
+    #[test]
+    fn a_workplace_that_lost_its_roads_is_unreachable() {
+        let (mut region, workplace) = employer_region_with_one_workplace();
+        let workplace_net = region.workplace_networks(workplace)[0];
+        let home_net = RegionRoadNetworkId {
+            region: RegionId(1),
+            road_network: 0,
+        };
+        let discovery = discovery_with_component(vec![workplace_net, home_net]);
+        assert!(region.contract_route_is_reachable(&discovery, workplace, RegionId(1)));
+
+        // Bulldoze the road tiles the workplace touched: it now has no networks.
+        assert!(region.bulldoze(0, 1).success);
+        assert!(region.bulldoze(1, 1).success);
+        region.ensure_derived_state();
+        assert!(
+            region.workplace_networks(workplace).is_empty(),
+            "no adjacent roads remain"
+        );
+        assert!(
+            !region.contract_route_is_reachable(&discovery, workplace, RegionId(1)),
+            "a workplace with no road networks is reachable from nowhere"
+        );
+    }
+
+    #[test]
+    fn release_contracts_with_unreachable_homes_drops_only_the_disconnected() {
+        let (mut region, workplace) = employer_region_with_one_workplace();
+        let workplace_net = region.workplace_networks(workplace)[0];
+
+        // Two contracts: citizen from home 1 and citizen from home 2.
+        let c1 = contract_from(1, 50, workplace);
+        let c2 = contract_from(2, 60, workplace);
+        region.accept_claim_and_create_assignment(&c1);
+        region.accept_claim_and_create_assignment(&c2);
+
+        // Discovery: home 1 shares the workplace's component; home 2 does not.
+        let discovery = discovery_with_component(vec![
+            workplace_net,
+            RegionRoadNetworkId {
+                region: RegionId(1),
+                road_network: 0,
+            },
+        ]);
+
+        let lost = region.release_contracts_with_unreachable_homes(&discovery);
+        assert_eq!(
+            lost.len(),
+            1,
+            "only the disconnected home's contract is lost"
+        );
+        assert_eq!(lost[0].1.region, RegionId(2));
+        assert_eq!(
+            region.contract_holders_at(workplace),
+            vec![c1.citizen],
+            "the reachable home's worker keeps the job"
+        );
+        // P7-a interaction: eviction re-syncs the reservation, so the freed seat
+        // becomes publishable. 2 seats, 2 contracts -> 0 open; after dropping
+        // one -> 1 open.
+        assert_eq!(
+            region.published_job_pools()[0].open_count,
+            1,
+            "the evicted contract's seat is freed back to publishable capacity"
+        );
+    }
+
+    #[test]
+    fn a_bridge_workplace_stays_reachable_while_either_network_reaches_home() {
+        // The `.any()` case, and the plan's bridge-asymmetry note: a workplace
+        // touching two disconnected local networks stays reachable as long as
+        // EITHER network shares a component with the home.
+        let mut region = RegionState::new(RegionId(9), 4, 4);
+        assert!(region.build(0, 0, BuildingKind::PowerPlant).success);
+        assert!(region.build(0, 1, BuildingKind::Road).success); // network A (powered)
+        assert!(region.build(1, 2, BuildingKind::Road).success); // network B (disconnected)
+        assert!(region.build(1, 1, BuildingKind::Commercial).success); // adjacent to both
+        region.ensure_derived_state();
+        let workplace = region.world.grid.get(1, 1).expect("commercial");
+        let nets = region.workplace_networks(workplace);
+        assert_eq!(nets.len(), 2, "the workplace bridges two road networks");
+
+        let home_net = RegionRoadNetworkId {
+            region: RegionId(1),
+            road_network: 0,
+        };
+        // Home reaches ONLY the second network; the first is in a lone component.
+        let discovery = CrossRegionDiscovery {
+            components: vec![vec![nets[0]], vec![nets[1], home_net]],
+            ..Default::default()
+        };
+        assert!(
+            region.contract_route_is_reachable(&discovery, workplace, RegionId(1)),
+            "reachable via the second network alone"
+        );
+
+        // Now home reaches neither network.
+        let unreachable = CrossRegionDiscovery {
+            components: vec![vec![nets[0]], vec![nets[1]], vec![home_net]],
+            ..Default::default()
+        };
+        assert!(!region.contract_route_is_reachable(&unreachable, workplace, RegionId(1)));
     }
 
     #[test]

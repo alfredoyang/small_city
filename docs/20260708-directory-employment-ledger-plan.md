@@ -1,13 +1,14 @@
 # Directory employment ledger — stable cross-region jobs without daily wipes
 
-Status: **proposal, P1-P5 done; P7 in progress (P7-a, P7-b done)** (data model,
+Status: **proposal, P1-P5 done; P7 in progress (P7-a, P7-b, P7-c done)** (data model,
 employer pool publishing, the claim flow, home apply, release/loss, and the
 contract-seat reservation foundation — see the "P<n>, implemented" sections
 at the end of this doc. P3-P5 are *staged*: built and tested, but nothing
 calls the ledger from the daily tick until P7-d's cutover). **P7 is split
 into P7-a..P7-d** (it is too large for one reviewable diff and flips the
-live allocator): P7-a retained reservations and P7-b connectivity
-fingerprint (done); P7-c discovery install + route invalidation; P7-d the cutover.
+live allocator): P7-a retained reservations, P7-b connectivity
+fingerprint, and P7-c discovery install + route invalidation (done);
+P7-d the cutover.
 **Remaining order is P7 → P6 → P8** — P6 (save/load durability) is deferred
 until after P7 activates the flow and removes the daily wipe; see the note
 at the P6 section head. This is an
@@ -3399,4 +3400,128 @@ None.
         │
         └── P7-c reads fingerprint for contract reachability re-checks;
             P7-d gates the employer route pass on it. (nobody reads it in P7-b)
+```
+
+## P7-c, implemented (2026-07-11)
+
+Employer-side route invalidation, and the discovery-snapshot install it reads.
+An employer can now drop a contract whose home region no longer reaches the
+workplace. Still test-driven — no tick cutover (P7-d wires the daily phase and
+the connectivity-fingerprint gate).
+
+### Status
+
+**Implemented, still staged.** `release_contracts_with_unreachable_homes` and
+`discovery_snapshot()` are reachable and tested but not called from the tick;
+the worker installs the snapshot every slice, but only P7-d's daily phase reads
+it. Zero behaviour change.
+
+### Scope
+
+| file | why |
+|------|-----|
+| `src/core/regions/runtime/mod.rs` | `discovery: Option<Arc<CrossRegionDiscovery>>` field + `set_discovery_snapshot` + `discovery_snapshot()` |
+| `src/core/regions/worker.rs` | install the snapshot per slice (one line, next to `set_discovery_generation`) |
+| `src/core/regions/mod.rs` | `workplace_networks`, `contract_route_is_reachable`, `release_contracts_with_unreachable_homes` |
+
+### What it does
+
+- **`workplace_networks(workplace)`** — the road networks a workplace touches,
+  as region-tagged `RegionRoadNetworkId`s (`discover_road_networks` +
+  `adjacent_road_entities`, the reachability side of `spare_job_slots_on_network`).
+- **`contract_route_is_reachable(&discovery, workplace, home)`** — transcribed
+  from the plan: `true` iff **any** of the workplace's current networks sits in
+  a discovery component that also contains a network in `home`. Uses live
+  workplace networks, not the stale `JobPool` rows.
+- **`release_contracts_with_unreachable_homes(&discovery)`** — the employer-side
+  route invalidation: drop every contract whose home no longer reaches the
+  workplace, return them for `JobLoss` reporting (P7-d). Deterministic
+  `(workplace, citizen)` order; each drop re-syncs the P7-a reservation via
+  `release_contract_if_matches`.
+- **The install** — `RegionWorker` hands each `RegionRuntime` the full
+  `Arc<CrossRegionDiscovery>` per slice, alongside the existing
+  `set_discovery_generation`. `discovery_generation` answers "did anything
+  change"; the component graph itself is needed to re-check reachability.
+
+### Why employer-side, and why it reads the snapshot
+
+A neighbour's road change never dirties the employer locally (no building/road/
+citizen/power change in the employer's own world). The employer learns of a
+disconnection only by re-checking reachability against the current discovery
+snapshot — hence the per-slice install of the whole component graph, not just
+its generation.
+
+### Edge cases (all tested)
+
+```text
+ bridge workplace, only one network reaches home   -> reachable (.any())
+ workplace with zero road networks (bulldozed)      -> unreachable everywhere -> evict
+ home in no shared component                        -> unreachable -> evict
+ two contracts, one home reachable one not          -> evict only the disconnected
+```
+
+### Tests added (6)
+
+`regions/mod.rs`:
+
+- `workplace_networks_returns_the_road_networks_the_workplace_touches`
+- `contract_route_is_reachable_only_when_home_shares_the_component` — shared →
+  reachable; split component and empty discovery → not.
+- `a_workplace_that_lost_its_roads_is_unreachable` — bulldoze the roads, then
+  unreachable.
+- `a_bridge_workplace_stays_reachable_while_either_network_reaches_home` — the
+  `.any()` multi-network path (codex Low); reachable via the second network
+  alone, unreachable when neither.
+- `release_contracts_with_unreachable_homes_drops_only_the_disconnected` — plus
+  a P7-a-interaction assertion (codex Low): the evicted seat becomes publishable
+  again (`open_count` 0 → 1), proving the reservation re-synced.
+
+`runtime/mod.rs`:
+
+- `the_discovery_snapshot_install_roundtrips` — bare runtime has none; set/get
+  returns it.
+
+### Existing tests modified
+
+None.
+
+### Risks remaining
+
+- **Not yet load-bearing.** Nothing tick-drives the route invalidation until
+  P7-d. The `discovery_snapshot()` accessor carries `#[allow(dead_code)]` until
+  then, like the other staged accessors.
+- **Discovery is one pass stale** (by design). A road bulldozed this tick keeps
+  its contract one extra day; already recorded in the plan's Risks.
+
+### Commands run
+
+```text
+ cargo fmt --check                          → clean
+ cargo clippy -- -D warnings                → no new findings
+ cargo clippy --all-targets -- -D warnings  → no new findings
+ cargo test -q                              → 411 lib tests pass (was 405), +6
+ codex exec resume small_city               → no production correctness/scope
+                                               findings; 2 Low test-gap notes,
+                                               both applied
+```
+
+### Diagram — employer-side route invalidation
+
+```text
+ home A bulldozes the only road A─B          (in employer B: nothing local changes)
+        │
+        ▼
+ directory rebuild: A and B fall into separate components
+        │  connectivity_fingerprint MOVES (P7-b)
+        ▼
+ B's next daily employment phase (P7-d) sees the fingerprint move, so it runs:
+   release_contracts_with_unreachable_homes(&discovery)
+        │  for each contract (workplace, citizen):
+        │    workplace_networks(workplace) ∩ component-containing-home(citizen.region)?
+        │      A7's home no longer in the workplace's component  -> DROP
+        ▼
+   drop contract  ->  re-sync reservation (seat freed)  ->  return for JobLoss
+        │
+        ▼
+   report_lost_employment(A7)  ->  wake home A  ->  A clears A7's assignment (P5)
 ```
