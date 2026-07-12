@@ -771,7 +771,7 @@ fn power_importing_producer_region_eventually_gets_remote_workers() {
     let game = build_export_starvation_fixture();
 
     // Let A's population grow toward its Residential cap and give the daily
-    // job-export phase several days to discover and fill both producers.
+    // employment phase several days to discover and fill both producers.
     tick_city_for_hours(&game, 24 * 5);
 
     let region_b_workers = game.remote_workers_at(RegionId(2), 1, 1).unwrap();

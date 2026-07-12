@@ -304,8 +304,8 @@ pub enum TravelStatus {
 /// P5 cross-region travel: round-trip identity for a traveler whose token is out
 /// in a neighbor region. `citizen.region()` is the home region; the neighbor
 /// echoes the whole id back on the return handoff and never dereferences the
-/// `Entity` as an ECS key (the same opaque-id trust boundary as
-/// `JobExportGrant.workplace`). `generation` is the active trip stamp — bumped
+/// `Entity` as an ECS key (the same opaque-id trust boundary as a remote
+/// `WorkplaceAssignment.workplace`). `generation` is the active trip stamp — bumped
 /// on each cross-out, never cleared, so a stale older trip can never match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TravelerId {

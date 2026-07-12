@@ -73,6 +73,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+#[cfg(test)]
 use crate::core::city_refs::CityCellRef;
 use crate::core::components::TravelerHandoff;
 use crate::core::entity::Entity;
@@ -87,9 +88,9 @@ use crate::core::regions::employment_directory::{
 };
 use crate::core::regions::handle::{RegionEventReceiver, RegionHandle, mailbox};
 use crate::core::regions::{
-    ExitLink, GoodsExportGrant, JobExportGrant, PendingGoodsDemand, PendingJobDemand,
-    PendingPowerDemand, PowerExportGrant, RegionId, RegionRoadNetworkId, RegionState,
-    RegionalTickGoodsPhase, RegionalTickJobPhase, RegionalTickPowerPhase,
+    ExitLink, GoodsExportGrant, PendingGoodsDemand, PendingPowerDemand, PowerExportGrant, RegionId,
+    RegionRoadNetworkId, RegionState, RegionalTickGoodsPhase, RegionalTickJobPhase,
+    RegionalTickPowerPhase,
 };
 use crate::core::world::CrossRegionGoodsRoutes;
 use crate::interface::input::MapOverlayInput;
@@ -123,18 +124,6 @@ pub enum RegionEvent {
     ApplyPowerExportGrant {
         request: PowerExportRequest,
         grant: PowerExportGrant,
-    },
-    /// Authoritative producer-side job-slot export allocation request.
-    ProcessJobExportRequest(JobExportAllocationRequest),
-    /// Producer-side release for a caller's previous job export allocations.
-    ReleaseJobExportAllocations(JobExportAllocationRelease),
-    /// Caller-side job export grant result.
-    ///
-    /// Retire-tickstate, P-c: the reply carries the request it answers,
-    /// same shape as `ApplyPowerExportGrant` (P-a).
-    ApplyJobExportGrant {
-        request: JobExportRequest,
-        grant: JobExportGrant,
     },
     /// Authoritative producer-side goods export allocation request.
     ProcessGoodsExportRequest(GoodsExportAllocationRequest),
@@ -189,20 +178,6 @@ pub struct PowerExportRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Consumer request for a producer to export one workplace slot for a job seeker.
-///
-/// Unlike power there is no demand amount: one citizen fills one whole slot.
-pub struct JobExportRequest {
-    pub request_id: UiRequestId,
-    pub caller_region: RegionId,
-    pub caller_network: RegionRoadNetworkId,
-    pub token: u32,
-    /// Retire-tickstate, P-c: echoed back by the grant reply so the caller
-    /// can re-derive the demand it answers without keeping a demand list.
-    pub citizen: Entity,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// Consumer request for a producer to export a whole batch of goods units.
 pub struct GoodsExportRequest {
     pub request_id: UiRequestId,
@@ -229,8 +204,6 @@ pub struct ExportAllocationRequest<R> {
 
 /// Producer-side power allocation request (one consumer request + candidates).
 pub type PowerExportAllocationRequest = ExportAllocationRequest<PowerExportRequest>;
-/// Producer-side job allocation request (one consumer request + candidates).
-pub type JobExportAllocationRequest = ExportAllocationRequest<JobExportRequest>;
 /// Producer-side goods allocation request (one consumer request + candidates).
 pub type GoodsExportAllocationRequest = ExportAllocationRequest<GoodsExportRequest>;
 
@@ -252,8 +225,6 @@ pub struct ExportAllocationRelease {
 
 /// Power flavor of the shared export allocation release.
 pub type PowerExportAllocationRelease = ExportAllocationRelease;
-/// Job flavor of the shared export allocation release.
-pub type JobExportAllocationRelease = ExportAllocationRelease;
 /// Goods flavor of the shared export allocation release.
 pub type GoodsExportAllocationRelease = ExportAllocationRelease;
 
@@ -264,16 +235,6 @@ trait ExportRequestKey {
 }
 
 impl ExportRequestKey for PowerExportRequest {
-    fn allocation_key(&self) -> ExportAllocationKey {
-        ExportAllocationKey {
-            caller_region: self.caller_region,
-            request_id: self.request_id,
-            token: self.token,
-        }
-    }
-}
-
-impl ExportRequestKey for JobExportRequest {
     fn allocation_key(&self) -> ExportAllocationKey {
         ExportAllocationKey {
             caller_region: self.caller_region,
@@ -319,12 +280,6 @@ pub enum OutboundMessage {
         grant: PowerExportGrant,
     },
     PowerExportAllocationsReleased(PowerExportAllocationRelease),
-    JobExportRequested(JobExportRequest),
-    JobExportRequestCompleted {
-        request: JobExportAllocationRequest,
-        grant: JobExportGrant,
-    },
-    JobExportAllocationsReleased(JobExportAllocationRelease),
     GoodsExportRequested(GoodsExportRequest),
     GoodsExportRequestCompleted {
         request: GoodsExportAllocationRequest,
@@ -349,10 +304,8 @@ pub enum OutboundMessage {
 pub struct RegionRuntime {
     state: RegionState,
     power_export_allocations: ExportAllocations<i32>,
-    job_export_allocations: ExportAllocations<Entity>,
     goods_export_allocations: ExportAllocations<u32>,
     power_export_producers: Vec<RegionId>,
-    job_export_producers: Vec<RegionId>,
     goods_export_producers: Vec<RegionId>,
     pending_goods_stock: Vec<(Entity, u32)>,
     // Retire-tickstate, P-a: the only caller-side memory power needs now that
@@ -363,8 +316,6 @@ pub struct RegionRuntime {
     // (RegionalGame's counter starts at 1), so the very first reply this
     // runtime ever sees compares correctly.
     current_power_request_id: UiRequestId,
-    // Retire-tickstate, P-c: same shape and same reasoning, for jobs.
-    current_job_request_id: UiRequestId,
     // Retire-tickstate, P-d: same shape and same reasoning, for goods.
     current_goods_request_id: UiRequestId,
     // Event-driven plan (docs/20260703-event-driven-architecture.md), P-2: the
@@ -376,14 +327,6 @@ pub struct RegionRuntime {
     // is serialized (`RegionRuntime` never is).
     discovery_generation: u64,
     seen_power_generation: u64,
-    // Event-driven plan, P-4: same shape as `seen_power_generation`, but for
-    // the job reconcile gate — a separate marker so the hourly power gate
-    // (which updates its own marker every hour) can never absorb a bump or
-    // local change destined for the daily job gate.
-    // P7-d: superseded by `seen_connectivity_fingerprint` for the job gate; kept
-    // (unread) until P8 removes the old-path bookkeeping.
-    #[allow(dead_code)]
-    seen_jobs_generation: u64,
     // Directory employment ledger plan, P7-d: the connectivity fingerprint this
     // region last reconciled cross-region employment against. The daily gate
     // fires when the installed discovery's fingerprint differs from this — a
@@ -410,38 +353,36 @@ pub struct RegionRuntime {
     receiver: RegionEventReceiver,
 }
 
-// CR3R — one reservation engine shared by power and jobs.
+// CR3R — one reservation engine shared by power and goods.
 //
-// Power and jobs once carried two byte-for-byte copies of the producer-side
-// reservation bookkeeping. CR3R keeps ONE generic engine and varies only the
-// reserved unit `U`: power reserves an `i32` demand, jobs reserve an `Entity`
-// slot. The transport/lifecycle (keying, staleness, upsert) is identical; only
-// "how do I read available capacity out of these units" stays resource-specific.
+// Power and goods once carried byte-for-byte copies of the producer-side
+// reservation bookkeeping (jobs shared it too until the employment ledger
+// replaced that path — P8). CR3R keeps ONE generic engine and varies only the
+// reserved unit `U`: power reserves an `i32` demand, goods reserve a `u32` batch.
+// The transport/lifecycle (keying, staleness, upsert) is identical; only "how do
+// I read available capacity out of these units" stays resource-specific.
 //
 //                    ExportAllocations<U>                 (one engine, two U's)
 //   ┌───────────────────────────────────────────────────────────────────────┐
 //   │ Vec<ExportAllocation<U>>                                                │
 //   │   each = { key: ExportAllocationKey,   ← (caller_region, gen, token)    │
 //   │           network: RegionRoadNetworkId,                                 │
-//   │           unit: U,                     ← i32 (power) | Entity (jobs)     │
+//   │           unit: U,                     ← i32 (power) | u32 (goods)       │
 //   │           caller_generation }                                           │
 //   │                                                                         │
-//   │ shared lifecycle:  upsert · release_stale_for_caller · units            │
-//   │ shared read:       reserved_units_excluding(key, network)  ← power      │
-//   │                    reserved_units_excluding_key(key)        ← jobs      │
+//   │ shared lifecycle:  upsert · release_stale_for_caller                    │
+//   │ shared read:       reserved_units_excluding(key, network)               │
 //   └───────────────────────────────────────────────────────────────────────┘
 //          ▲ instantiated as                          ▲ instantiated as
-//          power_export_allocations: ExportAllocations<i32>
-//          job_export_allocations:   ExportAllocations<Entity>
+//          power_export_allocations:  ExportAllocations<i32>
+//          goods_export_allocations:  ExportAllocations<u32>
 //
 //   resource-specific (NOT shared) — how units become "available capacity":
-//     power → sum reserved demand, subtract from per-network remaining (scalar)
-//     jobs  → remove each reserved slot Entity from the spare-slot set (discrete)
+//     power → sum reserved demand, subtract from per-network remaining
+//     goods → sum reserved units,  subtract from per-network free capacity
 //
-// The two `reserved_units_*` readers above are deliberately different and that
-// difference is the whole point: power capacity is POOLED PER NETWORK, so a
-// reservation on one network must not shrink another's; a job slot is ONE global
-// `Entity` that can be adjacent to two networks, so it must be excluded globally.
+// Both are POOLED PER NETWORK, so `reserved_units_excluding` is network-scoped: a
+// reservation on one network must not shrink another's remaining capacity.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Identity of one caller demand a producer has reserved for, shared by power and
@@ -455,9 +396,9 @@ struct ExportAllocationKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// One producer-owned transient reservation of a reserved unit `U` on a network.
 ///
-/// `U` is the resource's reserved unit: `i32` demand for power, `Entity` slot for
-/// jobs. `caller_generation` lets a producer drop a caller's reservations once the
-/// caller starts a new tick generation.
+/// `U` is the resource's reserved unit: `i32` demand for power, `u32` units for
+/// goods. `caller_generation` lets a producer drop a caller's reservations once
+/// the caller starts a new tick generation.
 struct ExportAllocation<U> {
     key: ExportAllocationKey,
     network: RegionRoadNetworkId,
@@ -466,11 +407,12 @@ struct ExportAllocation<U> {
 }
 
 #[derive(Debug)]
-/// Producer-side reservation bookkeeping shared by power and jobs (CR3R).
+/// Producer-side reservation bookkeeping shared by power and goods (CR3R).
 ///
 /// This carries only the transport/lifecycle that both resources share. How
 /// available capacity is computed from the reserved units stays resource-specific
-/// (a scalar remaining for power, a discrete spare set for jobs).
+/// (a per-network remaining amount for either), but both read it network-scoped
+/// via `reserved_units_excluding`.
 struct ExportAllocations<U> {
     allocations: Vec<ExportAllocation<U>>,
 }
@@ -507,24 +449,6 @@ impl<U: Copy> ExportAllocations<U> {
         self.allocations
             .iter()
             .filter(move |allocation| allocation.network == network && allocation.key != key)
-            .map(|allocation| allocation.unit)
-    }
-
-    /// Reserved units held by callers other than `key`, across *all* networks.
-    ///
-    /// Jobs use this network-agnostic view: the reserved unit is a global workplace
-    /// `Entity`, and one physical slot can be adjacent to two disconnected road
-    /// networks (a "bridge" workplace). A reservation taken under one network must
-    /// still block that same slot when requested via the other, or the producer
-    /// would double-grant one slot. Excluding `key` lets a caller's own retry
-    /// re-grant.
-    fn reserved_units_excluding_key(
-        &self,
-        key: ExportAllocationKey,
-    ) -> impl Iterator<Item = U> + '_ {
-        self.allocations
-            .iter()
-            .filter(move |allocation| allocation.key != key)
             .map(|allocation| allocation.unit)
     }
 
@@ -574,18 +498,14 @@ impl RegionRuntime {
         Self {
             state,
             power_export_allocations: ExportAllocations::new(),
-            job_export_allocations: ExportAllocations::new(),
             goods_export_allocations: ExportAllocations::new(),
             power_export_producers: Vec::new(),
-            job_export_producers: Vec::new(),
             goods_export_producers: Vec::new(),
             pending_goods_stock: Vec::new(),
             current_power_request_id: UiRequestId(0),
-            current_job_request_id: UiRequestId(0),
             current_goods_request_id: UiRequestId(0),
             discovery_generation: 0,
             seen_power_generation: 0,
-            seen_jobs_generation: 0,
             seen_connectivity_fingerprint: 0,
             seen_goods_generation: 0,
             employment_directory: None,
@@ -681,8 +601,8 @@ impl RegionRuntime {
     /// region — the consumer half of a workplace's remote roster.
     ///
     /// Recomputes the derived pass first (DT1), mirroring `inspect`, for a uniform
-    /// `&mut` read boundary. Remote assignments are set in the job-export tick, not
-    /// the derived pass, so this is a no-op for the returned data today; it stays
+    /// `&mut` read boundary. Remote assignments are set by the daily employment
+    /// phase, not the derived pass, so this is a no-op for the returned data today; it stays
     /// for consistency and future-proofing and is bounded (called only on panel open).
     pub fn remote_workers_for(
         &mut self,
@@ -795,18 +715,6 @@ impl RegionRuntime {
             RegionEvent::ApplyPowerExportGrant { request, grant } => {
                 self.apply_power_export_grant(request, grant)
             }
-            RegionEvent::ProcessJobExportRequest(request) => {
-                let grant = self.process_job_export_request(&request);
-                vec![OutboundMessage::JobExportRequestCompleted { request, grant }]
-            }
-            RegionEvent::ReleaseJobExportAllocations(release) => {
-                self.job_export_allocations
-                    .release_stale_for_caller(release.caller_region, release.request_id);
-                Vec::new()
-            }
-            RegionEvent::ApplyJobExportGrant { request, grant } => {
-                self.apply_job_export_grant(request, grant)
-            }
             RegionEvent::ProcessGoodsExportRequest(request) => {
                 let grant = self.process_goods_export_request(&request);
                 vec![OutboundMessage::GoodsExportRequestCompleted { request, grant }]
@@ -895,15 +803,6 @@ impl RegionRuntime {
             && let Some(source_region) = grant.source_region
         {
             insert_sorted_unique(&mut self.power_export_producers, source_region);
-        }
-    }
-
-    fn remember_job_export_producer(&mut self, grant: &JobExportGrant) {
-        if grant.granted {
-            // The granting producer is the owner of the granted workplace ref.
-            if let Some(workplace) = grant.workplace {
-                insert_sorted_unique(&mut self.job_export_producers, workplace.region());
-            }
         }
     }
 
@@ -1012,37 +911,25 @@ impl RegionRuntime {
         self.release_and_request_power(request_id, &demands)
     }
 
-    /// Retire-tickstate, P-c: jobs no longer pause the tick either (same
-    /// cutover as P-a for power). Fires the release/request (when dirty)
-    /// and moves straight into the goods phase in the same pass; whichever
-    /// reply lands later is applied whenever it arrives
-    /// (`apply_job_export_grant`, gated on `current_job_request_id`), for
-    /// the *next* tick to see.
+    /// The job phase: jobs never pause the tick, and cross-region employment is
+    /// the ledger's (`daily_employment_phase`), reconciled only on a dirty daily
+    /// boundary.
     ///
-    /// Self-dirtying-loop fix (caught while implementing this cutover, not
-    /// in the original plan text): applying a grant no longer re-dirties
-    /// the gate (`World::refresh_jobs_cache_after_grant_applied`), so once
-    /// a remote assignment settles, the next day reads quiet and leaves it
-    /// alone — exactly like power's quiet path leaving `powered` alone.
-    /// Without this, the daily wipe would re-run every day even for a
-    /// citizen whose remote job was already granted, permanently starving
-    /// them of salary (economy also only runs on the daily boundary, right
-    /// after the wipe).
-    ///
-    /// Directory employment ledger plan, P7-d: the cutover. The daily gate's
-    /// connectivity half is read here (the installed discovery's fingerprint vs
-    /// `seen_connectivity_fingerprint` — a connectivity change, not hint-value
-    /// noise, P7-b); the other halves (`jobs_exports_dirty`,
+    /// The daily gate's connectivity half is read here (the installed discovery's
+    /// fingerprint vs `seen_connectivity_fingerprint` — a connectivity change, not
+    /// hint-value noise, P7-b); the other halves (`jobs_exports_dirty`,
     /// `has_unassigned_citizen`) are checked fresh inside
     /// `continue_tick_to_job_demand_phase`, AFTER population growth, so a citizen
     /// spawned this tick is noticed the same day. The combined answer is
     /// `phase.jobs_dirty()`.
     ///
-    /// On a dirty daily tick the ledger runs (`daily_employment_phase`), not the
-    /// old `release_and_request_job` — that path is retired here (P8 deletes its
-    /// types). Local assignment already ran inside
-    /// `continue_tick_to_job_demand_phase` (no wipe), so the ledger sees an
-    /// accurate jobless set for its claims.
+    /// On a dirty daily tick the ledger runs; local assignment already ran inside
+    /// `continue_tick_to_job_demand_phase`, so the ledger sees an accurate jobless
+    /// set for its claims. A quiet day skips reconciliation entirely: applying an
+    /// assignment does not re-dirty the gate
+    /// (`World::refresh_jobs_cache_after_grant_applied`), so a settled worker's
+    /// day reads quiet and leaves the assignment untouched — the same trust-the-gate
+    /// shape as power's quiet path leaving `powered` alone.
     fn enter_job_phase(
         &mut self,
         request_id: UiRequestId,
@@ -1138,42 +1025,6 @@ impl RegionRuntime {
         outbound
     }
 
-    /// Release this caller's previous-generation job reservations, then
-    /// request the current demand batch. Fire-and-forget, mirrors
-    /// `release_and_request_power` exactly (P-a): stamps
-    /// `current_job_request_id` so a later reply can tell "my current
-    /// batch" from "a superseded one" (see `apply_job_export_grant`), and
-    /// returns immediately without waiting for any reply.
-    ///
-    /// P7-d retired this: the ledger's `daily_employment_phase` replaced the old
-    /// cross-region job path. P8 deletes it and the `JobExport*` types.
-    #[allow(dead_code)]
-    fn release_and_request_job(
-        &mut self,
-        request_id: UiRequestId,
-        demands: &[PendingJobDemand],
-    ) -> Vec<OutboundMessage> {
-        self.current_job_request_id = request_id;
-        let producer_regions = std::mem::take(&mut self.job_export_producers);
-        let mut outbound = vec![OutboundMessage::JobExportAllocationsReleased(
-            JobExportAllocationRelease {
-                caller_region: self.region_id(),
-                request_id,
-                producer_regions,
-            },
-        )];
-        outbound.extend(demands.iter().map(|demand| {
-            OutboundMessage::JobExportRequested(JobExportRequest {
-                request_id,
-                caller_region: self.region_id(),
-                caller_network: demand.caller_network,
-                token: demand.token,
-                citizen: demand.citizen,
-            })
-        }));
-        outbound
-    }
-
     /// Event-driven plan, P-5: same gate shape as P-2/P-4, wrapping the
     /// whole reconcile decision. `enter_goods_phase` is only ever reached on
     /// a daily boundary in practice — `enter_job_phase`'s own `is_daily()`
@@ -1262,8 +1113,8 @@ impl RegionRuntime {
         // self-correcting in steady state; pairing salary and tax on the same day
         // would require a global "all exports resolved" barrier before any economy
         // runs, which is far more synchronization for little gain.
-        // P7-d: producer-owned workplace tax now comes from EmploymentContract
-        // state, not the retired JobExport allocation ledger.
+        // Producer-owned workplace tax comes from EmploymentContract state (one
+        // slot per contracted seat).
         let exported_job_slots = self.state.contracted_workplace_tax_slots();
         RegionTickResponse {
             request_id,
@@ -1279,8 +1130,8 @@ impl RegionRuntime {
         request_id: UiRequestId,
         phase: RegionalTickGoodsPhase,
     ) -> RegionTickResponse {
-        // P7-d: producer-owned workplace tax now comes from EmploymentContract
-        // state, not the retired JobExport allocation ledger.
+        // Producer-owned workplace tax comes from EmploymentContract state (one
+        // slot per contracted seat).
         let exported_job_slots = self.state.contracted_workplace_tax_slots();
         let exported_goods_units = self.goods_export_allocations.units().sum();
         RegionTickResponse {
@@ -1336,63 +1187,6 @@ impl RegionRuntime {
             token: request.request.token,
             granted: true,
             source_region: Some(self.region_id()),
-        }
-    }
-
-    fn process_job_export_request(
-        &mut self,
-        request: &JobExportAllocationRequest,
-    ) -> JobExportGrant {
-        let producer_network = request.candidates[request.candidate_index];
-        let allocation_key = export_allocation_key(&request.request);
-        self.job_export_allocations
-            .release_stale_for_caller(request.request.caller_region, request.request.request_id);
-
-        // Producer-owned spare: slots on this network minus those already reserved
-        // by other active allocations (one slot occurrence per reservation). The
-        // exclusion spans all networks, not just `producer_network`: a workplace
-        // bridging two disconnected networks is one physical slot, so a reservation
-        // taken via either network must block it here. This key's own reservation,
-        // if any, is left in so a retry re-grants a slot.
-        let mut available = self.state.spare_job_slots_on_network(producer_network);
-        for reserved in self
-            .job_export_allocations
-            .reserved_units_excluding_key(allocation_key)
-        {
-            if let Some(index) = available.iter().position(|slot| *slot == reserved) {
-                available.remove(index);
-            }
-        }
-
-        let Some(workplace) = available.first().copied() else {
-            return JobExportGrant {
-                token: request.request.token,
-                granted: false,
-                workplace: None,
-                location: None,
-                salary: 0,
-            };
-        };
-        let salary = self.state.workplace_salary(workplace);
-        let region = self.region_id();
-        let location = self
-            .state
-            .workplace_position(workplace)
-            .map(|position| CityCellRef::local(region, position.x, position.y));
-
-        self.job_export_allocations.upsert(
-            allocation_key,
-            producer_network,
-            workplace,
-            request.request.request_id,
-        );
-
-        JobExportGrant {
-            token: request.request.token,
-            granted: true,
-            workplace: Some(workplace),
-            location,
-            salary,
         }
     }
 
@@ -1494,62 +1288,6 @@ impl RegionRuntime {
                         caller_region,
                         request_id: current_request_id,
                         producer_regions: vec![producer],
-                    },
-                )]
-            }
-            _ => Vec::new(),
-        }
-    }
-
-    /// Retire-tickstate, P-c: same shape as `apply_power_export_grant`
-    /// (P-a) — no continuation to consult, one staleness check against
-    /// `current_job_request_id` tells "my current batch" from "a
-    /// superseded one."
-    fn apply_job_export_grant(
-        &mut self,
-        request: JobExportRequest,
-        grant: JobExportGrant,
-    ) -> Vec<OutboundMessage> {
-        // Same producer-owned allocation invariant as power: a granted reply
-        // means the producer may hold a transient slot allocation even if this
-        // caller no longer applies it locally.
-        self.remember_job_export_producer(&grant);
-        if request.request_id != self.current_job_request_id {
-            // Same reasoning as power's stale-granted-release fix: a stale
-            // but granted reply reserved producer capacity that no future
-            // release is guaranteed to reach (this caller has already moved
-            // past that generation). Release it now instead of leaving it
-            // stuck.
-            return Self::release_stale_granted_job(
-                self.region_id(),
-                self.current_job_request_id,
-                &grant,
-            );
-        }
-        let demand = PendingJobDemand {
-            token: request.token,
-            citizen: request.citizen,
-            caller_network: request.caller_network,
-        };
-        self.state.apply_job_export_grant(demand, grant);
-        Vec::new()
-    }
-
-    /// A stale but *granted* job reply reserved a producer's workplace slot
-    /// that no future release is guaranteed to reach. Release it now. A
-    /// stale denial reserved nothing, so it needs no release.
-    fn release_stale_granted_job(
-        caller_region: RegionId,
-        current_request_id: UiRequestId,
-        grant: &JobExportGrant,
-    ) -> Vec<OutboundMessage> {
-        match grant.workplace {
-            Some(workplace) if grant.granted => {
-                vec![OutboundMessage::JobExportAllocationsReleased(
-                    JobExportAllocationRelease {
-                        caller_region,
-                        request_id: current_request_id,
-                        producer_regions: vec![workplace.region()],
                     },
                 )]
             }
@@ -2046,87 +1784,6 @@ mod tick_state_tests {
     }
 
     #[test]
-    #[ignore = "old JobExport path retired in P7-d; removed in P8"]
-    fn daily_tick_without_job_demands_releases_job_allocations_before_finishing() {
-        // Event-driven plan, P-2: this region's power gate goes quiet after
-        // its first tick (nothing ever dirties it or moves its generation
-        // across these 24 ticks), so it no longer emits a
-        // `PowerExportAllocationsReleased` on the 24th (daily) tick — that
-        // part of the original assertion tested the pre-P-2 unconditional
-        // reconcile, not this test's actual subject.
-        //
-        // Event-driven plan, P-4: jobs are now gated too, on `jobs_exports_dirty`
-        // (or a moved generation). A genuinely empty region (the original
-        // fixture here) starts and stays clean forever, so its daily
-        // reconcile would ALSO go quiet — no longer able to exercise this
-        // test's actual subject at all. One building is enough to dirty
-        // `jobs_exports_dirty` from construction (placement's
-        // `invalidate_resource_registry` chokepoint sets it, same as
-        // `power_exports_dirty`), so day 1's reconcile genuinely fires, with
-        // zero actual job demands (no citizens exist yet to seek one) — the
-        // exact "without_job_demands" shape this test's name describes. Built
-        // on a grid large enough that the road sits away from every edge, so
-        // `network_border_links` reports no border link at all — nothing
-        // (power, jobs, or goods) can attempt a real cross-region request, so
-        // the tick can never pause waiting for a producer that doesn't exist
-        // in this bare-runtime test. The gate itself doesn't care: it decides
-        // purely from `jobs_exports_dirty`/generation, independent of whether
-        // `phase.job_demands` ends up empty.
-        let mut region = RegionState::new(RegionId(1), 5, 5);
-        assert!(region.build(2, 2, BuildingKind::Commercial).success);
-        assert!(region.build(2, 1, BuildingKind::Road).success);
-        let mut runtime = RegionRuntime::new(region);
-        let mut last_outbound = Vec::new();
-
-        for request_id in 1..=24 {
-            runtime.push_event(RegionEvent::Tick {
-                request_id: UiRequestId(request_id),
-            });
-            last_outbound = runtime.process_next_event();
-        }
-
-        let job_release = message_index(&last_outbound, |message| {
-            matches!(message, OutboundMessage::JobExportAllocationsReleased(_))
-        });
-        let completed = message_index(&last_outbound, |message| {
-            matches!(message, OutboundMessage::RegionTickCompleted(_))
-        });
-
-        assert!(
-            job_release < completed,
-            "job reconciliation should release old allocations before finishing"
-        );
-
-        // Event-driven plan, P-4 (positive proof): this region never spawns a
-        // citizen (no Residential) and never receives a grant, so nothing
-        // ever re-dirties `jobs_exports_dirty` after day 1's reconcile clears
-        // it (unlike a region with an ongoing remote-employed citizen —
-        // `assign_local_jobs_for_daily_tick` unconditionally wipes every
-        // workplace assignment, local AND remote, every day "so remote jobs
-        // can be requested again from producer regions after local matching
-        // has taken its current slots" (economy.rs), and a successful grant
-        // re-dirties the flag via `apply_job_export_grant`'s own
-        // `invalidate_jobs_registry` call — so a region with ANY ongoing
-        // remote employment can never go quiet; it must genuinely
-        // re-reconcile every day, by design). Day 2 here has none of that:
-        // it must emit zero job export traffic at all.
-        for request_id in 25..=48 {
-            runtime.push_event(RegionEvent::Tick {
-                request_id: UiRequestId(request_id),
-            });
-            let outbound = runtime.process_next_event();
-            assert!(
-                !outbound.iter().any(|message| matches!(
-                    message,
-                    OutboundMessage::JobExportAllocationsReleased(_)
-                        | OutboundMessage::JobExportRequested(_)
-                )),
-                "day 2 must be genuinely quiet: no job export traffic at all"
-            );
-        }
-    }
-
-    #[test]
     fn daily_tick_without_goods_demands_releases_goods_allocations_before_finishing() {
         // Event-driven plan, P-5: mirrors the job version above, but for
         // goods. Same border-safe fixture (a lone Commercial building on a
@@ -2410,116 +2067,6 @@ mod tick_state_tests {
     }
 
     #[test]
-    fn job_grant_for_a_since_removed_citizen_is_a_no_op() {
-        // Retire-tickstate, P-c: same shape as power's
-        // `grant_for_a_since_removed_consumer_is_a_no_op` (P-a) -- a reply
-        // can echo a citizen that no longer exists (moved away, bulldozed
-        // home). request_id 0 matches a never-ticked runtime's current
-        // generation, so this is NOT dropped as stale; it reaches the ECS
-        // write, which must still no-op.
-        let mut runtime = consumer_runtime(RegionId(1));
-
-        runtime.push_event(RegionEvent::ApplyJobExportGrant {
-            request: JobExportRequest {
-                request_id: UiRequestId(0),
-                caller_region: RegionId(1),
-                caller_network: RegionRoadNetworkId {
-                    region: RegionId(1),
-                    road_network: 0,
-                },
-                token: 0,
-                citizen: crate::core::entity::Entity::new(RegionId(1), 999), // no such entity
-            },
-            grant: JobExportGrant {
-                token: 0,
-                granted: true,
-                workplace: Some(crate::core::entity::Entity::new(RegionId(2), 0)),
-                location: Some(crate::core::city_refs::CityCellRef::local(
-                    RegionId(2),
-                    0,
-                    0,
-                )),
-                salary: 4,
-            },
-        });
-        let outbound = runtime.process_next_event();
-
-        assert!(outbound.is_empty());
-    }
-
-    #[test]
-    #[ignore = "old JobExport path retired in P7-d; removed in P8"]
-    fn stale_job_reply_is_dropped_and_releases_the_producer() {
-        // Retire-tickstate, P-c: same staleness protection as power (P-a)
-        // -- a reply for a batch this caller has already superseded must
-        // be dropped, and if it arrived GRANTED, the producer's
-        // reservation must be actively released (a future release may
-        // never reach it otherwise).
-        let mut region = RegionState::new(RegionId(1), 5, 5);
-        assert!(region.build(2, 2, BuildingKind::Commercial).success);
-        assert!(region.build(2, 1, BuildingKind::Road).success);
-        let mut runtime = RegionRuntime::new(region);
-
-        // Day 1: dirty from construction, stamps current_job_request_id = 24.
-        let mut day1_outbound = Vec::new();
-        for request_id in 1..=24 {
-            runtime.push_event(RegionEvent::Tick {
-                request_id: UiRequestId(request_id),
-            });
-            day1_outbound = runtime.process_next_event();
-        }
-        assert!(
-            day1_outbound
-                .iter()
-                .any(|message| matches!(message, OutboundMessage::JobExportAllocationsReleased(_))),
-            "day 1 must be dirty (construction) and stamp a generation"
-        );
-
-        // Force day 2 dirty too (nothing else would re-dirty a region with
-        // no ongoing remote employment -- same trick used elsewhere in this
-        // module to reopen a gate deterministically).
-        runtime.set_discovery_generation(1);
-        for request_id in 25..=48 {
-            runtime.push_event(RegionEvent::Tick {
-                request_id: UiRequestId(request_id),
-            });
-            runtime.process_next_event();
-        }
-
-        // A grant for DAY 1's now-superseded batch arrives late, GRANTED.
-        let producer = RegionId(9);
-        runtime.push_event(RegionEvent::ApplyJobExportGrant {
-            request: JobExportRequest {
-                request_id: UiRequestId(24),
-                caller_region: RegionId(1),
-                caller_network: RegionRoadNetworkId {
-                    region: RegionId(1),
-                    road_network: 0,
-                },
-                token: 0,
-                citizen: crate::core::entity::Entity::new(RegionId(1), 999),
-            },
-            grant: JobExportGrant {
-                token: 0,
-                granted: true,
-                workplace: Some(crate::core::entity::Entity::new(producer, 0)),
-                location: Some(crate::core::city_refs::CityCellRef::local(producer, 0, 0)),
-                salary: 4,
-            },
-        });
-        let outbound = runtime.process_next_event();
-
-        assert!(
-            matches!(
-                outbound.as_slice(),
-                [OutboundMessage::JobExportAllocationsReleased(release)]
-                    if release.producer_regions == vec![producer]
-            ),
-            "a stale but granted job reply must release the producer's reservation"
-        );
-    }
-
-    #[test]
     fn stale_goods_reply_is_dropped_and_releases_the_producer() {
         // Retire-tickstate, P-d: same staleness protection as power/jobs.
         // A stale granted goods reply reserved producer stock, so dropping
@@ -2569,116 +2116,6 @@ mod tick_state_tests {
     }
 
     #[test]
-    #[ignore = "old JobExport path retired in P7-d; removed in P8"]
-    fn daily_tick_with_jobless_seeker_completes_immediately_and_requests_export() {
-        // Retire-tickstate, P-c: a locally-powered residential whose only
-        // workplace sits on a separate, unreachable road network grows
-        // citizens that stay locally jobless. The first daily tick that
-        // produces such a seeker now completes immediately (jobs no longer
-        // pause), same cutover as power (P-a).
-        let mut runtime = RegionRuntime::new(job_seeker_region(RegionId(1)));
-        while runtime.pending_event_count() > 0 {
-            runtime.process_next_event();
-        }
-
-        let mut requested = false;
-        for request_id in 1..=240u64 {
-            runtime.push_event(RegionEvent::Tick {
-                request_id: UiRequestId(request_id),
-            });
-            let outbound = runtime.process_next_event();
-            if outbound
-                .iter()
-                .any(|message| matches!(message, OutboundMessage::JobExportRequested(_)))
-            {
-                let release = message_index(&outbound, |message| {
-                    matches!(message, OutboundMessage::JobExportAllocationsReleased(_))
-                });
-                let request = message_index(&outbound, |message| {
-                    matches!(message, OutboundMessage::JobExportRequested(_))
-                });
-                assert!(
-                    release < request,
-                    "job reconciliation should release before requesting current demands"
-                );
-                assert!(
-                    has_tick_completed(&outbound),
-                    "the tick completes in the same pass it asks for exported jobs"
-                );
-                requested = true;
-                break;
-            }
-        }
-        assert!(
-            requested,
-            "a daily tick should eventually request a remote job"
-        );
-    }
-
-    #[test]
-    fn bridge_workplace_is_not_granted_twice_across_networks() {
-        // A single workplace adjacent to two disconnected road networks is one
-        // physical slot, yet it appears as spare on BOTH networks. CR1 deliberately
-        // keeps such networks in separate components, so two consumers in different
-        // components can each request this slot via a different network. A
-        // reservation taken via one network must block the other request, or the
-        // producer double-grants one slot (charging its tax twice while two remote
-        // citizens both "hold" the job). Regression guard for the CR3R network-scoped
-        // exclusion bug.
-        let mut runtime = RegionRuntime::new(bridge_producer_region(RegionId(2)));
-        // DT1: producer-side reads gate on applied power; bring the derived pass
-        // current after the paused builds (the worker does this before reading).
-        runtime.ensure_derived_state();
-
-        // Both disconnected networks expose the single bridge slot.
-        let networks: Vec<RegionRoadNetworkId> = runtime
-            .state()
-            .availability_hints()
-            .into_iter()
-            .filter(|hint| !hint.spare_job_slot_ids.is_empty())
-            .map(|hint| hint.network)
-            .collect();
-        assert_eq!(
-            networks.len(),
-            2,
-            "bridge slots should be spare on both networks"
-        );
-        let bridge = runtime.state().spare_job_slots_on_network(networks[0]);
-        // The bridge building's slots are the same physical slots on both networks.
-        assert!(!bridge.is_empty());
-        assert!(
-            bridge.iter().all(|slot| *slot == bridge[0]),
-            "one bridge building"
-        );
-        assert_eq!(
-            runtime.state().spare_job_slots_on_network(networks[1]),
-            bridge,
-            "the same physical slots are spare on the second network"
-        );
-
-        // Caller A reserves every slot of the bridge building via the first network.
-        for token in 0..bridge.len() as u32 {
-            let grant = runtime.process_job_export_request(&job_export_request(
-                RegionId(10),
-                token,
-                networks[0],
-            ));
-            assert!(grant.granted, "caller A takes bridge slot {token}");
-            assert_eq!(grant.workplace, Some(bridge[0]));
-        }
-
-        // Caller B (a different component) requests a slot of the same building via
-        // the second network. Every slot is already reserved, so it must be denied:
-        // the network-scoped exclusion bug missed caller A's reservations here.
-        let grant_b =
-            runtime.process_job_export_request(&job_export_request(RegionId(11), 99, networks[1]));
-        assert!(
-            !grant_b.granted,
-            "all bridge slots are reserved on the other network; no double-grant"
-        );
-    }
-
-    #[test]
     fn goods_export_request_reserves_producer_surplus_units() {
         let mut runtime = RegionRuntime::new(goods_producer_region(RegionId(2)));
         runtime.ensure_derived_state();
@@ -2717,26 +2154,6 @@ mod tick_state_tests {
         );
     }
 
-    fn job_export_request(
-        caller: RegionId,
-        token: u32,
-        producer_network: RegionRoadNetworkId,
-    ) -> JobExportAllocationRequest {
-        ExportAllocationRequest {
-            request: JobExportRequest {
-                request_id: UiRequestId(1),
-                caller_region: caller,
-                // The producer ignores the caller's own network; only the candidate
-                // (producer) network and the (caller, gen, token) key matter here.
-                caller_network: producer_network,
-                token,
-                citizen: crate::core::entity::Entity::new(caller, token),
-            },
-            candidates: vec![producer_network],
-            candidate_index: 0,
-        }
-    }
-
     fn goods_export_request(
         caller: RegionId,
         token: u32,
@@ -2768,14 +2185,6 @@ mod tick_state_tests {
     // networks: roads at (0,0) [west] and (2,0) [east] never connect (the commercial
     // between them is not a road), but the commercial is adjacent to both. The plant
     // powers the west network, so the commercial is powered and offers its slots.
-    fn bridge_producer_region(region_id: RegionId) -> RegionState {
-        let mut region = RegionState::new(region_id, 3, 2);
-        assert!(region.build(0, 0, BuildingKind::Road).success);
-        assert!(region.build(2, 0, BuildingKind::Road).success);
-        assert!(region.build(1, 0, BuildingKind::Commercial).success);
-        assert!(region.build(0, 1, BuildingKind::PowerPlant).success);
-        region
-    }
 
     fn goods_producer_region(region_id: RegionId) -> RegionState {
         let mut region = RegionState::new(region_id, 2, 2);
@@ -2804,19 +2213,6 @@ mod tick_state_tests {
     // Residential on a locally-powered border network whose only workplace is on a
     // disconnected network: jobs are counted (population grows) but unreachable, so
     // citizens stay locally jobless and seek a remote slot.
-    fn job_seeker_region(region_id: RegionId) -> RegionState {
-        let mut region = RegionState::new(region_id, 6, 3);
-        assert!(region.build(0, 0, BuildingKind::Residential).success);
-        assert!(region.build(0, 1, BuildingKind::Park).success);
-        for x in 1..=5 {
-            assert!(region.build(x, 0, BuildingKind::Road).success);
-        }
-        assert!(region.build(4, 1, BuildingKind::PowerPlant).success);
-        assert!(region.build(3, 2, BuildingKind::Road).success);
-        assert!(region.build(4, 2, BuildingKind::Road).success);
-        assert!(region.build(5, 2, BuildingKind::Industrial).success);
-        region
-    }
 }
 
 #[cfg(test)]
@@ -2860,20 +2256,6 @@ mod export_allocations_tests {
         // token-2's reservation on a different network is never counted.
         let reserved = allocations.reserved_units_excluding(key(1, 5, 0), net(2, 0));
         assert_eq!(reserved.collect::<Vec<_>>(), vec![4]);
-    }
-
-    #[test]
-    fn reserved_units_excluding_key_spans_all_networks() {
-        let mut allocations = ExportAllocations::<i32>::new();
-        allocations.upsert(key(1, 5, 0), net(2, 0), 3, UiRequestId(5));
-        allocations.upsert(key(1, 5, 1), net(2, 0), 4, UiRequestId(5));
-        allocations.upsert(key(1, 5, 2), net(2, 1), 9, UiRequestId(5));
-
-        // Network-agnostic (jobs): excluding token-0's own key, every other
-        // reservation counts regardless of which network it was taken under, so a
-        // bridge slot reserved via one network still blocks the other.
-        let reserved = allocations.reserved_units_excluding_key(key(1, 5, 0));
-        assert_eq!(reserved.collect::<Vec<_>>(), vec![4, 9]);
     }
 
     #[test]
@@ -3326,40 +2708,6 @@ mod employment_claim_flow_tests {
             directory.snapshot().accepted_by_home_region[&RegionId(1)].len(),
             1,
             "and the read cache still holds it -- acknowledge does not evict"
-        );
-    }
-
-    #[test]
-    fn the_daily_employment_phase_emits_no_legacy_job_export_traffic() {
-        // P7-d cutover claim (codex): the ledger's daily employment phase
-        // replaces the old JobExport request/grant path outright. Drive a region
-        // whose citizens stay jobless (no local jobs, no directory installed) so
-        // its daily employment reconcile is genuinely live every day, and prove
-        // it emits zero `JobExport*` traffic -- the old path's only wire signal.
-        let mut runtime = home_runtime(2);
-        assert!(
-            runtime.state().has_unassigned_citizen(),
-            "the fixture keeps a live, jobless daily employment phase"
-        );
-
-        for request_id in 1..=(2 * 24) {
-            runtime.push_event(RegionEvent::Tick {
-                request_id: UiRequestId(request_id),
-            });
-            let outbound = runtime.process_next_event();
-            assert!(
-                !outbound.iter().any(|message| matches!(
-                    message,
-                    OutboundMessage::JobExportRequested(_)
-                        | OutboundMessage::JobExportAllocationsReleased(_)
-                )),
-                "the ledger cutover must not emit any legacy JobExport traffic"
-            );
-        }
-
-        assert!(
-            runtime.state().has_unassigned_citizen(),
-            "still jobless: the phase ran live throughout, not vacuously quiet"
         );
     }
 

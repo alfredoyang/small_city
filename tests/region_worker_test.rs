@@ -3,15 +3,15 @@
 use small_city::core::regional_types::{RegionCommand, RegionTickResponse, UiRequestId};
 use small_city::core::regions::directory::RegionDirectory;
 use small_city::core::regions::runtime::{
-    ExportAllocationRequest, JobExportRequest, PowerExportRequest, RegionEvent, RegionRuntime,
+    ExportAllocationRequest, PowerExportRequest, RegionEvent, RegionRuntime,
 };
 use small_city::core::regions::worker::{
     RegionOwnerDirectory, RegionWorker, WorkerId, WorkerRoutingError,
     process_workers_with_deterministic_barrier,
 };
 use small_city::core::regions::{
-    BorderEdge, BorderLinkId, JobExportGrant, NetworkBorderLink, PowerExportGrant, RegionId,
-    RegionNeighborLink, RegionRoadNetworkId, RegionState, RegionalAvailabilityHint,
+    BorderEdge, BorderLinkId, NetworkBorderLink, PowerExportGrant, RegionId, RegionNeighborLink,
+    RegionRoadNetworkId, RegionState, RegionalAvailabilityHint,
 };
 use small_city::interface::events::{EconomyBreakdownView, GameEventView};
 use small_city::interface::input::BuildingKind;
@@ -835,74 +835,6 @@ fn cross_region_power_export_allocation_prevents_double_spend() {
 }
 
 #[test]
-fn job_export_request_completed_routes_apply_event_back_to_caller() {
-    let caller = RegionId(73);
-    let producer = RegionId(74);
-    let mut worker = worker_with_region_states(
-        WorkerId(48),
-        vec![
-            job_seeker_region(caller),
-            job_slot_producer_region(producer),
-        ],
-    );
-
-    worker
-        .push_event(
-            producer,
-            RegionEvent::ProcessJobExportRequest(ExportAllocationRequest {
-                request: JobExportRequest {
-                    request_id: UiRequestId(1),
-                    caller_region: caller,
-                    caller_network: network(73, 0),
-                    token: 0,
-                    citizen: small_city::core::entity::Entity::new(caller, 0),
-                },
-                candidates: vec![network(74, 0)],
-                candidate_index: 0,
-            }),
-        )
-        .unwrap();
-
-    let summary = worker.process_region_events(1);
-
-    assert!(summary.routing_errors.is_empty());
-    assert_eq!(pending_events(&worker, caller), 1);
-    assert_eq!(imported_job_count(&worker, caller), 0);
-}
-
-#[test]
-#[ignore = "P7-d: asserts the retired JobExport grant continuation runs in the caller region while the producer never ticks (turn(producer)==0). The ledger requires the producer region to tick to publish pools and validate claims. Old-path internal; removed in P8."]
-fn job_grant_continuation_runs_in_caller_region() {
-    let caller = RegionId(77);
-    let producer = RegionId(78);
-    let mut worker = worker_with_region_states(
-        WorkerId(50),
-        vec![
-            job_seeker_region(caller),
-            job_slot_producer_region(producer),
-        ],
-    );
-    worker.set_region_topology(vec![neighbor(77, BorderEdge::East, 78)]);
-
-    for request_id in 1..=240 {
-        worker.push_event(caller, tick(request_id)).unwrap();
-        drain_worker(&mut worker);
-        if imported_job_count(&worker, caller) > 0 {
-            assert_eq!(turn(&worker, caller), request_id as u32);
-            assert_eq!(
-                turn(&worker, producer),
-                0,
-                "producer must not run the caller's job continuation"
-            );
-            assert_eq!(imported_job_count(&worker, producer), 0);
-            return;
-        }
-    }
-
-    panic!("caller never recorded a remote workplace from the job export grant");
-}
-
-#[test]
 fn wrong_region_export_grants_are_ignored_without_mutating_state() {
     let region = RegionId(79);
     let mut worker =
@@ -932,41 +864,12 @@ fn wrong_region_export_grants_are_ignored_without_mutating_state() {
             },
         )
         .unwrap();
-    worker
-        .push_event(
-            region,
-            RegionEvent::ApplyJobExportGrant {
-                // Same reasoning as the power grant above: request_id 0
-                // matches current, so this reaches the ECS write, which
-                // must still no-op since no citizen with this id exists.
-                request: JobExportRequest {
-                    request_id: UiRequestId(0),
-                    caller_region: region,
-                    caller_network: network(79, 0),
-                    token: 0,
-                    citizen: small_city::core::entity::Entity::new(RegionId(80), 0),
-                },
-                grant: JobExportGrant {
-                    token: 0,
-                    granted: true,
-                    workplace: Some(small_city::core::entity::Entity::new(RegionId(80), 0)),
-                    location: Some(small_city::core::city_refs::CityCellRef::local(
-                        RegionId(80),
-                        0,
-                        0,
-                    )),
-                    salary: 4,
-                },
-            },
-        )
-        .unwrap();
 
-    let summary = worker.process_region_events(2);
+    let summary = worker.process_region_events(1);
 
     assert!(summary.routing_errors.is_empty());
     assert_eq!(turn(&worker, region), 0);
     assert!(!cell_powered(&worker, region, 0, 0));
-    assert_eq!(imported_job_count(&worker, region), 0);
 }
 
 #[test]
@@ -1187,7 +1090,7 @@ fn same_pass_release_is_routed_before_another_caller_power_request() {
 }
 
 #[test]
-fn cross_region_job_export_employs_jobless_citizen() {
+fn cross_region_remote_job_employs_jobless_citizen() {
     let consumer = job_seeker_region(RegionId(60));
     let producer = job_slot_producer_region(RegionId(61));
     let mut worker = worker_with_region_states(WorkerId(40), vec![consumer, producer]);
@@ -1272,7 +1175,7 @@ fn fired_remote_worker_finds_another_remote_job() {
 }
 
 #[test]
-fn cross_region_job_export_is_visible_as_producer_workplace_tile() {
+fn cross_region_remote_job_is_visible_as_producer_workplace_tile() {
     let consumer = job_seeker_region(RegionId(60));
     let producer = job_slot_producer_region(RegionId(61));
     let mut worker = worker_with_region_states(WorkerId(64), vec![consumer, producer]);
@@ -1306,7 +1209,7 @@ fn cross_region_job_export_is_visible_as_producer_workplace_tile() {
 }
 
 #[test]
-fn cross_region_job_export_does_not_cross_separate_components() {
+fn cross_region_remote_job_does_not_cross_separate_components() {
     let consumer = job_seeker_region(RegionId(62));
     let producer = job_slot_producer_region(RegionId(63));
     // No topology: the regions are in separate components (the trap).
@@ -1318,7 +1221,7 @@ fn cross_region_job_export_does_not_cross_separate_components() {
 }
 
 #[test]
-fn cross_region_job_export_reservation_prevents_double_spend() {
+fn cross_region_remote_job_reservation_prevents_double_spend() {
     // The producer has two spare commercial slots; the consumer grows three
     // jobless citizens. Only two may import a job: no slot is granted twice.
     let consumer = job_seeker_region(RegionId(64));
@@ -1332,7 +1235,7 @@ fn cross_region_job_export_reservation_prevents_double_spend() {
 }
 
 #[test]
-fn cross_region_job_export_tax_accrues_to_exporter_without_remote_entity() {
+fn cross_region_remote_job_tax_accrues_to_exporter_without_remote_entity() {
     // Same producer run twice: once connected (exports a job) and once isolated
     // (no export). The connected producer must end richer by the exported job's
     // workplace tax, and the consumer stores only an owned slot reference.
@@ -1366,8 +1269,8 @@ fn cross_region_job_export_tax_accrues_to_exporter_without_remote_entity() {
 #[test]
 fn tick_short_on_power_and_jobs_resolves_both_phases() {
     // The consumer imports power (its residential network has no local plant) and,
-    // once powered, grows citizens that are locally jobless and import a job. Both
-    // export phases must resolve in the same daily ticks.
+    // once powered, grows citizens that are locally jobless and take a remote job.
+    // Power import and remote employment must both resolve in the same daily ticks.
     let consumer = power_and_job_seeker_region(RegionId(68));
     let producer = power_and_job_producer_region(RegionId(69));
     let mut worker = worker_with_region_states(WorkerId(45), vec![consumer, producer]);

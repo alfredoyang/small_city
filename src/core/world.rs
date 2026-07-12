@@ -411,20 +411,17 @@ impl World {
         self.invalidate_jobs_registry();
     }
 
-    /// Retire-tickstate, P-c: refreshes the job cache after applying an
-    /// already-requested export grant, WITHOUT re-flagging
-    /// `jobs_exports_dirty`.
+    /// Refreshes the job cache after applying a remote assignment, WITHOUT
+    /// re-flagging `jobs_exports_dirty`.
     ///
-    /// `jobs_exports_dirty` now also gates the daily wipe in
-    /// `assign_local_jobs_for_daily_tick` (a quiet day skips the wipe
-    /// entirely, leaving existing assignments — local and remote — alone).
-    /// A grant landing is the reconcile gate's own answer arriving, not new
-    /// information for it to notice; re-setting the flag here would wipe
-    /// this very assignment again on the very next daily tick, forever
-    /// re-opening the same request with the citizen jobless every time
-    /// economy settles — the bug this method exists to close. Hints still
-    /// republish (harmless no-op via `publish_region`'s idempotence check
-    /// if nothing actually changed).
+    /// `jobs_exports_dirty` also gates the daily employment reconciliation (a
+    /// quiet day skips it entirely, leaving existing assignments — local and
+    /// remote — alone). A newly-applied assignment is the gate's own answer
+    /// arriving, not new information for it to notice; re-setting the flag here
+    /// would re-open the same reconciliation every daily tick, churning this very
+    /// assignment with the citizen jobless every time economy settles — the bug
+    /// this method exists to close. Hints still republish (harmless no-op via
+    /// `publish_region`'s idempotence check if nothing actually changed).
     pub(crate) fn refresh_jobs_cache_after_grant_applied(&self) {
         self.registry_cache.borrow_mut().invalidate_jobs();
         self.hints_dirty.set(true);

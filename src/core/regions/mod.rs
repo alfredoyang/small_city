@@ -293,14 +293,6 @@ pub(crate) struct PendingPowerDemand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Caller-local job seeker that may need a producer-exported workplace slot.
-pub(crate) struct PendingJobDemand {
-    pub token: u32,
-    pub citizen: Entity,
-    pub caller_network: RegionRoadNetworkId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Caller-local commercial goods demand that may need producer-exported units.
 pub(crate) struct PendingGoodsDemand {
     pub token: u32,
@@ -320,13 +312,10 @@ pub(crate) struct RegionalTickPowerPhase {
 /// Paused tick state after local job assignment and before the daily economy.
 pub(crate) struct RegionalTickJobPhase {
     phase: TickJobPhase,
-    // P7-d: always empty now (the ledger replaced demand collection); P8 removes it.
-    #[allow(dead_code)]
-    pub job_demands: Vec<PendingJobDemand>,
 }
 
 #[derive(Debug)]
-/// Paused tick state after job exports and before future goods exports.
+/// Paused tick state after the job phase and before the goods phase.
 pub(crate) struct RegionalTickGoodsPhase {
     phase: RegionalTickJobPhase,
     pub goods_demands: Vec<PendingGoodsDemand>,
@@ -338,8 +327,8 @@ impl RegionalTickJobPhase {
         self.phase.is_daily()
     }
 
-    /// Retire-tickstate, P-c: whether the daily wipe/reconcile actually ran
-    /// (computed fresh after population growth — see `continue_to_job_phase`).
+    /// Whether the daily employment reconciliation actually ran (computed fresh
+    /// after population growth — see `continue_to_job_phase`).
     pub(crate) fn jobs_dirty(&self) -> bool {
         self.phase.jobs_dirty()
     }
@@ -351,22 +340,6 @@ pub struct PowerExportGrant {
     pub token: u32,
     pub granted: bool,
     pub source_region: Option<RegionId>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Result of an authoritative producer-owned job-slot export allocation request.
-///
-/// Unlike power, the grant carries identity as city-wide refs: the producer's
-/// `workplace` (a region-tagged `Entity`, owned by the producer; the consumer
-/// never dereferences it, only stores/echoes it), its `location` (the self-describing
-/// workplace cell for the consumer's roster/display), and the `salary` the home region
-/// pays the worker. Workplace tax accrues to the exporting region instead.
-pub struct JobExportGrant {
-    pub token: u32,
-    pub granted: bool,
-    pub workplace: Option<Entity>,
-    pub location: Option<CityCellRef>,
-    pub salary: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,8 +415,7 @@ impl RegionState {
     pub fn tick_local(&mut self) -> CommandResult {
         let phase = begin_tick_power_phase(&mut self.world, self.id);
         // Single-region path: no cross-region reconcile gate exists here, so
-        // there's nothing to skip -- always wipe and rematch, unchanged from
-        // before P-c.
+        // there's nothing to skip -- always run the local job rematch.
         let job_phase = continue_to_job_phase(&mut self.world, self.id, phase, true);
         finish_tick_after_job_phase(&mut self.world, job_phase, &[])
     }
@@ -1106,7 +1078,7 @@ impl RegionState {
         // imported consumer is correctly re-included in this tick's fresh
         // request batch. The restore only protects reads that happen later
         // in this same pass — e.g. this region answering another region's
-        // incoming job export request before its own fresh grant has
+        // incoming power export request before its own fresh grant has
         // round-tripped back — see
         // docs/20260703-bug-cross-region-export-starvation-fix.md.
         let imported = imported_power_grants(&self.world);
@@ -1213,16 +1185,12 @@ impl RegionState {
             power_phase.phase,
             connectivity_dirty,
         );
-        // P7-d: the ledger replaced the old cross-region job demand collection.
-        // `job_demands` is retained (empty) on the phase until P8 removes it; the
-        // runtime now reconciles via `daily_employment_phase`, not these demands.
-        RegionalTickJobPhase {
-            phase,
-            job_demands: Vec::new(),
-        }
+        // The ledger (`daily_employment_phase`) owns cross-region employment now;
+        // this phase only carries the local job/economy boundary.
+        RegionalTickJobPhase { phase }
     }
 
-    /// Finishes the tick after job exports resolve.
+    /// Finishes the tick after the job phase resolves.
     ///
     /// `exported_job_slots` are this region's workplace entities reserved for
     /// remote workers; the economy accrues their workplace tax to this region.
@@ -1322,45 +1290,6 @@ impl RegionState {
         self.world.stats.power.total_power_shortage = (self.world.stats.power.total_power_demand
             - self.world.stats.power.total_power_supplied)
             .max(0);
-    }
-
-    /// Records a granted remote workplace on the still-jobless caller citizen.
-    ///
-    /// The consumer stores only owned summary data (region + opaque slot id +
-    /// salary); the exporting region keeps the slot's workplace tax. A citizen that
-    /// gained a local job since the request, or an already-remote one, is skipped.
-    ///
-    /// The salary is captured here at grant time and paid even if the producer's
-    /// slot stops being effective before its economy runs (producer-side tax is
-    /// guarded by `is_effective_workplace`, so it would not collect). The window is
-    /// one tick with no intervening world mutation, so this minor producer/consumer
-    /// asymmetry is harmless.
-    pub(crate) fn apply_job_export_grant(
-        &mut self,
-        demand: PendingJobDemand,
-        grant: JobExportGrant,
-    ) {
-        if !grant.granted {
-            return;
-        }
-        let (Some(workplace), Some(location)) = (grant.workplace, grant.location) else {
-            return;
-        };
-        let Some(citizen) = self.world.citizens.get_mut(&demand.citizen) else {
-            return;
-        };
-        if citizen.workplace_assignment.is_some() {
-            return;
-        }
-        citizen.workplace_assignment = Some(WorkplaceAssignment {
-            workplace,
-            location,
-            salary: grant.salary,
-        });
-        // Retire-tickstate, P-c: NOT invalidate_jobs_registry() -- that
-        // would re-flag jobs_exports_dirty, which now also gates the daily
-        // wipe. See refresh_jobs_cache_after_grant_applied's doc comment.
-        self.world.refresh_jobs_cache_after_grant_applied();
     }
 
     pub(crate) fn add_commercial_goods(&mut self, commercial: Entity, units: u32) {
@@ -1502,12 +1431,10 @@ impl RegionState {
             .any(|data| data.workplace_assignment.is_none())
     }
 
-    /// P7-d: this region's workplace entities reserved for remote contract
-    /// holders, one entry per contract, in `(workplace, citizen)` order. Feeds
-    /// the daily economy's producer-owned workplace tax — replacing the old
-    /// `job_export_allocations.units()` source. A workplace with N contracts
-    /// contributes N entries, matching the old ledger's per-reserved-slot shape.
-    #[allow(dead_code)] // P7-d: wired into finish_job_phase's tax source below.
+    /// This region's workplace entities reserved for remote contract holders, one
+    /// entry per contract, in `(workplace, citizen)` order. Feeds the daily
+    /// economy's producer-owned workplace tax (`finish_goods_phase`): a workplace
+    /// with N contracts contributes N entries, one taxed slot each.
     pub(crate) fn contracted_workplace_tax_slots(&self) -> Vec<Entity> {
         let mut slots = Vec::new();
         for (workplace, holders) in &self.employer_state.contracts_by_workplace {
@@ -1603,9 +1530,9 @@ impl RegionState {
     ///   keeps it.
     ///
     /// `refresh_jobs_cache_after_grant_applied`, not `invalidate_jobs_registry`
-    /// — re-flagging `jobs_exports_dirty` here would make the next daily wipe
-    /// destroy the very assignment just applied. Same reasoning, and the same
-    /// call, as the old path's `apply_job_export_grant`.
+    /// — re-flagging `jobs_exports_dirty` here would re-open the daily employment
+    /// gate every day even for a settled worker, churning the assignment just
+    /// applied instead of leaving a quiet day quiet.
     pub(crate) fn apply_workplace_assignment(
         &mut self,
         citizen: Entity,
@@ -2073,63 +2000,6 @@ impl RegionState {
         demands
     }
 
-    #[allow(dead_code)] // P7-d: old cross-region demand collection, retired; P8 deletes it.
-    fn pending_job_demands(&self) -> Vec<PendingJobDemand> {
-        let border_networks = self
-            .network_border_links()
-            .into_iter()
-            .map(|link| link.network)
-            .collect::<Vec<_>>();
-        if border_networks.is_empty() {
-            return Vec::new();
-        }
-
-        let networks = road_connectivity::discover_road_networks(&self.world);
-        let mut citizens = self.world.citizens.keys().copied().collect::<Vec<_>>();
-        citizens.sort_by_key(|citizen| citizen.0);
-
-        let mut demands = Vec::new();
-        for citizen in citizens {
-            let Some(citizen_data) = self.world.citizens.get(&citizen) else {
-                continue;
-            };
-            // Only a citizen left without any local or remote workplace seeks one.
-            if citizen_data.workplace_assignment.is_some() {
-                continue;
-            }
-            // Home is always local to this region; it's already the local id.
-            let home = citizen_data.home;
-            // A citizen reaches remote slots through the border road network its
-            // home connects to, mirroring the power consumer's caller network.
-            let Some(caller_network) = networks
-                .iter()
-                .filter(|network| {
-                    border_networks.contains(&RegionRoadNetworkId {
-                        region: self.id,
-                        road_network: network.id,
-                    })
-                })
-                .find(|network| {
-                    road_connectivity::adjacent_road_entities(&self.world, home)
-                        .any(|road| network.roads.contains(&road))
-                })
-                .map(|network| RegionRoadNetworkId {
-                    region: self.id,
-                    road_network: network.id,
-                })
-            else {
-                continue;
-            };
-
-            demands.push(PendingJobDemand {
-                token: demands.len() as u32,
-                citizen,
-                caller_network,
-            });
-        }
-        demands
-    }
-
     fn pending_goods_demands(&self) -> Vec<PendingGoodsDemand> {
         let border_networks = self
             .network_border_links()
@@ -2184,7 +2054,7 @@ impl RegionState {
 /// load/start derives local registries, topology, hints, and requests exports again
 /// ```
 ///
-/// Power and job export grants are runtime coordination, not durable world truth.
+/// Power and goods export grants are runtime coordination, not durable world truth.
 /// The loaded runner recomputes local derived state from buildings/resources, then
 /// future regional ticks rebuild imports through the normal event flow.
 fn scrub_transient_import_state_for_save(world: &mut World) {
@@ -2275,23 +2145,14 @@ mod tests {
         let citizen = *region.world.citizens.keys().next().expect("citizen");
         assert_eq!(region.world.cached_job_counts().unemployment, 1);
 
-        region.apply_job_export_grant(
-            PendingJobDemand {
-                token: 7,
-                citizen,
-                caller_network: RegionRoadNetworkId {
-                    region: RegionId(1),
-                    road_network: 0,
-                },
-            },
-            JobExportGrant {
-                token: 7,
-                granted: true,
-                workplace: Some(Entity::new(RegionId(2), 42)),
-                location: Some(CityCellRef::local(RegionId(2), 1, 0)),
+        assert!(region.apply_workplace_assignment(
+            citizen,
+            WorkplaceAssignment {
+                workplace: Entity::new(RegionId(2), 42),
+                location: CityCellRef::local(RegionId(2), 1, 0),
                 salary: 4,
             },
-        );
+        ));
 
         assert_eq!(region.imported_job_slots(), vec![(RegionId(2), 42)]);
         assert_eq!(region.world.cached_job_counts().unemployment, 0);
@@ -2549,23 +2410,14 @@ mod tests {
         residents.sort_by_key(|entity| entity.0);
         let commuter = residents[0];
 
-        region.apply_job_export_grant(
-            PendingJobDemand {
-                token: 1,
-                citizen: commuter,
-                caller_network: RegionRoadNetworkId {
-                    region: RegionId(1),
-                    road_network: 0,
-                },
-            },
-            JobExportGrant {
-                token: 1,
-                granted: true,
-                workplace: Some(Entity::new(RegionId(2), 9)),
-                location: Some(CityCellRef::local(RegionId(2), 1, 0)),
+        assert!(region.apply_workplace_assignment(
+            commuter,
+            WorkplaceAssignment {
+                workplace: Entity::new(RegionId(2), 9),
+                location: CityCellRef::local(RegionId(2), 1, 0),
                 salary: 4,
             },
-        );
+        ));
 
         // Matches the producer (region, cell): one commuter, tagged with its own
         // region (1) as home, at its home cell (0,0).
@@ -3485,9 +3337,9 @@ mod tests {
     }
 
     #[test]
-    fn applying_an_assignment_does_not_re_dirty_the_daily_wipe_gate() {
-        // If apply re-flagged `jobs_exports_dirty`, the next daily job phase
-        // would wipe the very assignment just applied (the bug
+    fn applying_an_assignment_does_not_re_dirty_the_daily_employment_gate() {
+        // If apply re-flagged `jobs_exports_dirty`, the next daily employment
+        // phase would churn the very assignment just applied (the bug
         // `refresh_jobs_cache_after_grant_applied` exists to close).
         let (mut region, citizen, assignment) = home_region_with_one_citizen();
         region.clear_jobs_exports_dirty();
@@ -3495,7 +3347,7 @@ mod tests {
         assert!(region.apply_workplace_assignment(citizen, assignment));
         assert!(
             !region.world.is_jobs_exports_dirty(),
-            "applying an accepted assignment must not re-open the daily wipe gate"
+            "applying an accepted assignment must not re-open the daily employment gate"
         );
     }
 
@@ -3871,18 +3723,17 @@ mod tests {
         }
     }
 
-    /// Retire-tickstate, P-c self-dirtying-loop fix (caught while
-    /// implementing this cutover, not in the original plan text): applying
-    /// a granted remote job must NOT re-flag `jobs_exports_dirty`, or the
-    /// daily wipe -- now also gated on that same flag, so a quiet day skips
-    /// it entirely -- would undo this very assignment on the very next
-    /// daily tick, permanently starving the citizen of salary every day
-    /// forever (economy also only runs on the daily boundary, right after
-    /// the wipe). Regression guard for
-    /// `regional_view_reports_city_goods_and_city_aware_inspect_notes`,
-    /// which caught this at the full multi-region-gameplay level.
+    /// Self-dirtying-loop fix (caught while implementing the P7-d cutover, not in
+    /// the original plan text): applying a remote assignment must NOT re-flag
+    /// `jobs_exports_dirty`, or the daily employment reconciliation -- gated on
+    /// that same flag, so a quiet day skips it entirely -- would churn this very
+    /// assignment on the next daily tick, permanently starving the citizen of
+    /// salary every day forever (economy also only runs on the daily boundary).
+    /// Regression guard for
+    /// `regional_view_reports_city_goods_and_city_aware_inspect_notes`, which
+    /// caught this at the full multi-region-gameplay level.
     #[test]
-    fn apply_job_export_grant_does_not_redirty_jobs_exports() {
+    fn apply_workplace_assignment_does_not_redirty_jobs_exports() {
         let mut region = RegionState::new(RegionId(1), 2, 2);
         let citizen = Entity::new(RegionId(1), 0);
         region.world.attach_citizen(
@@ -3906,35 +3757,26 @@ mod tests {
         region.clear_jobs_exports_dirty();
         assert!(!region.world.is_jobs_exports_dirty());
 
-        region.apply_job_export_grant(
-            PendingJobDemand {
-                token: 0,
-                citizen,
-                caller_network: RegionRoadNetworkId {
-                    region: RegionId(1),
-                    road_network: 0,
-                },
-            },
-            JobExportGrant {
-                token: 0,
-                granted: true,
-                workplace: Some(Entity::new(RegionId(2), 0)),
-                location: Some(CityCellRef::local(RegionId(2), 0, 0)),
+        assert!(region.apply_workplace_assignment(
+            citizen,
+            WorkplaceAssignment {
+                workplace: Entity::new(RegionId(2), 0),
+                location: CityCellRef::local(RegionId(2), 0, 0),
                 salary: 4,
             },
-        );
+        ));
 
         assert!(
             region.world.citizens[&citizen]
                 .workplace_assignment
                 .is_some(),
-            "the grant should have been applied"
+            "the assignment should have been applied"
         );
         assert!(
             !region.world.is_jobs_exports_dirty(),
-            "applying a grant must not re-dirty jobs_exports_dirty, or the \
-             daily wipe (gated on this same flag) would undo this very \
-             assignment on the very next daily tick, forever"
+            "applying an assignment must not re-dirty jobs_exports_dirty, or the \
+             daily employment reconciliation (gated on this same flag) would \
+             churn this very assignment on the next daily tick, forever"
         );
     }
 }

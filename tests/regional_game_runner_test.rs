@@ -259,7 +259,7 @@ fn two_worker_runner_routes_cross_worker_power_export() {
 }
 
 #[test]
-fn three_worker_runner_routes_cross_worker_job_export_in_3x3_region_grid() {
+fn three_worker_runner_routes_cross_worker_remote_jobs_in_3x3_region_grid() {
     let region_ids = [
         RegionId(31),
         RegionId(32),

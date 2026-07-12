@@ -14,13 +14,12 @@ use crate::core::regions::directory::RegionDirectory;
 use crate::core::regions::employment_directory::EmploymentDirectory;
 use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::runtime::{
-    ExportAllocationRelease, ExportAllocationRequest, GoodsExportRequest, JobExportRequest,
-    OutboundMessage, PowerExportRequest, RegionEvent, RegionRuntime, RegionRuntimeError,
+    ExportAllocationRelease, ExportAllocationRequest, GoodsExportRequest, OutboundMessage,
+    PowerExportRequest, RegionEvent, RegionRuntime, RegionRuntimeError,
 };
 use crate::core::regions::{
-    BorderEdge, BorderLinkId, GoodsExportGrant, JobExportGrant, NetworkBorderLink,
-    PowerExportGrant, RegionId, RegionNeighborLink, RegionRoadNetworkId, RegionState,
-    RegionalAvailabilityHint,
+    BorderEdge, BorderLinkId, GoodsExportGrant, NetworkBorderLink, PowerExportGrant, RegionId,
+    RegionNeighborLink, RegionRoadNetworkId, RegionState, RegionalAvailabilityHint,
 };
 use crate::core::world::CrossRegionGoodsRoutes;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -735,7 +734,6 @@ impl RegionWorker {
                 matches!(
                     message,
                     OutboundMessage::PowerExportAllocationsReleased(_)
-                        | OutboundMessage::JobExportAllocationsReleased(_)
                         | OutboundMessage::GoodsExportAllocationsReleased(_)
                 )
             });
@@ -789,15 +787,6 @@ impl RegionWorker {
             OutboundMessage::PowerExportAllocationsReleased(release) => {
                 self.route_export_allocation_release::<PowerExport>(release, routing_mode)
             }
-            OutboundMessage::JobExportRequested(request) => {
-                self.route_export_request::<JobExport>(request, routing_mode)
-            }
-            OutboundMessage::JobExportRequestCompleted { request, grant } => {
-                self.route_export_request_result::<JobExport>(request, grant, routing_mode)
-            }
-            OutboundMessage::JobExportAllocationsReleased(release) => {
-                self.route_export_allocation_release::<JobExport>(release, routing_mode)
-            }
             OutboundMessage::GoodsExportRequested(request) => {
                 self.route_export_request::<GoodsExport>(request, routing_mode)
             }
@@ -824,13 +813,12 @@ impl RegionWorker {
     /// P3: route a payload-free employment wake through the same deterministic
     /// barrier every other cross-region event uses.
     ///
-    /// `resource_rank: 4` places employment after power(0)/jobs(1)/goods(2)/
-    /// travel(3). It is a rank of its own rather than reusing jobs(1) because
-    /// the old job-export path is still live until P7, and the two must not
-    /// interleave ambiguously. `request_id`/`token` are zero: the event carries
-    /// no payload, so two wakes for the same `(target, source)` pair in one
-    /// pass are genuinely identical and idempotent — the region simply pulls
-    /// its work once.
+    /// `resource_rank: 4` places the employment wake after power(0), goods(2), and
+    /// travel(3) in the barrier order (rank 1 is a retired slot — it was the old
+    /// job-export path, removed in P8). `request_id`/`token` are zero: the event
+    /// carries no payload, so two wakes for the same `(target, source)` pair in one
+    /// pass are genuinely identical and idempotent — the region simply pulls its
+    /// work once.
     fn route_employment_directory_ready(
         &mut self,
         target_region: RegionId,
@@ -1161,24 +1149,26 @@ fn cross_region_goods_routes_for_region(
 /// The variable bits of one cross-region export resource for the shared routing.
 ///
 /// Everything in `route_export_request*` / `route_export_allocation_release` is
-/// identical between power and jobs; this trait supplies only what differs: which
+/// identical between power and goods; this trait supplies only what differs: which
 /// availability hint to read, how to build the concrete `RegionEvent`s, and the
 /// deny grant. Available-capacity computation and grant application stay on the
 /// producer runtime / `RegionState`, where the two resources genuinely diverge.
+/// (Cross-region jobs once rode this same routing; the employment ledger replaced
+/// that path — P8 — so only power and goods remain.)
 ///
 ///   route_outbound
 ///     ├─ route_export_request::<PowerExport>(req)   ┐  same candidate-walk,
-///     └─ route_export_request::<JobExport>(req)     ┘  missing-target deny,
+///     └─ route_export_request::<GoodsExport>(req)   ┘  missing-target deny,
 ///                  │                                   release ordering …
-///                  ▼  calls back into R = PowerExport | JobExport for:
+///                  ▼  calls back into R = PowerExport | GoodsExport for:
 ///        ┌──────────────────────────────────────────────────────────────┐
-///        │  has_spare(hint)        → has_spare_power | slot ids non-empty  │
-///        │  process_request_event  → ProcessPowerExportRequest | …Job…    │
-///        │  apply_grant_event      → ApplyPowerExportGrant | …Job…        │
-///        │  deny_grant(request)    → PowerExportGrant{..} | JobExportGrant │
+///        │  has_spare(hint)        → has_spare_power | goods units > 0     │
+///        │  process_request_event  → ProcessPowerExportRequest | …Goods…  │
+///        │  apply_grant_event      → ApplyPowerExportGrant | …Goods…      │
+///        │  deny_grant(request)    → PowerExportGrant{..} | GoodsExportGrant│
 ///        └──────────────────────────────────────────────────────────────┘
 ///
-/// `RegionEvent` / `OutboundMessage` variants stay concrete (PowerXxx / JobXxx);
+/// `RegionEvent` / `OutboundMessage` variants stay concrete (PowerXxx / GoodsXxx);
 /// the trait only chooses which one to build, so the wire format is unchanged.
 ///
 /// ```text
@@ -1187,14 +1177,14 @@ fn cross_region_goods_routes_for_region(
 ///   v
 /// Worker route_export_request<R>
 ///   |
-///   +-- PowerExport -> has_spare_power -> ProcessPowerExportRequest
+///   +-- PowerExport -> has_spare_power  -> ProcessPowerExportRequest
 ///   |
-///   +-- JobExport   -> slot ids non-empty -> ProcessJobExportRequest
+///   +-- GoodsExport -> spare units > 0  -> ProcessGoodsExportRequest
 ///                                       |
 ///                                       v
 ///                          Producer ExportAllocations<U>
 ///                            U = i32 power demand
-///                            U = Entity workplace slot
+///                            U = u32 goods units
 ///                                       |
 ///                                       v
 ///                          grant/deny -> caller applies grant
@@ -1291,54 +1281,6 @@ impl ExportResource for PowerExport {
     }
     fn release_event(release: ExportAllocationRelease) -> RegionEvent {
         RegionEvent::ReleasePowerExportAllocations(release)
-    }
-}
-
-/// Jobs: spare-slots hint, identity-free request, slot+salary grant.
-struct JobExport;
-
-impl ExportResource for JobExport {
-    type Request = JobExportRequest;
-    type Grant = JobExportGrant;
-
-    fn caller_region(request: &Self::Request) -> RegionId {
-        request.caller_region
-    }
-    fn caller_network(request: &Self::Request) -> RegionRoadNetworkId {
-        request.caller_network
-    }
-    fn has_spare(hint: &RegionalAvailabilityHint) -> bool {
-        !hint.spare_job_slot_ids.is_empty()
-    }
-    fn granted(grant: &Self::Grant) -> bool {
-        grant.granted
-    }
-    fn deny_grant(request: &Self::Request) -> Self::Grant {
-        JobExportGrant {
-            token: request.token,
-            granted: false,
-            workplace: None,
-            location: None,
-            salary: 0,
-        }
-    }
-    fn request_id(request: &Self::Request) -> UiRequestId {
-        request.request_id
-    }
-    fn token(request: &Self::Request) -> u32 {
-        request.token
-    }
-    fn resource_rank() -> u8 {
-        1
-    }
-    fn process_request_event(request: ExportAllocationRequest<Self::Request>) -> RegionEvent {
-        RegionEvent::ProcessJobExportRequest(request)
-    }
-    fn apply_grant_event(request: Self::Request, grant: Self::Grant) -> RegionEvent {
-        RegionEvent::ApplyJobExportGrant { request, grant }
-    }
-    fn release_event(release: ExportAllocationRelease) -> RegionEvent {
-        RegionEvent::ReleaseJobExportAllocations(release)
     }
 }
 

@@ -70,26 +70,9 @@ pub(crate) fn assign_local_jobs(world: &mut World, local_region: RegionId) {
     apply_workplace_assignments(world, local_region, &job_resolution.assignments);
 }
 
-/// Starts a daily local/remote job resolution from authoritative local state.
-///
-/// Daily ticks clear all prior assignments first so remote jobs can be requested
-/// again from producer regions after local matching has taken its current slots.
-///
-/// P7-d retired this: the ledger owns remote assignments (claim/apply/release/
-/// loss), so wiping them daily and re-requesting is exactly the churn the ledger
-/// replaces. `continue_to_job_phase` now calls `assign_local_jobs` directly. P8
-/// removes this function.
-#[allow(dead_code)] // P7-d: the daily wipe is retired; P8 deletes this.
-pub(crate) fn assign_local_jobs_for_daily_tick(world: &mut World, local_region: RegionId) {
-    for citizen in world.citizens.values_mut() {
-        citizen.workplace_assignment = None;
-    }
-    assign_local_jobs(world, local_region);
-}
-
 /// Runs the daily economy after job assignment (local in `assign_local_jobs`,
-/// remote in the cross-region job export phase) has already written each
-/// citizen's `workplace_assignment`.
+/// remote via the employment ledger) has already written each citizen's
+/// `workplace_assignment`.
 ///
 /// `exported_job_slots` lists this region's workplace entities reserved for
 /// remote workers in other regions. The exporting region owns those slots, so it
@@ -378,13 +361,10 @@ fn apply_workplace_assignments(
         });
         if let Some(citizen) = world.citizens.get_mut(&assignment.citizen) {
             match (citizen.workplace_assignment, workplace_assignment) {
-                // An existing remote job (`workplace.region() != this region`) is frozen
-                // until the daily job-export phase rebuilds it; local matching skips it.
+                // An existing remote job (`workplace.region() != this region`) is a
+                // stable ledger lease; local matching never touches it. Only the
+                // employment ledger (claim/apply/release/loss) changes remote work.
                 (Some(existing), _) if existing.workplace.as_local(local_region).is_none() => {}
-                // Paused derived refresh owns local matching only. Remote work
-                // is frozen until the explicit daily job-export phase clears and
-                // rebuilds assignments, which also releases producer allocations
-                // before routing new requests.
                 (_, next) => citizen.workplace_assignment = next,
             }
         }

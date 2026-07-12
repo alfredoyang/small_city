@@ -1,6 +1,6 @@
 # Directory employment ledger — stable cross-region jobs without daily wipes
 
-Status: **proposal, P1-P5 done; P7 done (P7-a..P7-d); P6 done** (data model,
+Status: **COMPLETE — P1-P8 all done** (data model,
 employer pool publishing, the claim flow, home apply, release/loss, and the
 contract-seat reservation foundation — see the "P<n>, implemented" sections
 at the end of this doc. P3-P5 are *staged*: built and tested, but nothing
@@ -8,10 +8,9 @@ calls the ledger from the daily tick until P7-d's cutover). **P7 is split
 into P7-a..P7-d** (it is too large for one reviewable diff and flips the
 live allocator): P7-a retained reservations, P7-b connectivity
 fingerprint, P7-c discovery install + route invalidation, and P7-d the
-cutover (all done).
-**Remaining: P8** (delete the inactive legacy `JobExport*` types/path). P6
-(save/load durability) ran after P7 as planned and is now done — see its
-"P6, implemented" section at the end of this doc. This is an
+cutover (all done). **P6** (save/load durability) ran after P7 as planned, and
+**P8** deleted the inactive legacy `JobExport*` path — both done; see their
+"implemented" sections at the end of this doc. The plan is fully landed. This is an
 alternative to pushing
 [20260706-per-producer-job-staleness.md](20260706-per-producer-job-staleness.md)
 further. It targets more precise citizen behavior: jobs should be
@@ -3815,4 +3814,120 @@ is unchanged and still pending.
  remote assignment  ∧  no matching contract        →  mark unemployed    (correction)
  pending claim (directory-only)                     →  dropped, re-claimed later
  local assignment (no contract, not cross-region)   →  untouched
+```
+
+## P8, implemented (2026-07-12)
+
+**Status:** implemented, deletion-only (no behavior change). Removes the inactive
+legacy cross-region job-export request/grant/allocation path that P7 made
+unreachable, keeping the shared generic export machinery that power and goods
+still use. Net −989 lines across 8 files.
+
+### Scope — what was deleted
+
+- **Types** (`runtime/mod.rs`, `mod.rs`): `JobExportRequest`, `JobExportGrant`,
+  `JobExportAllocationRequest`/`Release` aliases, the `ExportRequestKey` impl for
+  `JobExportRequest`, `PendingJobDemand`.
+- **Events** (`runtime/mod.rs`): `RegionEvent::{ProcessJobExportRequest,
+  ReleaseJobExportAllocations, ApplyJobExportGrant}`;
+  `OutboundMessage::{JobExportRequested, JobExportRequestCompleted,
+  JobExportAllocationsReleased}`; their dispatch and routing arms.
+- **Runtime state/methods**: fields `job_export_allocations`, `job_export_producers`,
+  `current_job_request_id`, `seen_jobs_generation`; methods
+  `remember_job_export_producer`, `release_and_request_job`,
+  `process_job_export_request`, `apply_job_export_grant` (runtime),
+  `release_stale_granted_job`; `RegionState::apply_job_export_grant`,
+  `RegionState::pending_job_demands`, `RegionalTickJobPhase.job_demands` field.
+- **Shared engine**: `ExportAllocations::reserved_units_excluding_key` — the
+  jobs-only network-agnostic slot reader (power and goods use the network-scoped
+  `reserved_units_excluding`, both retained).
+- **Worker** (`worker.rs`): `struct JobExport` + its `ExportResource` impl, its 3
+  routing arms, and the job arm of the release-partition.
+- **Economy**: `assign_local_jobs_for_daily_tick` (the old daily wipe).
+- **Tests**: the P7-d-ignored old-path tests and every remaining legacy-only test
+  (`job_grant_for_a_since_removed_citizen_is_a_no_op`,
+  `bridge_workplace_is_not_granted_twice_across_networks`,
+  `reserved_units_excluding_key_spans_all_networks`,
+  `job_export_request_completed_routes_apply_event_back_to_caller`,
+  `job_grant_continuation_runs_in_caller_region`, and the now-tautological
+  `the_daily_employment_phase_emits_no_legacy_job_export_traffic`) plus their
+  now-unused helpers.
+
+### What was NOT deleted (and why)
+
+- The generic export engine (`ExportAllocations<U>`, `ExportAllocationRequest<R>`,
+  `ExportAllocationRelease`, `ExportRequestKey`, `ExportResource`, the
+  `route_export_*` methods) — power and goods still ride it.
+- Barrier `resource_rank` values are unchanged: the employment wake keeps rank 4,
+  and rank 1 is now a retired slot. Renumbering would change route ordering, which
+  P8's `Behavior forbidden` prohibits.
+- `RegionState::has_unassigned_citizen` — a pre-existing P7-d dead item (the live
+  gate uses `World::has_unassigned_citizen`); unrelated to P8's scope, left as-is
+  and flagged here rather than deleted.
+
+### Migrated (not deleted) tests
+
+Three tests assert live behavior (remote-job views, the no-redirty invariant) and
+used the old grant only for setup; their setup was swapped to the ledger method
+`apply_workplace_assignment`, preserving every assertion:
+`imported_job_slots_are_owned_region_and_slot_summaries`,
+`remote_workers_for_lists_commuters_by_producer_cell`, and
+`apply_job_export_grant_does_not_redirty_jobs_exports` (renamed
+`apply_workplace_assignment_does_not_redirty_jobs_exports`).
+`wrong_region_export_grants_are_ignored_without_mutating_state` kept only its
+power half. Live ledger tests misnamed `*_job_export_*` were renamed
+`*_remote_job_*` so a source search no longer implies the deleted allocator exists.
+
+### Deviations from the doc, and why
+
+None of substance. The scope's "rename or simplify `jobs_exports_dirty`" was
+evaluated and skipped: its remaining local meaning ("a job-relevant local change
+happened") is still accurate and load-bearing for the daily gate, so no rename was
+required.
+
+### Stale comments removed (Review check #4)
+
+Every comment describing the removed path, the "daily wipe", or a "daily
+job-export phase" as present was updated (mod.rs, runtime/mod.rs, worker.rs,
+world.rs, economy.rs, simulation.rs, components.rs, adapter.rs,
+employment_directory.rs). The CR3R engine doc now reads power+goods, not
+power+jobs. A source search for `JobExport`/`job-export` finds only one
+intentional historical note ("…job-export path, removed in P8").
+
+### Risks remaining
+
+None specific to this patch — it deletes unreachable code. General residual risks
+for the whole plan are unchanged (see "## Risks" above); the ledger is now the
+sole cross-region employment authority with no legacy path left to diverge from.
+
+### Commands run
+
+```text
+ cargo fmt                                   → clean
+ cargo clippy -- -D warnings                 → 0
+ cargo clippy --all-targets -- -D warnings   → 0
+ cargo test -q                               → all binaries green; 3 ignored
+                                               (bridged P7-d, two_worker_barrier
+                                               parity, + 1 unrelated)
+ codex exec resume small_city (×2)           → "No findings. The P8 patch is
+                                               clean." (2 Low comment/naming
+                                               notes fixed and re-verified)
+```
+
+### Diagram — before/after P8
+
+```text
+ BEFORE P8 (P7 left it inert)          AFTER P8
+ ────────────────────────────         ────────────────────────────
+ cross-region jobs:                    cross-region jobs:
+   employment ledger  (live)             employment ledger  (live)
+   JobExport req/grant (dead, unused)    — deleted —
+
+ shared export engine:                 shared export engine:
+   ExportAllocations<i32>  power          ExportAllocations<i32>  power
+   ExportAllocations<Entity> jobs (dead)  — jobs instantiation gone —
+   ExportAllocations<u32>  goods          ExportAllocations<u32>  goods
+
+ RegionEvent / OutboundMessage:        RegionEvent / OutboundMessage:
+   Power* | Job*(dead) | Goods*          Power* | Goods*   (Job* removed)
 ```

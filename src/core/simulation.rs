@@ -76,31 +76,31 @@ pub(crate) struct TickPowerPhase {
 #[derive(Debug, Clone, Copy)]
 /// Paused tick state after local job assignment and before the daily economy.
 ///
-/// Regional runtimes pause here to import (remote) workplace slots for citizens
-/// left without a reachable local slot, then call `finish_tick_after_job_phase`
-/// once job export grants apply.
+/// Regional runtimes split the tick here: local job assignment has run, and the
+/// employment ledger reconciles cross-region work, before `finish_tick_after_job_phase`
+/// settles the economy.
 pub(crate) struct TickJobPhase {
     before: TickSummarySnapshot,
     before_time: GameTime,
     after_time: GameTime,
     is_daily: bool,
-    /// Retire-tickstate, P-c: whether the daily wipe/reconcile actually ran.
-    /// Computed AFTER `population::run` inside `continue_to_job_phase` (not
-    /// snapshotted before it), so a citizen spawned by growth THIS tick is
-    /// never missed -- see that function's doc comment (caught in review).
+    /// Whether the daily employment reconciliation actually ran. Computed AFTER
+    /// `population::run` inside `continue_to_job_phase` (not snapshotted before
+    /// it), so a citizen spawned by growth THIS tick is never missed -- see that
+    /// function's doc comment (caught in review).
     /// Always `false` on an hourly (non-daily) tick.
     jobs_dirty: bool,
 }
 
 impl TickJobPhase {
     /// Whether this tick crosses a daily boundary, when jobs and the economy
-    /// resolve. Cross-region job export only engages on daily ticks.
+    /// resolve. Cross-region employment only engages on daily ticks.
     pub(crate) fn is_daily(&self) -> bool {
         self.is_daily
     }
 
-    /// Whether the daily wipe/local-match/cross-region-reconcile ran this
-    /// tick. Only meaningful when `is_daily()`; always `false` otherwise.
+    /// Whether the daily local-match / employment reconciliation ran this tick.
+    /// Only meaningful when `is_daily()`; always `false` otherwise.
     pub(crate) fn jobs_dirty(&self) -> bool {
         self.jobs_dirty
     }
@@ -161,7 +161,7 @@ pub(crate) fn begin_tick_power_phase_quiet(
 /// Chains the job phase for the synchronous (single-region) tick path.
 ///
 /// Regional runtimes call `continue_to_job_phase` and `finish_tick_after_job_phase`
-/// separately so they can pause between them for cross-region job exports.
+/// separately so the goods phase and economy can resolve between them.
 #[cfg(test)]
 pub(crate) fn finish_tick_after_power_phase(
     world: &mut World,
@@ -169,9 +169,8 @@ pub(crate) fn finish_tick_after_power_phase(
     phase: TickPowerPhase,
 ) -> CommandResult {
     // Test-only single-region path: no cross-region reconcile gate exists
-    // here, so always wipe and rematch (discovery_dirty: true forces
-    // jobs_dirty true regardless of the fresh in-function check), unchanged
-    // from before P-c.
+    // here, so always run the local job rematch (discovery_dirty: true forces
+    // jobs_dirty true regardless of the fresh in-function check).
     let job_phase = continue_to_job_phase(world, local_region, phase, true);
     finish_tick_after_job_phase(world, job_phase, &[])
 }
@@ -179,17 +178,16 @@ pub(crate) fn finish_tick_after_power_phase(
 /// Runs the post-power systems and, on a daily boundary, local job assignment.
 ///
 /// Local assignment happens here (before the economy settles salaries/taxes) so a
-/// citizen left without a reachable local slot becomes a candidate for an imported
-/// remote workplace during the cross-region job export phase.
+/// citizen left without a reachable local slot becomes a candidate the employment
+/// ledger can claim an imported remote workplace for.
 ///
-/// Retire-tickstate, P-c: the daily wipe is now gated on jobs-dirtiness, not
-/// unconditional, so a quiet day (nothing jobs-relevant changed locally or
-/// remotely) skips it entirely, leaving every citizen's existing assignment
-/// -- local AND remote -- untouched. This closes a real bug: applying a
-/// granted remote assignment no longer re-dirties the gate (see
-/// `World::refresh_jobs_cache_after_grant_applied`), so a settled remote
-/// worker is left alone instead of being wiped and re-requested (jobless,
-/// unpaid) every single day forever.
+/// The daily local job assignment is gated on jobs-dirtiness, not unconditional,
+/// so a quiet day (nothing jobs-relevant changed locally or remotely) skips it
+/// entirely, leaving every citizen's existing assignment -- local AND remote --
+/// untouched. This closes a real bug: applying a remote assignment no longer
+/// re-dirties the gate (see `World::refresh_jobs_cache_after_grant_applied`), so a
+/// settled remote worker is left alone instead of being cleared and re-matched
+/// (jobless, unpaid) every single day forever.
 ///
 /// `discovery_dirty` is the caller's own reconcile gate (discovery
 /// generation moved) -- snapshotted before this runs, since it cannot
@@ -227,10 +225,9 @@ pub(crate) fn continue_to_job_phase(
     let jobs_dirty = is_daily
         && (world.is_jobs_exports_dirty() || discovery_dirty || world.has_unassigned_citizen());
     if jobs_dirty {
-        // P7-d: no more daily wipe. `assign_local_jobs` re-matches local seekers
-        // from scratch (equivalent to the old wipe-and-reassign for locals) while
-        // its two guards preserve every remote assignment the ledger owns, and
-        // the registry holds employer-contracted seats out of local reach (P7-a).
+        // `assign_local_jobs` matches the region's still-jobless local seekers.
+        // Its two guards preserve every remote assignment the ledger owns, and the
+        // registry holds employer-contracted seats out of local reach (P7-a).
         economy::assign_local_jobs(world, local_region);
     }
 

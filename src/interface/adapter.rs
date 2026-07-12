@@ -602,7 +602,7 @@ fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
         BuildingKind::Residential => {
             explain_road_and_power(world, entity, road_connected, &mut explanations);
             // TODO(cross-region display): this commute note is local-only. Cross-region
-            // access already affects simulation through regional job exports; teaching
+            // access already affects simulation through remote employment; teaching
             // this display helper about neighbor regions is a separate UI mission.
             explain_road_access(world, entity, building.kind, &mut explanations);
             if let Some(population) = world.populations.get(&entity)

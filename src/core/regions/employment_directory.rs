@@ -859,7 +859,7 @@ fn normalize_claim_decisions(mut decisions: Vec<JobClaimDecision>) -> Vec<JobCla
 /// network-scoped across regions exactly like power, so a pool is only a
 /// candidate when its network sits in the same `CrossRegionDiscovery`
 /// component as one of the home region's own border networks — the same
-/// reachability rule the old job-export path already uses. The caller
+/// component-reachability rule the cross-region power/goods paths use. The caller
 /// therefore supplies the discovery snapshot and the home's networks.
 ///
 /// Job *quality* matching is an explicit non-goal of the plan, so the pick is
