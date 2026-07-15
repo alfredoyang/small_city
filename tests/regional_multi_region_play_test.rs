@@ -356,13 +356,11 @@ fn remote_spare_jobs_without_road_link_do_not_unlock_population_growth() {
 }
 
 #[test]
-#[ignore = "P7-d: the end-to-end population invariant this asserts is NOT currently re-covered elsewhere -- it depends on behavior the ledger deliberately changed. Its exact count assumed the retired synchronous grant path AND bridge-claim symmetry, but P7-c makes a bridge workplace valid via either network yet claimable only via its lowest-id network, and the async handshake lets growth outpace employment. Re-establish this invariant (and un-ignore) when the bridge-claim asymmetry and growth/latency are addressed."]
-fn bridged_remote_workplace_is_not_double_counted_for_population_growth() {
+fn bridged_remote_workplaces_are_not_double_booked() {
     let game = RegionalGame::two_region_default(6, 4).unwrap();
     build_bridge_workplace_double_count_fixture(&game);
 
-    // P7-d: population grows toward the (bridged, counted-once) remote jobs and the
-    // ledger employs the residents over a few whole-city days.
+    // The ledger needs a few daily passes to publish, claim, validate, and apply.
     tick_city_for_hours(&game, 24 * 10);
 
     let inspect = game.inspect_region(RegionId(1), 1, 1).unwrap();
@@ -375,12 +373,26 @@ fn bridged_remote_workplace_is_not_double_counted_for_population_growth() {
         panic!("expected residential inspect");
     };
 
-    assert_eq!(population, 2);
-    assert_eq!(job_assignments.len(), 2);
+    assert_eq!(population, 5, "the residential reaches its own capacity");
+    assert_eq!(job_assignments.len(), 4, "one resident remains unemployed");
     assert!(
         job_assignments
             .iter()
-            .all(|assignment| { assignment.cell.region == RegionId(2) && assignment.is_remote })
+            .all(|assignment| assignment.cell.region == RegionId(2) && assignment.is_remote),
+        "every employed resident holds a remote ledger assignment"
+    );
+
+    let workers_at_left_bridge = game.remote_workers_at(RegionId(2), 1, 1).unwrap();
+    let workers_at_right_bridge = game.remote_workers_at(RegionId(2), 3, 1).unwrap();
+    assert_eq!(
+        workers_at_left_bridge.len(),
+        2,
+        "left bridge capacity is two"
+    );
+    assert_eq!(
+        workers_at_right_bridge.len(),
+        2,
+        "right bridge capacity is two"
     );
 }
 

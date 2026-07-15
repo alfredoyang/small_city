@@ -2,6 +2,7 @@
 
 use small_city::core::regional_types::{RegionCommand, RegionTickResponse, UiRequestId};
 use small_city::core::regions::directory::RegionDirectory;
+use small_city::core::regions::employment_directory::EmploymentDirectory;
 use small_city::core::regions::runtime::{
     ExportAllocationRequest, PowerExportRequest, RegionEvent, RegionRuntime,
 };
@@ -1355,8 +1356,7 @@ fn save_restart_drops_in_flight_goods_stock_without_double_counting() {
 }
 
 #[test]
-#[ignore = "P7/P6: asserts EXACT single-worker vs two-worker parity of every cell, including remote job_assignments, tick by tick. The ledger's async cross-region handshake converges at sharding-dependent ticks, so this diverges even with the mid-run save/load restart removed (verified) -- it is the cross-region job-admission relaxation in CLAUDE.md (employment may vary with worker_count), not a save/load durability gap. P6 makes the FULL load path durable (see save_load_rebuilds_cross_region_* which now pass). Re-enable only if rewritten to assert power/status parity + occupancy invariants rather than exact remote-assignment parity."]
-fn two_worker_barrier_matches_single_worker_for_power_and_jobs_script() {
+fn two_worker_barrier_preserves_power_status_and_remote_job_invariants() {
     let consumer = RegionId(90);
     let producer = RegionId(91);
     let topology = vec![neighbor(90, BorderEdge::East, 91)];
@@ -1370,15 +1370,18 @@ fn two_worker_barrier_matches_single_worker_for_power_and_jobs_script() {
     single.set_region_topology(topology.clone());
 
     let directory = Arc::new(RegionDirectory::new(topology));
+    let employment_directory = Arc::new(EmploymentDirectory::default());
     let owners = Arc::new(RegionOwnerDirectory::new());
-    let mut consumer_worker = RegionWorker::with_directory_and_owners(
+    let mut consumer_worker = RegionWorker::with_directories_and_owners(
         WorkerId(60),
         Arc::clone(&directory),
+        Arc::clone(&employment_directory),
         Arc::clone(&owners),
     );
-    let mut producer_worker = RegionWorker::with_directory_and_owners(
+    let mut producer_worker = RegionWorker::with_directories_and_owners(
         WorkerId(61),
         Arc::clone(&directory),
+        employment_directory,
         Arc::clone(&owners),
     );
     consumer_worker
@@ -1414,8 +1417,8 @@ fn two_worker_barrier_matches_single_worker_for_power_and_jobs_script() {
             UiRequestId(10_000 + index as u64),
             step,
         );
-        assert_worker_region_parity(&single, &consumer_worker, consumer);
-        assert_worker_region_parity(&single, &producer_worker, producer);
+        assert_worker_region_power_and_status_parity(&single, &consumer_worker, consumer);
+        assert_worker_region_power_and_status_parity(&single, &producer_worker, producer);
     }
 
     for request_id in 1..=(14 * 24) {
@@ -1433,8 +1436,8 @@ fn two_worker_barrier_matches_single_worker_for_power_and_jobs_script() {
             .unwrap();
         drain_workers_with_barrier(&mut [&mut consumer_worker, &mut producer_worker]);
 
-        assert_worker_region_parity(&single, &consumer_worker, consumer);
-        assert_worker_region_parity(&single, &producer_worker, producer);
+        assert_worker_region_power_and_status_parity(&single, &consumer_worker, consumer);
+        assert_worker_region_power_and_status_parity(&single, &producer_worker, producer);
 
         if request_id == 7 * 24 {
             restart_parity_regions_from_save(
@@ -1444,8 +1447,8 @@ fn two_worker_barrier_matches_single_worker_for_power_and_jobs_script() {
                 consumer,
                 producer,
             );
-            assert_worker_region_parity(&single, &consumer_worker, consumer);
-            assert_worker_region_parity(&single, &producer_worker, producer);
+            assert_worker_region_power_and_status_parity(&single, &consumer_worker, consumer);
+            assert_worker_region_power_and_status_parity(&single, &producer_worker, producer);
         }
     }
 
@@ -1453,24 +1456,8 @@ fn two_worker_barrier_matches_single_worker_for_power_and_jobs_script() {
         cell_powered(&consumer_worker, consumer, 0, 0),
         cell_powered(&single, consumer, 0, 0)
     );
-    assert_eq!(
-        imported_job_count(&consumer_worker, consumer),
-        imported_job_count(&single, consumer)
-    );
-    assert_eq!(
-        consumer_worker
-            .region(consumer)
-            .expect("multi consumer")
-            .state()
-            .view()
-            .status,
-        single
-            .region(consumer)
-            .expect("single consumer")
-            .state()
-            .view()
-            .status
-    );
+    assert_remote_job_occupancy_invariants(&single, &single, consumer, producer);
+    assert_remote_job_occupancy_invariants(&consumer_worker, &producer_worker, consumer, producer);
 }
 
 fn worker_with_regions(id: WorkerId, regions: &[RegionId]) -> RegionWorker {
@@ -1898,7 +1885,7 @@ fn run_build_step(
     drain_workers_with_barrier(&mut [consumer_worker, producer_worker]);
 }
 
-fn assert_worker_region_parity(
+fn assert_worker_region_power_and_status_parity(
     single_worker: &RegionWorker,
     multi_worker: &RegionWorker,
     region: RegionId,
@@ -1914,19 +1901,55 @@ fn assert_worker_region_parity(
         .state()
         .view();
 
-    assert_eq!(multi_view.status, single_view.status);
-    assert_eq!(multi_view.map.cells, single_view.map.cells);
+    assert_eq!(multi_view.status.turn, single_view.status.turn);
+    assert_eq!(multi_view.status.time, single_view.status.time);
+    assert_eq!(multi_view.status.population, single_view.status.population);
+    assert_eq!(multi_view.status.citizens, single_view.status.citizens);
+    assert_eq!(multi_view.status.jobs, single_view.status.jobs);
+    assert_eq!(multi_view.status.pollution, single_view.status.pollution);
+    let multi_power = multi_view
+        .map
+        .cells
+        .iter()
+        .map(|cell| (cell.x, cell.y, cell.powered))
+        .collect::<Vec<_>>();
+    let single_power = single_view
+        .map
+        .cells
+        .iter()
+        .map(|cell| (cell.x, cell.y, cell.powered))
+        .collect::<Vec<_>>();
+    assert_eq!(multi_power, single_power);
+}
+
+fn assert_remote_job_occupancy_invariants(
+    consumer_worker: &RegionWorker,
+    producer_worker: &RegionWorker,
+    consumer: RegionId,
+    producer: RegionId,
+) {
+    let consumer_state = consumer_worker
+        .region(consumer)
+        .expect("consumer region")
+        .state();
+    let producer_state = producer_worker
+        .region(producer)
+        .expect("producer region")
+        .state();
+    let remote_workers = consumer_state.remote_workers_for(
+        producer,
+        small_city::core::components::Position { x: 0, y: 1 },
+    );
+    let imported = consumer_state.imported_job_count();
+
     assert_eq!(
-        multi_worker
-            .region(region)
-            .expect("multi-worker region")
-            .state()
-            .stats_snapshot(),
-        single_worker
-            .region(region)
-            .expect("single-worker region")
-            .state()
-            .stats_snapshot()
+        remote_workers.len(),
+        imported,
+        "each imported assignment has exactly one worker in the producer roster"
+    );
+    assert!(
+        imported <= producer_state.view().status.jobs as usize,
+        "remote employment must not exceed the producer's workplace capacity"
     );
 }
 
