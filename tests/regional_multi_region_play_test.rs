@@ -182,6 +182,45 @@ fn commercial_inspect_keeps_unreachable_goods_route_without_border_link() {
 }
 
 #[test]
+fn disconnecting_a_goods_road_stops_cross_region_imports() {
+    let game = RegionalGame::two_region_default(3, 3).unwrap();
+    build_goods_producer(&game, RegionId(1));
+    build_goods_consumer(&game, RegionId(2));
+
+    tick_city_for_hours(&game, 24 * 7);
+
+    let before_disconnect = game.inspect_region(RegionId(2), 1, 0).unwrap();
+    let Some(InspectDetailsView::Commercial {
+        goods_sold_from_city,
+        ..
+    }) = before_disconnect.details
+    else {
+        panic!("expected commercial inspect");
+    };
+    assert!(goods_sold_from_city > 0, "goods trade must be active first");
+
+    // This is region 1's only east-border road, so removing it disconnects
+    // the producer's industrial network from region 2.
+    assert!(game.bulldoze(RegionId(1), 2, 0).unwrap().success);
+    tick_city_for_hours(&game, 24 * 3);
+
+    let after_disconnect = game.inspect_region(RegionId(2), 1, 0).unwrap();
+    let Some(InspectDetailsView::Commercial {
+        goods_sold_from_city,
+        ..
+    }) = after_disconnect.details
+    else {
+        panic!("expected commercial inspect");
+    };
+    assert_eq!(goods_sold_from_city, 0, "no goods arrive after the disconnect");
+    assert!(
+        after_disconnect
+            .flags
+            .contains(&InspectFlag::GoodsSupplyMissing)
+    );
+}
+
+#[test]
 fn remote_spare_jobs_allow_connected_residential_population_growth() {
     let game = RegionalGame::two_region_default(4, 3).unwrap();
     build_connected_remote_job_fixture(&game);
