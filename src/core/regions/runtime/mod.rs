@@ -95,7 +95,7 @@ use crate::core::regions::{
 use crate::core::world::CrossRegionGoodsRoutes;
 use crate::interface::input::MapOverlayInput;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// Event owned by one region runtime inbox.
 pub enum RegionEvent {
     /// Advance this region's local deterministic simulation by one tick.

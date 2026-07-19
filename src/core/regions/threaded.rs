@@ -45,17 +45,52 @@ pub struct ThreadedRegionWorker {
     join_handle: Option<JoinHandle<()>>,
 }
 
-impl ThreadedRegionWorker {
-    pub fn start(worker: RegionWorker) -> Self {
+/// Worker command channel prepared before the worker thread starts.
+///
+/// The coordinator owns a clone of the sender. P1 only prepares this seam;
+/// P2 will make the worker's event loop consume coordinator deliveries.
+pub(crate) struct PreparedThreadedRegionWorker {
+    worker_id: WorkerId,
+    worker: RegionWorker,
+    commands: Sender<ThreadedWorkerCommand>,
+    command_receiver: Receiver<ThreadedWorkerCommand>,
+}
+
+impl PreparedThreadedRegionWorker {
+    pub(crate) fn prepare(worker: RegionWorker) -> Self {
         let worker_id = worker.id();
         let (commands, command_receiver) = mpsc::channel();
-        let join_handle = thread::spawn(move || run_worker(worker, command_receiver));
-
         Self {
             worker_id,
+            worker,
             commands,
+            command_receiver,
+        }
+    }
+
+    #[allow(dead_code)] // P1 prepares this coordinator-facing channel for P2.
+    pub(crate) fn worker_id(&self) -> WorkerId {
+        self.worker_id
+    }
+
+    #[allow(dead_code)] // P1 prepares this coordinator-facing channel for P2.
+    pub(crate) fn command_sender(&self) -> Sender<ThreadedWorkerCommand> {
+        self.commands.clone()
+    }
+
+    pub(crate) fn start(self) -> ThreadedRegionWorker {
+        let join_handle = thread::spawn(move || run_worker(self.worker, self.command_receiver));
+        ThreadedRegionWorker {
+            worker_id: self.worker_id,
+            commands: self.commands,
             join_handle: Some(join_handle),
         }
+    }
+}
+
+impl ThreadedRegionWorker {
+    pub fn start(worker: RegionWorker) -> Self {
+        PreparedThreadedRegionWorker::prepare(worker).start()
     }
 
     pub fn worker_id(&self) -> WorkerId {
@@ -286,7 +321,16 @@ impl ThreadedRegionWorker {
 ///
 /// Region events still enter regions through `RegionHandle`; this enum is only
 /// for scheduler/control operations that must run on the worker-owning thread.
-enum ThreadedWorkerCommand {
+#[allow(dead_code)] // P1 adds inactive coordinator delivery; P2 produces it.
+pub(crate) enum ThreadedWorkerCommand {
+    /// Deliver one coordinator-routed event to an owned region inbox.
+    ///
+    /// P1 wires this command channel only. The coordinator has no runtime
+    /// producer until P2, so normal game execution cannot issue this command.
+    Deliver {
+        target_region: RegionId,
+        event: crate::core::regions::runtime::RegionEvent,
+    },
     /// Run the normal single-worker scheduler.
     ///
     /// Same-worker outbound events are delivered immediately. This is kept for
@@ -382,6 +426,12 @@ enum ThreadedWorkerCommand {
 fn run_worker(mut worker: RegionWorker, commands: Receiver<ThreadedWorkerCommand>) {
     for command in commands {
         match command {
+            ThreadedWorkerCommand::Deliver {
+                target_region,
+                event,
+            } => {
+                let _ = worker.push_event(target_region, event);
+            }
             ThreadedWorkerCommand::Process {
                 max_events_per_region,
                 reply,

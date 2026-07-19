@@ -97,6 +97,23 @@ impl RegionOwnerDirectory {
             .copied()
     }
 
+    /// Returns every registered region in stable routing order.
+    ///
+    /// The coordinator uses this only for explicit broadcast recipients. The
+    /// owner table itself remains a hash map because point lookups dominate.
+    #[allow(dead_code)] // P1 broadcast support is activated when P2 emits routes.
+    pub(crate) fn region_ids(&self) -> Vec<RegionId> {
+        let mut region_ids: Vec<_> = self
+            .owners
+            .lock()
+            .expect("region owner directory lock poisoned")
+            .keys()
+            .copied()
+            .collect();
+        region_ids.sort_unstable();
+        region_ids
+    }
+
     pub(crate) fn register_region(
         &self,
         region_id: RegionId,
