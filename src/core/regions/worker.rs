@@ -10,7 +10,7 @@ use crate::core::regional_types::{
 };
 use crate::core::regions::RegionRoadReport;
 pub use crate::core::regions::directory::CrossRegionDiscovery;
-use crate::core::regions::directory::RegionDirectory;
+use crate::core::regions::directory::{RegionDirectory, power_capacity_recheck_targets};
 use crate::core::regions::employment_directory::EmploymentDirectory;
 use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::runtime::{
@@ -22,7 +22,7 @@ use crate::core::regions::{
     RegionNeighborLink, RegionRoadNetworkId, RegionState, RegionalAvailabilityHint,
 };
 use crate::core::world::CrossRegionGoodsRoutes;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -70,6 +70,18 @@ pub struct WorkerRunSummary {
     pub command_replies: Vec<RegionCommandResponse>,
     pub tick_replies: Vec<RegionTickResponse>,
     pub snapshot_replies: Vec<RegionSnapshotResponse>,
+}
+
+/// One test-only autonomous scheduler round.
+///
+/// This intentionally uses the existing barrier-mode pass, preserving its
+/// per-region input installation, road refresh, and full hint-publish sweep.
+#[derive(Debug, Default)]
+pub(crate) struct AutonomousWorkerRound {
+    pub forwarded_events: Vec<ForwardedRegionEvent>,
+    #[allow(dead_code)] // P2 tests assert bounded slice progress.
+    pub processed_regions: usize,
+    pub routing_errors: Vec<WorkerRoutingError>,
 }
 
 #[derive(Debug)]
@@ -156,7 +168,7 @@ pub struct ForwardedRegionEvent {
     pub target_worker: WorkerId,
     pub target_region: RegionId,
     order_key: ForwardedEventOrderKey,
-    event: RegionEvent,
+    pub(crate) event: RegionEvent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -574,6 +586,32 @@ impl RegionWorker {
         self.process_region_events_with_mode(max_events_per_region, RegionRoutingMode::Barrier)
     }
 
+    /// Runs the P2 test-only autonomous scheduler round.
+    #[allow(dead_code)] // P2 test-only threaded adapter consumes this in its tests.
+    pub(crate) fn process_autonomous_round(
+        &mut self,
+        max_events_per_region: usize,
+    ) -> AutonomousWorkerRound {
+        let summary = self.process_region_events_for_barrier(max_events_per_region);
+        AutonomousWorkerRound {
+            forwarded_events: summary.forwarded_events,
+            processed_regions: summary.processed_regions,
+            routing_errors: summary.routing_errors,
+        }
+    }
+
+    pub(crate) fn has_pending_events(&self) -> bool {
+        self.regions
+            .iter()
+            .any(|runtime| runtime.pending_event_count() > 0)
+    }
+
+    pub(crate) fn has_dirty_hints(&self) -> bool {
+        self.regions
+            .iter()
+            .any(|runtime| runtime.state().is_hints_dirty())
+    }
+
     pub fn deliver_forwarded_events(
         &mut self,
         events: Vec<ForwardedRegionEvent>,
@@ -703,35 +741,26 @@ impl RegionWorker {
             }
             let recheck_id = self.next_worker_request_id();
             let discovery = self.directory.discovery_snapshot();
-            let mut notified = HashSet::new();
-            for hint in &hints {
-                let Some(component) = discovery.component_of(hint.network) else {
-                    continue;
+            for target_region in power_capacity_recheck_targets(&discovery, region_id, &hints) {
+                let order_key = ForwardedEventOrderKey {
+                    target_region,
+                    source_region: region_id,
+                    request_id: recheck_id,
+                    token: 0,
+                    resource_rank: 0,
+                    event_rank: 3, // after release/request/reply
                 };
-                for network in component {
-                    if network.region == region_id || !notified.insert(network.region) {
-                        continue; // skip self and duplicates
-                    }
-                    let order_key = ForwardedEventOrderKey {
-                        target_region: network.region,
-                        source_region: region_id,
+                if let Ok(WorkerRoutedMessage::Forwarded(event)) = self.route_region_event(
+                    target_region,
+                    region_id,
+                    RegionEvent::PowerCapacityRecheck {
                         request_id: recheck_id,
-                        token: hint.network.road_network,
-                        resource_rank: 0,
-                        event_rank: 3, // after release/request/reply
-                    };
-                    if let Ok(WorkerRoutedMessage::Forwarded(event)) = self.route_region_event(
-                        network.region,
-                        region_id,
-                        RegionEvent::PowerCapacityRecheck {
-                            request_id: recheck_id,
-                            source_region: region_id,
-                        },
-                        order_key,
-                        routing_mode,
-                    ) {
-                        forwarded_events.push(event);
-                    }
+                        source_region: region_id,
+                    },
+                    order_key,
+                    routing_mode,
+                ) {
+                    forwarded_events.push(event);
                 }
             }
         }

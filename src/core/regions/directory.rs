@@ -21,7 +21,7 @@
 //! Producer RegionRuntime validates allocation authoritatively
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -80,6 +80,29 @@ impl CrossRegionDiscovery {
             .find(|component| component.contains(&network))
             .map(Vec::as_slice)
     }
+}
+
+/// Returns every other region sharing a changed power-hint component.
+///
+/// The coordinator receives only these explicit recipients; topology remains
+/// owned by this directory snapshot.
+pub(crate) fn power_capacity_recheck_targets(
+    discovery: &CrossRegionDiscovery,
+    source: RegionId,
+    hints: &[RegionalAvailabilityHint],
+) -> Vec<RegionId> {
+    let mut targets = BTreeSet::new();
+    for hint in hints {
+        let Some(component) = discovery.component_of(hint.network) else {
+            continue;
+        };
+        for network in component {
+            if network.region != source {
+                targets.insert(network.region);
+            }
+        }
+    }
+    targets.into_iter().collect()
 }
 
 #[derive(Debug)]
