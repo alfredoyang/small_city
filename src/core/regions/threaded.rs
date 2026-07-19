@@ -581,7 +581,14 @@ fn run_worker_with_coordinator(
                 max_events_per_region,
                 reply,
             } => {
-                let _ = reply.send(worker.process_region_events_for_barrier(max_events_per_region));
+                let mut summary = worker.process_region_events_for_barrier(max_events_per_region);
+                for event in std::mem::take(&mut summary.coordinator_events) {
+                    if coordinator.route(event).is_err() {
+                        exit.reported = true;
+                        return;
+                    }
+                }
+                let _ = reply.send(summary);
             }
             ThreadedWorkerCommand::DeliverForwarded { events, reply } => {
                 let _ = reply.send(worker.deliver_forwarded_events(events));
@@ -669,6 +676,20 @@ fn drive_autonomous_worker(
         let round = worker.process_autonomous_round(MAX_EVENTS_PER_AUTONOMOUS_SLICE);
         if !round.routing_errors.is_empty() {
             return AutonomousDriveResult::Stopped;
+        }
+        for reply in round.command_replies {
+            coordinator.command_reply(reply);
+        }
+        for reply in round.tick_replies {
+            coordinator.tick_reply(reply);
+        }
+        for reply in round.snapshot_replies {
+            coordinator.snapshot_reply(reply);
+        }
+        for event in round.coordinator_events {
+            if coordinator.route(event).is_err() {
+                return AutonomousDriveResult::Stopped;
+            }
         }
         let mut rechecks = BTreeMap::<(u64, RegionId), BTreeSet<RegionId>>::new();
         for forwarded in round.forwarded_events {
@@ -820,7 +841,12 @@ mod tests {
                 .turn,
             1
         );
-        assert!(signal_receiver.try_recv().is_err());
+        assert!(matches!(
+            signal_receiver.try_recv(),
+            Ok(crate::core::regions::coordinator::RunnerSignal::TickReply(
+                _
+            ))
+        ));
         assert!(health.fault().is_none());
         coordinator
             .shutdown()

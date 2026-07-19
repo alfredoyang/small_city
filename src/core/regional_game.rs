@@ -1099,6 +1099,7 @@ impl From<RegionalGameRunnerError> for RegionalGameError {
             RegionalGameRunnerError::WorkerRoutingFailed { .. } => Self::WorkerRoutingFailed,
             RegionalGameRunnerError::WorkerStopped { .. } => Self::WorkerStopped,
             RegionalGameRunnerError::WorkerPanicked { .. } => Self::WorkerPanicked,
+            RegionalGameRunnerError::CoordinatorFaulted => Self::WorkerStopped,
         }
     }
 }

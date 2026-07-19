@@ -12,6 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::core::regional_types::{
+    RegionCommandResponse, RegionSnapshotResponse, RegionTickResponse,
+};
 use crate::core::regions::RegionId;
 use crate::core::regions::runtime::RegionEvent;
 use crate::core::regions::threaded::{ThreadedWorkerCommand, WorkerIdleReport};
@@ -19,7 +22,7 @@ use crate::core::regions::worker::{RegionOwnerDirectory, WorkerId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Coordinator-routable recipients for one region event.
-pub(crate) enum RegionRecipients {
+pub enum RegionRecipients {
     One(RegionId),
     Many(Vec<RegionId>),
     All,
@@ -27,7 +30,7 @@ pub(crate) enum RegionRecipients {
 
 #[derive(Debug, Clone)]
 /// One event plus the regions that must receive it.
-pub(crate) struct RoutedRegionEvent {
+pub struct RoutedRegionEvent {
     pub recipients: RegionRecipients,
     pub event: RegionEvent,
 }
@@ -56,10 +59,13 @@ pub(crate) enum CoordinatorShutdownError {
     ThreadPanicked,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Wake signal for the runner while the fault details stay in shared health.
+#[derive(Debug, PartialEq)]
+/// Runtime reply or fault delivered to the runner.
 pub(crate) enum RunnerSignal {
     Faulted,
+    CommandReply(RegionCommandResponse),
+    TickReply(RegionTickResponse),
+    SnapshotReply(RegionSnapshotResponse),
 }
 
 #[derive(Debug, Default)]
@@ -129,6 +135,18 @@ impl CoordinatorHandle {
             .send(CoordinatorCommand::Fault(CoordinatorFault::WorkerStopped(
                 worker_id,
             )));
+    }
+
+    pub(crate) fn command_reply(&self, reply: RegionCommandResponse) {
+        let _ = self.commands.send(CoordinatorCommand::CommandReply(reply));
+    }
+
+    pub(crate) fn tick_reply(&self, reply: RegionTickResponse) {
+        let _ = self.commands.send(CoordinatorCommand::TickReply(reply));
+    }
+
+    pub(crate) fn snapshot_reply(&self, reply: RegionSnapshotResponse) {
+        let _ = self.commands.send(CoordinatorCommand::SnapshotReply(reply));
     }
 
     /// Test-only fence for coordinator-driven worker integration tests.
@@ -210,6 +228,9 @@ impl Drop for RegionEventCoordinator {
 
 enum CoordinatorCommand {
     Route(Vec<RoutedRegionEvent>),
+    CommandReply(RegionCommandResponse),
+    TickReply(RegionTickResponse),
+    SnapshotReply(RegionSnapshotResponse),
     Fault(CoordinatorFault),
     DrainUntilIdle {
         reply: Sender<Result<(), CoordinatorError>>,
@@ -246,6 +267,15 @@ fn run_coordinator(
                 if health.latch(fault) {
                     let _ = signals.send(RunnerSignal::Faulted);
                 }
+            }
+            CoordinatorCommand::CommandReply(reply) => {
+                let _ = signals.send(RunnerSignal::CommandReply(reply));
+            }
+            CoordinatorCommand::TickReply(reply) => {
+                let _ = signals.send(RunnerSignal::TickReply(reply));
+            }
+            CoordinatorCommand::SnapshotReply(reply) => {
+                let _ = signals.send(RunnerSignal::SnapshotReply(reply));
             }
             CoordinatorCommand::DrainUntilIdle { reply } => {
                 let outcome = drain_until_idle(&commands, &owners, &workers, &health, &signals);
@@ -307,6 +337,15 @@ fn drain_until_idle(
                         result: Err(CoordinatorError::CoordinatorStopped),
                         shutdown_reply: None,
                     };
+                }
+                CoordinatorCommand::CommandReply(reply) => {
+                    let _ = signals.send(RunnerSignal::CommandReply(reply));
+                }
+                CoordinatorCommand::TickReply(reply) => {
+                    let _ = signals.send(RunnerSignal::TickReply(reply));
+                }
+                CoordinatorCommand::SnapshotReply(reply) => {
+                    let _ = signals.send(RunnerSignal::SnapshotReply(reply));
                 }
                 CoordinatorCommand::DrainUntilIdle { reply } => {
                     let _ = reply.send(Err(CoordinatorError::DrainLimitExceeded));

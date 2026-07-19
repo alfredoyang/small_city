@@ -4,11 +4,13 @@
 //! reads or mutates ECS state directly; all simulation work stays inside each
 //! `RegionRuntime`.
 
+#[cfg(test)]
 use crate::core::components::TravelerHandoff;
 use crate::core::regional_types::{
     RegionCommandResponse, RegionSnapshotResponse, RegionTickResponse, UiRequestId,
 };
 use crate::core::regions::RegionRoadReport;
+use crate::core::regions::coordinator::RoutedRegionEvent;
 pub use crate::core::regions::directory::CrossRegionDiscovery;
 use crate::core::regions::directory::{RegionDirectory, power_capacity_recheck_targets};
 use crate::core::regions::employment_directory::EmploymentDirectory;
@@ -70,6 +72,7 @@ pub struct WorkerRunSummary {
     pub command_replies: Vec<RegionCommandResponse>,
     pub tick_replies: Vec<RegionTickResponse>,
     pub snapshot_replies: Vec<RegionSnapshotResponse>,
+    pub coordinator_events: Vec<RoutedRegionEvent>,
 }
 
 /// One test-only autonomous scheduler round.
@@ -82,6 +85,10 @@ pub(crate) struct AutonomousWorkerRound {
     #[allow(dead_code)] // P2 tests assert bounded slice progress.
     pub processed_regions: usize,
     pub routing_errors: Vec<WorkerRoutingError>,
+    pub command_replies: Vec<RegionCommandResponse>,
+    pub tick_replies: Vec<RegionTickResponse>,
+    pub snapshot_replies: Vec<RegionSnapshotResponse>,
+    pub coordinator_events: Vec<RoutedRegionEvent>,
 }
 
 #[derive(Debug)]
@@ -597,6 +604,10 @@ impl RegionWorker {
             forwarded_events: summary.forwarded_events,
             processed_regions: summary.processed_regions,
             routing_errors: summary.routing_errors,
+            command_replies: summary.command_replies,
+            tick_replies: summary.tick_replies,
+            snapshot_replies: summary.snapshot_replies,
+            coordinator_events: summary.coordinator_events,
         }
     }
 
@@ -769,6 +780,7 @@ impl RegionWorker {
         let mut command_replies = Vec::new();
         let mut tick_replies = Vec::new();
         let mut snapshot_replies = Vec::new();
+        let mut coordinator_events = Vec::new();
 
         // Allocation releases are causal cleanup for the next export cycle.
         // Route them before new requests so runtime traversal order cannot make
@@ -789,6 +801,13 @@ impl RegionWorker {
                 Ok(WorkerRoutedMessage::CommandReply(reply)) => command_replies.push(reply),
                 Ok(WorkerRoutedMessage::TickReply(reply)) => tick_replies.push(reply),
                 Ok(WorkerRoutedMessage::SnapshotReply(reply)) => snapshot_replies.push(reply),
+                Ok(WorkerRoutedMessage::Coordinator(event)) => {
+                    if matches!(routing_mode, RegionRoutingMode::Immediate) {
+                        routing_errors.extend(self.deliver_coordinator_event_locally(event));
+                    } else {
+                        coordinator_events.push(event);
+                    }
+                }
                 Ok(WorkerRoutedMessage::Forwarded(event)) => forwarded_events.push(event),
                 Ok(WorkerRoutedMessage::ForwardedMany(mut events)) => {
                     forwarded_events.append(&mut events);
@@ -805,6 +824,7 @@ impl RegionWorker {
             command_replies,
             tick_replies,
             snapshot_replies,
+            coordinator_events,
         }
     }
 
@@ -842,13 +862,7 @@ impl RegionWorker {
             OutboundMessage::GoodsExportAllocationsReleased(release) => {
                 self.route_export_allocation_release::<GoodsExport>(release, routing_mode)
             }
-            OutboundMessage::TravelerHandedOff(handoff) => {
-                self.route_traveler_handoff(handoff, routing_mode)
-            }
-            OutboundMessage::EmploymentDirectoryReady {
-                target_region,
-                source_region: wake_source,
-            } => self.route_employment_directory_ready(target_region, wake_source, routing_mode),
+            OutboundMessage::CoordinatorRoute(event) => Ok(WorkerRoutedMessage::Coordinator(event)),
             OutboundMessage::RuntimeError(error) => Err(WorkerRoutingError::RuntimeError {
                 source_region,
                 error,
@@ -856,67 +870,21 @@ impl RegionWorker {
         }
     }
 
-    /// P3: route a payload-free employment wake through the same deterministic
-    /// barrier every other cross-region event uses.
-    ///
-    /// `resource_rank: 4` places the employment wake after power(0), goods(2), and
-    /// travel(3) in the barrier order (rank 1 is a retired slot — it was the old
-    /// job-export path, removed in P8). `request_id`/`token` are zero: the event
-    /// carries no payload, so two wakes for the same `(target, source)` pair in one
-    /// pass are genuinely identical and idempotent — the region simply pulls its
-    /// work once.
-    fn route_employment_directory_ready(
+    fn deliver_coordinator_event_locally(
         &mut self,
-        target_region: RegionId,
-        source_region: RegionId,
-        routing_mode: RegionRoutingMode,
-    ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
-        let order_key = ForwardedEventOrderKey {
-            target_region,
-            source_region,
-            request_id: UiRequestId(0),
-            token: 0,
-            resource_rank: 4,
-            event_rank: 0,
-        };
-        self.route_region_event(
-            target_region,
-            source_region,
-            RegionEvent::EmploymentDirectoryReady,
-            order_key,
-            routing_mode,
-        )
-    }
+        event: RoutedRegionEvent,
+    ) -> Vec<WorkerRoutingError> {
+        use crate::core::regions::coordinator::RegionRecipients;
 
-    /// P5b: routes a travel token to its destination region's inbox as a
-    /// `ReceiveTraveler` event, by the same `RegionNeighborLink` topology as
-    /// exports. Fire-and-forget: no grant, no tick pause.
-    fn route_traveler_handoff(
-        &mut self,
-        handoff: TravelerHandoff,
-        routing_mode: RegionRoutingMode,
-    ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
-        let target_region = handoff.to_region;
-        if self.owners.owner_of(target_region).is_none() {
-            return Err(WorkerRoutingError::MissingTargetRegion { target_region });
-        }
-        // Travel sorts after every export (rank 3); the token disambiguates by the
-        // home citizen's local id for a deterministic cross-worker merge.
-        let order_key = ForwardedEventOrderKey {
-            target_region,
-            source_region: handoff.traveler.citizen.region(),
-            request_id: UiRequestId(0),
-            token: handoff.traveler.citizen.local(),
-            resource_rank: 3,
-            event_rank: 0,
+        let recipients = match event.recipients {
+            RegionRecipients::One(region) => vec![region],
+            RegionRecipients::Many(regions) => regions,
+            RegionRecipients::All => self.owners.region_ids(),
         };
-        self.route_region_event(
-            target_region,
-            handoff.traveler.citizen.region(),
-            RegionEvent::ReceiveTraveler(handoff),
-            order_key,
-            routing_mode,
-        )
+        recipients
+            .into_iter()
+            .filter_map(|region| self.push_event(region, event.event.clone()).err())
+            .collect()
     }
 
     /// Routes a fresh consumer export request to the first reachable candidate.
@@ -1379,6 +1347,7 @@ impl ExportResource for GoodsExport {
 
 enum WorkerRoutedMessage {
     None,
+    Coordinator(RoutedRegionEvent),
     Forwarded(ForwardedRegionEvent),
     ForwardedMany(Vec<ForwardedRegionEvent>),
     CommandReply(RegionCommandResponse),
@@ -1630,18 +1599,21 @@ mod tests {
             }),
             kind: HandoffKind::Move,
         };
-        worker
-            .route_outbound(
+        let route = RoutedRegionEvent {
+            recipients: crate::core::regions::coordinator::RegionRecipients::One(RegionId(2)),
+            event: RegionEvent::ReceiveTraveler {
+                eligible_step: crate::core::regions::runtime::TravelStepId(2),
+                handoff,
+            },
+        };
+        assert!(matches!(
+            worker.route_outbound(
                 RegionId(1),
-                OutboundMessage::TravelerHandedOff(handoff),
+                OutboundMessage::CoordinatorRoute(route),
                 RegionRoutingMode::Immediate,
-            )
-            .unwrap();
-        assert_eq!(
-            worker.region(RegionId(2)).unwrap().pending_event_count(),
-            1,
-            "destination received a ReceiveTraveler event"
-        );
+            ),
+            Ok(WorkerRoutedMessage::Coordinator(_))
+        ));
     }
 
     #[test]
@@ -1654,7 +1626,12 @@ mod tests {
         let before = directory.rebuild_count();
 
         worker
-            .push_event(RegionId(1), RegionEvent::StepTravel)
+            .push_event(
+                RegionId(1),
+                RegionEvent::StepTravel {
+                    step: crate::core::regions::runtime::TravelStepId(1),
+                },
+            )
             .expect("event routed");
         let summary = worker.process_region_events_for_barrier(usize::MAX);
 
@@ -1758,7 +1735,12 @@ mod tests {
         );
 
         worker
-            .push_event(RegionId(1), RegionEvent::StepTravel)
+            .push_event(
+                RegionId(1),
+                RegionEvent::StepTravel {
+                    step: crate::core::regions::runtime::TravelStepId(1),
+                },
+            )
             .expect("step routed");
         assert!(
             worker

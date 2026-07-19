@@ -81,6 +81,7 @@ use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionCommandResponse, RegionSnapshotResponse,
     RegionTickResponse, RegionViewSnapshot, UiRequestId,
 };
+use crate::core::regions::coordinator::{RegionRecipients, RoutedRegionEvent};
 use crate::core::regions::directory::CrossRegionDiscovery;
 use crate::core::regions::employment_directory::{
     CitizenRef, EmploymentDirectory, EmploymentLeaseRef, JobClaimDecision, JobLoss, JobLossReason,
@@ -94,6 +95,16 @@ use crate::core::regions::{
 };
 use crate::core::world::CrossRegionGoodsRoutes;
 use crate::interface::input::MapOverlayInput;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Monotonic city-wide travel sub-tick identity.
+pub struct TravelStepId(pub u64);
+
+impl TravelStepId {
+    pub(crate) fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
 
 #[derive(Debug, Clone)]
 /// Event owned by one region runtime inbox.
@@ -139,7 +150,10 @@ pub enum RegionEvent {
     },
     /// P5b: a cross-region travel token handed in by a neighbor region (fire and
     /// forget — no grant, no tick pause).
-    ReceiveTraveler(TravelerHandoff),
+    ReceiveTraveler {
+        eligible_step: TravelStepId,
+        handoff: TravelerHandoff,
+    },
     /// Retire-tickstate, P-b: the eager nudge. Fired at a neighbor the
     /// instant this region's availability hint actually changes (worker's
     /// P-1 hint-publish sweep), instead of waiting for that neighbor's own
@@ -154,7 +168,7 @@ pub enum RegionEvent {
     /// P7c: advance movement by one 10-minute sub-tick (no economy). Broadcast to
     /// every region by the runner's `step_travel_city`; emits the crossings it
     /// buffers as `TravelerHandedOff` for the barrier to route.
-    StepTravel,
+    StepTravel { step: TravelStepId },
     /// Directory employment ledger plan, P3: a payload-free wake.
     ///
     /// It carries no claims, contracts, or losses — it only tells the region
@@ -288,14 +302,11 @@ pub enum OutboundMessage {
     GoodsExportAllocationsReleased(GoodsExportAllocationRelease),
     /// P5b: a travel token to route to `handoff.to_region` (worker delivers it as
     /// `RegionEvent::ReceiveTraveler`).
-    TravelerHandedOff(TravelerHandoff),
+    /// A target-bearing fire-and-forget delivery owned by the coordinator.
+    CoordinatorRoute(RoutedRegionEvent),
     /// Directory employment ledger plan, P3: wake `target_region` so it pulls
     /// its employment work from the directory. Payload-free by design; the
     /// worker delivers it as `RegionEvent::EmploymentDirectoryReady`.
-    EmploymentDirectoryReady {
-        target_region: RegionId,
-        source_region: RegionId,
-    },
     RuntimeError(RegionRuntimeError),
 }
 
@@ -349,6 +360,10 @@ pub struct RegionRuntime {
     // graph itself to re-check contract reachability. `None` until a worker
     // installs one.
     discovery: Option<Arc<CrossRegionDiscovery>>,
+    // A crossing is transport only until the next travel sub-tick. Keeping this
+    // transient preserves the existing travel save/rebuild rule.
+    pending_traveler_handoffs: Vec<(TravelStepId, TravelerHandoff)>,
+    last_travel_step: Option<TravelStepId>,
     handle: RegionHandle,
     receiver: RegionEventReceiver,
 }
@@ -510,6 +525,8 @@ impl RegionRuntime {
             seen_goods_generation: 0,
             employment_directory: None,
             discovery: None,
+            pending_traveler_handoffs: Vec::new(),
+            last_travel_step: None,
             handle,
             receiver,
         }
@@ -727,20 +744,35 @@ impl RegionRuntime {
             RegionEvent::ApplyGoodsExportGrant { request, grant } => {
                 self.apply_goods_export_grant(request, grant)
             }
-            RegionEvent::ReceiveTraveler(handoff) => self
-                .state
-                .receive_traveler_handoff(handoff)
-                .into_iter()
-                .map(OutboundMessage::TravelerHandedOff)
-                .collect(),
+            RegionEvent::ReceiveTraveler {
+                eligible_step,
+                handoff,
+            } => {
+                self.pending_traveler_handoffs
+                    .push((eligible_step, handoff));
+                Vec::new()
+            }
             RegionEvent::PowerCapacityRecheck { request_id, .. } => {
                 self.power_capacity_recheck(request_id)
             }
-            RegionEvent::StepTravel => {
-                // P7c: one movement sub-tick, then drain the crossings it buffered
-                // so the barrier routes them to neighbours for the next sub-tick.
+            RegionEvent::StepTravel { step } => {
+                if self.last_travel_step.is_some_and(|last| step <= last) {
+                    return Vec::new();
+                }
+                self.last_travel_step = Some(step);
+                let inbound = self.take_handoffs_eligible_at(step);
+                let mut outbound = Vec::new();
+                for handoff in inbound {
+                    outbound.extend(
+                        self.state
+                            .receive_traveler_handoff(handoff)
+                            .into_iter()
+                            .map(|handoff| self.traveler_handoff_route(step, handoff)),
+                    );
+                }
                 self.state.step_travel();
-                self.drained_traveler_handoff_messages()
+                outbound.extend(self.drained_traveler_handoff_messages(step));
+                outbound
             }
             RegionEvent::EmploymentDirectoryReady => self.handle_employment_directory_ready(),
         }
@@ -779,23 +811,61 @@ impl RegionRuntime {
     /// worker routes them through the same deterministic barrier every other
     /// cross-region event uses.
     fn emit_employment_directory_ready(&self, regions: Vec<RegionId>) -> Vec<OutboundMessage> {
-        let source_region = self.region_id();
         regions
             .into_iter()
-            .map(|target_region| OutboundMessage::EmploymentDirectoryReady {
-                target_region,
-                source_region,
+            .map(|target_region| {
+                OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
+                    recipients: RegionRecipients::One(target_region),
+                    event: RegionEvent::EmploymentDirectoryReady,
+                })
             })
             .collect()
     }
 
-    /// P5b: this tick's buffered crossings, routed by the worker.
-    fn drained_traveler_handoff_messages(&mut self) -> Vec<OutboundMessage> {
+    fn take_handoffs_eligible_at(&mut self, step: TravelStepId) -> Vec<TravelerHandoff> {
+        let pending = std::mem::take(&mut self.pending_traveler_handoffs);
+        let (ready, future): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|(eligible, _)| *eligible <= step);
+        self.pending_traveler_handoffs = future;
+        let mut handoffs = ready
+            .into_iter()
+            .map(|(_, handoff)| handoff)
+            .collect::<Vec<_>>();
+        handoffs.sort_by_key(|handoff| {
+            (
+                handoff.traveler.citizen,
+                handoff.traveler.generation,
+                match handoff.kind {
+                    crate::core::components::HandoffKind::Move => 0,
+                    crate::core::components::HandoffKind::Rollback => 1,
+                },
+            )
+        });
+        handoffs
+    }
+
+    /// This step's buffered crossings, eligible only on the following step.
+    fn drained_traveler_handoff_messages(&mut self, step: TravelStepId) -> Vec<OutboundMessage> {
         self.state
             .drain_traveler_handoffs()
             .into_iter()
-            .map(OutboundMessage::TravelerHandedOff)
+            .map(|handoff| self.traveler_handoff_route(step, handoff))
             .collect()
+    }
+
+    fn traveler_handoff_route(
+        &self,
+        step: TravelStepId,
+        handoff: TravelerHandoff,
+    ) -> OutboundMessage {
+        OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
+            recipients: RegionRecipients::One(handoff.to_region),
+            event: RegionEvent::ReceiveTraveler {
+                eligible_step: step.next(),
+                handoff,
+            },
+        })
     }
 
     fn remember_power_export_producer(&mut self, grant: &PowerExportGrant) {
@@ -944,9 +1014,7 @@ impl RegionRuntime {
             // Jobs resolve only on a daily boundary; an hourly tick neither makes
             // nor invalidates employment, so it runs no ledger reconciliation.
             let response = self.finish_job_phase(request_id, phase);
-            let mut outbound = vec![OutboundMessage::RegionTickCompleted(response)];
-            outbound.extend(self.drained_traveler_handoff_messages());
-            return outbound;
+            return vec![OutboundMessage::RegionTickCompleted(response)];
         }
         let mut outbound = if phase.jobs_dirty() {
             if let Some(fingerprint) = self.installed_connectivity_fingerprint() {
@@ -1047,16 +1115,13 @@ impl RegionRuntime {
             // Quiet: existing grants + the producer's ledger persist; no
             // release, no requests.
             let response = self.finish_goods_phase(request_id, phase);
-            let mut outbound = vec![OutboundMessage::RegionTickCompleted(response)];
-            outbound.extend(self.drained_traveler_handoff_messages());
-            return outbound;
+            return vec![OutboundMessage::RegionTickCompleted(response)];
         }
         self.seen_goods_generation = self.discovery_generation;
         self.state.clear_goods_exports_dirty();
         let mut outbound = self.release_and_request_goods(request_id, &phase.goods_demands);
         let response = self.finish_goods_phase(request_id, phase);
         outbound.push(OutboundMessage::RegionTickCompleted(response));
-        outbound.extend(self.drained_traveler_handoff_messages());
         outbound
     }
 
@@ -1707,6 +1772,94 @@ mod tick_state_tests {
     }
 
     #[test]
+    fn inbound_traveler_handoff_waits_for_its_eligible_step() {
+        use crate::core::components::{
+            HandoffKind, PlaceRef, TravelState, TravelToken, TravelerId,
+        };
+
+        let mut runtime = RegionRuntime::new(RegionState::new(RegionId(2), 2, 2));
+        let handoff = TravelerHandoff {
+            token: TravelToken {
+                state: TravelState::default(),
+                home: PlaceRef {
+                    region: RegionId(1),
+                    building: Entity::new(RegionId(1), 1),
+                },
+                work: None,
+                trip_gen: 7,
+            },
+            traveler: TravelerId {
+                citizen: Entity::new(RegionId(1), 9),
+                generation: 7,
+            },
+            to_region: RegionId(2),
+            entry_link: None,
+            kind: HandoffKind::Rollback,
+        };
+
+        runtime.process_event(RegionEvent::ReceiveTraveler {
+            eligible_step: TravelStepId(2),
+            handoff,
+        });
+        assert_eq!(runtime.pending_traveler_handoffs.len(), 1);
+        assert!(
+            runtime
+                .take_handoffs_eligible_at(TravelStepId(1))
+                .is_empty()
+        );
+        assert_eq!(runtime.pending_traveler_handoffs.len(), 1);
+        assert_eq!(runtime.take_handoffs_eligible_at(TravelStepId(2)).len(), 1);
+    }
+
+    #[test]
+    fn eligible_traveler_handoffs_are_ordered_by_traveler_identity() {
+        use crate::core::components::{
+            HandoffKind, PlaceRef, TravelState, TravelToken, TravelerId,
+        };
+
+        let mut runtime = RegionRuntime::new(RegionState::new(RegionId(2), 2, 2));
+        for citizen in [Entity::new(RegionId(1), 9), Entity::new(RegionId(1), 3)] {
+            runtime.pending_traveler_handoffs.push((
+                TravelStepId(2),
+                TravelerHandoff {
+                    token: TravelToken {
+                        state: TravelState::default(),
+                        home: PlaceRef {
+                            region: RegionId(1),
+                            building: Entity::new(RegionId(1), 1),
+                        },
+                        work: None,
+                        trip_gen: 7,
+                    },
+                    traveler: TravelerId {
+                        citizen,
+                        generation: 7,
+                    },
+                    to_region: RegionId(2),
+                    entry_link: None,
+                    kind: HandoffKind::Rollback,
+                },
+            ));
+        }
+
+        let handoffs = runtime.take_handoffs_eligible_at(TravelStepId(2));
+        assert_eq!(handoffs[0].traveler.citizen.local(), 3);
+        assert_eq!(handoffs[1].traveler.citizen.local(), 9);
+    }
+
+    #[test]
+    fn duplicate_travel_step_is_ignored() {
+        let mut runtime = RegionRuntime::new(RegionState::new(RegionId(1), 2, 2));
+        runtime.process_event(RegionEvent::StepTravel {
+            step: TravelStepId(3),
+        });
+        runtime.process_event(RegionEvent::StepTravel {
+            step: TravelStepId(3),
+        });
+        assert_eq!(runtime.last_travel_step, Some(TravelStepId(3)));
+    }
+
+    #[test]
     fn tick_with_exportable_demand_completes_immediately_and_requests_export() {
         // Retire-tickstate, P-a: power no longer pauses the tick. It fires
         // the release/request fire-and-forget and finishes in the same
@@ -2334,9 +2487,14 @@ mod employment_claim_flow_tests {
         outbound
             .iter()
             .filter_map(|message| match message {
-                OutboundMessage::EmploymentDirectoryReady { target_region, .. } => {
-                    Some(*target_region)
-                }
+                OutboundMessage::CoordinatorRoute(route) => match route.recipients {
+                    RegionRecipients::One(target_region)
+                        if matches!(route.event, RegionEvent::EmploymentDirectoryReady) =>
+                    {
+                        Some(target_region)
+                    }
+                    _ => None,
+                },
                 _ => None,
             })
             .collect()
@@ -2746,8 +2904,9 @@ mod employment_claim_flow_tests {
         assert!(
             wake.iter().any(|msg| matches!(
                 msg,
-                OutboundMessage::EmploymentDirectoryReady { target_region, .. }
-                    if *target_region == RegionId(9)
+                OutboundMessage::CoordinatorRoute(route)
+                    if matches!(route.recipients, RegionRecipients::One(RegionId(9)))
+                        && matches!(route.event, RegionEvent::EmploymentDirectoryReady)
             )),
             "declining the stale lease wakes its employer"
         );

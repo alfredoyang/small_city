@@ -5,19 +5,21 @@
 //! exposes only narrow UI-safe operations.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 
 use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionViewSnapshot, UiReply, UiRequestId,
 };
+use crate::core::regions::coordinator::{RegionEventCoordinator, RunnerHealth, RunnerSignal};
 use crate::core::regions::directory::RegionDirectory;
 use crate::core::regions::employment_directory::{
     EmploymentDirectory, rebuild_employment_broker_state,
 };
 use crate::core::regions::handle::RegionHandle;
-use crate::core::regions::runtime::RegionRuntime;
+use crate::core::regions::runtime::{RegionRuntime, TravelStepId};
 use crate::core::regions::threaded::{
-    ThreadedRegionWorker, ThreadedWorkerError, ThreadedWorkerShutdown,
+    PreparedThreadedRegionWorker, ThreadedRegionWorker, ThreadedWorkerError, ThreadedWorkerShutdown,
 };
 use crate::core::regions::worker::{
     ForwardedRegionEvent, RegionOwnerDirectory, RegionWorker, WorkerId, WorkerRoutingError,
@@ -82,15 +84,28 @@ pub enum RegionalGameRunnerError {
     WorkerPanicked {
         worker_id: WorkerId,
     },
+    CoordinatorFaulted,
 }
 
-#[derive(Debug)]
 /// Public threaded runner that owns regional worker threads.
 pub struct RegionalGameRunner {
     workers: Vec<ThreadedRegionWorker>,
     handles: Vec<RegionHandle>,
     owners: Arc<RegionOwnerDirectory>,
     operation_lock: Mutex<()>,
+    next_travel_step: AtomicU64,
+    coordinator: Option<RegionEventCoordinator>,
+    runner_signals: Mutex<mpsc::Receiver<RunnerSignal>>,
+    health: Arc<RunnerHealth>,
+}
+
+impl std::fmt::Debug for RegionalGameRunner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegionalGameRunner")
+            .field("worker_count", &self.workers.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RegionalGameRunner {
@@ -210,14 +225,34 @@ impl RegionalGameRunner {
             handles.push(handle);
         }
 
+        let prepared = workers
+            .into_iter()
+            .map(PreparedThreadedRegionWorker::prepare)
+            .collect::<Vec<_>>();
+        let coordinator_workers = prepared
+            .iter()
+            .map(|worker| (worker.worker_id(), worker.command_sender()))
+            .collect::<BTreeMap<_, _>>();
+        let health = Arc::new(RunnerHealth::default());
+        let (signals, runner_signals) = mpsc::channel::<RunnerSignal>();
+        let coordinator = RegionEventCoordinator::start(
+            Arc::clone(&owners),
+            coordinator_workers,
+            Arc::clone(&health),
+            signals,
+        );
         let runner = Self {
-            workers: workers
+            workers: prepared
                 .into_iter()
-                .map(ThreadedRegionWorker::start)
+                .map(|worker| worker.start_with_coordinator(coordinator.handle()))
                 .collect(),
             handles,
             owners,
             operation_lock: Mutex::new(()),
+            next_travel_step: AtomicU64::new(0),
+            coordinator: Some(coordinator),
+            runner_signals: Mutex::new(runner_signals),
+            health,
         };
         runner.process_worker_until_drained()?;
 
@@ -401,12 +436,22 @@ impl RegionalGameRunner {
     }
 
     pub fn shutdown(self) -> Result<RecoveredRegionalGame, RegionalGameRunnerError> {
+        let RegionalGameRunner {
+            workers: threaded_workers,
+            coordinator,
+            ..
+        } = self;
         let mut workers = Vec::new();
-        for worker in self.workers {
+        for worker in threaded_workers {
             let shutdown = worker
                 .shutdown(ThreadedWorkerShutdown::RejectPending)
                 .map_err(RegionalGameRunnerError::from)?;
             workers.push(shutdown.worker);
+        }
+        if let Some(coordinator) = coordinator {
+            coordinator
+                .shutdown()
+                .map_err(|_| RegionalGameRunnerError::CoordinatorFaulted)?;
         }
 
         Ok(RecoveredRegionalGame { workers })
@@ -427,6 +472,32 @@ impl RegionalGameRunner {
             .find(|handle| handle.region_id() == region_id)
     }
 
+    fn check_health(&self) -> Result<(), RegionalGameRunnerError> {
+        if self.health.fault().is_some() {
+            return Err(RegionalGameRunnerError::CoordinatorFaulted);
+        }
+        Ok(())
+    }
+
+    fn collect_runner_replies(
+        &self,
+        summary: &mut WorkerRunSummary,
+    ) -> Result<(), RegionalGameRunnerError> {
+        let signals = self
+            .runner_signals
+            .lock()
+            .expect("runner signal receiver poisoned");
+        while let Ok(signal) = signals.try_recv() {
+            match signal {
+                RunnerSignal::Faulted => return Err(RegionalGameRunnerError::CoordinatorFaulted),
+                RunnerSignal::CommandReply(reply) => summary.command_replies.push(reply),
+                RunnerSignal::TickReply(reply) => summary.tick_replies.push(reply),
+                RunnerSignal::SnapshotReply(reply) => summary.snapshot_replies.push(reply),
+            }
+        }
+        self.check_health()
+    }
+
     fn worker_for_region(
         &self,
         region_id: RegionId,
@@ -442,7 +513,7 @@ impl RegionalGameRunner {
             .ok_or(RegionalGameRunnerError::WorkerStopped { worker_id })
     }
 
-    /// P7c: advance movement by one 10-minute sub-tick across EVERY region, as a
+    /// Advances movement by one 10-minute sub-tick across EVERY region, as a
     /// single deterministic barrier pass. Broadcasts `StepTravel` to all region
     /// mailboxes, then drains each region's inbox (any `ReceiveTraveler`s handed in
     /// last sub-tick — processed first, FIFO, inserting their visiting tokens — plus
@@ -455,8 +526,9 @@ impl RegionalGameRunner {
             .operation_lock
             .lock()
             .expect("regional runner operation lock poisoned");
+        let step = TravelStepId(self.next_travel_step.fetch_add(1, Ordering::Relaxed) + 1);
         for handle in &self.handles {
-            handle.send(crate::core::regions::runtime::RegionEvent::StepTravel);
+            handle.send(crate::core::regions::runtime::RegionEvent::StepTravel { step });
         }
         let mut forwarded = Vec::new();
         for worker in &self.workers {
@@ -471,7 +543,16 @@ impl RegionalGameRunner {
             }
             forwarded.append(&mut summary.forwarded_events);
         }
-        self.deliver_forwarded_events(forwarded)
+        self.deliver_forwarded_events(forwarded)?;
+        self.process_worker_until_drained()?;
+        if let Some(coordinator) = &self.coordinator {
+            coordinator
+                .handle()
+                .drain_until_idle()
+                .map_err(|_| RegionalGameRunnerError::CoordinatorFaulted)?;
+        }
+        self.check_health()?;
+        Ok(())
     }
 
     /// Pumps every worker once while a synchronous runner call waits for its reply.
@@ -486,6 +567,7 @@ impl RegionalGameRunner {
     /// found or the safety cap is reached.
     fn process_one_reply_pass(&self) -> Result<WorkerRunSummary, RegionalGameRunnerError> {
         let mut combined = WorkerRunSummary::default();
+        self.collect_runner_replies(&mut combined)?;
 
         for worker in &self.workers {
             let mut summary = worker
@@ -512,6 +594,7 @@ impl RegionalGameRunner {
                 .append(&mut summary.forwarded_events);
         }
         self.deliver_forwarded_events(std::mem::take(&mut combined.forwarded_events))?;
+        self.collect_runner_replies(&mut combined)?;
 
         Ok(combined)
     }
@@ -563,6 +646,13 @@ impl RegionalGameRunner {
                 break;
             }
         }
+        if let Some(coordinator) = &self.coordinator {
+            coordinator
+                .handle()
+                .drain_until_idle()
+                .map_err(|_| RegionalGameRunnerError::CoordinatorFaulted)?;
+        }
+        self.check_health()?;
         Ok(())
     }
 
@@ -843,12 +933,18 @@ mod tests {
         );
         worker.add_region(runtime).unwrap();
 
+        let (signal_sender, runner_signals) = mpsc::channel();
+        drop(signal_sender);
         (
             RegionalGameRunner {
                 workers: vec![ThreadedRegionWorker::start(worker)],
                 handles: vec![handle.clone()],
                 owners,
                 operation_lock: Mutex::new(()),
+                next_travel_step: AtomicU64::new(0),
+                coordinator: None,
+                runner_signals: Mutex::new(runner_signals),
+                health: Arc::new(RunnerHealth::default()),
             },
             handle,
         )
