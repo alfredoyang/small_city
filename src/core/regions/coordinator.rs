@@ -44,6 +44,12 @@ pub(crate) enum CoordinatorError {
 /// First failure observed by the coordinator-owned execution path.
 pub(crate) enum CoordinatorFault {
     Routing(CoordinatorError),
+    CoordinatorStopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoordinatorShutdownError {
+    ThreadPanicked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +102,9 @@ impl CoordinatorHandle {
             .send(CoordinatorCommand::Route(events))
             .map_err(|_| {
                 let error = CoordinatorError::CoordinatorStopped;
-                self.health.latch(CoordinatorFault::Routing(error.clone()));
+                // P1 returns this error synchronously. P5 adds the wake needed
+                // when another thread is blocked awaiting a runner reply.
+                self.health.latch(CoordinatorFault::CoordinatorStopped);
                 error
             })
     }
@@ -106,6 +114,7 @@ impl CoordinatorHandle {
 pub(crate) struct RegionEventCoordinator {
     handle: CoordinatorHandle,
     join_handle: Option<JoinHandle<()>>,
+    stopped: bool,
 }
 
 impl RegionEventCoordinator {
@@ -125,6 +134,7 @@ impl RegionEventCoordinator {
         Self {
             handle,
             join_handle: Some(join_handle),
+            stopped: false,
         }
     }
 
@@ -132,7 +142,15 @@ impl RegionEventCoordinator {
         self.handle.clone()
     }
 
-    pub(crate) fn shutdown(mut self) {
+    pub(crate) fn shutdown(mut self) -> Result<(), CoordinatorShutdownError> {
+        self.stop_and_join()
+    }
+
+    fn stop_and_join(&mut self) -> Result<(), CoordinatorShutdownError> {
+        if self.stopped {
+            return Ok(());
+        }
+        self.stopped = true;
         let (reply, ready) = mpsc::channel();
         if self
             .handle
@@ -143,8 +161,17 @@ impl RegionEventCoordinator {
             let _ = ready.recv();
         }
         if let Some(join_handle) = self.join_handle.take() {
-            let _ = join_handle.join();
+            join_handle
+                .join()
+                .map_err(|_| CoordinatorShutdownError::ThreadPanicked)?;
         }
+        Ok(())
+    }
+}
+
+impl Drop for RegionEventCoordinator {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
     }
 }
 
@@ -299,7 +326,9 @@ mod tests {
             .expect("route command should enqueue");
 
         assert_eq!(received_target(&receiver), RegionId(2));
-        coordinator.shutdown();
+        coordinator
+            .shutdown()
+            .expect("coordinator should stop cleanly");
     }
 
     #[test]
@@ -313,14 +342,23 @@ mod tests {
 
         coordinator
             .handle()
-            .route(RoutedRegionEvent {
-                recipients: RegionRecipients::One(RegionId(2)),
-                event: event(),
-            })
+            .route_events(vec![
+                RoutedRegionEvent {
+                    recipients: RegionRecipients::One(RegionId(2)),
+                    event: event(),
+                },
+                RoutedRegionEvent {
+                    recipients: RegionRecipients::One(RegionId(1)),
+                    event: event(),
+                },
+            ])
             .expect("route command should enqueue");
 
         assert_eq!(received_target(&receiver), RegionId(2));
-        coordinator.shutdown();
+        assert_eq!(received_target(&receiver), RegionId(1));
+        coordinator
+            .shutdown()
+            .expect("coordinator should stop cleanly");
     }
 
     #[test]
@@ -349,7 +387,9 @@ mod tests {
         assert_eq!(received_target(&receiver), RegionId(1));
         assert_eq!(received_target(&receiver), RegionId(2));
         assert_eq!(received_target(&receiver), RegionId(3));
-        coordinator.shutdown();
+        coordinator
+            .shutdown()
+            .expect("coordinator should stop cleanly");
     }
 
     #[test]
@@ -374,7 +414,9 @@ mod tests {
 
         assert_eq!(received_target(&first_receiver), RegionId(1));
         assert_eq!(received_target(&second_receiver), RegionId(2));
-        coordinator.shutdown();
+        coordinator
+            .shutdown()
+            .expect("coordinator should stop cleanly");
     }
 
     #[test]
@@ -402,7 +444,9 @@ mod tests {
 
         assert_eq!(received_target(&receiver), RegionId(1));
         assert_eq!(received_target(&receiver), RegionId(2));
-        coordinator.shutdown();
+        coordinator
+            .shutdown()
+            .expect("coordinator should stop cleanly");
     }
 
     #[test]
@@ -438,7 +482,9 @@ mod tests {
             ))
         );
         assert!(receiver.recv_timeout(RECEIVE_TIMEOUT).is_err());
-        coordinator.shutdown();
+        coordinator
+            .shutdown()
+            .expect("coordinator should stop cleanly");
     }
 
     #[test]
@@ -464,7 +510,9 @@ mod tests {
                 CoordinatorError::MissingTargetRegion(RegionId(99))
             ))
         );
-        coordinator.shutdown();
+        coordinator
+            .shutdown()
+            .expect("coordinator should stop cleanly");
     }
 
     #[test]
@@ -501,13 +549,36 @@ mod tests {
                 WorkerId(7)
             )))
         );
-        coordinator.shutdown();
+        coordinator
+            .shutdown()
+            .expect("coordinator should stop cleanly");
     }
 
     #[test]
     fn shutdown_joins_the_coordinator_thread() {
         let owners = Arc::new(RegionOwnerDirectory::new());
         let (coordinator, _health, _signals) = coordinator(owners, BTreeMap::new());
-        coordinator.shutdown();
+        coordinator
+            .shutdown()
+            .expect("coordinator should stop cleanly");
+    }
+
+    #[test]
+    fn shutdown_reports_a_panicked_coordinator_thread() {
+        let (commands, receiver) = mpsc::channel();
+        drop(receiver);
+        let coordinator = RegionEventCoordinator {
+            handle: CoordinatorHandle {
+                commands,
+                health: Arc::new(RunnerHealth::default()),
+            },
+            join_handle: Some(thread::spawn(|| panic!("intentional test panic"))),
+            stopped: false,
+        };
+
+        assert_eq!(
+            coordinator.shutdown(),
+            Err(CoordinatorShutdownError::ThreadPanicked)
+        );
     }
 }

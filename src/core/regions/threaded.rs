@@ -430,7 +430,9 @@ fn run_worker(mut worker: RegionWorker, commands: Receiver<ThreadedWorkerCommand
                 target_region,
                 event,
             } => {
-                let _ = worker.push_event(target_region, event);
+                worker
+                    .push_event(target_region, event)
+                    .expect("coordinator routed an event to the wrong worker");
             }
             ThreadedWorkerCommand::Process {
                 max_events_per_region,
