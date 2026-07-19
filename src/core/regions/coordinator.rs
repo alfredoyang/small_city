@@ -15,10 +15,10 @@ use std::time::Duration;
 use crate::core::regional_types::{
     RegionCommandResponse, RegionSnapshotResponse, RegionTickResponse,
 };
-use crate::core::regions::RegionId;
 use crate::core::regions::runtime::RegionEvent;
 use crate::core::regions::threaded::{ThreadedWorkerCommand, WorkerIdleReport};
 use crate::core::regions::worker::{RegionOwnerDirectory, WorkerId};
+use crate::core::regions::{GoodsExportGrant, PowerExportGrant, RegionId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Coordinator-routable recipients for one region event.
@@ -422,9 +422,29 @@ fn route_events(
     for routed in events {
         let recipients = normalized_recipients(owners, routed.recipients);
         for target_region in recipients {
-            let worker_id = owners
-                .owner_of(target_region)
-                .ok_or(CoordinatorError::MissingTargetRegion(target_region))?;
+            let Some(worker_id) = owners.owner_of(target_region) else {
+                if let Some(denial) = missing_export_target_denial(&routed.event) {
+                    let caller = denial.caller_region;
+                    let caller_worker = owners
+                        .owner_of(caller)
+                        .ok_or(CoordinatorError::MissingTargetRegion(caller))?;
+                    let sender = workers
+                        .get(&caller_worker)
+                        .ok_or(CoordinatorError::MissingWorker(caller_worker))?
+                        .clone();
+                    deliveries.push(ResolvedDelivery {
+                        target_region: caller,
+                        worker_id: caller_worker,
+                        sender,
+                        event: denial.event,
+                    });
+                    continue;
+                }
+                if is_export_release(&routed.event) {
+                    continue;
+                }
+                return Err(CoordinatorError::MissingTargetRegion(target_region));
+            };
             let sender = workers
                 .get(&worker_id)
                 .ok_or(CoordinatorError::MissingWorker(worker_id))?
@@ -450,6 +470,52 @@ fn route_events(
     Ok(())
 }
 
+fn is_export_release(event: &RegionEvent) -> bool {
+    matches!(
+        event,
+        RegionEvent::ReleasePowerExportAllocations(_)
+            | RegionEvent::ReleaseGoodsExportAllocations(_)
+    )
+}
+
+/// A discovery snapshot can outlive a region reassignment. Treat a missing
+/// producer as an ordinary rejected attempt so the caller runtime can walk its
+/// remaining snapshot candidates; do not turn stale availability into a runner
+/// fault. All other missing targets remain routing failures.
+fn missing_export_target_denial(event: &RegionEvent) -> Option<MissingExportTargetDenial> {
+    match event {
+        RegionEvent::ProcessPowerExportRequest(request) => Some(MissingExportTargetDenial {
+            caller_region: request.request.caller_region,
+            event: RegionEvent::ApplyPowerExportGrant {
+                request: request.clone(),
+                grant: PowerExportGrant {
+                    token: request.request.token,
+                    granted: false,
+                    source_region: None,
+                },
+            },
+        }),
+        RegionEvent::ProcessGoodsExportRequest(request) => Some(MissingExportTargetDenial {
+            caller_region: request.request.caller_region,
+            event: RegionEvent::ApplyGoodsExportGrant {
+                request: request.clone(),
+                grant: GoodsExportGrant {
+                    token: request.request.token,
+                    granted: false,
+                    source_region: None,
+                    units: 0,
+                },
+            },
+        }),
+        _ => None,
+    }
+}
+
+struct MissingExportTargetDenial {
+    caller_region: RegionId,
+    event: RegionEvent,
+}
+
 fn normalized_recipients(
     owners: &RegionOwnerDirectory,
     recipients: RegionRecipients,
@@ -470,6 +536,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::core::entity::Entity;
+    use crate::core::regional_types::UiRequestId;
+    use crate::core::regions::runtime::{ExportAllocationRequest, PowerExportRequest};
     use crate::core::regions::worker::RegionOwnerDirectory;
 
     const RECEIVE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -496,6 +565,108 @@ mod tests {
         owners
             .register_region(RegionId(region_id), WorkerId(worker_id))
             .expect("test region registration should succeed");
+    }
+
+    #[test]
+    fn missing_power_producer_becomes_a_denial_for_the_caller() {
+        let caller = RegionId(1);
+        let event = RegionEvent::ProcessPowerExportRequest(ExportAllocationRequest {
+            request: PowerExportRequest {
+                request_id: UiRequestId(4),
+                caller_region: caller,
+                caller_network: crate::core::regions::RegionRoadNetworkId {
+                    region: caller,
+                    road_network: 0,
+                },
+                token: 7,
+                demand: 1,
+                consumer: Entity::new(caller, 3),
+            },
+            candidates: vec![crate::core::regions::RegionRoadNetworkId {
+                region: RegionId(2),
+                road_network: 0,
+            }],
+            candidate_index: 0,
+        });
+
+        let denial = missing_export_target_denial(&event).expect("export request");
+        assert_eq!(denial.caller_region, caller);
+        assert!(matches!(
+            denial.event,
+            RegionEvent::ApplyPowerExportGrant { grant, .. }
+                if !grant.granted && grant.source_region.is_none()
+        ));
+    }
+
+    #[test]
+    fn missing_power_producer_delivery_reaches_the_caller() {
+        let owners = RegionOwnerDirectory::new();
+        register(&owners, 1, 7);
+        let (sender, receiver) = mpsc::channel();
+        let workers = BTreeMap::from([(WorkerId(7), sender)]);
+        let request = ExportAllocationRequest {
+            request: PowerExportRequest {
+                request_id: UiRequestId(4),
+                caller_region: RegionId(1),
+                caller_network: crate::core::regions::RegionRoadNetworkId {
+                    region: RegionId(1),
+                    road_network: 0,
+                },
+                token: 7,
+                demand: 1,
+                consumer: Entity::new(RegionId(1), 3),
+            },
+            candidates: vec![crate::core::regions::RegionRoadNetworkId {
+                region: RegionId(2),
+                road_network: 0,
+            }],
+            candidate_index: 0,
+        };
+
+        route_events(
+            &owners,
+            &workers,
+            vec![RoutedRegionEvent {
+                recipients: RegionRecipients::One(RegionId(2)),
+                event: RegionEvent::ProcessPowerExportRequest(request),
+            }],
+        )
+        .expect("missing producer is a normal denial");
+
+        match receiver
+            .recv_timeout(RECEIVE_TIMEOUT)
+            .expect("caller delivery")
+        {
+            ThreadedWorkerCommand::Deliver {
+                target_region,
+                event: RegionEvent::ApplyPowerExportGrant { grant, .. },
+            } => {
+                assert_eq!(target_region, RegionId(1));
+                assert!(!grant.granted);
+            }
+            _ => panic!("unexpected coordinator delivery"),
+        }
+    }
+
+    #[test]
+    fn missing_export_release_is_not_a_routing_fault() {
+        let owners = RegionOwnerDirectory::new();
+        let workers = BTreeMap::new();
+        route_events(
+            &owners,
+            &workers,
+            vec![RoutedRegionEvent {
+                recipients: RegionRecipients::One(RegionId(2)),
+                event: RegionEvent::ReleasePowerExportAllocations(
+                    crate::core::regions::runtime::ExportAllocationRelease {
+                        caller_region: RegionId(1),
+                        request_id: UiRequestId(4),
+                        producer_regions: vec![RegionId(2)],
+                    },
+                ),
+            }],
+        )
+        .expect("a departed producer has no allocation state left to release");
     }
 
     fn received_target(receiver: &Receiver<ThreadedWorkerCommand>) -> RegionId {

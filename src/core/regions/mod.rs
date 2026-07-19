@@ -2022,7 +2022,7 @@ impl RegionState {
             if !border_networks.contains(&caller_network) {
                 continue;
             }
-            // ponytail: one message per unit because ExportResource grants are
+            // one message per unit because producer grants are
             // all-or-deny today. If goods capacity gets large, replace this with
             // a batched request and producer partial-grant support.
             for _ in 0..units {

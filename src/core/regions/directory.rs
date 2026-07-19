@@ -121,7 +121,7 @@ pub(crate) fn power_capacity_recheck_targets(
 ///   no rebuild                 per-region links + hints
 ///                                   │ rebuild + swap
 ///                                   v
-///                             active_snapshot ──clone──> route_export_request
+///                             active_snapshot ──clone──> consumer runtime request routing
 ///                              Mutex<Arc<discovery>>          │ pick from snapshot
 ///                                                             v
 ///                                                         candidates

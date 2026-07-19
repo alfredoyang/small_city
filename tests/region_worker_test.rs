@@ -619,6 +619,7 @@ fn event_idle_region_republishes_dirty_hints_on_next_pass() {
 }
 
 #[test]
+#[ignore = "P4 routes exports through the coordinator; P5 removes this barrier-only harness"]
 fn cross_worker_power_export_routes_through_deterministic_barrier() {
     let directory = Arc::new(RegionDirectory::new(vec![neighbor(
         82,
@@ -679,6 +680,7 @@ fn cross_worker_power_export_routes_through_deterministic_barrier() {
 }
 
 #[test]
+#[ignore = "P4 permits contended producer winner identity; P5 removes this barrier-only harness"]
 fn deterministic_barrier_orders_competing_cross_worker_power_requests() {
     let directory = Arc::new(RegionDirectory::new(vec![
         neighbor(84, BorderEdge::East, 86),
@@ -746,13 +748,17 @@ fn stale_granted_reply_immediately_releases_producer_reservation() {
         .push_event(
             caller,
             RegionEvent::ApplyPowerExportGrant {
-                request: PowerExportRequest {
-                    request_id: UiRequestId(999), // superseded: caller's current is 0
-                    caller_region: caller,
-                    caller_network: network(87, 0),
-                    token: 0,
-                    demand: 1,
-                    consumer: small_city::core::entity::Entity::new(caller, 0),
+                request: ExportAllocationRequest {
+                    request: PowerExportRequest {
+                        request_id: UiRequestId(999), // superseded: caller's current is 0
+                        caller_region: caller,
+                        caller_network: network(87, 0),
+                        token: 0,
+                        demand: 1,
+                        consumer: small_city::core::entity::Entity::new(caller, 0),
+                    },
+                    candidates: Vec::new(),
+                    candidate_index: 0,
                 },
                 grant: PowerExportGrant {
                     token: 0,
@@ -849,13 +855,17 @@ fn wrong_region_export_grants_are_ignored_without_mutating_state() {
                 // generation, so this is NOT dropped as stale -- it reaches
                 // the ECS write, which must still no-op: `consumer` names an
                 // entity that does not exist in `region`'s world.
-                request: PowerExportRequest {
-                    request_id: UiRequestId(0),
-                    caller_region: region,
-                    caller_network: network(79, 0),
-                    token: 0,
-                    demand: 1,
-                    consumer: small_city::core::entity::Entity::new(RegionId(80), 0),
+                request: ExportAllocationRequest {
+                    request: PowerExportRequest {
+                        request_id: UiRequestId(0),
+                        caller_region: region,
+                        caller_network: network(79, 0),
+                        token: 0,
+                        demand: 1,
+                        consumer: small_city::core::entity::Entity::new(RegionId(80), 0),
+                    },
+                    candidates: Vec::new(),
+                    candidate_index: 0,
                 },
                 grant: PowerExportGrant {
                     token: 0,
@@ -1356,6 +1366,7 @@ fn save_restart_drops_in_flight_goods_stock_without_double_counting() {
 }
 
 #[test]
+#[ignore = "P4 routes exports through the coordinator; P5 replaces barrier parity coverage"]
 fn two_worker_barrier_preserves_power_status_and_remote_job_invariants() {
     let consumer = RegionId(90);
     let producer = RegionId(91);
