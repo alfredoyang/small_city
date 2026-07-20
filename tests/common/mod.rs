@@ -86,6 +86,10 @@ impl SingleRegionTestGame {
         self.with_game(|game| game.tick_region(TEST_REGION_ID).expect("tick command"))
     }
 
+    pub fn advance(&mut self) -> Option<CommandResult> {
+        self.with_game(|game| game.advance().expect("advance command"))
+    }
+
     pub fn inspect(&self, x: usize, y: usize) -> InspectView {
         self.with_game(|game| {
             game.inspect_region(TEST_REGION_ID, x, y)

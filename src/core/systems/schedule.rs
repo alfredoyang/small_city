@@ -107,6 +107,9 @@ mod tests {
             workplace_assignment,
             morale: Morale::default(),
             money: 0,
+            arrival_action: crate::core::components::CitizenArrivalAction::ReturnHome,
+            work_trip_generation: 0,
+            attended_since_daily_settlement: false,
         }
     }
 

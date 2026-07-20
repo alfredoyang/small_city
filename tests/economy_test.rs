@@ -130,17 +130,16 @@ fn citizen_salary_rent_and_shopping_create_city_tax_income() {
     assert!(game.build(2, 1, BuildingKind::Road).success);
     assert!(game.build(3, 1, BuildingKind::Road).success);
 
-    let result = advance_one_day(&mut game);
+    let result = advance_to_first_payday(&mut game);
 
     assert_eq!(
         tick_economy(&result.event),
-        // This expected breakdown includes the local-goods path. Industrial
-        // production fills commercial storage, the citizen buys one local good,
-        // and city net now includes manufacturing tax in addition to rent,
-        // workplace tax, sales tax, and maintenance.
+        // Payroll begins only after residents have travelled to work. At the
+        // first paid settlement, one resident has arrived and can earn, rent,
+        // and shop while the other new residents still have no attendance.
         EconomyBreakdownView {
             salaries_paid: 3,
-            workplace_tax: 1,
+            workplace_tax: 4,
             rent_income: 2,
             commercial_sales_tax: 1,
             shoppers_served: 1,
@@ -151,13 +150,13 @@ fn citizen_salary_rent_and_shopping_create_city_tax_income() {
             exported_goods: 0,
             manufacturing_tax: 4,
             export_tax: 0,
-            rent_failures: 0,
+            rent_failures: 2,
             maintenance_cost: 3,
-            net: 5,
+            net: 8,
         }
     );
-    assert_eq!(game.view().status.citizens, 1);
-    assert_eq!(game.view().status.money, 58);
+    assert_eq!(game.view().status.citizens, 3);
+    assert_eq!(game.view().status.money, 63);
 }
 
 #[test]
@@ -255,7 +254,7 @@ fn profitable_commercial_auto_upgrades_from_shopping_profit() {
         assert!(game.build(x, 1, BuildingKind::Road).success);
     }
 
-    advance_one_week(&mut game);
+    advance_one_working_week(&mut game);
 
     match game.inspect(6, 0).details.expect("commercial details") {
         InspectDetailsView::Commercial {
@@ -364,7 +363,7 @@ fn disconnected_commercial_does_not_receive_shoppers_or_pay_sales_tax() {
         assert!(game.build(x, 1, BuildingKind::Road).success);
     }
 
-    let result = advance_one_week(&mut game);
+    let result = advance_one_working_week(&mut game);
 
     let economy = tick_economy(&result.event);
     assert!(economy.salaries_paid > 0);
@@ -388,7 +387,7 @@ fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
     assert!(game.build(2, 1, BuildingKind::Road).success);
     assert!(game.build(3, 1, BuildingKind::Road).success);
 
-    let first_tick = advance_one_day(&mut game);
+    let first_tick = advance_to_first_payday(&mut game);
     assert!(matches!(
         first_tick.event,
         GameEventView::TickSummary {
@@ -397,7 +396,7 @@ fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
             // before removing the commercial road connection.
             economy: EconomyBreakdownView {
                 salaries_paid: 3,
-                workplace_tax: 1,
+                workplace_tax: 4,
                 rent_income: 2,
                 commercial_sales_tax: 1,
                 shoppers_served: 1,
@@ -408,16 +407,19 @@ fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
                 exported_goods: 0,
                 manufacturing_tax: 4,
                 export_tax: 0,
-                rent_failures: 0,
+                rent_failures: 2,
                 maintenance_cost: 3,
-                net: 5,
+                net: 8,
             },
             ..
         }
     ));
 
     assert!(game.bulldoze(2, 1).success);
-    let second_tick = advance_one_day(&mut game);
+    // One day lets the assigned workers attempt the disconnected commute. The
+    // following settlement proves that no workplace arrival recorded attendance.
+    let _ = advance_one_working_day(&mut game);
+    let second_tick = advance_one_working_day(&mut game);
 
     assert_eq!(
         tick_economy(&second_tick.event),
@@ -438,11 +440,99 @@ fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
             exported_goods: 0,
             manufacturing_tax: 0,
             export_tax: 0,
-            rent_failures: 1,
+            rent_failures: 3,
             maintenance_cost: 3,
             net: -3,
         }
     );
+}
+
+#[test]
+fn unreachable_workplace_stops_salary_but_not_productive_workplace_tax() {
+    let mut game = SingleRegionTestGame::new(6, 3);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(3, 0, BuildingKind::Industrial).success);
+    assert!(game.build(4, 0, BuildingKind::PowerPlant).success);
+    for x in 0..=4 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+
+    let first_payday = advance_to_first_payday(&mut game);
+    assert!(tick_economy(&first_payday.event).salaries_paid > 0);
+    assert!(tick_economy(&first_payday.event).workplace_tax > 0);
+
+    // The industrial keeps its own power connection through the second plant.
+    // Break the bridge for the complete work window, then restore it before the
+    // next daily job resolution so the assignment remains productive but the
+    // citizen has no attendance to settle.
+    assert!(game.bulldoze(2, 1).success);
+    let _ = advance_hours(&mut game, 15);
+    assert!(game.build(2, 1, BuildingKind::Road).success);
+    let after_failed_commute = advance_hours(&mut game, 9).expect("daily settlement");
+    let economy = tick_economy(&after_failed_commute.event);
+
+    assert_eq!(economy.salaries_paid, 0);
+    assert!(economy.workplace_tax > 0);
+}
+
+#[test]
+fn save_load_pays_recorded_attendance_once() {
+    let path = std::env::temp_dir().join(format!(
+        "small_city_arrival_pay_roundtrip_{}.json",
+        std::process::id()
+    ));
+    let mut game = SingleRegionTestGame::new(6, 3);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(3, 0, BuildingKind::Industrial).success);
+    assert!(game.build(4, 0, BuildingKind::PowerPlant).success);
+    for x in 0..=4 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+
+    let _ = advance_to_first_payday(&mut game);
+    let _ = advance_hours(&mut game, 15);
+    game.save_to_file(&path).expect("save recorded attendance");
+
+    let mut loaded = SingleRegionTestGame::load_from_file(&path).expect("load recorded attendance");
+    std::fs::remove_file(&path).expect("remove attendance save");
+
+    let saved_attendance_payday = advance_hours(&mut loaded, 9).expect("daily settlement");
+    assert!(tick_economy(&saved_attendance_payday.event).salaries_paid > 0);
+
+    assert!(loaded.bulldoze(2, 1).success);
+    let _ = advance_hours(&mut loaded, 15);
+    assert!(loaded.build(2, 1, BuildingKind::Road).success);
+    let after_saved_attendance = advance_hours(&mut loaded, 9).expect("daily settlement");
+    assert_eq!(tick_economy(&after_saved_attendance.event).salaries_paid, 0);
+}
+
+#[test]
+fn mid_commute_save_can_miss_the_next_payroll() {
+    let path = std::env::temp_dir().join(format!(
+        "small_city_arrival_pay_mid_commute_{}.json",
+        std::process::id()
+    ));
+    let mut game = SingleRegionTestGame::new(45, 3);
+    assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
+    assert!(game.build(1, 0, BuildingKind::Residential).success);
+    assert!(game.build(35, 0, BuildingKind::Industrial).success);
+    assert!(game.build(36, 0, BuildingKind::PowerPlant).success);
+    for x in 0..=36 {
+        assert!(game.build(x, 1, BuildingKind::Road).success);
+    }
+
+    let _ = advance_to_first_payday(&mut game);
+    let _ = advance_hours(&mut game, 10);
+    game.save_to_file(&path).expect("save mid-commute");
+
+    let mut loaded = SingleRegionTestGame::load_from_file(&path).expect("load mid-commute");
+    std::fs::remove_file(&path).expect("remove mid-commute save");
+
+    let next_settlement = advance_hours(&mut loaded, 14).expect("daily settlement");
+    assert_eq!(tick_economy(&next_settlement.event).salaries_paid, 0);
+    assert!(tick_economy(&next_settlement.event).workplace_tax > 0);
 }
 
 #[test]
@@ -463,7 +553,7 @@ fn citizen_unable_to_pay_rent_gets_lower_happiness() {
     assert!(game.build(2, 1, BuildingKind::Road).success);
     assert!(game.build(3, 1, BuildingKind::Road).success);
 
-    advance_one_week(&mut game);
+    advance_one_working_week(&mut game);
     let before = residential_average_happiness(&game, 1, 0).expect("resident happiness");
 
     assert!(game.bulldoze(3, 1).success);
@@ -497,8 +587,12 @@ fn commercial_in_higher_land_value_area_pays_more_sales_tax() {
     let plain = commercial_tax_city(false);
     let premium = commercial_tax_city(true);
 
-    assert!(premium.commercial_sales_tax > plain.commercial_sales_tax);
-    assert!(premium.shoppers_served >= plain.shoppers_served);
+    assert!(plain.shoppers_served > 0);
+    assert!(premium.shoppers_served > 0);
+    assert!(
+        premium.commercial_sales_tax / premium.shoppers_served
+            > plain.commercial_sales_tax / plain.shoppers_served
+    );
 }
 
 #[test]
@@ -538,7 +632,7 @@ fn commercial_imports_goods_when_local_storage_is_empty() {
         tick_economy(&advance_one_day(&mut game).event).imported_goods_sold,
         0
     );
-    let economy = tick_economy(&advance_one_week(&mut game).event);
+    let economy = tick_economy(&advance_one_working_week(&mut game).event);
 
     assert_eq!(economy.local_goods_produced, 0);
     assert_eq!(economy.local_goods_sold, 0);
@@ -558,10 +652,10 @@ fn citizens_prefer_nearby_reachable_jobs() {
         assert!(game.build(x, 1, BuildingKind::Road).success);
     }
 
-    let economy = tick_economy(&advance_one_day(&mut game).event);
+    let economy = tick_economy(&advance_to_first_payday(&mut game).event);
 
     assert_eq!(economy.salaries_paid, 3);
-    assert_eq!(economy.workplace_tax, 1);
+    assert_eq!(economy.workplace_tax, 8);
 }
 
 #[test]
@@ -647,6 +741,52 @@ fn advance_one_day(
     result
 }
 
+fn advance_one_working_day(
+    game: &mut SingleRegionTestGame,
+) -> small_city::interface::events::CommandResult {
+    let mut result = None;
+    for _ in 0..24 * 6 {
+        if let Some(tick) = game.advance() {
+            result = Some(tick);
+        }
+    }
+    result.expect("one day includes daily economy")
+}
+
+fn advance_hours(
+    game: &mut SingleRegionTestGame,
+    hours: usize,
+) -> Option<small_city::interface::events::CommandResult> {
+    let mut result = None;
+    for _ in 0..hours * 6 {
+        if let Some(tick) = game.advance() {
+            result = Some(tick);
+        }
+    }
+    result
+}
+
+fn advance_to_first_payday(
+    game: &mut SingleRegionTestGame,
+) -> small_city::interface::events::CommandResult {
+    let first_day = advance_one_working_day(game);
+    assert_eq!(tick_economy(&first_day.event).salaries_paid, 0);
+
+    let first_payday = advance_one_working_day(game);
+    assert!(tick_economy(&first_payday.event).salaries_paid > 0);
+    first_payday
+}
+
+fn advance_one_working_week(
+    game: &mut SingleRegionTestGame,
+) -> small_city::interface::events::CommandResult {
+    let mut result = advance_one_working_day(game);
+    for _ in 1..7 {
+        result = advance_one_working_day(game);
+    }
+    result
+}
+
 fn advance_one_week(
     game: &mut SingleRegionTestGame,
 ) -> small_city::interface::events::CommandResult {
@@ -680,7 +820,7 @@ fn commercial_tax_city(with_park: bool) -> EconomyBreakdownView {
         assert!(game.build(2, 2, BuildingKind::Park).success);
     }
 
-    tick_economy(&advance_one_day(&mut game).event)
+    tick_economy(&advance_to_first_payday(&mut game).event)
 }
 
 fn shopping_happiness_city(commercial_x: usize) -> i32 {
@@ -696,7 +836,7 @@ fn shopping_happiness_city(commercial_x: usize) -> i32 {
         assert!(game.build(x, 1, BuildingKind::Road).success);
     }
 
-    advance_one_week(&mut game);
+    advance_one_working_week(&mut game);
     residential_average_happiness(&game, 1, 0).expect("resident happiness")
 }
 
@@ -717,8 +857,8 @@ fn imported_goods_sold_after_two_ticks(far_from_edge: bool) -> i32 {
         }
     }
 
-    advance_one_week(&mut game);
-    tick_economy(&advance_one_day(&mut game).event).imported_goods_sold
+    let _ = advance_to_first_payday(&mut game);
+    tick_economy(&advance_one_working_day(&mut game).event).imported_goods_sold
 }
 
 fn residential_rent(game: &SingleRegionTestGame, x: usize, y: usize) -> i32 {

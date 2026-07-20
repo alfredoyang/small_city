@@ -74,7 +74,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use crate::core::city_refs::CityCellRef;
-use crate::core::components::TravelerHandoff;
+use crate::core::components::{PlaceRef, TravelerHandoff, TravelerId};
 use crate::core::entity::Entity;
 use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionCommandResponse, RegionSnapshotResponse,
@@ -195,6 +195,12 @@ pub enum RegionEvent {
     /// every region by the runner's `step_travel_city`; emits the crossings it
     /// buffers as `TravelerHandedOff` for the coordinator to route.
     StepTravel { step: TravelStepId },
+    /// P1: a token host reports that a citizen reached its work endpoint. The
+    /// home region validates its own assignment and trip-purpose state.
+    DestinationArrived {
+        traveler: TravelerId,
+        destination: PlaceRef,
+    },
     /// Directory employment ledger plan, P3: a payload-free wake.
     ///
     /// It carries no claims, contracts, or losses — it only tells the region
@@ -893,7 +899,15 @@ impl RegionRuntime {
                 }
                 self.state.step_travel();
                 outbound.extend(self.drained_traveler_handoff_messages(step));
+                outbound.extend(self.drained_destination_arrival_messages());
                 outbound
+            }
+            RegionEvent::DestinationArrived {
+                traveler,
+                destination,
+            } => {
+                self.state.apply_destination_arrived(traveler, destination);
+                Vec::new()
             }
             RegionEvent::EmploymentDirectoryReady => self.handle_employment_directory_ready(),
         }
@@ -973,6 +987,30 @@ impl RegionRuntime {
             .into_iter()
             .map(|handoff| self.traveler_handoff_route(step, handoff))
             .collect()
+    }
+
+    /// Routes this movement step's core-produced work-arrival facts through the
+    /// same coordinator/FIFO path for local and cross-region commuters.
+    fn drained_destination_arrival_messages(&mut self) -> Vec<OutboundMessage> {
+        self.state
+            .drain_destination_arrivals()
+            .into_iter()
+            .map(|arrival| self.destination_arrival_route(arrival.traveler, arrival.destination))
+            .collect()
+    }
+
+    fn destination_arrival_route(
+        &self,
+        traveler: TravelerId,
+        destination: PlaceRef,
+    ) -> OutboundMessage {
+        OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
+            recipients: RegionRecipients::One(traveler.citizen.region()),
+            event: RegionEvent::DestinationArrived {
+                traveler,
+                destination,
+            },
+        })
     }
 
     fn traveler_handoff_route(
@@ -2187,6 +2225,118 @@ mod tick_state_tests {
             step: TravelStepId(3),
         });
         assert_eq!(runtime.last_travel_step, Some(TravelStepId(3)));
+    }
+
+    #[test]
+    fn step_travel_routes_pending_arrival_to_the_citizens_home_region() {
+        use crate::core::components::PendingDestinationArrival;
+
+        let mut runtime = RegionRuntime::new(RegionState::new(RegionId(2), 2, 2));
+        let traveler = TravelerId {
+            citizen: Entity::new(RegionId(1), 7),
+            generation: 3,
+        };
+        let destination = PlaceRef {
+            region: RegionId(2),
+            building: Entity::new(RegionId(2), 4),
+        };
+        runtime
+            .state_mut()
+            .world
+            .outgoing_destination_arrivals
+            .push(PendingDestinationArrival {
+                traveler,
+                destination,
+            });
+
+        let outbound = runtime.process_event(RegionEvent::StepTravel {
+            step: TravelStepId(1),
+        });
+
+        assert!(matches!(
+            outbound.as_slice(),
+            [OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
+                recipients: RegionRecipients::One(RegionId(1)),
+                event: RegionEvent::DestinationArrived {
+                    traveler: routed_traveler,
+                    destination: routed_destination,
+                },
+            })] if *routed_traveler == traveler && *routed_destination == destination
+        ));
+    }
+
+    #[test]
+    fn destination_arrival_records_attendance_once_for_the_current_work_trip() {
+        use crate::core::city_refs::CityCellRef;
+        use crate::core::components::{Citizen, CitizenArrivalAction, Morale, WorkplaceAssignment};
+
+        let citizen_id = Entity::new(RegionId(1), 7);
+        let workplace = Entity::new(RegionId(2), 4);
+        let mut runtime = RegionRuntime::new(RegionState::new(RegionId(1), 2, 2));
+        runtime.state_mut().world.citizens.insert(
+            citizen_id,
+            Citizen {
+                id: citizen_id,
+                age: 1,
+                home: Entity::new(RegionId(1), 0),
+                workplace_assignment: Some(WorkplaceAssignment {
+                    workplace,
+                    location: CityCellRef::local(RegionId(2), 0, 0),
+                    salary: 100,
+                }),
+                morale: Morale::default(),
+                money: 0,
+                arrival_action: CitizenArrivalAction::StartWorkShift,
+                work_trip_generation: 3,
+                attended_since_daily_settlement: false,
+            },
+        );
+        let event = RegionEvent::DestinationArrived {
+            traveler: TravelerId {
+                citizen: citizen_id,
+                generation: 3,
+            },
+            destination: PlaceRef {
+                region: RegionId(2),
+                building: workplace,
+            },
+        };
+
+        runtime.process_event(event.clone());
+        runtime.process_event(event);
+        let citizen = &runtime.state().world.citizens[&citizen_id];
+        assert!(citizen.attended_since_daily_settlement);
+        assert_eq!(citizen.arrival_action, CitizenArrivalAction::ReturnHome);
+
+        {
+            let citizen = runtime
+                .state_mut()
+                .world
+                .citizens
+                .get_mut(&citizen_id)
+                .expect("citizen remains present");
+            citizen.attended_since_daily_settlement = false;
+            citizen.arrival_action = CitizenArrivalAction::StartWorkShift;
+        }
+        runtime.process_event(RegionEvent::DestinationArrived {
+            traveler: TravelerId {
+                citizen: citizen_id,
+                generation: 2,
+            },
+            destination: PlaceRef {
+                region: RegionId(2),
+                building: workplace,
+            },
+        });
+        assert_eq!(
+            runtime.state().world.citizens[&citizen_id].work_trip_generation,
+            3,
+            "a stale arrival must not affect the current work trip"
+        );
+        assert!(
+            !runtime.state().world.citizens[&citizen_id].attended_since_daily_settlement,
+            "a stale generation must not record attendance for the new trip"
+        );
     }
 
     #[test]

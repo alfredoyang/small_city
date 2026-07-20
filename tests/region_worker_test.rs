@@ -3,7 +3,7 @@
 use small_city::core::regional_types::{RegionCommand, RegionTickResponse, UiRequestId};
 use small_city::core::regions::directory::RegionDirectory;
 use small_city::core::regions::runtime::{
-    ExportAllocationRequest, PowerExportRequest, RegionEvent, RegionRuntime,
+    ExportAllocationRequest, PowerExportRequest, RegionEvent, RegionRuntime, TravelStepId,
 };
 use small_city::core::regions::worker::{
     RegionOwnerDirectory, RegionWorker, WorkerId, WorkerRoutingError,
@@ -1211,10 +1211,14 @@ fn road_connected_region_uses_neighbor_goods_before_edge_imports() {
     let (consumer_economy, producer_economy) =
         run_goods_trade_days(&mut worker, consumer, producer, 1);
 
-    assert!(
-        consumer_economy.local_goods_sold > 0,
-        "{consumer_economy:?}"
-    );
+    let consumer_inspect = worker
+        .region_mut(consumer)
+        .expect("consumer region")
+        .inspect(1, 0);
+    let Some(InspectDetailsView::Commercial { goods_stored, .. }) = consumer_inspect.details else {
+        panic!("expected consumer commercial");
+    };
+    assert!(goods_stored > 0, "{consumer_inspect:?}");
     assert_eq!(
         consumer_economy.imported_goods_sold, 0,
         "{consumer_economy:?}"
@@ -1230,8 +1234,11 @@ fn disconnected_region_still_uses_edge_goods_market() {
     let producer = RegionId(73);
     let mut worker = goods_trade_worker(false, consumer, producer);
 
+    let (before_attendance, _) = run_goods_trade_days(&mut worker, consumer, producer, 2);
+    assert_eq!(before_attendance.imported_goods_sold, 0);
+
     let (consumer_economy, producer_economy) =
-        run_goods_trade_days(&mut worker, consumer, producer, 2);
+        run_goods_trade_days(&mut worker, consumer, producer, 8);
 
     assert_eq!(consumer_economy.local_goods_sold, 0);
     assert_eq!(consumer_economy.imported_goods_sold, 1);
@@ -1456,6 +1463,17 @@ fn run_goods_trade_days(
             } else if reply.region_id == producer {
                 producer_economy = tick_economy(&reply.result.events[0]);
             }
+        }
+
+        for sub_tick in 1..=6 {
+            let step = TravelStepId(u64::from(turn(worker, consumer)) * 6 + sub_tick);
+            worker
+                .push_event(consumer, RegionEvent::StepTravel { step })
+                .unwrap();
+            worker
+                .push_event(producer, RegionEvent::StepTravel { step })
+                .unwrap();
+            drain_worker(worker);
         }
     }
     (consumer_economy, producer_economy)

@@ -1,6 +1,6 @@
 //! Citizen entity support, including home links, happiness, and aggregate population sync.
 
-use crate::core::components::{Citizen, Morale};
+use crate::core::components::{Citizen, CitizenArrivalAction, Morale};
 use crate::core::entity::Entity;
 use crate::core::systems::{road_connectivity, road_network_analysis};
 use crate::core::world::World;
@@ -19,6 +19,9 @@ pub(crate) fn spawn_for_home(world: &mut World, residential: Entity, count: i32)
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,
+                arrival_action: CitizenArrivalAction::ReturnHome,
+                work_trip_generation: 0,
+                attended_since_daily_settlement: false,
             },
         );
     }

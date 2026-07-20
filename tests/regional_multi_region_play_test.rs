@@ -72,9 +72,7 @@ fn regional_view_reports_city_goods_and_city_aware_inspect_notes() {
     build_goods_producer(&game, RegionId(1));
     build_goods_consumer(&game, RegionId(2));
 
-    for _ in 0..(7 * 24) {
-        game.tick_all_regions().unwrap();
-    }
+    advance_city_for_hours(&game, 7 * 24);
 
     let view = game.view().unwrap();
     assert!(view.goods.city_goods_produced > 0, "{:?}", view.goods);
@@ -117,9 +115,7 @@ fn commercial_inspect_reports_outside_goods_sales_when_city_supply_missing() {
     let game = RegionalGame::two_region_default(3, 3).unwrap();
     build_goods_consumer(&game, RegionId(2));
 
-    for _ in 0..(2 * 24) {
-        game.tick_all_regions().unwrap();
-    }
+    advance_city_for_hours(&game, 7 * 24);
 
     let inspect = game.inspect_region(RegionId(2), 1, 0).unwrap();
     let Some(InspectDetailsView::Commercial {
@@ -187,7 +183,7 @@ fn disconnecting_a_goods_road_stops_cross_region_imports() {
     build_goods_producer(&game, RegionId(1));
     build_goods_consumer(&game, RegionId(2));
 
-    tick_city_for_hours(&game, 24 * 7);
+    advance_city_for_hours(&game, 24 * 7);
 
     let before_disconnect = game.inspect_region(RegionId(2), 1, 0).unwrap();
     let Some(InspectDetailsView::Commercial {
@@ -202,7 +198,7 @@ fn disconnecting_a_goods_road_stops_cross_region_imports() {
     // This is region 1's only east-border road, so removing it disconnects
     // the producer's industrial network from region 2.
     assert!(game.bulldoze(RegionId(1), 2, 0).unwrap().success);
-    tick_city_for_hours(&game, 24 * 3);
+    advance_city_for_hours(&game, 24 * 3);
 
     let after_disconnect = game.inspect_region(RegionId(2), 1, 0).unwrap();
     let Some(InspectDetailsView::Commercial {
@@ -212,7 +208,10 @@ fn disconnecting_a_goods_road_stops_cross_region_imports() {
     else {
         panic!("expected commercial inspect");
     };
-    assert_eq!(goods_sold_from_city, 0, "no goods arrive after the disconnect");
+    assert_eq!(
+        goods_sold_from_city, 0,
+        "no goods arrive after the disconnect"
+    );
     assert!(
         after_disconnect
             .flags
@@ -714,6 +713,12 @@ fn tick_region_for_one_day(game: &RegionalGame, region: RegionId) {
 fn tick_city_for_hours(game: &RegionalGame, hours: usize) {
     for _ in 0..hours {
         assert!(game.tick_city().unwrap().success);
+    }
+}
+
+fn advance_city_for_hours(game: &RegionalGame, hours: usize) {
+    for _ in 0..hours * 6 {
+        game.advance().unwrap();
     }
 }
 

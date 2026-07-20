@@ -29,7 +29,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::core::city_refs::CityCellRef;
 use crate::core::components::{
-    HandoffKind, PendingHandoff, Position, PowerSource, TravelState, TravelToken, TravelerHandoff,
+    CitizenArrivalAction, HandoffKind, PendingDestinationArrival, PendingHandoff, PlaceRef,
+    Position, PowerSource, TravelState, TravelToken, TravelerHandoff, TravelerId,
     WorkplaceAssignment,
 };
 use crate::core::entity::Entity;
@@ -427,6 +428,36 @@ impl RegionState {
     /// layer to drain (`drain_traveler_handoffs`).
     pub(crate) fn step_travel(&mut self) {
         travel::step_tokens(&mut self.world);
+    }
+
+    /// Drains work-arrival facts produced by the core movement step. The runtime
+    /// owns coordinator routing; this state layer owns the World buffer.
+    pub(crate) fn drain_destination_arrivals(&mut self) -> Vec<PendingDestinationArrival> {
+        std::mem::take(&mut self.world.outgoing_destination_arrivals)
+    }
+
+    /// Records attendance only when the home-owned current work trip reached the
+    /// citizen's still-assigned workplace.
+    pub(crate) fn apply_destination_arrived(
+        &mut self,
+        traveler: TravelerId,
+        destination: PlaceRef,
+    ) {
+        let Some(citizen) = self.world.citizens.get_mut(&traveler.citizen) else {
+            return;
+        };
+        let Some(assignment) = citizen.workplace_assignment else {
+            return;
+        };
+        if citizen.arrival_action != CitizenArrivalAction::StartWorkShift
+            || citizen.work_trip_generation != traveler.generation
+            || assignment.workplace != destination.building
+        {
+            return;
+        }
+
+        citizen.attended_since_daily_settlement = true;
+        citizen.arrival_action = CitizenArrivalAction::ReturnHome;
     }
 
     /// Applies one player build command through the core systems.
@@ -3308,7 +3339,7 @@ mod tests {
     }
 
     #[test]
-    fn an_applied_remote_assignment_is_paid_by_the_next_daily_economy_phase() {
+    fn an_attended_remote_assignment_is_paid_by_the_next_daily_economy_phase() {
         // P4 review checks: "payment path uses home-region
         // Citizen.workplace_assignment" and "accepted worker is paid on the next
         // daily economy phase after apply."
@@ -3324,8 +3355,14 @@ mod tests {
         economy::run(&mut region.world, &[]);
         let jobless_delta = region.world.citizens[&citizen].money - before;
 
-        // Now apply the remote assignment and settle another day.
+        // Now apply the remote assignment, record the P1 arrival, and settle.
         assert!(region.apply_workplace_assignment(citizen, assignment));
+        region
+            .world
+            .citizens
+            .get_mut(&citizen)
+            .unwrap()
+            .attended_since_daily_settlement = true;
         let before = region.world.citizens[&citizen].money;
         economy::run(&mut region.world, &[]);
         let employed_delta = region.world.citizens[&citizen].money - before;
@@ -3546,10 +3583,12 @@ mod tests {
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,
+                arrival_action: CitizenArrivalAction::ReturnHome,
+                work_trip_generation: 1,
+                attended_since_daily_settlement: false,
             },
         );
         a.world.away_residents.insert(citizen);
-        a.world.away_generation.insert(citizen, 1);
         let home = Entity::new(RegionId(1), 0);
         let workplace = Entity::new(RegionId(2), 9);
         let token = TravelToken {
@@ -3642,10 +3681,12 @@ mod tests {
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,
+                arrival_action: CitizenArrivalAction::ReturnHome,
+                work_trip_generation: 1,
+                attended_since_daily_settlement: false,
             },
         );
         a.world.away_residents.insert(citizen);
-        a.world.away_generation.insert(citizen, 1);
 
         let bounce = a.receive_traveler_handoff(TravelerHandoff {
             token: TravelToken {
@@ -3751,6 +3792,9 @@ mod tests {
                     rent_stress: 0,
                 },
                 money: 0,
+                arrival_action: CitizenArrivalAction::ReturnHome,
+                work_trip_generation: 0,
+                attended_since_daily_settlement: false,
             },
         );
         // attach_citizen itself dirties the flag; clear it to isolate the

@@ -130,11 +130,17 @@ pub(crate) fn run_with_goods_exports(
         // Salary/tax come from the assigned workplace; rent comes from the
         // citizen's home land value and building level; shopping tax comes from
         // the next available commercial shopping slot.
-        let (home, workplace_assignment) = world
+        let (home, workplace_assignment, attended) = world
             .citizens
             .get(&citizen_entity)
-            .map(|citizen| (citizen.home, citizen.workplace_assignment))
-            .unwrap_or((Entity(u64::MAX), None));
+            .map(|citizen| {
+                (
+                    citizen.home,
+                    citizen.workplace_assignment,
+                    citizen.attended_since_daily_settlement,
+                )
+            })
+            .unwrap_or((Entity(u64::MAX), None, false));
         // A remote workplace pays the citizen salary captured at grant time but
         // collects no local workplace tax: that tax accrues to the exporting
         // region instead (see `exported_job_slots` below).
@@ -142,7 +148,7 @@ pub(crate) fn run_with_goods_exports(
         // salary/tax from authoritative world state; a remote job pays the salary
         // captured at grant time and collects no local workplace tax (that accrues to
         // the exporting region — see `exported_job_slots`).
-        let salary = match workplace_assignment {
+        let (ungated_salary, local_workplace_tax) = match workplace_assignment {
             Some(assignment) => match assignment.workplace.as_local(world.region_id) {
                 Some(workplace) => salary_for_workplace(world, workplace)
                     .map(|salary| (salary, workplace_tax_for_workplace(world, workplace)))
@@ -151,6 +157,7 @@ pub(crate) fn run_with_goods_exports(
             },
             None => (0, 0),
         };
+        let salary = if attended { ungated_salary } else { 0 };
         let rent = rent_per_citizen(world, home);
         let shopping = next_shopping_offer(world, home, &shopping_slots);
 
@@ -162,13 +169,15 @@ pub(crate) fn run_with_goods_exports(
                 continue;
             };
 
-            // Salary is private citizen money. Workplace tax is the city's income
-            // from that productive job. Industrial jobs intentionally pay more tax
-            // than commercial jobs.
-            if salary.0 > 0 {
-                citizen.money += salary.0;
-                salaries_paid += salary.0;
-                workplace_tax += salary.1;
+            // Attendance gates the citizen's private salary. Producer-side local
+            // workplace tax remains tied to productive capacity, and remote tax
+            // still accrues through the exporting region's contract slot below.
+            if salary > 0 {
+                citizen.money += salary;
+                salaries_paid += salary;
+            }
+            if ungated_salary > 0 {
+                workplace_tax += local_workplace_tax;
             }
 
             // Rent is paid per citizen. Failure does not remove the citizen, but it
@@ -213,6 +222,7 @@ pub(crate) fn run_with_goods_exports(
             }
 
             citizen.morale.actual = citizen.morale.actual.clamp(0, 100);
+            citizen.attended_since_daily_settlement = false;
         }
         if let Some(commercial) = sold_local_good_from {
             consume_local_good(world, commercial);
@@ -1054,13 +1064,49 @@ mod tests {
             citizens::apply_daily_happiness_decay(&mut world);
             citizens::update_happiness(&mut world);
             // The daily tick assigns local jobs before the economy settles; mirror
-            // that here so the citizen earns the salary it spends on shopping.
+            // that here, then record the P1 work arrival before the citizen earns
+            // the salary it spends on shopping.
             super::assign_local_jobs(&mut world, RegionId(1));
+            world
+                .citizens
+                .get_mut(&citizen)
+                .expect("citizen remains present")
+                .attended_since_daily_settlement = true;
             let economy = run(&mut world, &[]);
             assert_eq!(economy.shoppers_served, 1);
         }
 
         assert_eq!(citizen_decay(&world, citizen), 0);
+    }
+
+    #[test]
+    fn attendance_gates_local_salary_but_not_local_workplace_tax() {
+        let (mut world, citizen) = shopping_recovery_world(false, true);
+        super::assign_local_jobs(&mut world, RegionId(1));
+        let workplace = world.citizens[&citizen]
+            .workplace_assignment
+            .expect("local job assigned")
+            .workplace;
+        let expected_tax = super::workplace_tax_for_workplace(&world, workplace);
+
+        let unattended = run(&mut world, &[]);
+
+        assert_eq!(unattended.salaries_paid, 0);
+        assert_eq!(unattended.workplace_tax, expected_tax);
+        assert!(
+            !world.citizens[&citizen].attended_since_daily_settlement,
+            "daily settlement clears the attendance interval"
+        );
+
+        world
+            .citizens
+            .get_mut(&citizen)
+            .unwrap()
+            .attended_since_daily_settlement = true;
+        let attended = run(&mut world, &[]);
+
+        assert!(attended.salaries_paid > 0);
+        assert_eq!(attended.workplace_tax, expected_tax);
     }
 
     fn shopping_recovery_world(with_local_goods: bool, connected_shop: bool) -> (World, Entity) {

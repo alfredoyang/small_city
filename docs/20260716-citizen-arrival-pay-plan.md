@@ -1,6 +1,6 @@
 # Citizen arrival-pay plan
 
-Status: **plan**.
+Status: **P1/P2 implemented; P3 deferred**.
 
 ## Goal
 
@@ -386,6 +386,17 @@ citizen salary: local workplace tax remains derived from the effective local
 workplace, and exported workplace tax remains contract-based in the producer
 region. An unpaid worker therefore does not change either producer-side tax
 path. A later balance decision may gate producer tax on attendance too.
+
+```text
+startup balance risk
+  newly assigned citizens have no attendance until they complete one commute
+  -> first rent settlement can fail
+  -> missed-rent morale can temporarily lower happiness
+
+P2 accepts this bounded startup pressure. Scenario coverage limits it in a
+healthy starter city; changing rent timing, morale, or starting money is a
+separate balance decision.
+```
 
 ## Save/load
 

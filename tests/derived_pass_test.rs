@@ -144,13 +144,13 @@ fn midday_workplace_change_does_not_settle_money_until_daily_boundary() {
     assert!(game.build(2, 0, BuildingKind::Commercial).success);
     let after_build_money = game.view().status.money;
 
-    assert!(game.tick().success);
+    advance_one_hour(&mut game);
     let after_midday_tick = game.view();
     assert_eq!(after_midday_tick.status.turn, 25);
     assert_eq!(after_midday_tick.status.money, after_build_money);
 
     for _ in 0..23 {
-        assert!(game.tick().success);
+        advance_one_hour(&mut game);
     }
     assert_ne!(
         game.view().status.money,
@@ -159,26 +159,26 @@ fn midday_workplace_change_does_not_settle_money_until_daily_boundary() {
     );
 }
 
-/// DT3 should keep the running simulation stable: the assignment visible before
-/// economy settlement is the one salary/tax uses at the next daily boundary.
+/// Arrival-gated payroll: the assignment visible before economy settlement pays
+/// only after the citizen has completed a work commute in the prior interval.
 #[test]
-fn money_and_assignments_match_scripted_tick_values_after_dt3_split() {
+fn money_and_assignments_match_scripted_values_after_arrival_gated_pay() {
     let mut game = SingleRegionTestGame::new(5, 4);
     build_growth_city(&mut game);
 
     advance_one_day(&mut game);
     assert_eq!(assignment_count(&game.view(), 1, 0), 1);
-    assert_eq!(game.view().status.money, 65);
+    assert_eq!(game.view().status.money, 63);
 
     advance_one_day(&mut game);
     assert_eq!(assignment_count(&game.view(), 1, 0), 2);
-    assert_eq!(game.view().status.money, 71);
+    assert_eq!(game.view().status.money, 65);
 }
 
-/// DT4 is an audit/ordering cleanup, so a longer running script should keep the
-/// same time outputs: turn, money, population, and assignment count.
+/// Arrival-gated payroll changes first-day income but remains deterministic over
+/// a longer running script.
 #[test]
-fn long_scripted_run_pins_time_outputs_after_dt4_audit() {
+fn long_scripted_run_pins_time_outputs_after_arrival_gated_pay() {
     let mut game = SingleRegionTestGame::new(5, 4);
     build_growth_city(&mut game);
 
@@ -189,7 +189,7 @@ fn long_scripted_run_pins_time_outputs_after_dt4_audit() {
     let view = game.view();
     assert_eq!(view.status.turn, 336);
     assert_eq!(view.status.population, 2);
-    assert_eq!(view.status.money, 143);
+    assert_eq!(view.status.money, 137);
     assert_eq!(assignment_count(&view, 1, 0), 2);
 }
 
@@ -237,21 +237,21 @@ fn paused_amenity_change_moves_happiness_target_without_actual_happiness() {
 
 /// DT2 should not change actual happiness during normal ticking. This pins a
 /// scripted run where a citizen grows, a paused amenity changes only the target,
-/// then the next daily tick applies the same actual-happiness formula as before:
-/// target minus accumulated daily decay.
+/// then the next daily settlement applies attendance-gated income before the
+/// actual-happiness formula.
 #[test]
-fn actual_happiness_matches_scripted_tick_values_after_h2_split() {
+fn actual_happiness_matches_scripted_values_after_arrival_gated_pay() {
     let mut game = SingleRegionTestGame::new(5, 4);
     build_growth_city(&mut game);
 
     advance_one_day(&mut game);
-    assert_happiness(&game.view(), Some(75), Some(76));
+    assert_happiness(&game.view(), Some(70), Some(76));
 
     assert!(game.build(1, 2, BuildingKind::Park).success);
-    assert_happiness(&game.view(), Some(75), Some(92));
+    assert_happiness(&game.view(), Some(70), Some(92));
 
     advance_one_day(&mut game);
-    assert_happiness(&game.view(), Some(85), Some(87));
+    assert_happiness(&game.view(), Some(78), Some(87));
 }
 
 fn build_growth_city(game: &mut SingleRegionTestGame) {
@@ -286,7 +286,13 @@ fn assignment_count(view: &GameView, x: usize, y: usize) -> usize {
 }
 
 fn advance_one_day(game: &mut SingleRegionTestGame) {
-    for _ in 0..24 {
-        assert!(game.tick().success);
+    for _ in 0..24 * 6 {
+        let _ = game.advance();
+    }
+}
+
+fn advance_one_hour(game: &mut SingleRegionTestGame) {
+    for _ in 0..6 {
+        let _ = game.advance();
     }
 }

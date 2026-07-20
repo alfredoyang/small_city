@@ -76,7 +76,7 @@ fn tick_returns_structured_summary_events() {
         assert!(game.build(x, 1, BuildingKind::Road).success);
     }
 
-    let result = advance_one_week(&mut game);
+    let result = advance_one_working_week(&mut game);
 
     assert!(result.success);
     assert_eq!(result.events.len(), 3);
@@ -91,8 +91,8 @@ fn tick_returns_structured_summary_events() {
                 after: 5
             },
             money: MetricChange {
-                before: 216,
-                after: 249
+                before: 195,
+                after: 228
             },
             happiness: MetricChange {
                 before: 90,
@@ -166,11 +166,11 @@ fn tick_summary_message_includes_metric_changes() {
         assert!(game.build(x, 1, BuildingKind::Road).success);
     }
 
-    let message = advance_one_week(&mut game).message();
+    let message = advance_one_working_week(&mut game).message();
 
     assert!(message.contains("population 5 (+0)"));
     assert!(message.contains("Year 1, Month 1, Week 2, Day 1, 00:00"));
-    assert!(message.contains("money 260 (+34)"));
+    assert!(message.contains("money 239 (+34)"));
     assert!(message.contains("powered buildings 3 (+0)"));
     // The message expectation changed because tick feedback now explains goods
     // production, local/imported sales, export flow, and related taxes.
@@ -283,4 +283,16 @@ fn advance_one_week(
         result = game.tick();
     }
     result
+}
+
+fn advance_one_working_week(
+    game: &mut SingleRegionTestGame,
+) -> small_city::interface::events::CommandResult {
+    let mut result = None;
+    for _ in 0..24 * 7 * 6 {
+        if let Some(tick) = game.advance() {
+            result = Some(tick);
+        }
+    }
+    result.expect("one week includes daily economy")
 }

@@ -95,11 +95,9 @@ pub(crate) struct World {
     // re-derives placement on the next tick.
     #[serde(skip, default)]
     pub(crate) tokens: HashMap<Entity, crate::core::components::TravelToken>,
-    // R-a: the home region's record of residents currently away across a region
-    // boundary. Inserted on cross-out (the token is placed in the neighbour),
-    // removed on home-arrival (the token is back, idle-at-home, no token
-    // needed). Together with `away_generation` it disambiguates a cross-region
-    // away resident from an idle/new one. `#[serde(skip)]` like `tokens`.
+    // The home region's record of residents on an active local-or-cross-region
+    // commute. Inserted when a work token is created and removed when the token
+    // returns home. `#[serde(skip)]` like `tokens`.
     #[serde(skip, default)]
     pub(crate) away_residents: std::collections::HashSet<Entity>,
     // P5: crossings this region decided on this tick (moves and rollbacks),
@@ -107,15 +105,17 @@ pub(crate) struct World {
     // them. The core only produces them; it never routes.
     #[serde(skip, default)]
     pub(crate) outgoing_handoffs: Vec<crate::core::components::PendingHandoff>,
+    // P1: work-arrival facts produced by the core mover. The regions layer drains
+    // and routes them to the citizen's home region; core never imports runtime
+    // messaging types.
+    #[serde(skip, default)]
+    pub(crate) outgoing_destination_arrivals:
+        Vec<crate::core::components::PendingDestinationArrival>,
     // P5/P-c input: "to reach final target region R, walk to one of these local
     // route exits." Each candidate carries its road cell, border link, and immediate
     // next-hop region from the Layer-1 route map. Empty means no remote commuting.
     #[serde(skip, default)]
     pub(crate) remote_exit_cells: HashMap<RegionId, Vec<RouteExit>>,
-    // P5: per-citizen generation of the trip currently out of region, so a stale
-    // `Return` (generation mismatch) is ignored. Bumped on each outbound emit.
-    #[serde(skip, default)]
-    pub(crate) away_generation: HashMap<Entity, u32>,
     // DT1: marks the applied derived state (powered flags, stats, pollution,
     // local effects, happiness) out of date after a config change. Unlike the
     // registry cache above (which stores derived *resolution data* recomputed
@@ -238,8 +238,8 @@ impl World {
             tokens: HashMap::new(),
             away_residents: std::collections::HashSet::new(),
             outgoing_handoffs: Vec::new(),
+            outgoing_destination_arrivals: Vec::new(),
             remote_exit_cells: HashMap::new(),
-            away_generation: HashMap::new(),
             derived_dirty: Cell::new(false),
             road_topology_dirty: Cell::new(false),
             hints_dirty: Cell::new(false),
@@ -716,6 +716,9 @@ mod tests {
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,
+                arrival_action: crate::core::components::CitizenArrivalAction::ReturnHome,
+                work_trip_generation: 0,
+                attended_since_daily_settlement: false,
             },
         );
 
@@ -743,6 +746,9 @@ mod tests {
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,
+                arrival_action: crate::core::components::CitizenArrivalAction::ReturnHome,
+                work_trip_generation: 0,
+                attended_since_daily_settlement: false,
             },
         );
 
