@@ -1,6 +1,6 @@
 # Citizen arrival-pay plan
 
-Status: **P1/P2 implemented; P3 deferred**.
+Status: **implemented**.
 
 ## Goal
 
@@ -355,15 +355,9 @@ inside the existing entity-sorted economy loop:
   attended_since_daily_settlement = false
 ```
 
-This intentionally does not prorate a late arrival. A later work-credit plan
-can replace the boolean attendance record with worked 10-minute subticks while
-keeping the same `DestinationArrived` and home-owned-purpose protocol.
-
-For a remote worker, the token host cannot mutate the home-owned `Citizen`.
-P3 must therefore report compact worked intervals to the home region, never one
-credit event per movement subtick. The host accumulates credit while its token
-is parked `AtWork`, then routes an interval on work departure and on any daily
-settlement cut that would otherwise cross a payroll boundary.
+This is the final payroll rule: one accepted workplace arrival earns the full
+daily salary. Late arrival earns the same salary as an early arrival; there is
+no worked-time credit, prorated pay, or per-subtick employment accounting.
 
 ## Boundaries
 
@@ -610,67 +604,5 @@ fn settle_daily_payroll(world: &mut World) {
         };
         citizen.attended_since_daily_settlement = false;
     }
-}
-```
-
-### P3: Worked-time credit (later)
-
-```text
-Scope
-  replace daily boolean attendance with 10-minute work credit and prorated pay;
-  report remote worked intervals to the citizen's home region at departure and
-  at a daily settlement cut, not once per work subtick.
-
-Tests
-  late arrival earns less than full-day arrival
-  unreachable citizen earns zero
-  fractional-credit rounding is deterministic
-```
-
-```rust
-// Token host: keeps this transient counter with the token while it is parked.
-fn record_work_subtick(token: &mut TravelToken) {
-    let Some(work) = token.work else {
-        return;
-    };
-    if token.state.status == TravelStatus::AtWork
-        && token.state.building == Some(work.building)
-    {
-        token.worked_subticks_since_report += 1;
-    }
-}
-
-// Token host: emit once at work departure, or split at the daily boundary.
-fn report_worked_interval(
-    token: &mut TravelToken,
-    citizen: Entity,
-) -> Option<PendingWorkedInterval> {
-    let workplace = token.work?;
-    let worked_subticks = std::mem::take(&mut token.worked_subticks_since_report);
-    Some(PendingWorkedInterval {
-        traveler: TravelerId { citizen, generation: token.trip_gen },
-        workplace,
-        worked_subticks,
-    })
-}
-
-// Home region: after P1 accepted arrival, the action is ReturnHome. Validate
-// that current trip stamp and workplace, then add the compact interval credit.
-fn apply_worked_interval(home: &mut RegionState, interval: WorkedInterval) {
-    if !current_work_interval_is_valid(home, interval.traveler, interval.workplace) {
-        return;
-    }
-    let Some(citizen) = home.world.citizens.get_mut(&interval.traveler.citizen)
-    else {
-        return;
-    };
-    citizen.worked_subticks_since_daily_settlement += interval.worked_subticks;
-}
-
-// full_daily_salary comes from the same local-authoritative / remote-captured
-// salary lookup P2 preserves; this helper only prorates that result.
-fn prorated_salary(citizen: &Citizen, full_daily_salary: i32) -> i32 {
-    full_daily_salary * citizen.worked_subticks_since_daily_settlement
-        / WORK_SUBTICKS_PER_DAY
 }
 ```
