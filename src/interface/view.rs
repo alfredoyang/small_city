@@ -82,6 +82,10 @@ pub struct CitizenDetailView {
     pub age: u32,
     pub happiness: i32,
     pub money: i32,
+    /// Whether this assigned citizen has not reached work since the last daily
+    /// settlement. Only meaningful for a residential roster entry with `WorksAt`.
+    #[serde(default)]
+    pub unpaid_since_daily_settlement: bool,
     pub relation: CitizenRelation,
 }
 
@@ -295,6 +299,10 @@ pub enum InspectDetailsView {
         average_happiness: Option<i32>,
         average_happiness_target: Option<i32>,
         average_money: Option<i32>,
+        /// Assigned residents who have not reached their workplace since the
+        /// last daily settlement.
+        #[serde(default)]
+        unpaid_citizens: i32,
         job_assignments: Vec<JobAssignmentView>,
     },
     Commercial {

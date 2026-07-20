@@ -49,6 +49,7 @@ fn inspect_residential_shows_powered_state_and_population() {
             average_happiness: None,
             average_happiness_target: None,
             average_money: None,
+            unpaid_citizens: 0,
             job_assignments: Vec::new(),
         })
     );
@@ -74,10 +75,15 @@ fn inspect_and_cell_view_show_local_citizen_workplace_tile() {
     }
 
     let inspect = game.inspect(1, 0);
-    let assignment = match &inspect.details {
+    let (assignment, unpaid_citizens) = match &inspect.details {
         Some(InspectDetailsView::Residential {
-            job_assignments, ..
-        }) => job_assignments.first().copied().expect("local assignment"),
+            job_assignments,
+            unpaid_citizens,
+            ..
+        }) => (
+            job_assignments.first().copied().expect("local assignment"),
+            *unpaid_citizens,
+        ),
         details => panic!("expected residential inspect, got {details:?}"),
     };
     let cell_assignment = game
@@ -93,8 +99,26 @@ fn inspect_and_cell_view_show_local_citizen_workplace_tile() {
     assert_eq!((assignment.cell.x, assignment.cell.y), (2, 0));
     assert_eq!(assignment.salary, 3);
     assert!(!assignment.is_remote);
+    assert_eq!(unpaid_citizens, 1);
     assert_eq!(cell_assignment, assignment);
     assert!(format_inspect(&inspect).contains("local R1 (2, 0) salary 3"));
+    assert!(format_inspect(&inspect).contains("Unpaid  1 not arrived"));
+
+    // Advance through 09:00 (the work-phase start) and enough movement steps
+    // for this two-road local commute to arrive.
+    for _ in 0..60 {
+        let _ = game.advance();
+    }
+
+    let arrived_inspect = game.inspect(1, 0);
+    let arrived_unpaid_citizens = match &arrived_inspect.details {
+        Some(InspectDetailsView::Residential {
+            unpaid_citizens, ..
+        }) => *unpaid_citizens,
+        details => panic!("expected residential inspect, got {details:?}"),
+    };
+    assert_eq!(arrived_unpaid_citizens, 0);
+    assert!(format_inspect(&arrived_inspect).contains("Unpaid  0 not arrived"));
 }
 
 #[test]
@@ -128,6 +152,7 @@ fn roster_lists_residents_with_their_workplace_and_workers_with_their_home() {
             is_remote: false,
         } if cell.x == 2 && cell.y == 0
     ));
+    assert!(residential.roster[0].unpaid_since_daily_settlement);
 
     // Workplace roster: the local worker, tagged with where they live.
     let commercial = game.inspect(2, 0);
@@ -147,6 +172,11 @@ fn roster_lists_residents_with_their_workplace_and_workers_with_their_home() {
 
     // Deterministic: the same state inspected twice yields the identical roster.
     assert_eq!(game.inspect(1, 0).roster, residential.roster);
+
+    for _ in 0..60 {
+        let _ = game.advance();
+    }
+    assert!(!game.inspect(1, 0).roster[0].unpaid_since_daily_settlement);
 }
 
 #[test]

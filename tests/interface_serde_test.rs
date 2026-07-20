@@ -172,6 +172,7 @@ fn sample_inspect_view() -> InspectView {
             age: 35,
             happiness: 70,
             money: 12_000,
+            unpaid_since_daily_settlement: false,
             relation: CitizenRelation::LivesAt {
                 region: None,
                 x: 4,

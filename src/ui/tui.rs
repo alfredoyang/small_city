@@ -1415,7 +1415,7 @@ fn cell_has_roster(inspect: &InspectView) -> bool {
 /// Modal roster of the selected building's citizens.
 ///
 /// ```text
-///  Residential          -> residents,      each row: where they work
+///  Residential          -> residents,      each row: arrival status and where they work
 ///  Commercial/Industrial -> local workers,  each row: where they live
 /// ```
 ///
@@ -1485,7 +1485,12 @@ fn render_citizen_panel(
         // Last column is context-sensitive: on a workplace it lists where each worker lives;
         // on a residential it lists where each resident works.
         let relation_header = if is_workplace { "Lives at" } else { "Works at" };
-        let header = Row::new(["#", "Age", "Happy", "$", relation_header]).style(
+        let mut header_cells = vec!["#", "Age", "Happy", "$"];
+        if !is_workplace {
+            header_cells.push("Arrival");
+        }
+        header_cells.push(relation_header);
+        let header = Row::new(header_cells).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -1498,27 +1503,32 @@ fn render_citizen_panel(
                 .chain(remote.iter())
                 .enumerate()
                 .map(|(index, citizen)| {
-                    Row::new([
+                    let mut cells = vec![
                         format!("#{}", index + 1),
                         citizen.age.to_string(),
                         citizen.happiness.to_string(),
                         format!("${}", citizen.money),
-                        relation_text(citizen),
-                    ])
+                    ];
+                    if !is_workplace {
+                        cells.push(arrival_text(citizen).to_string());
+                    }
+                    cells.push(relation_text(citizen));
+                    Row::new(cells)
                 });
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(4),
-                Constraint::Length(5),
-                Constraint::Length(6),
-                Constraint::Length(6),
-                Constraint::Min(12),
-            ],
-        )
-        .header(header)
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("> ");
+        let mut widths = vec![
+            Constraint::Length(4),
+            Constraint::Length(5),
+            Constraint::Length(6),
+            Constraint::Length(6),
+        ];
+        if !is_workplace {
+            widths.push(Constraint::Length(12));
+        }
+        widths.push(Constraint::Min(12));
+        let table = Table::new(rows, widths)
+            .header(header)
+            .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("> ");
         // Clamp in case the roster shrank while the panel was open: ratatui scrolls an
         // out-of-range selection into view but won't draw the highlight, so the cursor
         // would vanish. `total` is non-zero here, so the subtraction is safe.
@@ -1693,6 +1703,14 @@ fn relation_text(citizen: &CitizenDetailView) -> String {
             Some(region) => format!("region {} ({},{})", region.0, x, y),
             None => format!("({x},{y})"),
         },
+    }
+}
+
+fn arrival_text(citizen: &CitizenDetailView) -> &'static str {
+    match citizen.relation {
+        CitizenRelation::WorksAt { .. } if citizen.unpaid_since_daily_settlement => "not arrived",
+        CitizenRelation::WorksAt { .. } => "arrived",
+        _ => "-",
     }
 }
 
@@ -2056,6 +2074,7 @@ fn tui_inspect_card(inspect: &InspectView) -> (String, Vec<String>) {
             average_happiness,
             average_happiness_target,
             average_money,
+            unpaid_citizens,
             job_assignments,
         } => vec![
             tui_status_line(
@@ -2082,6 +2101,7 @@ fn tui_inspect_card(inspect: &InspectView) -> (String, Vec<String>) {
                 option_value(*average_money),
                 rent_per_citizen
             ),
+            format!("Unpaid  {} not arrived", unpaid_citizens),
             format!("Work    {}", tui_job_summary(job_assignments)),
         ],
         InspectDetailsView::Commercial {
@@ -4256,6 +4276,7 @@ mod tests {
             age: 27,
             happiness: 72,
             money: 14,
+            unpaid_since_daily_settlement: false,
             relation: CitizenRelation::Unemployed,
         }];
 
@@ -4300,6 +4321,7 @@ mod tests {
             age: 27,
             happiness: 72,
             money: 14,
+            unpaid_since_daily_settlement: false,
             relation: CitizenRelation::Unemployed,
         }];
         let visitors = vec![RoadTravelerEndpointView {
@@ -4452,6 +4474,7 @@ mod tests {
             age: 27,
             happiness: 72,
             money: 14,
+            unpaid_since_daily_settlement: false,
             relation: CitizenRelation::WorksAt {
                 cell: CityCellRef::local(RegionId(1), 2, 0),
                 salary: 3,
@@ -4516,6 +4539,7 @@ mod tests {
                     age: 27,
                     happiness: 72,
                     money: 14,
+                    unpaid_since_daily_settlement: true,
                     relation: CitizenRelation::WorksAt {
                         cell: CityCellRef::local(RegionId(1), 2, 0),
                         salary: 3,
@@ -4526,6 +4550,7 @@ mod tests {
                     age: 34,
                     happiness: 41,
                     money: 3,
+                    unpaid_since_daily_settlement: false,
                     relation: CitizenRelation::Unemployed,
                 },
             ],
@@ -4546,9 +4571,11 @@ mod tests {
         // residential-style roster — details None is not a workplace — so "Works at").
         assert!(text.contains("Age"));
         assert!(text.contains("Happy"));
+        assert!(text.contains("Arrival"));
         assert!(text.contains("Works at"));
         // Per-row, column-aligned values (no verb — the header supplies it).
         assert!(text.contains("(2,0) · $3"));
+        assert!(text.contains("not arrived"));
         assert!(text.contains("unemployed"));
         // The selected row (index 1) carries the cursor symbol.
         assert!(text.contains("> #2"));
@@ -4563,6 +4590,29 @@ mod tests {
             })
             .expect("render citizen panel");
         assert!(buffer_text(terminal.backend().buffer()).contains("> #2"));
+
+        let arrived = InspectView {
+            roster: vec![CitizenDetailView {
+                unpaid_since_daily_settlement: false,
+                relation: CitizenRelation::WorksAt {
+                    cell: CityCellRef::local(RegionId(1), 2, 0),
+                    salary: 3,
+                    is_remote: false,
+                },
+                ..inspect.roster[0]
+            }],
+            ..inspect.clone()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_citizen_panel(frame, area, &arrived, &[], 0);
+            })
+            .expect("render arrived citizen panel");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("arrived"));
+        assert!(!text.contains("not arrived"));
 
         // On a workplace (Industrial details) the last column flips to "Lives at".
         let workplace = InspectView {
@@ -4588,7 +4638,9 @@ mod tests {
                 render_citizen_panel(frame, area, &workplace, &[], 0);
             })
             .expect("render citizen panel");
-        assert!(buffer_text(terminal.backend().buffer()).contains("Lives at"));
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Lives at"));
+        assert!(!text.contains("Arrival"));
     }
 
     /// A workplace roster mixing a local worker and a remote commuter: both rows
@@ -4626,6 +4678,7 @@ mod tests {
                 age: 40,
                 happiness: 55,
                 money: 8,
+                unpaid_since_daily_settlement: false,
                 relation: CitizenRelation::LivesAt {
                     region: None,
                     x: 0,
@@ -4639,6 +4692,7 @@ mod tests {
             age: 31,
             happiness: 70,
             money: 9,
+            unpaid_since_daily_settlement: false,
             relation: CitizenRelation::LivesAt {
                 region: Some(RegionId(1)),
                 x: 4,

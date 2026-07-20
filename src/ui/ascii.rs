@@ -534,6 +534,7 @@ pub fn inspect_card_lines(inspect: &InspectView) -> Vec<String> {
             average_happiness,
             average_happiness_target,
             average_money,
+            unpaid_citizens,
             job_assignments,
         } => with_flag_line(
             inspect,
@@ -561,6 +562,7 @@ pub fn inspect_card_lines(inspect: &InspectView) -> Vec<String> {
                     optional_number(*average_money),
                     rent_per_citizen
                 ),
+                format!("Unpaid  {} not arrived", unpaid_citizens),
                 format!("Work    {}", format_job_assignments(job_assignments)),
                 local_effects_line(inspect),
             ],

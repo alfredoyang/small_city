@@ -258,6 +258,8 @@ pub(crate) fn road_traveler_panel_seed(
                     age: citizen.age,
                     happiness: citizen.morale.actual,
                     money: citizen.money,
+                    unpaid_since_daily_settlement: citizen.workplace_assignment.is_some()
+                        && !citizen.attended_since_daily_settlement,
                     relation: citizen_relation(world, BuildingKind::Residential, citizen),
                 });
             }
@@ -345,6 +347,8 @@ fn citizen_roster(world: &World, x: usize, y: usize) -> Vec<CitizenDetailView> {
             age: citizen.age,
             happiness: citizen.morale.actual,
             money: citizen.money,
+            unpaid_since_daily_settlement: citizen.workplace_assignment.is_some()
+                && !citizen.attended_since_daily_settlement,
             relation: citizen_relation(world, building.kind, citizen),
         })
         .collect()
@@ -415,6 +419,8 @@ pub(crate) fn remote_workers_for(
                 age: citizen.age,
                 happiness: citizen.morale.actual,
                 money: citizen.money,
+                unpaid_since_daily_settlement: citizen.workplace_assignment.is_some()
+                    && !citizen.attended_since_daily_settlement,
                 relation: CitizenRelation::LivesAt {
                     region: Some(home_region),
                     x: home.map(|position| position.x).unwrap_or(0),
@@ -483,6 +489,7 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                     world, entity,
                 ),
                 average_money: citizens::average_money_for_home(world, entity),
+                unpaid_citizens: unpaid_citizens_for_home(world, entity),
                 job_assignments: job_assignment_views_for_home(world, entity),
             }
         }
@@ -558,6 +565,18 @@ fn inspect_details(world: &World, x: usize, y: usize) -> InspectDetailsView {
                 .unwrap_or(0),
         },
     }
+}
+
+fn unpaid_citizens_for_home(world: &World, home: Entity) -> i32 {
+    world
+        .citizens
+        .values()
+        .filter(|citizen| {
+            citizen.home == home
+                && citizen.workplace_assignment.is_some()
+                && !citizen.attended_since_daily_settlement
+        })
+        .count() as i32
 }
 
 fn inspect_explanations(world: &World, x: usize, y: usize) -> Vec<String> {
@@ -1372,6 +1391,7 @@ mod tests {
                 age: 1,
                 happiness: 50,
                 money: 0,
+                unpaid_since_daily_settlement: false,
                 relation: CitizenRelation::Unemployed,
             }]
         );
