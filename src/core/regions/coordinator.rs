@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::core::regional_types::{
     RegionCommandResponse, RegionSnapshotResponse, RegionTickResponse,
 };
-use crate::core::regions::runtime::RegionEvent;
+use crate::core::regions::runtime::{RegionEvent, RuntimeReply};
 use crate::core::regions::threaded::{ThreadedWorkerCommand, WorkerIdleReport};
 use crate::core::regions::worker::{RegionOwnerDirectory, WorkerId};
 use crate::core::regions::{GoodsExportGrant, PowerExportGrant, RegionId};
@@ -59,13 +59,14 @@ pub(crate) enum CoordinatorShutdownError {
     ThreadPanicked,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 /// Runtime reply or fault delivered to the runner.
 pub(crate) enum RunnerSignal {
     Faulted,
     CommandReply(RegionCommandResponse),
     TickReply(RegionTickResponse),
     SnapshotReply(RegionSnapshotResponse),
+    RuntimeReply(RuntimeReply),
 }
 
 #[derive(Debug, Default)]
@@ -147,6 +148,10 @@ impl CoordinatorHandle {
 
     pub(crate) fn snapshot_reply(&self, reply: RegionSnapshotResponse) {
         let _ = self.commands.send(CoordinatorCommand::SnapshotReply(reply));
+    }
+
+    pub(crate) fn runtime_reply(&self, reply: RuntimeReply) {
+        let _ = self.commands.send(CoordinatorCommand::RuntimeReply(reply));
     }
 
     /// Test-only fence for coordinator-driven worker integration tests.
@@ -231,6 +236,7 @@ enum CoordinatorCommand {
     CommandReply(RegionCommandResponse),
     TickReply(RegionTickResponse),
     SnapshotReply(RegionSnapshotResponse),
+    RuntimeReply(RuntimeReply),
     Fault(CoordinatorFault),
     DrainUntilIdle {
         reply: Sender<Result<(), CoordinatorError>>,
@@ -276,6 +282,9 @@ fn run_coordinator(
             }
             CoordinatorCommand::SnapshotReply(reply) => {
                 let _ = signals.send(RunnerSignal::SnapshotReply(reply));
+            }
+            CoordinatorCommand::RuntimeReply(reply) => {
+                let _ = signals.send(RunnerSignal::RuntimeReply(reply));
             }
             CoordinatorCommand::DrainUntilIdle { reply } => {
                 let outcome = drain_until_idle(&commands, &owners, &workers, &health, &signals);
@@ -347,6 +356,9 @@ fn drain_until_idle(
                 CoordinatorCommand::SnapshotReply(reply) => {
                     let _ = signals.send(RunnerSignal::SnapshotReply(reply));
                 }
+                CoordinatorCommand::RuntimeReply(reply) => {
+                    let _ = signals.send(RunnerSignal::RuntimeReply(reply));
+                }
                 CoordinatorCommand::DrainUntilIdle { reply } => {
                     let _ = reply.send(Err(CoordinatorError::DrainLimitExceeded));
                 }
@@ -365,10 +377,7 @@ fn drain_until_idle(
             };
         }
     }
-    DrainOutcome {
-        result: Err(CoordinatorError::DrainLimitExceeded),
-        shutdown_reply: None,
-    }
+    drain_error(health, signals, CoordinatorError::DrainLimitExceeded)
 }
 
 fn drain_error(
@@ -844,10 +853,10 @@ mod tests {
             ])
             .expect("route command should enqueue");
 
-        assert_eq!(
+        assert!(matches!(
             signals.recv_timeout(RECEIVE_TIMEOUT),
             Ok(RunnerSignal::Faulted)
-        );
+        ));
         assert_eq!(
             health.fault().as_deref(),
             Some(&CoordinatorFault::Routing(
@@ -873,10 +882,10 @@ mod tests {
             })
             .expect("route command should enqueue");
 
-        assert_eq!(
+        assert!(matches!(
             signals.recv_timeout(RECEIVE_TIMEOUT),
             Ok(RunnerSignal::Faulted)
-        );
+        ));
         assert_eq!(
             health.fault().as_deref(),
             Some(&CoordinatorFault::Routing(
@@ -904,10 +913,10 @@ mod tests {
                 event: event(),
             })
             .expect("route command should enqueue");
-        assert_eq!(
+        assert!(matches!(
             signals.recv_timeout(RECEIVE_TIMEOUT),
             Ok(RunnerSignal::Faulted)
-        );
+        ));
 
         handle
             .route(RoutedRegionEvent {
@@ -1017,5 +1026,43 @@ mod tests {
         drop(commands);
         first_worker.join().expect("first worker should stop");
         second_worker.join().expect("second worker should stop");
+    }
+
+    #[test]
+    fn drain_limit_latches_runner_health() {
+        let owners = Arc::new(RegionOwnerDirectory::new());
+        let (commands, command_receiver) = mpsc::channel();
+        let health = RunnerHealth::default();
+        let (signals, signal_receiver) = mpsc::channel();
+        let (worker_sender, worker_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            for command in worker_receiver {
+                if let ThreadedWorkerCommand::DrainReport { reply } = command {
+                    let _ = reply.send(WorkerIdleReport {
+                        pending_events: true,
+                        dirty_hints: false,
+                    });
+                }
+            }
+        });
+        let workers = BTreeMap::from([(WorkerId(7), worker_sender)]);
+
+        let outcome = drain_until_idle(&command_receiver, &owners, &workers, &health, &signals);
+
+        assert_eq!(outcome.result, Err(CoordinatorError::DrainLimitExceeded));
+        assert_eq!(
+            health.fault().as_deref(),
+            Some(&CoordinatorFault::Routing(
+                CoordinatorError::DrainLimitExceeded
+            ))
+        );
+        assert!(matches!(
+            signal_receiver.recv_timeout(RECEIVE_TIMEOUT),
+            Ok(RunnerSignal::Faulted)
+        ));
+
+        drop(workers);
+        drop(commands);
+        worker.join().expect("test worker should stop");
     }
 }

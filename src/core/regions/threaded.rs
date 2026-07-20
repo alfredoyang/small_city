@@ -5,16 +5,12 @@
 //! `RegionHandle`, explicitly request bounded processing passes, and then
 //! recover the worker during shutdown for deterministic inspection or handoff.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use crate::core::regions::RegionId;
-use crate::core::regions::coordinator::{CoordinatorHandle, RegionRecipients, RoutedRegionEvent};
-use crate::core::regions::worker::{
-    ForwardedRegionEvent, RegionWorker, WorkerId, WorkerRoutingError, WorkerRunSummary,
-};
-use crate::interface::view::{InspectView, RoadTravelerPanelSeedView};
+use crate::core::regions::coordinator::CoordinatorHandle;
+use crate::core::regions::worker::{RegionWorker, WorkerId, WorkerRunSummary};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Deterministic shutdown behavior for a threaded worker.
@@ -148,159 +144,6 @@ impl ThreadedRegionWorker {
             })
     }
 
-    pub fn process_region_events_for_barrier(
-        &self,
-        max_events_per_region: usize,
-    ) -> Result<WorkerRunSummary, ThreadedWorkerError> {
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.commands
-            .send(ThreadedWorkerCommand::ProcessBarrier {
-                max_events_per_region,
-                reply: reply_sender,
-            })
-            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
-                worker_id: self.worker_id,
-            })?;
-
-        reply_receiver
-            .recv()
-            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
-                worker_id: self.worker_id,
-            })
-    }
-
-    pub fn deliver_forwarded_events(
-        &self,
-        events: Vec<ForwardedRegionEvent>,
-    ) -> Result<Vec<WorkerRoutingError>, ThreadedWorkerError> {
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.commands
-            .send(ThreadedWorkerCommand::DeliverForwarded {
-                events,
-                reply: reply_sender,
-            })
-            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
-                worker_id: self.worker_id,
-            })?;
-
-        reply_receiver
-            .recv()
-            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
-                worker_id: self.worker_id,
-            })
-    }
-
-    pub fn inspect_region(
-        &self,
-        region_id: RegionId,
-        x: usize,
-        y: usize,
-    ) -> Result<Option<InspectView>, ThreadedWorkerError> {
-        // Like region_view, inspect reads the worker-owned runtime directly on
-        // the worker thread after explicitly requested event processing.
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.commands
-            .send(ThreadedWorkerCommand::Inspect {
-                region_id,
-                x,
-                y,
-                reply: reply_sender,
-            })
-            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
-                worker_id: self.worker_id,
-            })?;
-
-        reply_receiver
-            .recv()
-            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
-                worker_id: self.worker_id,
-            })
-    }
-
-    /// Enter-panel road-traveler detail for `(region_id, x, y)`, read on the worker
-    /// thread. Local-only: unlike `inspect_region` this reads directly without any
-    /// job/goods route refresh first, since visitor endpoint data already lives in
-    /// the current tick's `world.tokens`.
-    pub fn road_traveler_panel_seed(
-        &self,
-        region_id: RegionId,
-        x: usize,
-        y: usize,
-    ) -> Result<Option<RoadTravelerPanelSeedView>, ThreadedWorkerError> {
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.commands
-            .send(ThreadedWorkerCommand::RoadTravelerPanelSeed {
-                region_id,
-                x,
-                y,
-                reply: reply_sender,
-            })
-            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
-                worker_id: self.worker_id,
-            })?;
-
-        reply_receiver
-            .recv()
-            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
-                worker_id: self.worker_id,
-            })
-    }
-
-    /// Anchor `Position` of the building at `(region_id, x, y)`, read on the worker
-    /// thread. The runner uses it to normalize a clicked footprint cell to the
-    /// workplace anchor before the remote-roster fan-out.
-    pub fn building_anchor_at(
-        &self,
-        region_id: RegionId,
-        x: usize,
-        y: usize,
-    ) -> Result<Option<crate::core::components::Position>, ThreadedWorkerError> {
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.commands
-            .send(ThreadedWorkerCommand::BuildingAnchorAt {
-                region_id,
-                x,
-                y,
-                reply: reply_sender,
-            })
-            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
-                worker_id: self.worker_id,
-            })?;
-
-        reply_receiver
-            .recv()
-            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
-                worker_id: self.worker_id,
-            })
-    }
-
-    /// Remote staff (cross-region commuters) of the workplace at `(producer_region,
-    /// pos)` that live in THIS worker's owned regions. Like `inspect_region`, it
-    /// reads the worker-owned runtimes directly on the worker thread. The runner
-    /// fans this out to every worker and merges the results.
-    pub fn remote_workers_at(
-        &self,
-        producer_region: RegionId,
-        pos: crate::core::components::Position,
-    ) -> Result<Vec<crate::interface::view::CitizenDetailView>, ThreadedWorkerError> {
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.commands
-            .send(ThreadedWorkerCommand::RemoteWorkersAt {
-                producer_region,
-                pos,
-                reply: reply_sender,
-            })
-            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
-                worker_id: self.worker_id,
-            })?;
-
-        reply_receiver
-            .recv()
-            .map_err(|_| ThreadedWorkerError::WorkerThreadStopped {
-                worker_id: self.worker_id,
-            })
-    }
-
     pub fn shutdown(
         mut self,
         mode: ThreadedWorkerShutdown,
@@ -364,86 +207,9 @@ pub(crate) enum ThreadedWorkerCommand {
     /// Test-only quiescence report for coordinator-driven worker tests.
     DrainReport { reply: Sender<WorkerIdleReport> },
     /// Run the normal single-worker scheduler.
-    ///
-    /// Same-worker outbound events are delivered immediately. This is kept for
-    /// direct threaded-worker tests and single-worker utility calls; the
-    /// multi-worker runner uses `ProcessBarrier` instead.
     Process {
         max_events_per_region: usize,
         reply: Sender<WorkerRunSummary>,
-    },
-    /// Run one deterministic-barrier scheduler pass.
-    ///
-    /// Purpose: make competing cross-region export requests deterministic across
-    /// worker threads. A normal `Process` pass immediately delivers same-worker
-    /// events, so a region on the producer's worker could reach the producer
-    /// before a lower-key request from another worker. `ProcessBarrier` avoids
-    /// that shortcut: every region-to-region outbound event, including
-    /// same-worker targets, is returned as a `ForwardedRegionEvent`. The runner
-    /// then merges all workers' events, sorts them by the stable routing key,
-    /// and sends them back with `DeliverForwarded`.
-    ///
-    /// ```text
-    /// Worker A              runner barrier              Worker B
-    /// ────────              ──────────────              ────────
-    /// ProcessBarrier ──┐
-    ///                  ├─ collect all forwarded events
-    /// ProcessBarrier ──┘
-    ///                    sort by deterministic key
-    ///                         ├─ DeliverForwarded -> target worker
-    ///                         └─ DeliverForwarded -> target worker
-    /// ```
-    ProcessBarrier {
-        max_events_per_region: usize,
-        reply: Sender<WorkerRunSummary>,
-    },
-    /// Push already-sorted forwarded events into this worker's owned region inboxes.
-    ///
-    /// The runner sorts and groups events before sending this command; the worker
-    /// only validates that each target region is owned here and enqueues it.
-    DeliverForwarded {
-        events: Vec<ForwardedRegionEvent>,
-        reply: Sender<Vec<WorkerRoutingError>>,
-    },
-    /// Read an inspect view from one owned runtime on the worker thread.
-    ///
-    /// This keeps UI-facing reads out of ECS internals while avoiding direct
-    /// access to `RegionRuntime` from the runner thread.
-    Inspect {
-        region_id: RegionId,
-        x: usize,
-        y: usize,
-        reply: Sender<Option<InspectView>>,
-    },
-    /// Read the Enter-panel road-traveler detail from one owned runtime.
-    ///
-    /// Local-only, like `Inspect`: no job/goods route refresh, since visitor
-    /// endpoint data already lives in the current tick's tokens.
-    RoadTravelerPanelSeed {
-        region_id: RegionId,
-        x: usize,
-        y: usize,
-        reply: Sender<Option<RoadTravelerPanelSeedView>>,
-    },
-    /// Resolve the anchor `Position` of the building at `(region_id, x, y)`.
-    ///
-    /// Lets the runner normalize a clicked footprint cell to the workplace anchor
-    /// before the remote-roster fan-out, so a multi-cell workplace lists its remote
-    /// staff on every footprint cell.
-    BuildingAnchorAt {
-        region_id: RegionId,
-        x: usize,
-        y: usize,
-        reply: Sender<Option<crate::core::components::Position>>,
-    },
-    /// Enumerate the remote staff of a workplace from this worker's owned regions.
-    ///
-    /// The reverse of `Inspect`'s local-only roster: it scans the consumer regions
-    /// where commuters live, keyed on `(producer_region, pos)`.
-    RemoteWorkersAt {
-        producer_region: RegionId,
-        pos: crate::core::components::Position,
-        reply: Sender<Vec<crate::interface::view::CitizenDetailView>>,
     },
     /// Stop the worker thread and return the owned `RegionWorker`.
     ///
@@ -477,49 +243,6 @@ fn run_worker(mut worker: RegionWorker, commands: Receiver<ThreadedWorkerCommand
                 reply,
             } => {
                 let _ = reply.send(worker.process_region_events(max_events_per_region));
-            }
-            ThreadedWorkerCommand::ProcessBarrier {
-                max_events_per_region,
-                reply,
-            } => {
-                let _ = reply.send(worker.process_region_events_for_barrier(max_events_per_region));
-            }
-            ThreadedWorkerCommand::DeliverForwarded { events, reply } => {
-                let _ = reply.send(worker.deliver_forwarded_events(events));
-            }
-            ThreadedWorkerCommand::Inspect {
-                region_id,
-                x,
-                y,
-                reply,
-            } => {
-                let _ = reply.send(inspect_from_worker(&mut worker, region_id, x, y));
-            }
-            ThreadedWorkerCommand::RoadTravelerPanelSeed {
-                region_id,
-                x,
-                y,
-                reply,
-            } => {
-                let seed = worker
-                    .region_mut(region_id)
-                    .map(|runtime| runtime.road_traveler_panel_seed(x, y));
-                let _ = reply.send(seed);
-            }
-            ThreadedWorkerCommand::BuildingAnchorAt {
-                region_id,
-                x,
-                y,
-                reply,
-            } => {
-                let _ = reply.send(worker.building_anchor_at(region_id, x, y));
-            }
-            ThreadedWorkerCommand::RemoteWorkersAt {
-                producer_region,
-                pos,
-                reply,
-            } => {
-                let _ = reply.send(worker.remote_workers_at(producer_region, pos));
             }
             ThreadedWorkerCommand::Shutdown { mode, reply } => {
                 let final_pass = match mode {
@@ -566,6 +289,15 @@ fn run_worker_with_coordinator(
                 }
             }
             ThreadedWorkerCommand::DrainReport { reply } => {
+                if worker.has_dirty_hints() {
+                    match drive_autonomous_worker(&mut worker, &coordinator) {
+                        AutonomousDriveResult::Idle => {}
+                        AutonomousDriveResult::Stopped | AutonomousDriveResult::RoundLimit => {
+                            exit.reported = true;
+                            break;
+                        }
+                    }
+                }
                 let _ = reply.send(WorkerIdleReport {
                     pending_events: worker.has_pending_events(),
                     dirty_hints: worker.has_dirty_hints(),
@@ -576,56 +308,6 @@ fn run_worker_with_coordinator(
                 reply,
             } => {
                 let _ = reply.send(worker.process_region_events(max_events_per_region));
-            }
-            ThreadedWorkerCommand::ProcessBarrier {
-                max_events_per_region,
-                reply,
-            } => {
-                let mut summary = worker.process_region_events_for_barrier(max_events_per_region);
-                for event in std::mem::take(&mut summary.coordinator_events) {
-                    if coordinator.route(event).is_err() {
-                        exit.reported = true;
-                        return;
-                    }
-                }
-                let _ = reply.send(summary);
-            }
-            ThreadedWorkerCommand::DeliverForwarded { events, reply } => {
-                let _ = reply.send(worker.deliver_forwarded_events(events));
-            }
-            ThreadedWorkerCommand::Inspect {
-                region_id,
-                x,
-                y,
-                reply,
-            } => {
-                let _ = reply.send(inspect_from_worker(&mut worker, region_id, x, y));
-            }
-            ThreadedWorkerCommand::RoadTravelerPanelSeed {
-                region_id,
-                x,
-                y,
-                reply,
-            } => {
-                let seed = worker
-                    .region_mut(region_id)
-                    .map(|runtime| runtime.road_traveler_panel_seed(x, y));
-                let _ = reply.send(seed);
-            }
-            ThreadedWorkerCommand::BuildingAnchorAt {
-                region_id,
-                x,
-                y,
-                reply,
-            } => {
-                let _ = reply.send(worker.building_anchor_at(region_id, x, y));
-            }
-            ThreadedWorkerCommand::RemoteWorkersAt {
-                producer_region,
-                pos,
-                reply,
-            } => {
-                let _ = reply.send(worker.remote_workers_at(producer_region, pos));
             }
             ThreadedWorkerCommand::Shutdown { mode, reply } => {
                 let final_pass = match mode {
@@ -686,47 +368,11 @@ fn drive_autonomous_worker(
         for reply in round.snapshot_replies {
             coordinator.snapshot_reply(reply);
         }
+        for reply in round.runtime_replies {
+            coordinator.runtime_reply(reply);
+        }
         for event in round.coordinator_events {
             if coordinator.route(event).is_err() {
-                return AutonomousDriveResult::Stopped;
-            }
-        }
-        let mut rechecks = BTreeMap::<(u64, RegionId), BTreeSet<RegionId>>::new();
-        for forwarded in round.forwarded_events {
-            match forwarded.event {
-                crate::core::regions::runtime::RegionEvent::PowerCapacityRecheck {
-                    request_id,
-                    source_region,
-                } => {
-                    rechecks
-                        .entry((request_id.0, source_region))
-                        .or_default()
-                        .insert(forwarded.target_region);
-                }
-                event => {
-                    if coordinator
-                        .route(RoutedRegionEvent {
-                            recipients: RegionRecipients::One(forwarded.target_region),
-                            event,
-                        })
-                        .is_err()
-                    {
-                        return AutonomousDriveResult::Stopped;
-                    }
-                }
-            }
-        }
-        for ((request_id, source_region), targets) in rechecks {
-            if coordinator
-                .route(RoutedRegionEvent {
-                    recipients: RegionRecipients::Many(targets.into_iter().collect()),
-                    event: crate::core::regions::runtime::RegionEvent::PowerCapacityRecheck {
-                        request_id: crate::core::regional_types::UiRequestId(request_id),
-                        source_region,
-                    },
-                })
-                .is_err()
-            {
                 return AutonomousDriveResult::Stopped;
             }
         }
@@ -736,19 +382,6 @@ fn drive_autonomous_worker(
     }
     coordinator.worker_round_limit_exceeded(worker.id());
     AutonomousDriveResult::RoundLimit
-}
-
-fn inspect_from_worker(
-    worker: &mut RegionWorker,
-    region_id: RegionId,
-    x: usize,
-    y: usize,
-) -> Option<InspectView> {
-    worker.refresh_importable_remote_jobs(region_id);
-    worker.refresh_cross_region_goods_routes(region_id);
-    worker
-        .region_mut(region_id)
-        .map(|runtime| runtime.inspect(x, y))
 }
 
 #[cfg(test)]

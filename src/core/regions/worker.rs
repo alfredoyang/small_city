@@ -18,7 +18,7 @@ use crate::core::regions::directory::{RegionDirectory, power_capacity_recheck_ta
 use crate::core::regions::employment_directory::EmploymentDirectory;
 use crate::core::regions::handle::RegionHandle;
 use crate::core::regions::runtime::{
-    OutboundMessage, RegionEvent, RegionRuntime, RegionRuntimeError,
+    OutboundMessage, RegionEvent, RegionRuntime, RegionRuntimeError, RuntimeReply,
 };
 use crate::core::regions::{
     BorderEdge, BorderLinkId, NetworkBorderLink, RegionId, RegionNeighborLink, RegionState,
@@ -69,26 +69,26 @@ impl RegionAddError {
 pub struct WorkerRunSummary {
     pub processed_regions: usize,
     pub routing_errors: Vec<WorkerRoutingError>,
-    pub forwarded_events: Vec<ForwardedRegionEvent>,
     pub command_replies: Vec<RegionCommandResponse>,
     pub tick_replies: Vec<RegionTickResponse>,
     pub snapshot_replies: Vec<RegionSnapshotResponse>,
+    pub runtime_replies: Vec<RuntimeReply>,
     pub coordinator_events: Vec<RoutedRegionEvent>,
 }
 
-/// One test-only autonomous scheduler round.
+/// One coordinator-driven scheduler round.
 ///
-/// This intentionally uses the existing barrier-mode pass, preserving its
-/// per-region input installation, road refresh, and full hint-publish sweep.
+/// It preserves per-region input installation, road refresh, and the full
+/// hint-publish sweep.
 #[derive(Debug, Default)]
 pub(crate) struct AutonomousWorkerRound {
-    pub forwarded_events: Vec<ForwardedRegionEvent>,
     #[allow(dead_code)] // P2 tests assert bounded slice progress.
     pub processed_regions: usize,
     pub routing_errors: Vec<WorkerRoutingError>,
     pub command_replies: Vec<RegionCommandResponse>,
     pub tick_replies: Vec<RegionTickResponse>,
     pub snapshot_replies: Vec<RegionSnapshotResponse>,
+    pub runtime_replies: Vec<RuntimeReply>,
     pub coordinator_events: Vec<RoutedRegionEvent>,
 }
 
@@ -170,99 +170,13 @@ impl Default for RegionOwnerDirectory {
     }
 }
 
-#[derive(Debug)]
-/// One event that must cross from one worker to another at the M3 barrier.
-pub struct ForwardedRegionEvent {
-    pub target_worker: WorkerId,
-    pub target_region: RegionId,
-    order_key: ForwardedEventOrderKey,
-    pub(crate) event: RegionEvent,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-/// Stable merge key for cross-worker delivery.
-///
-/// Requests reaching a producer must not depend on thread timing. The barrier
-/// sorts by target first (producer inbox), then caller/source and request token:
-///
-/// ```text
-/// Worker A outbound ┐
-/// Worker B outbound ├─ collect ─ sort key ─ deliver to target inboxes
-/// Worker C outbound ┘
-/// ```
-struct ForwardedEventOrderKey {
-    target_region: RegionId,
-    source_region: RegionId,
-    request_id: UiRequestId,
-    token: u32,
-    resource_rank: u8,
-    event_rank: u8,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegionRoutingMode {
     /// Normal single-worker behavior: owned target inboxes receive events now.
     Immediate,
-    /// M3 barrier behavior: all region-to-region events wait for stable ordering.
-    Barrier,
-}
-
-#[derive(Debug, Default)]
-/// Combined result from one deterministic multi-worker barrier step.
-pub struct DeterministicBarrierSummary {
-    pub worker_summaries: Vec<WorkerRunSummary>,
-    pub routing_errors: Vec<WorkerRoutingError>,
-}
-
-/// Runs each worker's local pass, then deterministically delivers region events.
-///
-/// Local runtime processing stays single-threaded per worker. During a barrier
-/// pass, every region-to-region export control event is collected, ordered by
-/// `ForwardedEventOrderKey`, and only then pushed into target inboxes. That
-/// includes same-worker targets; otherwise a local caller could beat a lower-key
-/// remote caller to the same producer just because it bypassed the merge point.
-pub fn process_workers_with_deterministic_barrier(
-    workers: &mut [&mut RegionWorker],
-    max_events_per_region: usize,
-) -> DeterministicBarrierSummary {
-    let mut summaries = Vec::new();
-    let mut forwarded = Vec::new();
-    let mut routing_errors = Vec::new();
-
-    for worker in workers.iter_mut() {
-        let mut summary = worker.process_region_events_for_barrier(max_events_per_region);
-        forwarded.append(&mut summary.forwarded_events);
-        routing_errors.extend(summary.routing_errors.iter().copied());
-        summaries.push(summary);
-    }
-
-    sort_forwarded_events(&mut forwarded);
-    for forwarded_event in forwarded {
-        let Some(target_worker) = workers
-            .iter_mut()
-            .find(|worker| worker.id() == forwarded_event.target_worker)
-        else {
-            routing_errors.push(WorkerRoutingError::MissingTargetRegion {
-                target_region: forwarded_event.target_region,
-            });
-            continue;
-        };
-        if let Err(error) =
-            target_worker.push_event(forwarded_event.target_region, forwarded_event.event)
-        {
-            routing_errors.push(error);
-        }
-    }
-
-    DeterministicBarrierSummary {
-        worker_summaries: summaries,
-        routing_errors,
-    }
-}
-
-/// Sorts forwarded region events by the stable M3 merge key.
-pub fn sort_forwarded_events(events: &mut [ForwardedRegionEvent]) {
-    events.sort_by_key(|event| event.order_key);
+    /// Production coordinator behavior: every inter-region delivery is emitted
+    /// as a target-bearing coordinator route without worker-side merging.
+    Coordinator,
 }
 
 #[derive(Debug)]
@@ -462,78 +376,6 @@ impl RegionWorker {
             .find(|runtime| runtime.region_id() == region_id)
     }
 
-    /// Anchor `Position` of the building at `(x, y)` in one owned region, used to
-    /// normalize a clicked footprint cell to the workplace anchor before the remote
-    /// roster scan. `None` if this worker does not own `region_id` or the cell is
-    /// empty.
-    pub(crate) fn building_anchor_at(
-        &self,
-        region_id: RegionId,
-        x: usize,
-        y: usize,
-    ) -> Option<crate::core::components::Position> {
-        self.region(region_id)
-            .and_then(|runtime| runtime.building_anchor_at(x, y))
-    }
-
-    /// Remote staff of the workplace at `(producer_region, pos)`: every owned
-    /// region's residents who commute there. The producer region is skipped (its
-    /// own workers at that cell are Local, already on the local roster). Within a
-    /// region the order is `Entity.0`; the runner sorts the cross-worker merge by
-    /// home region for full determinism.
-    pub(crate) fn remote_workers_at(
-        &mut self,
-        producer_region: RegionId,
-        pos: crate::core::components::Position,
-    ) -> Vec<crate::interface::view::CitizenDetailView> {
-        let mut workers = Vec::new();
-        for runtime in &mut self.regions {
-            if runtime.region_id() == producer_region {
-                continue;
-            }
-            workers.extend(runtime.remote_workers_for(producer_region, pos));
-        }
-        workers
-    }
-
-    pub(crate) fn refresh_importable_remote_jobs(&mut self, region_id: RegionId) {
-        let Some(index) = self
-            .regions
-            .iter()
-            .position(|runtime| runtime.region_id() == region_id)
-        else {
-            return;
-        };
-        let importable_remote_jobs = {
-            let runtime = &self.regions[index];
-            importable_remote_jobs_for_region(
-                &self.directory.discovery_snapshot(),
-                runtime.region_id(),
-                &runtime.state().network_border_links(),
-            )
-        };
-        self.regions[index].set_importable_remote_jobs(importable_remote_jobs);
-    }
-
-    pub(crate) fn refresh_cross_region_goods_routes(&mut self, region_id: RegionId) {
-        let Some(index) = self
-            .regions
-            .iter()
-            .position(|runtime| runtime.region_id() == region_id)
-        else {
-            return;
-        };
-        let routes = {
-            let runtime = &self.regions[index];
-            cross_region_goods_routes_for_region(
-                &self.directory.discovery_snapshot(),
-                runtime.region_id(),
-                &runtime.state().network_border_links(),
-            )
-        };
-        self.regions[index].set_cross_region_goods_routes(routes);
-    }
-
     pub fn handle_for(&self, region_id: RegionId) -> Option<RegionHandle> {
         self.region(region_id).map(RegionRuntime::handle)
     }
@@ -587,27 +429,20 @@ impl RegionWorker {
         self.process_region_events_with_mode(max_events_per_region, RegionRoutingMode::Immediate)
     }
 
-    pub fn process_region_events_for_barrier(
-        &mut self,
-        max_events_per_region: usize,
-    ) -> WorkerRunSummary {
-        self.process_region_events_with_mode(max_events_per_region, RegionRoutingMode::Barrier)
-    }
-
-    /// Runs the P2 test-only autonomous scheduler round.
-    #[allow(dead_code)] // P2 test-only threaded adapter consumes this in its tests.
+    /// Runs one coordinator-driven scheduler round.
     pub(crate) fn process_autonomous_round(
         &mut self,
         max_events_per_region: usize,
     ) -> AutonomousWorkerRound {
-        let summary = self.process_region_events_for_barrier(max_events_per_region);
+        let summary = self
+            .process_region_events_with_mode(max_events_per_region, RegionRoutingMode::Coordinator);
         AutonomousWorkerRound {
-            forwarded_events: summary.forwarded_events,
             processed_regions: summary.processed_regions,
             routing_errors: summary.routing_errors,
             command_replies: summary.command_replies,
             tick_replies: summary.tick_replies,
             snapshot_replies: summary.snapshot_replies,
+            runtime_replies: summary.runtime_replies,
             coordinator_events: summary.coordinator_events,
         }
     }
@@ -622,21 +457,6 @@ impl RegionWorker {
         self.regions
             .iter()
             .any(|runtime| runtime.state().is_hints_dirty())
-    }
-
-    pub fn deliver_forwarded_events(
-        &mut self,
-        events: Vec<ForwardedRegionEvent>,
-    ) -> Vec<WorkerRoutingError> {
-        let mut errors = Vec::new();
-        for forwarded_event in events {
-            if let Err(error) =
-                self.push_event(forwarded_event.target_region, forwarded_event.event)
-            {
-                errors.push(error);
-            }
-        }
-        errors
     }
 
     fn process_region_events_with_mode(
@@ -734,7 +554,7 @@ impl RegionWorker {
             runtime.state().clear_hints_dirty();
         }
 
-        let mut forwarded_events = Vec::new();
+        let mut coordinator_events = Vec::new();
 
         // Retire-tickstate, P-b: the eager nudge. Gated on `publish_region`'s
         // own idempotence check -- only fans out on a REAL change, not on
@@ -754,25 +574,15 @@ impl RegionWorker {
             let recheck_id = self.next_worker_request_id();
             let discovery = self.directory.discovery_snapshot();
             for target_region in power_capacity_recheck_targets(&discovery, region_id, &hints) {
-                let order_key = ForwardedEventOrderKey {
+                if let Ok(WorkerRoutedMessage::Coordinator(event)) = self.route_region_event(
                     target_region,
-                    source_region: region_id,
-                    request_id: recheck_id,
-                    token: 0,
-                    resource_rank: 0,
-                    event_rank: 3, // after release/request/reply
-                };
-                if let Ok(WorkerRoutedMessage::Forwarded(event)) = self.route_region_event(
-                    target_region,
-                    region_id,
                     RegionEvent::PowerCapacityRecheck {
                         request_id: recheck_id,
                         source_region: region_id,
                     },
-                    order_key,
                     routing_mode,
                 ) {
-                    forwarded_events.push(event);
+                    coordinator_events.push(event);
                 }
             }
         }
@@ -781,13 +591,14 @@ impl RegionWorker {
         let mut command_replies = Vec::new();
         let mut tick_replies = Vec::new();
         let mut snapshot_replies = Vec::new();
-        let mut coordinator_events = Vec::new();
+        let mut runtime_replies = Vec::new();
 
         for (source_region, message) in outbound {
             match self.route_outbound(source_region, message) {
                 Ok(WorkerRoutedMessage::CommandReply(reply)) => command_replies.push(reply),
                 Ok(WorkerRoutedMessage::TickReply(reply)) => tick_replies.push(reply),
                 Ok(WorkerRoutedMessage::SnapshotReply(reply)) => snapshot_replies.push(reply),
+                Ok(WorkerRoutedMessage::RuntimeReply(reply)) => runtime_replies.push(reply),
                 Ok(WorkerRoutedMessage::Coordinator(event)) => {
                     if matches!(routing_mode, RegionRoutingMode::Immediate) {
                         routing_errors.extend(self.deliver_coordinator_event_locally(event));
@@ -795,7 +606,6 @@ impl RegionWorker {
                         coordinator_events.push(event);
                     }
                 }
-                Ok(WorkerRoutedMessage::Forwarded(event)) => forwarded_events.push(event),
                 Ok(WorkerRoutedMessage::None) => {}
                 Err(error) => routing_errors.push(error),
             }
@@ -804,10 +614,10 @@ impl RegionWorker {
         WorkerRunSummary {
             processed_regions,
             routing_errors,
-            forwarded_events,
             command_replies,
             tick_replies,
             snapshot_replies,
+            runtime_replies,
             coordinator_events,
         }
     }
@@ -827,6 +637,57 @@ impl RegionWorker {
             OutboundMessage::RegionSnapshotReady(reply) => {
                 Ok(WorkerRoutedMessage::SnapshotReply(reply))
             }
+            OutboundMessage::RegionInspectReady {
+                request_id,
+                region_id,
+                inspect,
+            } => Ok(WorkerRoutedMessage::RuntimeReply(RuntimeReply::Inspect {
+                request_id,
+                region_id,
+                inspect: Box::new(inspect),
+            })),
+            OutboundMessage::RoadTravelerPanelSeedReady {
+                request_id,
+                region_id,
+                seed,
+            } => Ok(WorkerRoutedMessage::RuntimeReply(
+                RuntimeReply::RoadTravelerPanelSeed {
+                    request_id,
+                    region_id,
+                    seed,
+                },
+            )),
+            OutboundMessage::BuildingAnchorReady {
+                request_id,
+                region_id,
+                anchor,
+            } => Ok(WorkerRoutedMessage::RuntimeReply(
+                RuntimeReply::BuildingAnchor {
+                    request_id,
+                    region_id,
+                    anchor,
+                },
+            )),
+            OutboundMessage::RemoteWorkersReady {
+                request_id,
+                region_id,
+                workers,
+            } => Ok(WorkerRoutedMessage::RuntimeReply(
+                RuntimeReply::RemoteWorkers {
+                    request_id,
+                    region_id,
+                    workers,
+                },
+            )),
+            OutboundMessage::PowerImportsSettled {
+                request_id,
+                region_id,
+            } => Ok(WorkerRoutedMessage::RuntimeReply(
+                RuntimeReply::PowerImportsSettled {
+                    request_id,
+                    region_id,
+                },
+            )),
             OutboundMessage::CoordinatorRoute(event) => Ok(WorkerRoutedMessage::Coordinator(event)),
             OutboundMessage::RuntimeError(error) => Err(WorkerRoutingError::RuntimeError {
                 source_region,
@@ -855,9 +716,7 @@ impl RegionWorker {
     fn route_region_event(
         &mut self,
         target_region: RegionId,
-        source_region: RegionId,
         event: RegionEvent,
-        mut order_key: ForwardedEventOrderKey,
         routing_mode: RegionRoutingMode,
     ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
         if routing_mode == RegionRoutingMode::Immediate && self.region(target_region).is_some() {
@@ -865,17 +724,14 @@ impl RegionWorker {
             return Ok(WorkerRoutedMessage::None);
         }
 
-        let Some(target_worker) = self.owners.owner_of(target_region) else {
-            return Err(WorkerRoutingError::MissingTargetRegion { target_region });
-        };
-        order_key.target_region = target_region;
-        order_key.source_region = source_region;
-        Ok(WorkerRoutedMessage::Forwarded(ForwardedRegionEvent {
-            target_worker,
-            target_region,
-            order_key,
-            event,
-        }))
+        if routing_mode == RegionRoutingMode::Coordinator {
+            return Ok(WorkerRoutedMessage::Coordinator(RoutedRegionEvent {
+                recipients: crate::core::regions::coordinator::RegionRecipients::One(target_region),
+                event,
+            }));
+        }
+
+        Err(WorkerRoutingError::MissingTargetRegion { target_region })
     }
 
     fn publish_region_summary(
@@ -920,7 +776,7 @@ fn border_neighbor_map_for_region(
     map
 }
 
-fn importable_remote_jobs_for_region(
+pub(crate) fn importable_remote_jobs_for_region(
     discovery: &CrossRegionDiscovery,
     region_id: RegionId,
     border_links: &[NetworkBorderLink],
@@ -954,7 +810,7 @@ fn importable_remote_jobs_for_region(
     remote_slots.len() as i32
 }
 
-fn cross_region_goods_routes_for_region(
+pub(crate) fn cross_region_goods_routes_for_region(
     discovery: &CrossRegionDiscovery,
     region_id: RegionId,
     border_links: &[NetworkBorderLink],
@@ -988,10 +844,10 @@ fn cross_region_goods_routes_for_region(
 enum WorkerRoutedMessage {
     None,
     Coordinator(RoutedRegionEvent),
-    Forwarded(ForwardedRegionEvent),
     CommandReply(RegionCommandResponse),
     TickReply(RegionTickResponse),
     SnapshotReply(RegionSnapshotResponse),
+    RuntimeReply(RuntimeReply),
 }
 
 #[cfg(test)]
@@ -1135,7 +991,7 @@ mod tests {
                 },
             )
             .expect("event routed");
-        let summary = worker.process_region_events_for_barrier(usize::MAX);
+        let summary = worker.process_region_events(usize::MAX);
 
         assert!(summary.routing_errors.is_empty());
         assert_eq!(
@@ -1246,7 +1102,7 @@ mod tests {
             .expect("step routed");
         assert!(
             worker
-                .process_region_events_for_barrier(usize::MAX)
+                .process_region_events(usize::MAX)
                 .routing_errors
                 .is_empty()
         );

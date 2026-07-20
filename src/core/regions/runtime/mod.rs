@@ -87,6 +87,9 @@ use crate::core::regions::employment_directory::{
     choose_best_pool,
 };
 use crate::core::regions::handle::{RegionEventReceiver, RegionHandle, mailbox};
+use crate::core::regions::worker::{
+    cross_region_goods_routes_for_region, importable_remote_jobs_for_region,
+};
 use crate::core::regions::{
     ExitLink, GoodsExportGrant, PendingGoodsDemand, PendingPowerDemand, PowerExportGrant, RegionId,
     RegionRoadNetworkId, RegionState, RegionalTickGoodsPhase, RegionalTickJobPhase,
@@ -114,6 +117,30 @@ pub enum RegionEvent {
     BuildSnapshot {
         request_id: UiRequestId,
         overlay: MapOverlayInput,
+    },
+    /// Build one UI-safe inspection view on the owning region worker.
+    InspectRegion {
+        request_id: UiRequestId,
+        x: usize,
+        y: usize,
+    },
+    /// Build one UI-safe road traveler panel seed on the owning worker.
+    RoadTravelerPanelSeed {
+        request_id: UiRequestId,
+        x: usize,
+        y: usize,
+    },
+    /// Resolve the anchor for a UI-selected building footprint cell.
+    BuildingAnchorAt {
+        request_id: UiRequestId,
+        x: usize,
+        y: usize,
+    },
+    /// Return this home region's workers for one producer workplace.
+    RemoteWorkersFor {
+        request_id: UiRequestId,
+        producer_region: RegionId,
+        pos: crate::core::components::Position,
     },
     /// Run one player command through this region's local event loop.
     RunCommand {
@@ -166,7 +193,7 @@ pub enum RegionEvent {
     },
     /// P7c: advance movement by one 10-minute sub-tick (no economy). Broadcast to
     /// every region by the runner's `step_travel_city`; emits the crossings it
-    /// buffers as `TravelerHandedOff` for the barrier to route.
+    /// buffers as `TravelerHandedOff` for the coordinator to route.
     StepTravel { step: TravelStepId },
     /// Directory employment ledger plan, P3: a payload-free wake.
     ///
@@ -287,6 +314,30 @@ pub enum OutboundMessage {
     RegionCommandCompleted(RegionCommandResponse),
     RegionTickCompleted(RegionTickResponse),
     RegionSnapshotReady(RegionSnapshotResponse),
+    RegionInspectReady {
+        request_id: UiRequestId,
+        region_id: RegionId,
+        inspect: crate::interface::view::InspectView,
+    },
+    RoadTravelerPanelSeedReady {
+        request_id: UiRequestId,
+        region_id: RegionId,
+        seed: crate::interface::view::RoadTravelerPanelSeedView,
+    },
+    BuildingAnchorReady {
+        request_id: UiRequestId,
+        region_id: RegionId,
+        anchor: Option<crate::core::components::Position>,
+    },
+    RemoteWorkersReady {
+        request_id: UiRequestId,
+        region_id: RegionId,
+        workers: Vec<crate::interface::view::CitizenDetailView>,
+    },
+    PowerImportsSettled {
+        request_id: UiRequestId,
+        region_id: RegionId,
+    },
     /// P5b: a travel token to route to `handoff.to_region` (worker delivers it as
     /// `RegionEvent::ReceiveTraveler`).
     /// A target-bearing fire-and-forget delivery owned by the coordinator.
@@ -295,6 +346,35 @@ pub enum OutboundMessage {
     /// its employment work from the directory. Payload-free by design; the
     /// worker delivers it as `RegionEvent::EmploymentDirectoryReady`.
     RuntimeError(RegionRuntimeError),
+}
+
+#[derive(Debug)]
+/// UI-safe reply produced by one runtime event and forwarded through the runner.
+pub enum RuntimeReply {
+    Inspect {
+        request_id: UiRequestId,
+        region_id: RegionId,
+        inspect: Box<crate::interface::view::InspectView>,
+    },
+    RoadTravelerPanelSeed {
+        request_id: UiRequestId,
+        region_id: RegionId,
+        seed: crate::interface::view::RoadTravelerPanelSeedView,
+    },
+    BuildingAnchor {
+        request_id: UiRequestId,
+        region_id: RegionId,
+        anchor: Option<crate::core::components::Position>,
+    },
+    RemoteWorkers {
+        request_id: UiRequestId,
+        region_id: RegionId,
+        workers: Vec<crate::interface::view::CitizenDetailView>,
+    },
+    PowerImportsSettled {
+        request_id: UiRequestId,
+        region_id: RegionId,
+    },
 }
 
 #[derive(Debug)]
@@ -583,6 +663,18 @@ impl RegionRuntime {
         self.state.set_cross_region_goods_routes(routes);
     }
 
+    fn refresh_inspect_routes(&mut self) {
+        let Some(discovery) = self.discovery.clone() else {
+            return;
+        };
+        let border_links = self.state.network_border_links();
+        let jobs = importable_remote_jobs_for_region(&discovery, self.region_id(), &border_links);
+        let goods =
+            cross_region_goods_routes_for_region(&discovery, self.region_id(), &border_links);
+        self.set_importable_remote_jobs(jobs);
+        self.set_cross_region_goods_routes(goods);
+    }
+
     /// Inspects one cell, recomputing the derived pass first if a paused command
     /// left it dirty (DT1), so inspect reflects the latest config like the view.
     pub fn inspect(&mut self, x: usize, y: usize) -> crate::interface::view::InspectView {
@@ -697,6 +789,37 @@ impl RegionRuntime {
                     self.build_snapshot(request_id, overlay),
                 )]
             }
+            RegionEvent::InspectRegion { request_id, x, y } => {
+                self.refresh_inspect_routes();
+                vec![OutboundMessage::RegionInspectReady {
+                    request_id,
+                    region_id: self.region_id(),
+                    inspect: self.inspect(x, y),
+                }]
+            }
+            RegionEvent::RoadTravelerPanelSeed { request_id, x, y } => {
+                vec![OutboundMessage::RoadTravelerPanelSeedReady {
+                    request_id,
+                    region_id: self.region_id(),
+                    seed: self.road_traveler_panel_seed(x, y),
+                }]
+            }
+            RegionEvent::BuildingAnchorAt { request_id, x, y } => {
+                vec![OutboundMessage::BuildingAnchorReady {
+                    request_id,
+                    region_id: self.region_id(),
+                    anchor: self.building_anchor_at(x, y),
+                }]
+            }
+            RegionEvent::RemoteWorkersFor {
+                request_id,
+                producer_region,
+                pos,
+            } => vec![OutboundMessage::RemoteWorkersReady {
+                request_id,
+                region_id: self.region_id(),
+                workers: self.remote_workers_for(producer_region, pos),
+            }],
             RegionEvent::RunCommand {
                 request_id,
                 command,
@@ -705,7 +828,12 @@ impl RegionRuntime {
                 vec![OutboundMessage::RegionCommandCompleted(response)]
             }
             RegionEvent::SettlePowerImports { request_id } => {
-                self.start_power_import_settlement(request_id)
+                let mut outbound = self.start_power_import_settlement(request_id);
+                outbound.push(OutboundMessage::PowerImportsSettled {
+                    request_id,
+                    region_id: self.region_id(),
+                });
+                outbound
             }
             RegionEvent::ProcessPowerExportRequest(request) => {
                 let grant = self.process_power_export_request(&request);
@@ -801,8 +929,8 @@ impl RegionRuntime {
     }
 
     /// P3: the wake fan-out. One payload-free message per target region; the
-    /// worker routes them through the same deterministic barrier every other
-    /// cross-region event uses.
+    /// coordinator routes them through the same event path as every other
+    /// cross-region event.
     fn emit_employment_directory_ready(&self, regions: Vec<RegionId>) -> Vec<OutboundMessage> {
         regions
             .into_iter()
@@ -1276,13 +1404,13 @@ impl RegionRuntime {
         // to this region in its own economy step.
         //
         // Settlement can lag the home region by one daily tick, by design: regions
-        // finish ticks independently with no cross-region economy barrier. A
+        // finish ticks independently with no cross-region economy fence. A
         // producer with no local job seekers finishes its own job phase in the same
         // pass as its Tick -- often before a fresh consumer request reaches it -- so
         // that day's economy uses the *previous* day's reservations (they persist
         // until the caller's next-generation release). This is deterministic and
         // self-correcting in steady state; pairing salary and tax on the same day
-        // would require a global "all exports resolved" barrier before any economy
+        // would require a global "all exports resolved" fence before any economy
         // runs, which is far more synchronization for little gain.
         // Producer-owned workplace tax comes from EmploymentContract state (one
         // slot per contracted seat).

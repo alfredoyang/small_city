@@ -61,6 +61,10 @@ pub enum RegionalGameError {
         request_id: UiRequestId,
         region_id: RegionId,
     },
+    RuntimeReplyMissing {
+        request_id: UiRequestId,
+        region_id: RegionId,
+    },
     CommandReplyTypeMismatch {
         request_id: UiRequestId,
         region_id: RegionId,
@@ -1093,6 +1097,13 @@ impl From<RegionalGameRunnerError> for RegionalGameError {
                 request_id,
                 region_id,
             } => Self::SnapshotReplyMissing {
+                request_id,
+                region_id,
+            },
+            RegionalGameRunnerError::RuntimeReplyMissing {
+                request_id,
+                region_id,
+            } => Self::RuntimeReplyMissing {
                 request_id,
                 region_id,
             },

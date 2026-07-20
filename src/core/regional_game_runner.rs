@@ -11,19 +11,21 @@ use std::sync::{Arc, Mutex, mpsc};
 use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionViewSnapshot, UiReply, UiRequestId,
 };
-use crate::core::regions::coordinator::{RegionEventCoordinator, RunnerHealth, RunnerSignal};
+use crate::core::regions::coordinator::{
+    RegionEventCoordinator, RegionRecipients, RoutedRegionEvent, RunnerHealth, RunnerSignal,
+};
 use crate::core::regions::directory::RegionDirectory;
 use crate::core::regions::employment_directory::{
     EmploymentDirectory, rebuild_employment_broker_state,
 };
+#[cfg(test)]
 use crate::core::regions::handle::RegionHandle;
-use crate::core::regions::runtime::{RegionRuntime, TravelStepId};
+use crate::core::regions::runtime::{RegionEvent, RegionRuntime, RuntimeReply, TravelStepId};
 use crate::core::regions::threaded::{
     PreparedThreadedRegionWorker, ThreadedRegionWorker, ThreadedWorkerError, ThreadedWorkerShutdown,
 };
 use crate::core::regions::worker::{
-    ForwardedRegionEvent, RegionOwnerDirectory, RegionWorker, WorkerId, WorkerRoutingError,
-    WorkerRunSummary, sort_forwarded_events,
+    RegionOwnerDirectory, RegionWorker, WorkerId, WorkerRoutingError, WorkerRunSummary,
 };
 use crate::core::regions::{RegionId, RegionNeighborLink, RegionState};
 use crate::interface::events::CommandResult;
@@ -74,6 +76,10 @@ pub enum RegionalGameRunnerError {
         request_id: UiRequestId,
         region_id: RegionId,
     },
+    RuntimeReplyMissing {
+        request_id: UiRequestId,
+        region_id: RegionId,
+    },
     WorkerRoutingFailed {
         worker_id: WorkerId,
         error: WorkerRoutingError,
@@ -90,10 +96,10 @@ pub enum RegionalGameRunnerError {
 /// Public threaded runner that owns regional worker threads.
 pub struct RegionalGameRunner {
     workers: Vec<ThreadedRegionWorker>,
-    handles: Vec<RegionHandle>,
     owners: Arc<RegionOwnerDirectory>,
     operation_lock: Mutex<()>,
     next_travel_step: AtomicU64,
+    next_runtime_request: AtomicU64,
     coordinator: Option<RegionEventCoordinator>,
     runner_signals: Mutex<mpsc::Receiver<RunnerSignal>>,
     health: Arc<RunnerHealth>,
@@ -203,13 +209,10 @@ impl RegionalGameRunner {
                 )
             })
             .collect::<Vec<_>>();
-        let mut handles = Vec::new();
 
         for (index, region) in regions.into_iter().enumerate() {
             let worker_index = region_worker_indexes[index];
             let runtime = RegionRuntime::new(region);
-            let handle = runtime.handle();
-
             if let Err(error) = workers[worker_index].add_region(runtime) {
                 return Err(match error.routing_error() {
                     WorkerRoutingError::DuplicateRegion { region_id } => {
@@ -221,8 +224,6 @@ impl RegionalGameRunner {
                     },
                 });
             }
-
-            handles.push(handle);
         }
 
         let prepared = workers
@@ -246,10 +247,10 @@ impl RegionalGameRunner {
                 .into_iter()
                 .map(|worker| worker.start_with_coordinator(coordinator.handle()))
                 .collect(),
-            handles,
             owners,
             operation_lock: Mutex::new(()),
             next_travel_step: AtomicU64::new(0),
+            next_runtime_request: AtomicU64::new(1),
             coordinator: Some(coordinator),
             runner_signals: Mutex::new(runner_signals),
             health,
@@ -275,15 +276,16 @@ impl RegionalGameRunner {
             .operation_lock
             .lock()
             .expect("regional runner operation lock poisoned");
-        let handles = requests
-            .iter()
-            .map(|(_, region_id)| self.handle_for_owned_region(*region_id))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        for ((request_id, _), handle) in requests.iter().zip(handles) {
-            handle.send(crate::core::regions::runtime::RegionEvent::Tick {
-                request_id: *request_id,
-            });
+        for (_, region_id) in requests {
+            self.worker_for_region(*region_id)?;
+        }
+        for (request_id, region_id) in requests {
+            self.route_region_event(
+                *region_id,
+                RegionEvent::Tick {
+                    request_id: *request_id,
+                },
+            )?;
         }
         self.wait_for_tick_replies(requests)
     }
@@ -298,12 +300,13 @@ impl RegionalGameRunner {
             .operation_lock
             .lock()
             .expect("regional runner operation lock poisoned");
-        self.handle_for_owned_region(region_id)?.send(
-            crate::core::regions::runtime::RegionEvent::RunCommand {
+        self.route_region_event(
+            region_id,
+            RegionEvent::RunCommand {
                 request_id,
                 command,
             },
-        );
+        )?;
         self.wait_for_command_reply(request_id, region_id)
     }
 
@@ -325,12 +328,13 @@ impl RegionalGameRunner {
             .operation_lock
             .lock()
             .expect("regional runner operation lock poisoned");
-        self.handle_for_owned_region(region_id)?.send(
-            crate::core::regions::runtime::RegionEvent::BuildSnapshot {
+        self.route_region_event(
+            region_id,
+            RegionEvent::BuildSnapshot {
                 request_id,
                 overlay,
             },
-        );
+        )?;
         let snapshot = self.wait_for_snapshot_reply(request_id, region_id)?;
 
         Ok(UiReply::RegionSnapshotReady {
@@ -350,10 +354,15 @@ impl RegionalGameRunner {
             .operation_lock
             .lock()
             .expect("regional runner operation lock poisoned");
-        self.worker_for_region(region_id)?
-            .inspect_region(region_id, x, y)
-            .map_err(RegionalGameRunnerError::from)?
-            .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })
+        let request_id = self.next_runtime_request_id();
+        self.route_region_event(region_id, RegionEvent::InspectRegion { request_id, x, y })?;
+        match self.wait_for_runtime_reply(request_id, region_id)? {
+            RuntimeReply::Inspect { inspect, .. } => Ok(*inspect),
+            _ => Err(RegionalGameRunnerError::RuntimeReplyMissing {
+                request_id,
+                region_id,
+            }),
+        }
     }
 
     /// Enter-panel road-traveler detail for `(region_id, x, y)`, local-only like
@@ -368,10 +377,18 @@ impl RegionalGameRunner {
             .operation_lock
             .lock()
             .expect("regional runner operation lock poisoned");
-        self.worker_for_region(region_id)?
-            .road_traveler_panel_seed(region_id, x, y)
-            .map_err(RegionalGameRunnerError::from)?
-            .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })
+        let request_id = self.next_runtime_request_id();
+        self.route_region_event(
+            region_id,
+            RegionEvent::RoadTravelerPanelSeed { request_id, x, y },
+        )?;
+        match self.wait_for_runtime_reply(request_id, region_id)? {
+            RuntimeReply::RoadTravelerPanelSeed { seed, .. } => Ok(seed),
+            _ => Err(RegionalGameRunnerError::RuntimeReplyMissing {
+                request_id,
+                region_id,
+            }),
+        }
     }
 
     /// Remote staff of the workplace at `(producer_region, pos)`: cross-region
@@ -394,26 +411,49 @@ impl RegionalGameRunner {
 
         // Parity with inspect_region: reject an unknown workplace region instead of
         // silently returning an empty roster.
-        let producer_worker = self.worker_for_region(producer_region)?;
-
-        // Normalize a clicked footprint cell to the workplace anchor: a multi-cell
-        // building records only its anchor on each commuter's assignment, so without
-        // this only the anchor cell would list remote workers. An empty cell (no
-        // anchor) has no remote staff.
-        let Some(anchor) = producer_worker
-            .building_anchor_at(producer_region, pos.x, pos.y)
-            .map_err(RegionalGameRunnerError::from)?
+        let request_id = self.next_runtime_request_id();
+        self.route_region_event(
+            producer_region,
+            RegionEvent::BuildingAnchorAt {
+                request_id,
+                x: pos.x,
+                y: pos.y,
+            },
+        )?;
+        let RuntimeReply::BuildingAnchor { anchor, .. } =
+            self.wait_for_runtime_reply(request_id, producer_region)?
         else {
+            return Err(RegionalGameRunnerError::RuntimeReplyMissing {
+                request_id,
+                region_id: producer_region,
+            });
+        };
+        let Some(anchor) = anchor else {
             return Ok(Vec::new());
         };
 
         let mut workers = Vec::new();
-        for worker in &self.workers {
-            workers.extend(
-                worker
-                    .remote_workers_at(producer_region, anchor)
-                    .map_err(RegionalGameRunnerError::from)?,
-            );
+        let request_id = self.next_runtime_request_id();
+        for region_id in self.owners.region_ids() {
+            self.route_region_event(
+                region_id,
+                RegionEvent::RemoteWorkersFor {
+                    request_id,
+                    producer_region,
+                    pos: anchor,
+                },
+            )?;
+            let RuntimeReply::RemoteWorkers {
+                workers: region_workers,
+                ..
+            } = self.wait_for_runtime_reply(request_id, region_id)?
+            else {
+                return Err(RegionalGameRunnerError::RuntimeReplyMissing {
+                    request_id,
+                    region_id,
+                });
+            };
+            workers.extend(region_workers);
         }
         workers.sort_by_key(home_region_key);
         Ok(workers)
@@ -427,12 +467,19 @@ impl RegionalGameRunner {
             .operation_lock
             .lock()
             .expect("regional runner operation lock poisoned");
-        for handle in &self.handles {
-            handle.send(
-                crate::core::regions::runtime::RegionEvent::SettlePowerImports { request_id },
-            );
-        }
-        self.process_worker_until_drained()
+        let regions = self.owners.region_ids();
+        let coordinator = self
+            .coordinator
+            .as_ref()
+            .ok_or(RegionalGameRunnerError::CoordinatorFaulted)?;
+        coordinator
+            .handle()
+            .route(RoutedRegionEvent {
+                recipients: RegionRecipients::Many(regions.clone()),
+                event: RegionEvent::SettlePowerImports { request_id },
+            })
+            .map_err(|_| RegionalGameRunnerError::CoordinatorFaulted)?;
+        self.wait_for_power_import_settlements(request_id, &regions)
     }
 
     pub fn shutdown(self) -> Result<RecoveredRegionalGame, RegionalGameRunnerError> {
@@ -457,26 +504,113 @@ impl RegionalGameRunner {
         Ok(RecoveredRegionalGame { workers })
     }
 
-    fn handle_for_owned_region(
-        &self,
-        region_id: RegionId,
-    ) -> Result<&RegionHandle, RegionalGameRunnerError> {
-        self.worker_for_region(region_id)?;
-        self.handle_for(region_id)
-            .ok_or(RegionalGameRunnerError::UnknownRegion { region_id })
-    }
-
-    fn handle_for(&self, region_id: RegionId) -> Option<&RegionHandle> {
-        self.handles
-            .iter()
-            .find(|handle| handle.region_id() == region_id)
-    }
-
     fn check_health(&self) -> Result<(), RegionalGameRunnerError> {
         if self.health.fault().is_some() {
             return Err(RegionalGameRunnerError::CoordinatorFaulted);
         }
         Ok(())
+    }
+
+    fn next_runtime_request_id(&self) -> UiRequestId {
+        UiRequestId(self.next_runtime_request.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn route_region_event(
+        &self,
+        region_id: RegionId,
+        event: RegionEvent,
+    ) -> Result<(), RegionalGameRunnerError> {
+        self.worker_for_region(region_id)?;
+        let coordinator = self
+            .coordinator
+            .as_ref()
+            .ok_or(RegionalGameRunnerError::CoordinatorFaulted)?;
+        coordinator
+            .handle()
+            .route(RoutedRegionEvent {
+                recipients: RegionRecipients::One(region_id),
+                event,
+            })
+            .map_err(|_| RegionalGameRunnerError::CoordinatorFaulted)
+    }
+
+    fn wait_for_runtime_reply(
+        &self,
+        request_id: UiRequestId,
+        region_id: RegionId,
+    ) -> Result<RuntimeReply, RegionalGameRunnerError> {
+        for _ in 0..MAX_REPLY_PASSES {
+            let summary = self.process_one_reply_pass()?;
+            if let Some(reply) = summary
+                .runtime_replies
+                .into_iter()
+                .find(|reply| match reply {
+                    RuntimeReply::Inspect {
+                        request_id: id,
+                        region_id: region,
+                        ..
+                    }
+                    | RuntimeReply::RoadTravelerPanelSeed {
+                        request_id: id,
+                        region_id: region,
+                        ..
+                    }
+                    | RuntimeReply::BuildingAnchor {
+                        request_id: id,
+                        region_id: region,
+                        ..
+                    }
+                    | RuntimeReply::RemoteWorkers {
+                        request_id: id,
+                        region_id: region,
+                        ..
+                    }
+                    | RuntimeReply::PowerImportsSettled {
+                        request_id: id,
+                        region_id: region,
+                    } => *id == request_id && *region == region_id,
+                })
+            {
+                return Ok(reply);
+            }
+        }
+        Err(RegionalGameRunnerError::RuntimeReplyMissing {
+            request_id,
+            region_id,
+        })
+    }
+
+    fn wait_for_power_import_settlements(
+        &self,
+        request_id: UiRequestId,
+        regions: &[RegionId],
+    ) -> Result<(), RegionalGameRunnerError> {
+        let mut pending = regions.to_vec();
+        for _ in 0..MAX_REPLY_PASSES {
+            let summary = self.process_one_reply_pass()?;
+            for reply in summary.runtime_replies {
+                let RuntimeReply::PowerImportsSettled {
+                    request_id: reply_request_id,
+                    region_id,
+                } = reply
+                else {
+                    continue;
+                };
+                if reply_request_id != request_id {
+                    continue;
+                }
+                if let Some(position) = pending.iter().position(|region| *region == region_id) {
+                    pending.remove(position);
+                }
+            }
+            if pending.is_empty() {
+                return Ok(());
+            }
+        }
+        Err(RegionalGameRunnerError::RuntimeReplyMissing {
+            request_id,
+            region_id: pending[0],
+        })
     }
 
     fn collect_runner_replies(
@@ -493,6 +627,7 @@ impl RegionalGameRunner {
                 RunnerSignal::CommandReply(reply) => summary.command_replies.push(reply),
                 RunnerSignal::TickReply(reply) => summary.tick_replies.push(reply),
                 RunnerSignal::SnapshotReply(reply) => summary.snapshot_replies.push(reply),
+                RunnerSignal::RuntimeReply(reply) => summary.runtime_replies.push(reply),
             }
         }
         self.check_health()
@@ -514,7 +649,7 @@ impl RegionalGameRunner {
     }
 
     /// Advances movement by one 10-minute sub-tick across EVERY region, as a
-    /// single deterministic barrier pass. Broadcasts `StepTravel` to all region
+    /// one coordinator-driven pass. Broadcasts `StepTravel` to all region
     /// mailboxes, then drains each region's inbox (any `ReceiveTraveler`s handed in
     /// last sub-tick — processed first, FIFO, inserting their visiting tokens — plus
     /// the one `StepTravel`) at a full-inbox budget, and delivers the crossings
@@ -527,30 +662,21 @@ impl RegionalGameRunner {
             .lock()
             .expect("regional runner operation lock poisoned");
         let step = TravelStepId(self.next_travel_step.fetch_add(1, Ordering::Relaxed) + 1);
-        for handle in &self.handles {
-            handle.send(crate::core::regions::runtime::RegionEvent::StepTravel { step });
-        }
-        let mut forwarded = Vec::new();
-        for worker in &self.workers {
-            let mut summary = worker
-                .process_region_events_for_barrier(usize::MAX)
-                .map_err(RegionalGameRunnerError::from)?;
-            if let Some(error) = summary.routing_errors.first().copied() {
-                return Err(RegionalGameRunnerError::WorkerRoutingFailed {
-                    worker_id: worker.worker_id(),
-                    error,
-                });
-            }
-            forwarded.append(&mut summary.forwarded_events);
-        }
-        self.deliver_forwarded_events(forwarded)?;
-        self.process_worker_until_drained()?;
-        if let Some(coordinator) = &self.coordinator {
-            coordinator
-                .handle()
-                .drain_until_idle()
-                .map_err(|_| RegionalGameRunnerError::CoordinatorFaulted)?;
-        }
+        let coordinator = self
+            .coordinator
+            .as_ref()
+            .ok_or(RegionalGameRunnerError::CoordinatorFaulted)?;
+        coordinator
+            .handle()
+            .route(RoutedRegionEvent {
+                recipients: RegionRecipients::All,
+                event: RegionEvent::StepTravel { step },
+            })
+            .map_err(|_| RegionalGameRunnerError::CoordinatorFaulted)?;
+        coordinator
+            .handle()
+            .drain_until_idle()
+            .map_err(|_| RegionalGameRunnerError::CoordinatorFaulted)?;
         self.check_health()?;
         Ok(())
     }
@@ -561,97 +687,27 @@ impl RegionalGameRunner {
     /// loops: the requested command/tick/snapshot may sit behind older events, or
     /// may need cross-region export request/grant events before its final reply
     /// exists. One pass gives each region at most one event of work, collects any
-    /// replies produced along the way, then delivers forwarded cross-worker
-    /// events through the deterministic barrier. The `wait_for_*` helpers repeat
-    /// this bounded pass until the matching `(request_id, region_id)` reply is
+    /// replies produced along the way, then asks the coordinator to drain queued
+    /// cross-worker events. The `wait_for_*` helpers repeat this bounded pass until
+    /// the matching `(request_id, region_id)` reply is
     /// found or the safety cap is reached.
     fn process_one_reply_pass(&self) -> Result<WorkerRunSummary, RegionalGameRunnerError> {
         let mut combined = WorkerRunSummary::default();
         self.collect_runner_replies(&mut combined)?;
-
-        for worker in &self.workers {
-            let mut summary = worker
-                .process_region_events_for_barrier(1)
-                .map_err(RegionalGameRunnerError::from)?;
-
-            if let Some(error) = summary.routing_errors.first().copied() {
-                return Err(RegionalGameRunnerError::WorkerRoutingFailed {
-                    worker_id: worker.worker_id(),
-                    error,
-                });
-            }
-
-            combined.processed_regions += summary.processed_regions;
-            combined
-                .command_replies
-                .append(&mut summary.command_replies);
-            combined.tick_replies.append(&mut summary.tick_replies);
-            combined
-                .snapshot_replies
-                .append(&mut summary.snapshot_replies);
-            combined
-                .forwarded_events
-                .append(&mut summary.forwarded_events);
-        }
-        self.deliver_forwarded_events(std::mem::take(&mut combined.forwarded_events))?;
+        let coordinator = self
+            .coordinator
+            .as_ref()
+            .ok_or(RegionalGameRunnerError::CoordinatorFaulted)?;
+        coordinator
+            .handle()
+            .drain_until_idle()
+            .map_err(|_| RegionalGameRunnerError::CoordinatorFaulted)?;
         self.collect_runner_replies(&mut combined)?;
-
         Ok(combined)
     }
 
-    fn deliver_forwarded_events(
-        &self,
-        mut events: Vec<ForwardedRegionEvent>,
-    ) -> Result<(), RegionalGameRunnerError> {
-        sort_forwarded_events(&mut events);
-
-        let mut by_worker: BTreeMap<WorkerId, Vec<ForwardedRegionEvent>> = BTreeMap::new();
-        for event in events {
-            by_worker
-                .entry(event.target_worker)
-                .or_default()
-                .push(event);
-        }
-
-        for (worker_id, worker_events) in by_worker {
-            let target_region = worker_events[0].target_region;
-            let Some(worker) = self
-                .workers
-                .iter()
-                .find(|worker| worker.worker_id() == worker_id)
-            else {
-                return Err(RegionalGameRunnerError::WorkerRoutingFailed {
-                    worker_id,
-                    error: WorkerRoutingError::MissingTargetRegion { target_region },
-                });
-            };
-            let errors = worker
-                .deliver_forwarded_events(worker_events)
-                .map_err(RegionalGameRunnerError::from)?;
-            if let Some(error) = errors.into_iter().next() {
-                return Err(RegionalGameRunnerError::WorkerRoutingFailed { worker_id, error });
-            }
-        }
-
-        Ok(())
-    }
-
     fn process_worker_until_drained(&self) -> Result<(), RegionalGameRunnerError> {
-        // Export propagation and imported-resource continuations are
-        // asynchronous within worker passes. Stop once a pass finds no queued
-        // work, while keeping the same safety cap used by command replies.
-        for _ in 0..MAX_REPLY_PASSES {
-            let summary = self.process_one_reply_pass()?;
-            if summary.processed_regions == 0 {
-                break;
-            }
-        }
-        if let Some(coordinator) = &self.coordinator {
-            coordinator
-                .handle()
-                .drain_until_idle()
-                .map_err(|_| RegionalGameRunnerError::CoordinatorFaulted)?;
-        }
+        self.process_one_reply_pass()?;
         self.check_health()?;
         Ok(())
     }
@@ -933,18 +989,27 @@ mod tests {
         );
         worker.add_region(runtime).unwrap();
 
+        let prepared = PreparedThreadedRegionWorker::prepare(worker);
+        let coordinator_workers =
+            BTreeMap::from([(prepared.worker_id(), prepared.command_sender())]);
+        let health = Arc::new(RunnerHealth::default());
         let (signal_sender, runner_signals) = mpsc::channel();
-        drop(signal_sender);
+        let coordinator = RegionEventCoordinator::start(
+            owners.clone(),
+            coordinator_workers,
+            Arc::clone(&health),
+            signal_sender,
+        );
         (
             RegionalGameRunner {
-                workers: vec![ThreadedRegionWorker::start(worker)],
-                handles: vec![handle.clone()],
+                workers: vec![prepared.start_with_coordinator(coordinator.handle())],
                 owners,
                 operation_lock: Mutex::new(()),
                 next_travel_step: AtomicU64::new(0),
-                coordinator: None,
+                next_runtime_request: AtomicU64::new(1),
+                coordinator: Some(coordinator),
                 runner_signals: Mutex::new(runner_signals),
-                health: Arc::new(RunnerHealth::default()),
+                health,
             },
             handle,
         )
