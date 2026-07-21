@@ -479,12 +479,16 @@ impl RegionWorker {
 
             processed_regions += 1;
             let discovery = self.directory.discovery_snapshot();
-            let importable_remote_jobs = importable_remote_jobs_for_region(
+            let border_links = runtime.state().network_border_links();
+            let importable_remote_jobs =
+                importable_remote_jobs_for_region(&discovery, runtime.region_id(), &border_links);
+            let cross_region_goods_routes = cross_region_goods_routes_for_region(
                 &discovery,
                 runtime.region_id(),
-                &runtime.state().network_border_links(),
+                &border_links,
             );
             runtime.set_importable_remote_jobs(importable_remote_jobs);
+            runtime.set_cross_region_goods_routes(cross_region_goods_routes);
             // Event-driven plan, P-2: install this pass's directory generation
             // before processing events, so the power reconcile gate compares
             // against the same snapshot this slice's routing already used.

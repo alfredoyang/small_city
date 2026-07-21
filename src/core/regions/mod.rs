@@ -893,7 +893,11 @@ impl RegionState {
                         //     to the home region so it can clear `active_travelers`
                         //     there.
                         if token.home.region == self.id {
-                            travel::apply_traveler_return(&mut self.world, traveler);
+                            if self.world.trucks.contains_key(&traveler.entity) {
+                                self.apply_truck_rollback(traveler);
+                            } else {
+                                travel::apply_traveler_return(&mut self.world, traveler);
+                            }
                         } else {
                             handoffs.push(TravelerHandoff {
                                 token: token.clone(),
@@ -946,11 +950,7 @@ impl RegionState {
             HandoffKind::Move => {
                 // If this is the home region, gate on the four-part guard.
                 if handoff.token.home.region == self.id
-                    && !travel::home_accepts(
-                        &self.world,
-                        handoff.traveler.entity,
-                        handoff.traveler.generation,
-                    )
+                    && !self.accepts_inbound_home_traveler(handoff.traveler)
                 {
                     // Stale or duplicate — drop silently.
                     return Vec::new();
@@ -981,9 +981,21 @@ impl RegionState {
                 }
             }
             HandoffKind::Rollback => {
-                travel::apply_traveler_return(&mut self.world, handoff.traveler);
+                if self.world.trucks.contains_key(&handoff.traveler.entity) {
+                    self.apply_truck_rollback(handoff.traveler);
+                } else {
+                    travel::apply_traveler_return(&mut self.world, handoff.traveler);
+                }
                 Vec::new()
             }
+        }
+    }
+
+    fn accepts_inbound_home_traveler(&self, traveler: TravelerId) -> bool {
+        if self.world.trucks.contains_key(&traveler.entity) {
+            self.accepts_truck_return(traveler)
+        } else {
+            travel::home_accepts(&self.world, traveler.entity, traveler.generation)
         }
     }
 
@@ -1075,10 +1087,7 @@ impl RegionState {
                     network,
                     has_spare_power: capacity.remaining_capacity > 0,
                     spare_job_slot_ids,
-                    spare_goods_units: economy::exportable_goods_units_on_network(
-                        &self.world,
-                        network.road_network,
-                    ),
+                    spare_goods_units: self.factory_goods_units_on_network(network),
                 }
             })
             .collect::<Vec<_>>();
@@ -1108,13 +1117,6 @@ impl RegionState {
             .find(|capacity| capacity.road_network == network.road_network)
             .map(|capacity| capacity.remaining_capacity)
             .unwrap_or(0)
-    }
-
-    pub(crate) fn goods_network_remaining_units(&self, network: RegionRoadNetworkId) -> u32 {
-        if network.region != self.id {
-            return 0;
-        }
-        economy::exportable_goods_units_on_network(&self.world, network.road_network)
     }
 
     pub(crate) fn begin_tick_power_demand_phase(&mut self) -> RegionalTickPowerPhase {
@@ -1245,18 +1247,6 @@ impl RegionState {
         RegionalTickJobPhase { phase }
     }
 
-    /// Finishes the tick after the job phase resolves.
-    ///
-    /// `exported_job_slots` are this region's workplace entities reserved for
-    /// remote workers; the economy accrues their workplace tax to this region.
-    pub(crate) fn finish_tick_job_demand_phase(
-        &mut self,
-        phase: RegionalTickJobPhase,
-        exported_job_slots: &[Entity],
-    ) -> CommandResult {
-        finish_tick_after_job_phase(&mut self.world, phase.phase, exported_job_slots)
-    }
-
     pub(crate) fn continue_tick_to_goods_demand_phase(
         &mut self,
         job_phase: RegionalTickJobPhase,
@@ -1370,18 +1360,6 @@ impl RegionState {
             .max(0);
     }
 
-    pub(crate) fn add_commercial_goods(&mut self, commercial: Entity, units: u32) {
-        economy::add_commercial_goods(&mut self.world, commercial, units as i32);
-        // Event-driven plan, P-1/P-5: this cross-region delivery path writes
-        // `local_goods_stored` directly and bypasses every invalidate_*/mark_*
-        // chokepoint, so it needs its own explicit marks — both hints (so
-        // remote shoppers see updated availability) and this region's own
-        // goods export dirty flag (a delivered shipment changes this
-        // building's future free capacity).
-        self.world.mark_hints_dirty();
-        self.world.mark_goods_exports_dirty();
-    }
-
     fn factory_entities(&self) -> Vec<Entity> {
         let mut factories = self
             .world
@@ -1424,6 +1402,22 @@ impl RegionState {
                 BuildingData::Commercial { .. } | BuildingData::None => None,
             })
             .unwrap_or(0)
+    }
+
+    fn factory_goods_units_on_network(&self, network: RegionRoadNetworkId) -> u32 {
+        if network.region != self.id {
+            return 0;
+        }
+        self.factory_entities()
+            .into_iter()
+            .filter(|factory| self.is_effective_factory(*factory))
+            .filter(|factory| {
+                crate::core::systems::road_network_analysis::access_for(&self.world, *factory)
+                    .network_id
+                    == Some(network.road_network)
+            })
+            .map(|factory| self.factory_available_goods(factory).max(0) as u32)
+            .sum()
     }
 
     fn is_effective_factory(&self, factory: Entity) -> bool {
@@ -1492,10 +1486,10 @@ impl RegionState {
         })
     }
 
-    fn choose_factory_for_local_shipment(
+    fn choose_factory_for_shipment(
         &self,
         producer_network: RegionRoadNetworkId,
-        commercial: Entity,
+        commercial: PlaceRef,
         units: i32,
     ) -> Option<Entity> {
         if producer_network.region != self.id {
@@ -1511,11 +1505,16 @@ impl RegionState {
                     crate::core::systems::road_network_analysis::access_for(&self.world, factory);
                 (access.network_id == Some(producer_network.road_network))
                     .then(|| {
-                        crate::core::systems::road_network_analysis::distance_between_buildings(
-                            &self.world,
-                            factory,
-                            commercial,
-                        )
+                        if commercial.region == self.id {
+                            crate::core::systems::road_network_analysis::distance_between_buildings(
+                                &self.world,
+                                factory,
+                                commercial.building,
+                            )
+                        } else {
+                            travel::start_trip_from_building(&self.world, factory, commercial)
+                                .map(|_| 0)
+                        }
                         .map(|distance| (factory, distance))
                     })
                     .flatten()
@@ -1532,7 +1531,7 @@ impl RegionState {
             .map(|(factory, _distance)| factory)
     }
 
-    pub(crate) fn produce_factory_goods_for_daily_tick(&mut self) {
+    pub fn produce_factory_goods_for_daily_tick(&mut self) {
         ensure_derived_state(&mut self.world, self.id);
         self.reconcile_factory_trucks();
         let factories = self.factory_entities();
@@ -1543,12 +1542,17 @@ impl RegionState {
             let produced = economy::industrial_goods_production(&self.world, factory);
             let capacity = self.factory_warehouse_capacity(factory);
             if let Some(goods) = self.factory_goods_mut(factory) {
+                let before = goods.stored_units;
                 goods.stored_units = (goods.stored_units + produced).clamp(0, capacity);
+                if goods.stored_units != before {
+                    self.world.mark_hints_dirty();
+                    self.world.mark_goods_exports_dirty();
+                }
             }
         }
     }
 
-    pub(crate) fn dispatch_local_goods_shipment(
+    pub(crate) fn dispatch_goods_shipment(
         &mut self,
         request: &GoodsSupplyRequest,
         producer_network: RegionRoadNetworkId,
@@ -1557,22 +1561,22 @@ impl RegionState {
         ensure_derived_state(&mut self.world, self.id);
         self.reconcile_factory_trucks();
         let units_i32 = request.units as i32;
+        let commercial_place = PlaceRef {
+            region: request.caller_region,
+            building: request.commercial,
+        };
         let order = GoodsOrderId {
             commercial: request.commercial,
             request_id: request.request_id,
             token: request.token,
         };
         let Some(factory) =
-            self.choose_factory_for_local_shipment(producer_network, request.commercial, units_i32)
+            self.choose_factory_for_shipment(producer_network, commercial_place, units_i32)
         else {
             return denied_goods_grant(request.token);
         };
         let Some(truck_id) = self.first_idle_truck(factory, units_i32) else {
             return denied_goods_grant(request.token);
-        };
-        let commercial_place = PlaceRef {
-            region: request.caller_region,
-            building: request.commercial,
         };
         let Some(state) = travel::start_trip_from_building(&self.world, factory, commercial_place)
         else {
@@ -1620,7 +1624,38 @@ impl RegionState {
         }
     }
 
-    pub(crate) fn record_local_goods_grant(
+    fn accepts_truck_return(&self, traveler: TravelerId) -> bool {
+        self.world
+            .trucks
+            .get(&traveler.entity)
+            .is_some_and(|truck| truck.trip_generation == traveler.generation)
+            && self.world.active_travelers.contains(&traveler.entity)
+    }
+
+    fn apply_truck_return(&mut self, traveler: TravelerId) {
+        if !self.accepts_truck_return(traveler) {
+            return;
+        }
+        self.world.active_travelers.remove(&traveler.entity);
+        if let Some(truck) = self.world.trucks.get_mut(&traveler.entity) {
+            truck.arrival_action = ArrivalAction::ReturnHome;
+        }
+    }
+
+    fn apply_truck_rollback(&mut self, traveler: TravelerId) {
+        let Some((factory, shipment)) = self.world.trucks.get(&traveler.entity).and_then(|truck| {
+            (truck.trip_generation == traveler.generation)
+                .then(|| truck.shipment.map(|shipment| (truck.factory, shipment)))
+                .flatten()
+        }) else {
+            self.apply_truck_return(traveler);
+            return;
+        };
+        self.clear_goods_shipment_reservation(traveler.entity, factory, shipment);
+        self.world.active_travelers.remove(&traveler.entity);
+    }
+
+    pub(crate) fn record_goods_order(
         &mut self,
         request_id: UiRequestId,
         token: u32,
@@ -1684,6 +1719,8 @@ impl RegionState {
             stored_order.inbound_reserved_units == 0 && stored_order.remaining_units == 0
         };
         economy::add_commercial_goods(&mut self.world, order.commercial, units);
+        self.world.mark_hints_dirty();
+        self.world.mark_goods_exports_dirty();
         if remove_order {
             self.world.goods_orders.remove(&order);
         }
@@ -2701,7 +2738,7 @@ mod tests {
             commercial,
         };
 
-        let grant = region.dispatch_local_goods_shipment(
+        let grant = region.dispatch_goods_shipment(
             &request,
             network,
             ExportAllocationKey {
@@ -2711,12 +2748,7 @@ mod tests {
             },
         );
         assert!(grant.granted);
-        region.record_local_goods_grant(
-            request.request_id,
-            request.token,
-            commercial,
-            request.units,
-        );
+        region.record_goods_order(request.request_id, request.token, commercial, request.units);
         assert_eq!(region.world.tokens.len(), 1);
         let before_save_generation = region
             .world

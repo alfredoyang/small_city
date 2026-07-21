@@ -1117,6 +1117,245 @@ factory downgrade:
     leave loaded excess trucks until they return, then reconcile again
 ```
 
+## Goods Delivery Diagrams
+
+### Ownership
+
+```text
+Factory region owns truth:
+
+  Factory building
+    warehouse.stored_units
+    warehouse.reserved_outbound_units
+
+  Truck entity
+    factory
+    cargo_capacity
+    trip_generation
+    arrival_action
+    shipment
+
+Commercial region owns truth:
+
+  Commercial building
+    local_goods_stored
+
+  GoodsOrder
+    order id = commercial + request_id + token
+    inbound_reserved_units
+    remaining_units
+
+Movement host owns transient body:
+
+  World.tokens[truck_entity]
+    TravelToken { home=factory, kind=Truck { shipment snapshot } }
+```
+
+### Local Delivery
+
+```text
+same region:
+
+  Commercial demand
+        |
+        v
+  GoodsSupplyRequest
+        |
+        v
+  Factory accepts
+        |
+        +-- reserve factory stock
+        +-- mark truck busy
+        +-- create GoodsOrder
+        +-- spawn TravelToken
+        |
+        v
+  StepTravel ... StepTravel
+        |
+        v
+  DestinationArrived(truck, commercial)
+        |
+        v
+  ApplyGoodsDelivery
+        |
+        +-- commercial stock += cargo
+        +-- order inbound reservation -= cargo
+        |
+        v
+  ConfirmGoodsDelivery
+        |
+        +-- factory stored -= cargo
+        +-- factory outbound reservation -= cargo
+        +-- truck shipment = None
+        +-- truck returns to factory
+```
+
+### Remote Delivery
+
+```text
+producer region A                         consumer region B
+
+Factory accepts request
+  reserve stock
+  mark truck busy
+  spawn loaded token
+        |
+        v
+StepTravel to border
+        |
+        v
+ReceiveTraveler -----------------------> receive truck token
+                                           |
+                                           v
+                                      StepTravel to commercial
+                                           |
+                                           v
+DestinationArrived <------------------- emit arrival to factory owner
+        |
+        v
+validate truck generation/action/shipment
+        |
+        v
+ApplyGoodsDelivery --------------------> commercial stock += cargo
+                                           order reservation -= cargo
+                                           |
+                                           v
+ConfirmGoodsDelivery <------------------ confirm delivery
+        |
+        v
+factory consumes reserved stock
+truck shipment clears
+truck returns to factory
+```
+
+### One Commercial, Multiple Factories
+
+```text
+Commercial needs 6 goods
+GOODS_PER_TRUCK = 3
+
+request_id = 100
+
+  token 0: commercial C asks for 3
+       candidates: factory A network, factory B network
+       accepted by factory A / truck A1
+
+  token 1: commercial C asks for 3
+       candidates: factory A network, factory B network
+       factory A has no idle truck or no free stock
+       accepted by factory B / truck B1
+
+Result:
+
+  factory A reserved_outbound += 3
+  factory B reserved_outbound += 3
+  commercial C inbound_reserved += 6
+
+  truck A1 arrival -> C stock += 3
+  truck B1 arrival -> C stock += 3
+```
+
+### One Factory, Multiple Trucks
+
+```text
+Level 2 factory has 2 trucks
+GOODS_PER_TRUCK = 3
+
+Commercial asks for 6 goods
+
+  token 0 -> factory F / truck F1 / cargo 3
+  token 1 -> factory F / truck F2 / cargo 3
+
+Both trucks may move at the same time:
+
+  F1: factory -> road -> commercial -> factory
+  F2: factory -> road -> commercial -> factory
+
+Factory reservation while both are outbound:
+
+  stored_units = 6
+  reserved_outbound_units = 6
+  available = 0
+
+After both confirmations:
+
+  stored_units = 0
+  reserved_outbound_units = 0
+  both trucks idle at factory
+```
+
+### Two Remote Commercials
+
+```text
+producer region A                         consumer region B
+
+Factory F(level 2, two trucks)
+
+  order 1: commercial C1 in region B
+  order 2: commercial C2 in region B
+
+dispatch:
+
+  truck F1 -> C1
+  truck F2 -> C2
+
+handoff:
+
+  A StepTravel emits ReceiveTraveler(F1) -> B
+  A StepTravel emits ReceiveTraveler(F2) -> B
+
+delivery:
+
+  B StepTravel emits DestinationArrived(F1, C1) -> A
+  B StepTravel emits DestinationArrived(F2, C2) -> A
+
+confirmation:
+
+  A validates both truck shipments
+  B applies cargo to each commercial
+  B confirms both deliveries to A
+  A clears both shipments and stock reservations
+```
+
+### Road Break Rollback
+
+```text
+loaded truck on road
+        |
+        v
+road deleted before destination
+        |
+        v
+StepTravel sees target unreachable
+        |
+        v
+Rollback handoff to factory owner
+        |
+        v
+factory cleanup:
+  reserved_outbound_units -= cargo
+  truck.shipment = None
+  truck.arrival_action = ReturnHome
+  active_travelers.remove(truck)
+  no commercial stock change
+```
+
+Remote road break:
+
+```text
+A factory truck crosses into B
+        |
+        v
+B road to commercial is deleted
+        |
+        v
+B StepTravel emits rollback to A
+        |
+        v
+A clears factory reservation and truck shipment
+B commercial receives no goods
+```
+
 ## Invariants
 
 ```text

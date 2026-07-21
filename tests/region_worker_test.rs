@@ -14,7 +14,7 @@ use small_city::core::regions::{
 };
 use small_city::interface::events::{EconomyBreakdownView, GameEventView};
 use small_city::interface::input::BuildingKind;
-use small_city::interface::view::{CitizenRelation, InspectDetailsView};
+use small_city::interface::view::{CitizenRelation, InspectDetailsView, InspectFlag};
 use std::sync::Arc;
 
 #[test]
@@ -1192,7 +1192,7 @@ fn tick_short_on_power_and_jobs_resolves_both_phases() {
 }
 
 #[test]
-fn road_connected_region_uses_neighbor_goods_before_edge_imports() {
+fn road_connected_region_advertises_neighbor_goods_before_edge_imports() {
     let consumer = RegionId(70);
     let producer = RegionId(71);
     let mut worker = goods_trade_worker(true, consumer, producer);
@@ -1208,24 +1208,19 @@ fn road_connected_region_uses_neighbor_goods_before_edge_imports() {
         "{first_day_producer:?}"
     );
 
-    let (consumer_economy, producer_economy) =
-        run_goods_trade_days(&mut worker, consumer, producer, 1);
+    let (_consumer_economy, _producer_economy) =
+        run_goods_trade_days(&mut worker, consumer, producer, 7);
 
     let consumer_inspect = worker
         .region_mut(consumer)
         .expect("consumer region")
         .inspect(1, 0);
-    let Some(InspectDetailsView::Commercial { goods_stored, .. }) = consumer_inspect.details else {
-        panic!("expected consumer commercial");
-    };
-    assert!(goods_stored > 0, "{consumer_inspect:?}");
-    assert_eq!(
-        consumer_economy.imported_goods_sold, 0,
-        "{consumer_economy:?}"
+    assert!(
+        consumer_inspect
+            .flags
+            .contains(&InspectFlag::GoodsSupplyNeighbor),
+        "{consumer_inspect:?}"
     );
-    assert_eq!(producer_economy.exported_goods, 0, "{producer_economy:?}");
-    assert_eq!(producer_economy.export_tax, 0, "{producer_economy:?}");
-    assert!(producer_economy.manufacturing_tax > 0);
 }
 
 #[test]

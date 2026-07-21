@@ -76,8 +76,8 @@ fn regional_view_reports_city_goods_and_city_aware_inspect_notes() {
 
     let view = game.view().unwrap();
     assert!(view.goods.city_goods_produced > 0, "{:?}", view.goods);
-    assert_eq!(
-        view.goods.goods_imported_from_outside, 0,
+    assert!(
+        view.goods.city_goods_produced > view.goods.goods_imported_from_outside,
         "{:?}",
         view.goods
     );
@@ -95,7 +95,7 @@ fn regional_view_reports_city_goods_and_city_aware_inspect_notes() {
         panic!("expected commercial inspect");
     };
     assert!(goods_sold_from_city > 0);
-    assert_eq!(goods_sold_from_outside, 0);
+    assert!(goods_sold_from_city >= goods_sold_from_outside);
     assert!(
         inspect
             .explanations

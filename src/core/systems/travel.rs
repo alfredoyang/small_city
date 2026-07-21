@@ -50,6 +50,8 @@ use crate::core::world::World;
 enum TokenArrival {
     /// Keep walking.
     Walking,
+    /// The current road can no longer reach the local target.
+    Blocked,
     /// Arrived at the workplace — idle `AtWork`, `building = work.building`.
     ArrivedWork,
     /// Arrived at home — the token should be removed and the citizen cleared from
@@ -161,6 +163,20 @@ pub(crate) fn step_tokens(world: &mut World) {
                 match arrival {
                     TokenArrival::ArrivedHome => {
                         removes.push((traveler_entity, true, token.trip_gen));
+                    }
+                    TokenArrival::Blocked => {
+                        if matches!(token.kind, TravelKind::Truck { .. }) {
+                            handoffs.push(PendingHandoff::Rollback {
+                                traveler: TravelerId {
+                                    entity: traveler_entity,
+                                    generation: token.trip_gen,
+                                },
+                                to_region: token.home.region,
+                            });
+                            removes.push((traveler_entity, false, token.trip_gen));
+                        } else {
+                            updates.push((traveler_entity, next_state));
+                        }
                     }
                     TokenArrival::ArrivedWork | TokenArrival::Walking => {
                         if let Some(arrival) = destination_arrived_after_step(
@@ -556,14 +572,14 @@ fn advance_to_building(
             // ticks).
             let Some(network) = network_of_cell(networks, cell) else {
                 // Off-graph → stay put (§4b).
-                return (state, TokenArrival::Walking);
+                return (state, TokenArrival::Blocked);
             };
             let next = world
                 .routes_to(target_building, network)
                 .get(&cell)
                 .copied();
             let Some(next) = next else {
-                return (state, TokenArrival::Walking); // unreachable → stay
+                return (state, TokenArrival::Blocked);
             };
             let degree = road_degree_in_network(world, cell, network);
             let cost = step_cost(world, state.prev_cell, cell, Some(next), degree);

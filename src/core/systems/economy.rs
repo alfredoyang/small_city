@@ -557,7 +557,6 @@ fn apply_prepared_goods_flow(
 #[derive(Debug, Default)]
 struct GoodsDistributionPlan {
     commercial_free_capacity: HashMap<Entity, i32>,
-    industrial_surplus: Vec<(Entity, i32)>,
 }
 
 fn goods_distribution_after_local_storage(world: &World) -> GoodsDistributionPlan {
@@ -596,7 +595,6 @@ fn goods_distribution_after_local_storage(world: &World) -> GoodsDistributionPla
         })
         .collect::<HashMap<_, _>>();
 
-    let mut industrial_surplus = Vec::new();
     for industrial in productive_industrials {
         let mut remaining_goods = industrial_goods_production(world, industrial);
         for commercial in nearest_commercials_for_goods(world, industrial, &productive_commercials)
@@ -611,12 +609,10 @@ fn goods_distribution_after_local_storage(world: &World) -> GoodsDistributionPla
                 break;
             }
         }
-        industrial_surplus.push((industrial, remaining_goods.max(0)));
     }
 
     GoodsDistributionPlan {
         commercial_free_capacity,
-        industrial_surplus,
     }
 }
 
@@ -639,17 +635,6 @@ pub(crate) fn commercial_goods_demands_after_local_distribution(
             .unwrap_or((*network_id, usize::MAX, usize::MAX, commercial.0))
     });
     demands
-}
-
-pub(crate) fn exportable_goods_units_on_network(world: &World, network_id: u32) -> u32 {
-    goods_distribution_after_local_storage(world)
-        .industrial_surplus
-        .into_iter()
-        .filter(|(industrial, _units)| {
-            road_network_analysis::access_for(world, *industrial).network_id == Some(network_id)
-        })
-        .map(|(_industrial, units)| units.max(0) as u32)
-        .sum()
 }
 
 fn sort_entities_by_position(world: &World, entities: &mut [Entity]) {

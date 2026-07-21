@@ -98,6 +98,7 @@ fn availability_hints_publish_exportable_goods_units() {
     assert!(region.build(1, 1, BuildingKind::Industrial).success);
 
     region.ensure_derived_state();
+    region.produce_factory_goods_for_daily_tick();
     let hints = region.availability_hints();
 
     assert_eq!(hints.len(), 1);

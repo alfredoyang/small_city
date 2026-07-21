@@ -408,7 +408,11 @@ impl TravelToken {
                 }
             }
             TravelKind::Truck { shipment } => {
-                if self.state.building == Some(shipment.commercial.building) {
+                if self.state.destination == Some(self.home.building) {
+                    self.home
+                } else if self.state.destination == Some(shipment.commercial.building) {
+                    shipment.commercial
+                } else if self.state.building == Some(shipment.commercial.building) {
                     self.home
                 } else {
                     shipment.commercial

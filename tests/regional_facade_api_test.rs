@@ -91,12 +91,12 @@ fn tick_returns_structured_summary_events() {
                 after: 5
             },
             money: MetricChange {
-                before: 170,
-                after: 202
+                before: 193,
+                after: 226
             },
             happiness: MetricChange {
-                before: 89,
-                after: 90
+                before: 90,
+                after: 91
             },
             // The profitable industrial can auto-upgrade at the weekly boundary,
             // increasing its pollution source after the economy event is applied.
@@ -112,8 +112,8 @@ fn tick_returns_structured_summary_events() {
                 before: 3,
                 after: 3
             },
-            // P2 truck delivery means the planned local goods are not necessarily
-            // available to shoppers until the next travel pass.
+            // Goods delivered by city trucks are available to shoppers at the
+            // settlement boundary; leftover production can still be exported.
             economy: EconomyBreakdownView {
                 salaries_paid: 18,
                 workplace_tax: 8,
@@ -121,15 +121,15 @@ fn tick_returns_structured_summary_events() {
                 commercial_sales_tax: 9,
                 shoppers_served: 3,
                 local_goods_produced: 4,
-                local_goods_stored: 4,
-                local_goods_sold: 0,
-                imported_goods_sold: 3,
-                exported_goods: 0,
+                local_goods_stored: 3,
+                local_goods_sold: 3,
+                imported_goods_sold: 0,
+                exported_goods: 1,
                 manufacturing_tax: 4,
-                export_tax: 0,
+                export_tax: 1,
                 rent_failures: 0,
                 maintenance_cost: 4,
-                net: 32
+                net: 33
             },
         }
     );
@@ -169,13 +169,13 @@ fn tick_summary_message_includes_metric_changes() {
 
     assert!(message.contains("population 5 (+0)"));
     assert!(message.contains("Year 1, Month 1, Week 2, Day 1, 00:00"));
-    assert!(message.contains("money 213 (+33)"));
+    assert!(message.contains("money 237 (+34)"));
     assert!(message.contains("powered buildings 3 (+0)"));
     // The message expectation changed because tick feedback now explains goods
     // production, local/imported sales, export flow, and related taxes.
     assert!(
         message.contains(
-            "Economy: salaries paid 18, workplace tax +8, rent +15, sales tax +9, shoppers 3, local goods produced 4, stored 4, sold 0, imported 3, exported 0, manufacturing tax +4, export tax +0, rent failures 0, maintenance -3, net +33"
+            "Economy: salaries paid 18, workplace tax +8, rent +15, sales tax +9, shoppers 3, local goods produced 4, stored 3, sold 3, imported 0, exported 1, manufacturing tax +4, export tax +1, rent failures 0, maintenance -3, net +34"
         )
     );
     assert!(message.contains("Commercial at (2, 0) upgraded to level 2 from reinvestment"));
