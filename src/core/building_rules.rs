@@ -1,7 +1,7 @@
 //! Tunable per-building rules (footprint area per upgrade level).
 //!
 //! These are game *rules*, not constants: a JSON ruleset is baked into the binary
-//! (the embedded default) and an external `config/buildings.json` may override it.
+//! (the embedded default) and an external `config/game_settings.json` may override it.
 //! The active ruleset is meant to travel with a save so replays stay deterministic
 //! (the save-stamping is wired where the rules are first read).
 //!

@@ -4,7 +4,7 @@ Status: **M0–M5 implemented and complete** on branch `multi-cell` (each
 codex-reviewed, all tests green). The whole plan is done: configurable footprint
 ruleset (M0), footprint plumbing (M1), grow/merge/block + area capacity (M2),
 contents transfer on merge (M3), inspect visibility (M4), and external
-`config/buildings.json` override + save-stamping for replay parity (M5). The only
+`config/game_settings.json` override + save-stamping for replay parity (M5). The only
 deferred item is cosmetic: a unified multi-cell sprite + footprint-spanning
 cursor (buildings already render cell-by-cell correctly today).
 
@@ -76,7 +76,7 @@ recompiling.
   TOML/RON are avoided since they would add one).
 - **Delivery: embedded default + optional external override.** A baseline ruleset
   is baked into the binary with `include_str!` so the game always runs; an
-  external `config/buildings.json` overrides it when present. Malformed overrides
+  external `config/game_settings.json` overrides it when present. Malformed overrides
   fail loudly with a clear error; the embedded default is guarded by a parse test.
 - **Lives in `core`** as a `BuildingRules` resource; the UI never reads it.
 
@@ -111,7 +111,7 @@ the saved rules**, not the current external JSON:
   the embedded baseline so **legacy saves load unchanged** (they get the [1,2,4]
   default).
 - A **new** game reads the embedded default / external override; that ruleset then
-  travels with the city. Editing `config/buildings.json` afterwards affects only
+  travels with the city. Editing `config/game_settings.json` afterwards affects only
   *new* games — an existing save replays identically regardless. Replay parity is
   guaranteed.
 - The rules are stored once at the `RegionalGameSave` level and injected into each
@@ -203,7 +203,7 @@ fn upgrade(entity):
 
 - **M0 — configurable footprint ruleset.** `core/building_rules.rs`:
   `BuildingRules` (per-kind `footprint_area_per_level`), embedded default via
-  `include_str!` + optional `config/buildings.json` override, validation, and
+  `include_str!` + optional `config/game_settings.json` override, validation, and
   `footprint_area(kind, level)`. Stamp it into `RegionalGameSave`
   (`#[serde(default)]`) and inject into each region's `World`. No gameplay change
   yet — nothing reads the area until M2. Tests: default parses and validates; a
@@ -251,7 +251,7 @@ How the ruleset and capacity thread through, decided while building M0/M1:
   neighbor's residents until M3 lands (accepted by the split).
 - **File override + save-stamping is its own follow-up** (call it M5). It is the
   threaded-save plumbing: add `building_rules` to `RegionalGameSave`
-  (`#[serde(default)]`), load `config/buildings.json` at new-game time, and inject
+  (`#[serde(default)]`), load `config/game_settings.json` at new-game time, and inject
   the rules into each `RegionState`'s `World` before the runner takes ownership
   (in `from_regions_with_layout_and_worker_setup` / `from_save`). Until M5,
   every `World` uses the embedded default — a *single* source, so determinism and
@@ -275,7 +275,7 @@ the size guideline — keep M2's scope to growth+capacity and leave transfer to 
 - **Save migration**: `footprint` defaults to 1×1 and `building_rules` defaults to
   the embedded baseline, so existing saves load unchanged.
 - **Config vs. determinism**: the ruleset is stamped into saves and load uses the
-  saved rules, so editing `config/buildings.json` never breaks an existing city's
+  saved rules, so editing `config/game_settings.json` never breaks an existing city's
   replay parity — it only affects new games.
 - **Region borders**: footprints never cross a region edge (out-of-grid cells are
   not claimable → may block an upgrade at the border, which is correct).
@@ -324,7 +324,7 @@ simulation state, `RegionalGame` owns the city-wide ruleset for save/load, and U
 only sees view models.
 
 ```text
-config/buildings.json (optional, new game only)
+config/game_settings.json (optional, new game only)
         |
         v
 BuildingRules
@@ -415,7 +415,7 @@ embedded src/core/buildings_default.json
         v
 BuildingRules::default()
 
-optional config/buildings.json
+optional config/game_settings.json
         |
         v
 BuildingRules::load(path)
@@ -588,7 +588,7 @@ New game:
 RegionalGame::three_by_three_default()
         |
         v
-BuildingRules::load("config/buildings.json").unwrap_or_default()
+BuildingRules::load("config/game_settings.json").unwrap_or_default()
         |
         v
 inject same rules into all 9 RegionState.world values
@@ -627,7 +627,7 @@ region.set_building_rules(saved_rules.clone())
 RegionalGame runner starts
 ```
 
-This keeps replay parity: editing `config/buildings.json` affects new games only,
+This keeps replay parity: editing `config/game_settings.json` affects new games only,
 not existing saves.
 
 ## UI command path: upgrade to region worker

@@ -37,8 +37,8 @@ use crate::interface::view::{
 };
 
 const DEFAULT_SINGLE_REGION_ID: RegionId = RegionId(1);
-/// External building-rules override path read when a new game starts (absent in tests → embedded).
-const BUILDING_RULES_OVERRIDE_PATH: &str = "config/buildings.json";
+/// External game-settings override path read when a new game starts (absent in tests -> embedded).
+const BUILDING_RULES_OVERRIDE_PATH: &str = "config/game_settings.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Deterministic errors returned by regional facade operations.
@@ -184,7 +184,7 @@ struct RegionalGameSave {
     regions: Vec<RegionStateSaveRecord>,
     layout: RegionalLayoutSave,
     // Tunable building rules travel with the save so a city replays under the rules it was created
-    // with, regardless of the current config/buildings.json. Defaults to the embedded baseline for
+    // with, regardless of the current config/game_settings.json. Defaults to the embedded baseline for
     // saves written before this field existed.
     #[serde(default)]
     building_rules: BuildingRules,
