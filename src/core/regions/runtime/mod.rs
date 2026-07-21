@@ -74,7 +74,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use crate::core::city_refs::CityCellRef;
-use crate::core::components::{PlaceRef, TravelerHandoff, TravelerId};
+use crate::core::components::{GoodsOrderId, PlaceRef, TravelerHandoff, TravelerId};
 use crate::core::entity::Entity;
 use crate::core::regional_types::{
     RegionCommand, RegionCommandReply, RegionCommandResponse, RegionSnapshotResponse,
@@ -91,9 +91,9 @@ use crate::core::regions::worker::{
     cross_region_goods_routes_for_region, importable_remote_jobs_for_region,
 };
 use crate::core::regions::{
-    ExitLink, GoodsSupplyGrant, PendingGoodsDemand, PendingPowerDemand, PowerExportGrant, RegionId,
-    RegionRoadNetworkId, RegionState, RegionalTickGoodsPhase, RegionalTickJobPhase,
-    RegionalTickPowerPhase,
+    ExitLink, ExportAllocationKey, GOODS_PER_TRUCK, GoodsSupplyGrant, PendingGoodsDemand,
+    PendingPowerDemand, PowerExportGrant, RegionId, RegionRoadNetworkId, RegionState,
+    RegionalTickGoodsPhase, RegionalTickJobPhase, RegionalTickPowerPhase, denied_goods_grant,
 };
 use crate::core::systems::economy;
 use crate::core::world::CrossRegionGoodsRoutes;
@@ -201,6 +201,31 @@ pub enum RegionEvent {
     DestinationArrived {
         traveler: TravelerId,
         destination: PlaceRef,
+    },
+    /// P2 goods trucks: the factory accepted a truck arrival at a commercial
+    /// endpoint and asks that commercial owner to apply the cargo.
+    ApplyGoodsDelivery {
+        traveler: TravelerId,
+        order: GoodsOrderId,
+        allocation_key: ExportAllocationKey,
+        commercial: Entity,
+        units: i32,
+    },
+    /// P2 goods trucks: the commercial owner applied the cargo, so the factory can
+    /// consume warehouse reservation and let the truck return home.
+    ConfirmGoodsDelivery {
+        traveler: TravelerId,
+        order: GoodsOrderId,
+        allocation_key: ExportAllocationKey,
+        units: i32,
+    },
+    /// P2 goods trucks: the commercial owner could not apply the cargo. The
+    /// factory frees its reservation and the existing travel token returns home.
+    RejectGoodsDelivery {
+        traveler: TravelerId,
+        order: GoodsOrderId,
+        allocation_key: ExportAllocationKey,
+        units: i32,
     },
     /// Directory employment ledger plan, P3: a payload-free wake.
     ///
@@ -472,15 +497,6 @@ pub struct RegionRuntime {
 //
 // Both are POOLED PER NETWORK, so `reserved_units_excluding` is network-scoped: a
 // reservation on one network must not shrink another's remaining capacity.
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Identity of one caller demand a producer has reserved for, shared by power and
-/// jobs: a `(caller_region, generation, token)` triple.
-struct ExportAllocationKey {
-    caller_region: RegionId,
-    request_id: UiRequestId,
-    token: u32,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// One producer-owned transient reservation of a reserved unit `U` on a network.
@@ -907,7 +923,69 @@ impl RegionRuntime {
                 traveler,
                 destination,
             } => {
+                if let Some(shipment) = self
+                    .state
+                    .validate_goods_truck_arrival(traveler, destination)
+                {
+                    return vec![OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
+                        recipients: RegionRecipients::One(shipment.commercial.region),
+                        event: RegionEvent::ApplyGoodsDelivery {
+                            traveler,
+                            order: shipment.order,
+                            allocation_key: shipment.allocation_key,
+                            commercial: shipment.commercial.building,
+                            units: shipment.units,
+                        },
+                    })];
+                }
                 self.state.apply_destination_arrived(traveler, destination);
+                Vec::new()
+            }
+            RegionEvent::ApplyGoodsDelivery {
+                traveler,
+                order,
+                allocation_key,
+                commercial,
+                units,
+            } => {
+                let applied = commercial == order.commercial
+                    && self.state.apply_goods_delivery(traveler, order, units);
+                let event = if applied {
+                    RegionEvent::ConfirmGoodsDelivery {
+                        traveler,
+                        order,
+                        allocation_key,
+                        units,
+                    }
+                } else {
+                    RegionEvent::RejectGoodsDelivery {
+                        traveler,
+                        order,
+                        allocation_key,
+                        units,
+                    }
+                };
+                vec![OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
+                    recipients: RegionRecipients::One(traveler.entity.region()),
+                    event,
+                })]
+            }
+            RegionEvent::ConfirmGoodsDelivery {
+                traveler,
+                order: _,
+                allocation_key: _,
+                units,
+            } => {
+                self.state.confirm_goods_delivery(traveler, units);
+                Vec::new()
+            }
+            RegionEvent::RejectGoodsDelivery {
+                traveler,
+                order: _,
+                allocation_key: _,
+                units,
+            } => {
+                self.state.cancel_goods_delivery(traveler, units);
                 Vec::new()
             }
             RegionEvent::EmploymentDirectoryReady => self.handle_employment_directory_ready(),
@@ -1349,27 +1427,35 @@ impl RegionRuntime {
         if !phase.phase.is_daily() {
             return None;
         }
+        self.state.produce_factory_goods_for_daily_tick();
         let exported_goods_units = self.goods_supply_allocations.units().sum();
         let prepared = self.state.prepare_goods_flow(exported_goods_units);
         for (token, grant) in prepared.local_grants().iter().enumerate() {
-            let request = GoodsSupplyRequest {
-                request_id: self.current_goods_request_id,
-                caller_region: self.region_id(),
-                caller_network: RegionRoadNetworkId {
-                    region: self.region_id(),
-                    road_network: grant.caller_network,
-                },
-                token: token as u32,
-                units: grant.units,
-                commercial: grant.commercial,
-            };
-            let local_grant = GoodsSupplyGrant {
-                token: request.token,
-                granted: true,
-                source_region: Some(self.region_id()),
-                units: grant.units,
-            };
-            self.apply_goods_supply_grant(request, local_grant);
+            let mut remaining = grant.units;
+            let mut chunk = 0_u32;
+            while remaining > 0 {
+                let units = remaining.min(GOODS_PER_TRUCK as u32);
+                let request = GoodsSupplyRequest {
+                    request_id: self.current_goods_request_id,
+                    caller_region: self.region_id(),
+                    caller_network: RegionRoadNetworkId {
+                        region: self.region_id(),
+                        road_network: grant.caller_network,
+                    },
+                    token: (token as u32).saturating_mul(1024).saturating_add(chunk),
+                    units,
+                    commercial: grant.commercial,
+                };
+                let local_grant =
+                    self.process_goods_supply_request(&GoodsSupplyAllocationRequest {
+                        request: request.clone(),
+                        candidates: vec![request.caller_network],
+                        candidate_index: 0,
+                    });
+                self.apply_goods_supply_grant(request, local_grant);
+                remaining -= units;
+                chunk += 1;
+            }
         }
         Some(prepared)
     }
@@ -1595,14 +1681,27 @@ impl RegionRuntime {
     ) -> GoodsSupplyGrant {
         let Some(producer_network) = request.candidates.get(request.candidate_index).copied()
         else {
-            return GoodsSupplyGrant {
-                token: request.request.token,
-                granted: false,
-                source_region: None,
-                units: 0,
-            };
+            return denied_goods_grant(request.request.token);
         };
         let allocation_key = export_allocation_key(&request.request);
+        if producer_network.region == self.region_id()
+            && request.request.caller_region == self.region_id()
+        {
+            let grant = self.state.dispatch_local_goods_shipment(
+                &request.request,
+                producer_network,
+                allocation_key,
+            );
+            if grant.granted {
+                self.goods_supply_allocations.upsert(
+                    allocation_key,
+                    producer_network,
+                    grant.units,
+                    request.request.request_id,
+                );
+            }
+            return grant;
+        }
         self.goods_supply_allocations
             .release_stale_for_caller(request.request.caller_region, request.request.request_id);
         let active_export_allocations: u32 = self
@@ -1615,12 +1714,7 @@ impl RegionRuntime {
             .saturating_sub(active_export_allocations);
 
         if remaining < request.request.units {
-            return GoodsSupplyGrant {
-                token: request.request.token,
-                granted: false,
-                source_region: None,
-                units: 0,
-            };
+            return denied_goods_grant(request.request.token);
         }
 
         self.goods_supply_allocations.upsert(
@@ -1742,8 +1836,12 @@ impl RegionRuntime {
         }
         if grant.granted && grant.units > 0 {
             if grant.source_region == Some(self.region_id()) {
-                self.state
-                    .add_commercial_goods(request.commercial, grant.units);
+                self.state.record_local_goods_grant(
+                    request.request_id,
+                    request.token,
+                    request.commercial,
+                    grant.units,
+                );
             } else {
                 self.pending_goods_stock
                     .push((request.commercial, grant.units));
@@ -2165,6 +2263,39 @@ mod tick_state_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn routed_event(outbound: &[OutboundMessage]) -> RegionEvent {
+        match outbound {
+            [OutboundMessage::CoordinatorRoute(RoutedRegionEvent { event, .. })] => event.clone(),
+            _ => panic!("expected exactly one routed event, got {outbound:?}"),
+        }
+    }
+
+    fn local_goods_runtime() -> (RegionRuntime, Entity, Entity, RegionRoadNetworkId) {
+        let mut region = RegionState::new(RegionId(1), 3, 2);
+        assert!(region.build(0, 0, BuildingKind::Industrial).success);
+        assert!(region.build(1, 0, BuildingKind::Road).success);
+        assert!(region.build(2, 0, BuildingKind::Commercial).success);
+        assert!(region.build(1, 1, BuildingKind::PowerPlant).success);
+        region.ensure_derived_state();
+        region.produce_factory_goods_for_daily_tick();
+
+        let factory = region.world.grid.get(0, 0).expect("factory");
+        let commercial = region.world.grid.get(2, 0).expect("commercial");
+        let road_network =
+            crate::core::systems::road_network_analysis::access_for(&region.world, commercial)
+                .network_id
+                .expect("commercial road network");
+        (
+            RegionRuntime::new(region),
+            factory,
+            commercial,
+            RegionRoadNetworkId {
+                region: RegionId(1),
+                road_network,
+            },
+        )
     }
 
     fn power_attempt(request: PowerExportRequest) -> PowerExportAllocationRequest {
@@ -2696,7 +2827,7 @@ mod tick_state_tests {
     }
 
     #[test]
-    fn local_goods_grant_applies_immediately_without_pending_stock() {
+    fn local_goods_grant_records_order_without_immediate_stock() {
         let mut runtime = RegionRuntime::new(goods_seeker_region(RegionId(1)));
         let commercial = runtime.state().world.grid.get(1, 1).expect("commercial");
         assert_eq!(
@@ -2735,8 +2866,13 @@ mod tick_state_tests {
                 &runtime.state().world,
                 commercial
             ),
+            0,
+            "same-region goods grants now wait for a truck arrival"
+        );
+        assert_eq!(
+            runtime.state().world.goods_orders.len(),
             1,
-            "same-region goods grants preserve local immediate settlement"
+            "the commercial keeps the pending inbound order"
         );
     }
 
@@ -2911,6 +3047,178 @@ mod tick_state_tests {
         assert!(
             requested,
             "a daily tick should eventually request remote goods"
+        );
+    }
+
+    #[test]
+    fn local_goods_grant_waits_for_truck_arrival() {
+        let (mut runtime, factory, commercial, network) = local_goods_runtime();
+        let request = GoodsSupplyRequest {
+            request_id: UiRequestId(11),
+            caller_region: RegionId(1),
+            caller_network: network,
+            token: 0,
+            units: GOODS_PER_TRUCK as u32,
+            commercial,
+        };
+        runtime.current_goods_request_id = request.request_id;
+        let attempt = GoodsSupplyAllocationRequest {
+            request,
+            candidates: vec![network],
+            candidate_index: 0,
+        };
+
+        let grant = runtime.process_goods_supply_request(&attempt);
+        assert!(grant.granted, "factory should accept a truck delivery");
+        assert_eq!(
+            crate::core::systems::economy::commercial_goods_stored(
+                &runtime.state().world,
+                commercial
+            ),
+            0,
+            "accepted local goods do not refill commercial storage immediately"
+        );
+        runtime.apply_goods_supply_grant(attempt.request, grant);
+        assert_eq!(runtime.state().world.goods_orders.len(), 1);
+        assert_eq!(runtime.state().world.tokens.len(), 1);
+        assert_eq!(
+            runtime.state().world.buildings[&factory].data,
+            crate::core::components::BuildingData::Industrial {
+                goods: crate::core::components::FactoryGoodsState {
+                    stored_units: 4,
+                    reserved_outbound_units: GOODS_PER_TRUCK,
+                },
+                business: Default::default(),
+            }
+        );
+
+        let step_outbound = runtime.process_event(RegionEvent::StepTravel {
+            step: TravelStepId(1),
+        });
+        let arrival = routed_event(&step_outbound);
+        assert!(matches!(arrival, RegionEvent::DestinationArrived { .. }));
+
+        let delivery = routed_event(&runtime.process_event(arrival.clone()));
+        assert!(matches!(delivery, RegionEvent::ApplyGoodsDelivery { .. }));
+        assert_eq!(
+            runtime
+                .state()
+                .world
+                .trucks
+                .values()
+                .next()
+                .unwrap()
+                .arrival_action,
+            crate::core::components::ArrivalAction::ReturnHome
+        );
+
+        let confirm = routed_event(&runtime.process_event(delivery));
+        assert!(matches!(confirm, RegionEvent::ConfirmGoodsDelivery { .. }));
+        assert_eq!(
+            crate::core::systems::economy::commercial_goods_stored(
+                &runtime.state().world,
+                commercial
+            ),
+            GOODS_PER_TRUCK,
+            "commercial storage refills only when the delivery event applies"
+        );
+        runtime.process_event(confirm);
+        let truck = runtime.state().world.trucks.values().next().unwrap();
+        assert!(
+            truck.shipment.is_none(),
+            "confirmation clears the factory shipment"
+        );
+        assert_eq!(
+            runtime.state().world.buildings[&factory].data,
+            crate::core::components::BuildingData::Industrial {
+                goods: crate::core::components::FactoryGoodsState {
+                    stored_units: 1,
+                    reserved_outbound_units: 0,
+                },
+                business: Default::default(),
+            }
+        );
+
+        let duplicate = runtime.process_event(arrival);
+        assert!(
+            duplicate.is_empty(),
+            "duplicate arrival cannot authorize a second delivery"
+        );
+        assert_eq!(
+            crate::core::systems::economy::commercial_goods_stored(
+                &runtime.state().world,
+                commercial
+            ),
+            GOODS_PER_TRUCK
+        );
+    }
+
+    #[test]
+    fn busy_factory_truck_denies_a_second_local_shipment() {
+        let (mut runtime, _factory, commercial, network) = local_goods_runtime();
+        runtime.current_goods_request_id = UiRequestId(12);
+        let first = GoodsSupplyRequest {
+            request_id: UiRequestId(12),
+            caller_region: RegionId(1),
+            caller_network: network,
+            token: 0,
+            units: GOODS_PER_TRUCK as u32,
+            commercial,
+        };
+        let second = GoodsSupplyRequest { token: 1, ..first };
+
+        let first_grant = runtime.process_goods_supply_request(&GoodsSupplyAllocationRequest {
+            request: first,
+            candidates: vec![network],
+            candidate_index: 0,
+        });
+        assert!(first_grant.granted);
+        let second_grant = runtime.process_goods_supply_request(&GoodsSupplyAllocationRequest {
+            request: second,
+            candidates: vec![network],
+            candidate_index: 0,
+        });
+        assert!(
+            !second_grant.granted,
+            "the single level-1 truck is busy until delivery returns"
+        );
+    }
+
+    #[test]
+    fn disconnected_local_factory_cannot_dispatch_goods_truck() {
+        let mut region = RegionState::new(RegionId(1), 3, 2);
+        assert!(region.build(0, 0, BuildingKind::Industrial).success);
+        assert!(region.build(2, 0, BuildingKind::Commercial).success);
+        assert!(region.build(0, 1, BuildingKind::PowerPlant).success);
+        region.ensure_derived_state();
+        region.produce_factory_goods_for_daily_tick();
+        let commercial = region.world.grid.get(2, 0).expect("commercial");
+        let request = GoodsSupplyRequest {
+            caller_region: RegionId(1),
+            request_id: UiRequestId(13),
+            token: 0,
+            units: 1,
+            commercial,
+            caller_network: RegionRoadNetworkId {
+                region: RegionId(1),
+                road_network: 0,
+            },
+        };
+        let grant = region.dispatch_local_goods_shipment(
+            &request,
+            request.caller_network,
+            ExportAllocationKey {
+                caller_region: RegionId(1),
+                request_id: UiRequestId(13),
+                token: 0,
+            },
+        );
+
+        assert!(!grant.granted);
+        assert!(region.world.tokens.is_empty());
+        assert_eq!(
+            crate::core::systems::economy::commercial_goods_stored(&region.world, commercial),
+            0
         );
     }
 

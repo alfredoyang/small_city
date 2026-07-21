@@ -31,6 +31,9 @@ struct ZoneRules {
     /// Footprint area required at each level (index 0 = level 1). Positive and
     /// non-decreasing (an upgrade must never shrink a footprint).
     footprint_area_per_level: Vec<u32>,
+    /// Industrial-only truck fleet size by level. Other zones may omit it.
+    #[serde(default)]
+    truck_count_per_level: Option<Vec<u16>>,
 }
 
 /// Tunable building rules, keyed by zone name ("Residential" / "Commercial" /
@@ -110,6 +113,19 @@ impl BuildingRules {
         table[index]
     }
 
+    pub fn industrial_truck_count(&self, level: u8) -> u16 {
+        let Some(table) = self
+            .buildings
+            .get("Industrial")
+            .and_then(|zone| zone.truck_count_per_level.as_ref())
+            .filter(|table| !table.is_empty())
+        else {
+            return default_industrial_truck_count(level);
+        };
+        let index = (level.max(1) as usize - 1).min(table.len() - 1);
+        table[index]
+    }
+
     /// Every configurable zone must have a non-empty, strictly-positive,
     /// non-decreasing area table.
     fn validate(&self) -> Result<(), String> {
@@ -147,9 +163,28 @@ impl BuildingRules {
                     pair[1], pair[0]
                 ));
             }
+            if kind == BuildingKind::Industrial
+                && let Some(trucks) = &zone.truck_count_per_level
+            {
+                if trucks.len() < REQUIRED_LEVELS {
+                    return Err(format!(
+                        "{key} truck_count_per_level needs at least {REQUIRED_LEVELS} levels, got {}",
+                        trucks.len()
+                    ));
+                }
+                if trucks.contains(&0) {
+                    return Err(format!("{key} truck count must be positive"));
+                }
+            }
         }
         Ok(())
     }
+}
+
+fn default_industrial_truck_count(level: u8) -> u16 {
+    const DEFAULT: [u16; 3] = [1, 2, 4];
+    let index = (level.max(1) as usize - 1).min(DEFAULT.len() - 1);
+    DEFAULT[index]
 }
 
 /// Whether a rectangle of area `from` can become a rectangle of area `to` by extending one full
@@ -176,6 +211,9 @@ mod tests {
         assert_eq!(rules.footprint_area(BuildingKind::Residential, 1), 1);
         assert_eq!(rules.footprint_area(BuildingKind::Residential, 2), 2);
         assert_eq!(rules.footprint_area(BuildingKind::Residential, 3), 4);
+        assert_eq!(rules.industrial_truck_count(1), 1);
+        assert_eq!(rules.industrial_truck_count(2), 2);
+        assert_eq!(rules.industrial_truck_count(3), 4);
     }
 
     #[test]
@@ -242,6 +280,19 @@ mod tests {
             "Commercial":{"footprint_area_per_level":[1,2,4]},
             "Industrial":{"footprint_area_per_level":[1,2,4]}}}"#;
         assert!(BuildingRules::from_json(short).is_err());
+    }
+
+    #[test]
+    fn invalid_industrial_truck_table_is_rejected() {
+        let short = r#"{"buildings":{"Residential":{"footprint_area_per_level":[1,2,4]},
+            "Commercial":{"footprint_area_per_level":[1,2,4]},
+            "Industrial":{"footprint_area_per_level":[1,2,4],"truck_count_per_level":[1,2]}}}"#;
+        assert!(BuildingRules::from_json(short).is_err());
+
+        let zero = r#"{"buildings":{"Residential":{"footprint_area_per_level":[1,2,4]},
+            "Commercial":{"footprint_area_per_level":[1,2,4]},
+            "Industrial":{"footprint_area_per_level":[1,2,4],"truck_count_per_level":[1,0,4]}}}"#;
+        assert!(BuildingRules::from_json(zero).is_err());
     }
 
     #[test]

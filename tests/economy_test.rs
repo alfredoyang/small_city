@@ -596,7 +596,7 @@ fn commercial_in_higher_land_value_area_pays_more_sales_tax() {
 }
 
 #[test]
-fn industrial_goods_fill_commercial_storage_and_surplus_exports() {
+fn industrial_goods_plan_local_storage_then_trucks_deliver_part_of_it() {
     let mut game = SingleRegionTestGame::new(10, 10);
     assert!(game.build(0, 0, BuildingKind::PowerPlant).success);
     assert!(game.build(5, 0, BuildingKind::PowerPlant).success);
@@ -608,14 +608,18 @@ fn industrial_goods_fill_commercial_storage_and_surplus_exports() {
         assert!(game.build(x, 1, BuildingKind::Road).success);
     }
 
-    let economy = tick_economy(&advance_one_day(&mut game).event);
+    let economy = tick_economy(&advance_one_working_day(&mut game).event);
 
     assert_eq!(economy.local_goods_produced, 12);
     assert_eq!(economy.local_goods_stored, 8);
     assert_eq!(economy.exported_goods, 4);
     assert_eq!(economy.manufacturing_tax, 12);
     assert_eq!(economy.export_tax, 4);
-    assert_eq!(commercial_goods(&game, 4, 0), (8, 8));
+    assert_eq!(
+        commercial_goods(&game, 4, 0),
+        (7, 8),
+        "level-1 factories have one truck each, so two full cargoes plus one small cargo arrive"
+    );
 }
 
 #[test]

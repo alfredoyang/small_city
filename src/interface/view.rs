@@ -251,6 +251,9 @@ pub struct RoadTravelerPanelSeedView {
     /// Full detail rows for travelers whose home is this region, in the same
     /// shape as a building roster.
     pub local_details: Vec<CitizenDetailView>,
+    /// Local factory trucks on this road cell. Kept as a count for P2; cargo
+    /// detail can be added once foreign truck handoff exists.
+    pub local_truck_count: usize,
     /// Endpoint summaries for visiting bodies whose home is elsewhere. Sorted
     /// and grouped: several visitors sharing the same home/work endpoint
     /// summarize as one row with `count > 1` rather than one row per traveler,

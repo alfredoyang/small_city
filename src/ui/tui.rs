@@ -66,14 +66,16 @@ struct TuiState {
     /// (and refreshed on tick), never per frame. Empty for residential rosters and workplaces with
     /// no remote staff. Rendered below the local workers, region-tagged via `LivesAt { region }`.
     citizen_remote: Vec<CitizenDetailView>,
-    /// When set, a modal lists the travelers on the selected road cell: local citizens plus
-    /// visiting bodies' endpoint summaries. Opened by Enter on a road with travelers.
+    /// When set, a modal lists the travelers on the selected road cell: local citizens,
+    /// local trucks, plus visiting bodies' endpoint summaries.
     road_traveler_panel: bool,
     /// Local travelers' detail rows, fetched once when the panel opens.
     /// ponytail: snapshot-only, not refreshed on tick like `citizen_remote` — tokens
     /// move every sub-tick, so a live refresh would need a facade round-trip that
     /// often; close/reopen to refresh. Revisit if playtesting shows this is confusing.
     road_traveler_locals: Vec<CitizenDetailView>,
+    /// Local factory trucks on the inspected road cell.
+    road_traveler_trucks: usize,
     /// Visiting bodies' endpoint summaries, fetched once alongside `road_traveler_locals`.
     road_traveler_visitors: Vec<RoadTravelerEndpointView>,
     /// Whether the chrome panels (header bar, tool strip, City HUD, legend) may use emoji icons.
@@ -168,6 +170,7 @@ impl Default for TuiState {
             citizen_remote: Vec::new(),
             road_traveler_panel: false,
             road_traveler_locals: Vec::new(),
+            road_traveler_trucks: 0,
             road_traveler_visitors: Vec::new(),
             use_emoji: true,
             hud_prev: None,
@@ -980,6 +983,7 @@ impl TuiRuntime {
                     let seed = self.game.road_traveler_panel_seed(x, y);
                     self.state.road_traveler_panel = true;
                     self.state.road_traveler_locals = seed.local_details;
+                    self.state.road_traveler_trucks = seed.local_truck_count;
                     self.state.road_traveler_visitors = seed.visitor_endpoints;
                     self.state.message = "Traveler details (Esc close)".to_string();
                     self.dirty = true;
@@ -1349,6 +1353,7 @@ fn render(
             root,
             inspect,
             &state.road_traveler_locals,
+            state.road_traveler_trucks,
             &state.road_traveler_visitors,
         );
     }
@@ -1567,11 +1572,12 @@ fn render_road_traveler_panel(
     area: Rect,
     inspect: &InspectView,
     locals: &[CitizenDetailView],
+    trucks: usize,
     visitors: &[RoadTravelerEndpointView],
 ) {
     let popup = centered_rect(60, 60, area);
     let visitor_total: usize = visitors.iter().map(|endpoint| endpoint.count).sum();
-    let total = locals.len() + visitor_total;
+    let total = locals.len() + trucks + visitor_total;
     let title = format!(
         "Travelers at ({},{}) — {} traveler(s) · Esc close",
         inspect.x, inspect.y, total
@@ -1587,16 +1593,14 @@ fn render_road_traveler_panel(
         return;
     }
 
-    // Reserve a section for visitor summary lines only when there are any.
-    let (local_area, visitor_area) = if visitors.is_empty() {
+    // Reserve summary lines only when trucks or visitors are present.
+    let summary_lines = visitors.len() as u16 + u16::from(trucks > 0);
+    let (local_area, visitor_area) = if summary_lines == 0 {
         (inner, None)
     } else {
         let parts = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(visitors.len() as u16 + 1),
-            ])
+            .constraints([Constraint::Min(1), Constraint::Length(summary_lines + 1)])
             .split(inner);
         (parts[0], Some(parts[1]))
     };
@@ -1634,11 +1638,14 @@ fn render_road_traveler_panel(
 
     if let Some(visitor_area) = visitor_area {
         let mut lines = vec![Line::from(Span::styled(
-            "Visitors:",
+            "Other travelers:",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ))];
+        if trucks > 0 {
+            lines.push(Line::from(format!("  {} local truck(s)", trucks)));
+        }
         lines.extend(
             visitors
                 .iter()
@@ -4335,7 +4342,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_road_traveler_panel(frame, area, &inspect, &locals, &visitors);
+                render_road_traveler_panel(frame, area, &inspect, &locals, 0, &visitors);
             })
             .expect("render road traveler panel");
         let text = buffer_text(terminal.backend().buffer());
@@ -4343,7 +4350,7 @@ mod tests {
         assert!(text.contains("Travelers at (4,2)"));
         assert!(text.contains("3 traveler(s)"));
         assert!(text.contains("27")); // local row's age column
-        assert!(text.contains("Visitors:"));
+        assert!(text.contains("Other travelers:"));
         assert!(text.contains("2× region 3 → no job"));
     }
 

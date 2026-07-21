@@ -966,7 +966,8 @@ mod tests {
     ) {
         let building = world.buildings.get_mut(&entity).expect("business building");
         match &mut building.data {
-            BuildingData::Commercial { business, .. } | BuildingData::Industrial { business } => {
+            BuildingData::Commercial { business, .. }
+            | BuildingData::Industrial { business, .. } => {
                 *business = BusinessFinance {
                     business_cash,
                     last_period_profit,

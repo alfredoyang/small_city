@@ -11,13 +11,13 @@
 //! simply a one-region `RegionalGame`. Owned by exactly one worker thread at a time;
 //! moved between threads, never shared.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::core::components::{
-    Building, Citizen, HappinessEffect, PollutionSource, Population, Position, PowerConsumer,
-    PowerProvider,
+    Building, Citizen, GoodsOrder, HappinessEffect, PollutionSource, Population, Position,
+    PowerConsumer, PowerProvider, Truck,
 };
 use crate::core::entity::Entity;
 use crate::core::grid::Grid;
@@ -200,6 +200,14 @@ pub(crate) struct World {
     pub populations: HashMap<Entity, Population>,
     #[serde(default)]
     pub citizens: HashMap<Entity, Citizen>,
+    #[serde(default)]
+    pub(crate) trucks: BTreeMap<Entity, Truck>,
+    #[serde(
+        default,
+        serialize_with = "serialize_goods_orders",
+        deserialize_with = "deserialize_goods_orders"
+    )]
+    pub(crate) goods_orders: BTreeMap<crate::core::components::GoodsOrderId, GoodsOrder>,
     pub power_providers: HashMap<Entity, PowerProvider>,
     pub power_consumers: HashMap<Entity, PowerConsumer>,
     pub pollution_sources: HashMap<Entity, PollutionSource>,
@@ -251,6 +259,8 @@ impl World {
             buildings: HashMap::new(),
             populations: HashMap::new(),
             citizens: HashMap::new(),
+            trucks: BTreeMap::new(),
+            goods_orders: BTreeMap::new(),
             power_providers: HashMap::new(),
             power_consumers: HashMap::new(),
             pollution_sources: HashMap::new(),
@@ -665,13 +675,35 @@ impl CrossRegionGoodsRoutes {
     }
 }
 
+fn serialize_goods_orders<S>(
+    orders: &BTreeMap<crate::core::components::GoodsOrderId, GoodsOrder>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    orders.values().collect::<Vec<_>>().serialize(serializer)
+}
+
+fn deserialize_goods_orders<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<crate::core::components::GoodsOrderId, GoodsOrder>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let orders = Vec::<GoodsOrder>::deserialize(deserializer)?;
+    Ok(orders.into_iter().map(|order| (order.id, order)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::World;
     use crate::core::components::{
-        Building, BuildingData, Citizen, Footprint, Morale, Population, Position,
+        Building, BuildingData, Citizen, Footprint, GoodsOrder, GoodsOrderId, Morale, Population,
+        Position,
     };
     use crate::core::entity::Entity;
+    use crate::core::regional_types::UiRequestId;
     use crate::interface::input::BuildingKind;
 
     #[test]
@@ -697,6 +729,31 @@ mod tests {
         assert!(record.has_population);
         assert!(!record.has_citizen);
         assert!(!record.has_power_provider);
+    }
+
+    #[test]
+    fn active_goods_orders_serialize_as_values_not_map_keys() {
+        let mut world = World::new(2, 2);
+        let commercial = Entity::new(world.region_id, 7);
+        let id = GoodsOrderId {
+            commercial,
+            request_id: UiRequestId(3),
+            token: 1,
+        };
+        world.goods_orders.insert(
+            id,
+            GoodsOrder {
+                id,
+                commercial,
+                requested_units: 3,
+                inbound_reserved_units: 3,
+                remaining_units: 0,
+            },
+        );
+
+        let json = serde_json::to_string(&world).expect("serialize active goods order");
+        let loaded: World = serde_json::from_str(&json).expect("deserialize active goods order");
+        assert_eq!(loaded.goods_orders[&id].inbound_reserved_units, 3);
     }
 
     #[test]

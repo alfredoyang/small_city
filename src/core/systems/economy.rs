@@ -912,6 +912,7 @@ pub(crate) fn ensure_business_building_data(world: &mut World) {
                 (BuildingKind::Industrial, BuildingData::Industrial { .. }) => {}
                 (BuildingKind::Industrial, _) => {
                     building.data = BuildingData::Industrial {
+                        goods: Default::default(),
                         business: BusinessFinance::default(),
                     };
                 }
@@ -926,9 +927,8 @@ pub(crate) fn business_finance(world: &World, entity: Entity) -> Option<Business
         .buildings
         .get(&entity)
         .and_then(|building| match building.data {
-            BuildingData::Commercial { business, .. } | BuildingData::Industrial { business } => {
-                Some(business)
-            }
+            BuildingData::Commercial { business, .. }
+            | BuildingData::Industrial { business, .. } => Some(business),
             BuildingData::None => None,
         })
 }
@@ -1017,9 +1017,8 @@ fn business_finance_mut(world: &mut World, entity: Entity) -> Option<&mut Busine
         .buildings
         .get_mut(&entity)
         .and_then(|building| match &mut building.data {
-            BuildingData::Commercial { business, .. } | BuildingData::Industrial { business } => {
-                Some(business)
-            }
+            BuildingData::Commercial { business, .. }
+            | BuildingData::Industrial { business, .. } => Some(business),
             BuildingData::None => None,
         })
 }

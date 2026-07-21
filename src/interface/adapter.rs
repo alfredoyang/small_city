@@ -118,6 +118,7 @@ fn traveler_views(world: &World) -> Vec<CitizenTravelView> {
             // prunes stale entries at the end of each sub-tick, but a paused
             // frame may see a not-yet-pruned entry).
             world.citizens.contains_key(id)
+                || world.trucks.contains_key(id)
                 // A foreign token: the home is elsewhere, the citizen is not
                 // in this region's `world.citizens`. Always include.
                 || token.home.region != self_region
@@ -217,7 +218,11 @@ fn road_traveler_count(world: &World, x: usize, y: usize) -> usize {
     world
         .tokens
         .iter()
-        .filter(|(id, token)| world.citizens.contains_key(id) || token.home.region != self_region)
+        .filter(|(id, token)| {
+            world.citizens.contains_key(id)
+                || world.trucks.contains_key(id)
+                || token.home.region != self_region
+        })
         .filter(|(_, token)| token.state.current_cell == Some(entity))
         .count()
 }
@@ -251,8 +256,12 @@ pub(crate) fn road_traveler_panel_seed(
     let mut visitor_keys: Vec<(RegionId, Option<RegionId>, Option<CityCellRef>)> = Vec::new();
     for (id, token) in tokens {
         if token.home.region == world.region_id {
-            // Stale local token whose citizen was already removed: skip, like
-            // road_traveler_count's alive check.
+            if world.trucks.contains_key(id) {
+                seed.local_truck_count += 1;
+                continue;
+            }
+            // Stale local token whose citizen/truck was already removed: skip,
+            // like road_traveler_count's alive check.
             if let Some(citizen) = world.citizens.get(id) {
                 seed.local_details.push(CitizenDetailView {
                     age: citizen.age,
@@ -1112,9 +1121,12 @@ mod tests {
     use super::{calculate_demand, traveler_views, view_world};
     use crate::core::city_refs::CityCellRef;
     use crate::core::components::{
-        Citizen, Morale, PlaceRef, TravelKind, TravelState, TravelStatus, TravelToken,
+        ArrivalAction, Citizen, GoodsOrderId, Morale, PlaceRef, Shipment, TravelKind, TravelState,
+        TravelStatus, TravelToken, Truck,
     };
     use crate::core::entity::Entity;
+    use crate::core::regional_types::UiRequestId;
+    use crate::core::regions::{ExportAllocationKey, RegionRoadNetworkId};
     use crate::core::systems::placement::place_building;
     use crate::core::world::World;
     use crate::interface::input::BuildingKind;
@@ -1264,6 +1276,65 @@ mod tests {
         );
     }
 
+    fn add_truck(world: &mut World, local: u32, cell: Entity) -> Entity {
+        let id = Entity::new(world.region_id, local);
+        let factory = Entity::new(world.region_id, 200 + local);
+        let commercial = Entity::new(world.region_id, 300 + local);
+        let order = GoodsOrderId {
+            commercial,
+            request_id: UiRequestId(1),
+            token: local,
+        };
+        let shipment = Shipment {
+            order,
+            allocation_key: ExportAllocationKey {
+                caller_region: world.region_id,
+                request_id: UiRequestId(1),
+                token: local,
+            },
+            producer_network: RegionRoadNetworkId {
+                region: world.region_id,
+                road_network: 0,
+            },
+            commercial: PlaceRef {
+                region: world.region_id,
+                building: commercial,
+            },
+            units: 1,
+        };
+        world.trucks.insert(
+            id,
+            Truck {
+                id,
+                factory,
+                cargo_capacity: 3,
+                arrival_action: ArrivalAction::DeliverGoods,
+                trip_generation: 1,
+                shipment: Some(shipment),
+            },
+        );
+        world.tokens.insert(
+            id,
+            TravelToken {
+                state: TravelState {
+                    status: TravelStatus::Traveling,
+                    current_cell: Some(cell),
+                    destination: None,
+                    building: None,
+                    dwell: 0,
+                    prev_cell: None,
+                },
+                home: PlaceRef {
+                    region: world.region_id,
+                    building: factory,
+                },
+                kind: TravelKind::Truck { shipment },
+                trip_gen: 1,
+            },
+        );
+        id
+    }
+
     fn add_foreign_token(world: &mut World, _citizen: Entity, token: TravelToken) -> Entity {
         // Use a unique key. For a foreign token, the citizen key in
         // `world.tokens` doesn't have to be a real citizen in this region —
@@ -1372,6 +1443,24 @@ mod tests {
             1,
             "stale local token must not count, foreign token still does"
         );
+    }
+
+    #[test]
+    fn road_traveler_panel_seed_counts_local_trucks() {
+        let mut world = World::new(2, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        let r0 = world.grid.get(0, 0).expect("r0");
+        add_truck(&mut world, 7, r0);
+
+        assert_eq!(super::inspect_world(&world, 0, 0).road_traveler_count, 1);
+        assert_eq!(
+            traveler_views(&world),
+            vec![CitizenTravelView { x: 0, y: 0 }]
+        );
+        let seed = super::road_traveler_panel_seed(&world, 0, 0);
+        assert_eq!(seed.local_truck_count, 1);
+        assert!(seed.local_details.is_empty());
+        assert!(seed.visitor_endpoints.is_empty());
     }
 
     /// A local traveler (home is this region) gets a full `CitizenDetailView`

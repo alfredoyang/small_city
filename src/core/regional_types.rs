@@ -4,6 +4,8 @@
 //! the runner or lower-level threading code depend on the `RegionalGame` facade
 //! module.
 
+use serde::{Deserialize, Serialize};
+
 use crate::core::regions::RegionId;
 use crate::interface::events::CommandResult;
 use crate::interface::input::BuildingKind;
@@ -11,7 +13,7 @@ use crate::interface::view::BuildPreviewView;
 use crate::interface::view::CityGoodsView;
 use crate::interface::view::GameView;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 /// Stable request identity for UI-to-region event replies.
 ///
 /// Regional work is queued and processed asynchronously by worker passes, while

@@ -218,9 +218,9 @@ fn reassign_citizen_homes(world: &mut World, from: Entity, to: Entity) {
 /// Private business cash a building holds (0 for kinds without business data).
 fn business_cash_of(world: &World, entity: Entity) -> i32 {
     match world.buildings.get(&entity).map(|building| &building.data) {
-        Some(BuildingData::Commercial { business, .. } | BuildingData::Industrial { business }) => {
-            business.business_cash
-        }
+        Some(
+            BuildingData::Commercial { business, .. } | BuildingData::Industrial { business, .. },
+        ) => business.business_cash,
         _ => 0,
     }
 }
@@ -229,7 +229,8 @@ fn business_cash_of(world: &World, entity: Entity) -> i32 {
 fn add_business_cash(world: &mut World, entity: Entity, amount: i32) {
     if let Some(building) = world.buildings.get_mut(&entity) {
         match &mut building.data {
-            BuildingData::Commercial { business, .. } | BuildingData::Industrial { business } => {
+            BuildingData::Commercial { business, .. }
+            | BuildingData::Industrial { business, .. } => {
                 business.business_cash += amount;
             }
             BuildingData::None => {}

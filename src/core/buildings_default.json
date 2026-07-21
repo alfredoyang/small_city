@@ -2,6 +2,6 @@
   "buildings": {
     "Residential": { "footprint_area_per_level": [1, 2, 4] },
     "Commercial": { "footprint_area_per_level": [1, 2, 4] },
-    "Industrial": { "footprint_area_per_level": [1, 2, 4] }
+    "Industrial": { "footprint_area_per_level": [1, 2, 4], "truck_count_per_level": [1, 2, 4] }
   }
 }

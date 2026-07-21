@@ -29,15 +29,17 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::core::city_refs::CityCellRef;
 use crate::core::components::{
-    ArrivalAction, HandoffKind, PendingDestinationArrival, PendingHandoff, PlaceRef, Position,
-    PowerSource, TravelKind, TravelState, TravelToken, TravelerHandoff, TravelerId,
-    WorkplaceAssignment,
+    ArrivalAction, BuildingData, FactoryGoodsState, GoodsOrder, GoodsOrderId, HandoffKind,
+    PendingDestinationArrival, PendingHandoff, PlaceRef, Position, PowerSource, Shipment,
+    TravelKind, TravelState, TravelToken, TravelerHandoff, TravelerId, Truck, WorkplaceAssignment,
 };
 use crate::core::entity::Entity;
+use crate::core::regional_types::UiRequestId;
 use crate::core::regions::directory::CrossRegionDiscovery;
 use crate::core::regions::employment_directory::{
     CitizenRef, EmployerState as EmploymentEmployerState, EmploymentContract, JobClaim, JobPool,
 };
+use crate::core::regions::runtime::GoodsSupplyRequest;
 use crate::core::resources::CityStats;
 use crate::core::simulation::{
     TickJobPhase, TickPowerPhase, begin_tick_power_phase, begin_tick_power_phase_quiet,
@@ -87,11 +89,19 @@ pub(crate) struct RegionalSpareCapacity {
     pub job_slots: i32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 /// Owned summary key for one deterministic road network inside one region.
 pub struct RegionRoadNetworkId {
     pub region: RegionId,
     pub road_network: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Identity of one caller demand a producer has reserved for.
+pub struct ExportAllocationKey {
+    pub caller_region: RegionId,
+    pub request_id: UiRequestId,
+    pub token: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -352,6 +362,18 @@ pub struct GoodsSupplyGrant {
     pub granted: bool,
     pub source_region: Option<RegionId>,
     pub units: u32,
+}
+
+pub(crate) const GOODS_PER_TRUCK: i32 = 3;
+const GOODS_WAREHOUSE_CAPACITY: i32 = 24;
+
+pub(crate) fn denied_goods_grant(token: u32) -> GoodsSupplyGrant {
+    GoodsSupplyGrant {
+        token,
+        granted: false,
+        source_region: None,
+        units: 0,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1360,6 +1382,432 @@ impl RegionState {
         self.world.mark_goods_exports_dirty();
     }
 
+    fn factory_entities(&self) -> Vec<Entity> {
+        let mut factories = self
+            .world
+            .buildings
+            .iter()
+            .filter_map(|(entity, building)| {
+                (building.kind == BuildingKind::Industrial).then_some(*entity)
+            })
+            .collect::<Vec<_>>();
+        road_connectivity::sort_entities_by_position(&self.world, &mut factories);
+        factories
+    }
+
+    fn factory_warehouse_capacity(&self, factory: Entity) -> i32 {
+        self.world
+            .buildings
+            .get(&factory)
+            .map(|building| GOODS_WAREHOUSE_CAPACITY * i32::from(building.level.max(1)))
+            .unwrap_or(0)
+    }
+
+    fn factory_goods_mut(&mut self, factory: Entity) -> Option<&mut FactoryGoodsState> {
+        self.world
+            .buildings
+            .get_mut(&factory)
+            .and_then(|building| match &mut building.data {
+                BuildingData::Industrial { goods, .. } => Some(goods),
+                BuildingData::Commercial { .. } | BuildingData::None => None,
+            })
+    }
+
+    fn factory_available_goods(&self, factory: Entity) -> i32 {
+        self.world
+            .buildings
+            .get(&factory)
+            .and_then(|building| match building.data {
+                BuildingData::Industrial { goods, .. } => {
+                    Some((goods.stored_units - goods.reserved_outbound_units).max(0))
+                }
+                BuildingData::Commercial { .. } | BuildingData::None => None,
+            })
+            .unwrap_or(0)
+    }
+
+    fn is_effective_factory(&self, factory: Entity) -> bool {
+        self.world
+            .buildings
+            .get(&factory)
+            .is_some_and(|building| building.kind == BuildingKind::Industrial)
+            && self
+                .world
+                .power_consumers
+                .get(&factory)
+                .is_some_and(|consumer| consumer.powered)
+            && crate::core::systems::road_network_analysis::access_for(&self.world, factory)
+                .network_id
+                .is_some()
+    }
+
+    fn reconcile_factory_trucks(&mut self) {
+        let factories = self.factory_entities();
+        for factory in factories {
+            let Some(building) = self.world.buildings.get(&factory) else {
+                continue;
+            };
+            let desired = usize::from(
+                self.world
+                    .building_rules()
+                    .industrial_truck_count(building.level),
+            );
+            let current = self
+                .world
+                .trucks
+                .values()
+                .filter(|truck| truck.factory == factory)
+                .count();
+            for _ in current..desired {
+                let id = self.world.spawn();
+                self.world.trucks.insert(
+                    id,
+                    Truck {
+                        id,
+                        factory,
+                        cargo_capacity: GOODS_PER_TRUCK,
+                        arrival_action: ArrivalAction::ReturnHome,
+                        trip_generation: 0,
+                        shipment: None,
+                    },
+                );
+            }
+        }
+
+        let valid_factories = self.factory_entities().into_iter().collect::<HashSet<_>>();
+        self.world.trucks.retain(|id, truck| {
+            valid_factories.contains(&truck.factory)
+                || truck.shipment.is_some()
+                || self.world.tokens.contains_key(id)
+        });
+    }
+
+    fn first_idle_truck(&self, factory: Entity, units: i32) -> Option<Entity> {
+        self.world.trucks.iter().find_map(|(id, truck)| {
+            (truck.factory == factory
+                && truck.shipment.is_none()
+                && !self.world.tokens.contains_key(id)
+                && truck.cargo_capacity >= units)
+                .then_some(*id)
+        })
+    }
+
+    fn choose_factory_for_local_shipment(
+        &self,
+        producer_network: RegionRoadNetworkId,
+        commercial: Entity,
+        units: i32,
+    ) -> Option<Entity> {
+        if producer_network.region != self.id {
+            return None;
+        }
+        self.factory_entities()
+            .into_iter()
+            .filter(|factory| self.is_effective_factory(*factory))
+            .filter(|factory| self.factory_available_goods(*factory) >= units)
+            .filter(|factory| self.first_idle_truck(*factory, units).is_some())
+            .filter_map(|factory| {
+                let access =
+                    crate::core::systems::road_network_analysis::access_for(&self.world, factory);
+                (access.network_id == Some(producer_network.road_network))
+                    .then(|| {
+                        crate::core::systems::road_network_analysis::distance_between_buildings(
+                            &self.world,
+                            factory,
+                            commercial,
+                        )
+                        .map(|distance| (factory, distance))
+                    })
+                    .flatten()
+            })
+            .min_by_key(|(factory, distance)| {
+                let position_key = self
+                    .world
+                    .positions
+                    .get(factory)
+                    .map(|position| (position.y, position.x, factory.0))
+                    .unwrap_or((usize::MAX, usize::MAX, factory.0));
+                (*distance, position_key)
+            })
+            .map(|(factory, _distance)| factory)
+    }
+
+    pub(crate) fn produce_factory_goods_for_daily_tick(&mut self) {
+        ensure_derived_state(&mut self.world, self.id);
+        self.reconcile_factory_trucks();
+        let factories = self.factory_entities();
+        for factory in factories {
+            if !self.is_effective_factory(factory) {
+                continue;
+            }
+            let produced = economy::industrial_goods_production(&self.world, factory);
+            let capacity = self.factory_warehouse_capacity(factory);
+            if let Some(goods) = self.factory_goods_mut(factory) {
+                goods.stored_units = (goods.stored_units + produced).clamp(0, capacity);
+            }
+        }
+    }
+
+    pub(crate) fn dispatch_local_goods_shipment(
+        &mut self,
+        request: &GoodsSupplyRequest,
+        producer_network: RegionRoadNetworkId,
+        allocation_key: ExportAllocationKey,
+    ) -> GoodsSupplyGrant {
+        ensure_derived_state(&mut self.world, self.id);
+        self.reconcile_factory_trucks();
+        let units_i32 = request.units as i32;
+        let order = GoodsOrderId {
+            commercial: request.commercial,
+            request_id: request.request_id,
+            token: request.token,
+        };
+        let Some(factory) =
+            self.choose_factory_for_local_shipment(producer_network, request.commercial, units_i32)
+        else {
+            return denied_goods_grant(request.token);
+        };
+        let Some(truck_id) = self.first_idle_truck(factory, units_i32) else {
+            return denied_goods_grant(request.token);
+        };
+        let commercial_place = PlaceRef {
+            region: request.caller_region,
+            building: request.commercial,
+        };
+        let Some(state) = travel::start_trip_from_building(&self.world, factory, commercial_place)
+        else {
+            return denied_goods_grant(request.token);
+        };
+
+        if let Some(goods) = self.factory_goods_mut(factory) {
+            goods.reserved_outbound_units += units_i32;
+        }
+        let shipment = Shipment {
+            order,
+            allocation_key,
+            producer_network,
+            commercial: commercial_place,
+            units: units_i32,
+        };
+        let Some(truck) = self.world.trucks.get_mut(&truck_id) else {
+            return denied_goods_grant(request.token);
+        };
+        truck.trip_generation += 1;
+        truck.arrival_action = ArrivalAction::DeliverGoods;
+        truck.shipment = Some(shipment);
+        let traveler = TravelerId {
+            entity: truck_id,
+            generation: truck.trip_generation,
+        };
+        self.world.active_travelers.insert(truck_id);
+        self.world.tokens.insert(
+            truck_id,
+            TravelToken {
+                state,
+                home: PlaceRef {
+                    region: self.id,
+                    building: factory,
+                },
+                kind: TravelKind::Truck { shipment },
+                trip_gen: traveler.generation,
+            },
+        );
+        GoodsSupplyGrant {
+            token: request.token,
+            granted: true,
+            source_region: Some(self.id),
+            units: request.units,
+        }
+    }
+
+    pub(crate) fn record_local_goods_grant(
+        &mut self,
+        request_id: UiRequestId,
+        token: u32,
+        commercial: Entity,
+        units: u32,
+    ) {
+        let id = GoodsOrderId {
+            commercial,
+            request_id,
+            token,
+        };
+        let units = units as i32;
+        self.world.goods_orders.insert(
+            id,
+            GoodsOrder {
+                id,
+                commercial,
+                requested_units: units,
+                inbound_reserved_units: units,
+                remaining_units: 0,
+            },
+        );
+    }
+
+    pub(crate) fn validate_goods_truck_arrival(
+        &mut self,
+        traveler: TravelerId,
+        destination: PlaceRef,
+    ) -> Option<Shipment> {
+        let truck = self.world.trucks.get_mut(&traveler.entity)?;
+        if truck.trip_generation != traveler.generation
+            || truck.arrival_action != ArrivalAction::DeliverGoods
+        {
+            return None;
+        }
+        let shipment = truck.shipment?;
+        if shipment.commercial != destination {
+            return None;
+        }
+        truck.arrival_action = ArrivalAction::ReturnHome;
+        Some(shipment)
+    }
+
+    pub(crate) fn apply_goods_delivery(
+        &mut self,
+        traveler: TravelerId,
+        order: GoodsOrderId,
+        units: i32,
+    ) -> bool {
+        let remove_order = {
+            let Some(stored_order) = self.world.goods_orders.get_mut(&order) else {
+                return false;
+            };
+            if stored_order.commercial != order.commercial
+                || stored_order.inbound_reserved_units < units
+                || units <= 0
+            {
+                return false;
+            }
+            stored_order.inbound_reserved_units -= units;
+            stored_order.inbound_reserved_units == 0 && stored_order.remaining_units == 0
+        };
+        economy::add_commercial_goods(&mut self.world, order.commercial, units);
+        if remove_order {
+            self.world.goods_orders.remove(&order);
+        }
+        if let Some(token) = self.world.tokens.get_mut(&traveler.entity) {
+            token.state.destination = None;
+        }
+        true
+    }
+
+    pub(crate) fn confirm_goods_delivery(&mut self, traveler: TravelerId, units: i32) {
+        let Some((factory, shipment)) = self.world.trucks.get(&traveler.entity).and_then(|truck| {
+            (truck.trip_generation == traveler.generation)
+                .then(|| truck.shipment.map(|shipment| (truck.factory, shipment)))
+                .flatten()
+        }) else {
+            return;
+        };
+        if shipment.units != units {
+            return;
+        }
+        if let Some(goods) = self.factory_goods_mut(factory) {
+            goods.stored_units = goods.stored_units.saturating_sub(units);
+            goods.reserved_outbound_units = goods.reserved_outbound_units.saturating_sub(units);
+        }
+        if let Some(truck) = self.world.trucks.get_mut(&traveler.entity) {
+            truck.shipment = None;
+            truck.arrival_action = ArrivalAction::ReturnHome;
+        }
+    }
+
+    pub(crate) fn cancel_goods_delivery(&mut self, traveler: TravelerId, units: i32) {
+        let Some((factory, shipment)) = self.world.trucks.get(&traveler.entity).and_then(|truck| {
+            (truck.trip_generation == traveler.generation)
+                .then(|| truck.shipment.map(|shipment| (truck.factory, shipment)))
+                .flatten()
+        }) else {
+            return;
+        };
+        if shipment.units != units {
+            return;
+        }
+        if let Some(goods) = self.factory_goods_mut(factory) {
+            goods.reserved_outbound_units = goods.reserved_outbound_units.saturating_sub(units);
+        }
+        if let Some(truck) = self.world.trucks.get_mut(&traveler.entity) {
+            truck.shipment = None;
+            truck.arrival_action = ArrivalAction::ReturnHome;
+        }
+    }
+
+    fn clear_goods_shipment_reservation(
+        &mut self,
+        truck_id: Entity,
+        factory: Entity,
+        shipment: Shipment,
+    ) {
+        if let Some(goods) = self.factory_goods_mut(factory) {
+            goods.reserved_outbound_units =
+                goods.reserved_outbound_units.saturating_sub(shipment.units);
+        }
+        let remove_order = self
+            .world
+            .goods_orders
+            .get_mut(&shipment.order)
+            .map(|order| {
+                order.inbound_reserved_units =
+                    order.inbound_reserved_units.saturating_sub(shipment.units);
+                order.inbound_reserved_units == 0 && order.remaining_units == 0
+            })
+            .unwrap_or(false);
+        if remove_order {
+            self.world.goods_orders.remove(&shipment.order);
+        }
+        if let Some(truck) = self.world.trucks.get_mut(&truck_id) {
+            truck.shipment = None;
+            truck.arrival_action = ArrivalAction::ReturnHome;
+        }
+    }
+
+    fn resume_persisted_goods_shipments(&mut self) {
+        let truck_ids = self.world.trucks.keys().copied().collect::<Vec<_>>();
+        for truck_id in truck_ids {
+            if self.world.tokens.contains_key(&truck_id) {
+                continue;
+            }
+            let Some((factory, shipment)) = self
+                .world
+                .trucks
+                .get(&truck_id)
+                .and_then(|truck| truck.shipment.map(|shipment| (truck.factory, shipment)))
+            else {
+                continue;
+            };
+            let Some(state) =
+                travel::start_trip_from_building(&self.world, factory, shipment.commercial)
+            else {
+                self.clear_goods_shipment_reservation(truck_id, factory, shipment);
+                continue;
+            };
+            let Some(truck) = self.world.trucks.get_mut(&truck_id) else {
+                continue;
+            };
+            truck.trip_generation = truck.trip_generation.saturating_add(1);
+            truck.arrival_action = ArrivalAction::DeliverGoods;
+            let traveler = TravelerId {
+                entity: truck_id,
+                generation: truck.trip_generation,
+            };
+            self.world.active_travelers.insert(truck_id);
+            self.world.tokens.insert(
+                truck_id,
+                TravelToken {
+                    state,
+                    home: PlaceRef {
+                        region: self.id,
+                        building: factory,
+                    },
+                    kind: TravelKind::Truck { shipment },
+                    trip_gen: traveler.generation,
+                },
+            );
+        }
+    }
+
     /// Returns spare local workplace slot entities reachable from one road network.
     ///
     /// These are the slots in `remaining_workplaces` whose building connects to
@@ -1992,6 +2440,7 @@ impl RegionState {
         };
         state.sync_job_reservations();
         refresh_derived_state_for_world(&mut state.world, id);
+        state.resume_persisted_goods_shipments();
         // Event-driven plan, P-1: force hints_dirty true on load (runtime state,
         // including this flag, is never serialized) so the first worker pass
         // after load republishes this region's availability hints.
@@ -2190,6 +2639,123 @@ mod tests {
 
         assert!(!source.contains(&forbidden));
         assert!(source.contains("crate::core::simulation"));
+    }
+
+    #[test]
+    fn configured_industrial_level_creates_exact_factory_truck_count() {
+        let mut region = RegionState::new(RegionId(1), 3, 2);
+        assert!(region.build(0, 0, BuildingKind::Industrial).success);
+        assert!(region.build(1, 0, BuildingKind::Road).success);
+        assert!(region.build(1, 1, BuildingKind::PowerPlant).success);
+        let factory = region.world.grid.get(0, 0).expect("factory");
+
+        region.produce_factory_goods_for_daily_tick();
+        assert_eq!(
+            region
+                .world
+                .trucks
+                .values()
+                .filter(|truck| truck.factory == factory)
+                .count(),
+            1
+        );
+
+        region.world.buildings.get_mut(&factory).unwrap().level = 3;
+        region.produce_factory_goods_for_daily_tick();
+        assert_eq!(
+            region
+                .world
+                .trucks
+                .values()
+                .filter(|truck| truck.factory == factory)
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn persisted_active_goods_shipment_resumes_with_truck_token_on_load() {
+        let mut region = RegionState::new(RegionId(1), 3, 2);
+        assert!(region.build(0, 0, BuildingKind::Industrial).success);
+        assert!(region.build(1, 0, BuildingKind::Road).success);
+        assert!(region.build(2, 0, BuildingKind::Commercial).success);
+        assert!(region.build(1, 1, BuildingKind::PowerPlant).success);
+        let commercial = region.world.grid.get(2, 0).expect("commercial");
+        region.ensure_derived_state();
+        let network = RegionRoadNetworkId {
+            region: RegionId(1),
+            road_network: crate::core::systems::road_network_analysis::access_for(
+                &region.world,
+                commercial,
+            )
+            .network_id
+            .expect("commercial network"),
+        };
+        region.produce_factory_goods_for_daily_tick();
+        let request = GoodsSupplyRequest {
+            caller_region: RegionId(1),
+            caller_network: network,
+            request_id: UiRequestId(21),
+            token: 0,
+            units: GOODS_PER_TRUCK as u32,
+            commercial,
+        };
+
+        let grant = region.dispatch_local_goods_shipment(
+            &request,
+            network,
+            ExportAllocationKey {
+                caller_region: RegionId(1),
+                request_id: request.request_id,
+                token: request.token,
+            },
+        );
+        assert!(grant.granted);
+        region.record_local_goods_grant(
+            request.request_id,
+            request.token,
+            commercial,
+            request.units,
+        );
+        assert_eq!(region.world.tokens.len(), 1);
+        let before_save_generation = region
+            .world
+            .trucks
+            .values()
+            .next()
+            .expect("truck")
+            .trip_generation;
+
+        let save_bytes = serde_json::to_vec(&region.into_save_record()).expect("save");
+        let save_record: RegionStateSaveRecord =
+            serde_json::from_slice(&save_bytes).expect("load record");
+        assert!(
+            save_record.world.tokens.is_empty(),
+            "travel tokens are transient save state"
+        );
+
+        let loaded = RegionState::from_save_record(save_record);
+        let (truck_id, truck) = loaded.world.trucks.iter().next().expect("truck");
+        assert!(
+            truck.shipment.is_some(),
+            "shipment truth survives save/load"
+        );
+        assert_eq!(truck.arrival_action, ArrivalAction::DeliverGoods);
+        assert_eq!(
+            truck.trip_generation,
+            before_save_generation + 1,
+            "load mints a fresh trip stamp for the rebuilt token"
+        );
+        assert!(
+            loaded.world.active_travelers.contains(truck_id),
+            "the resumed truck is marked active"
+        );
+        assert_eq!(
+            loaded.world.tokens.len(),
+            1,
+            "load recreates the transient token for an active shipment"
+        );
+        assert_eq!(loaded.world.goods_orders.len(), 1);
     }
 
     #[test]

@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::city_refs::CityCellRef;
 use crate::core::entity::Entity;
-use crate::core::regions::{BorderLinkId, RegionId};
+use crate::core::regional_types::UiRequestId;
+use crate::core::regions::{BorderLinkId, ExportAllocationKey, RegionId, RegionRoadNetworkId};
 use crate::interface::input::BuildingKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,8 +99,20 @@ pub enum BuildingData {
     /// Industrial business state for tracking private profit and reinvestment.
     Industrial {
         #[serde(default)]
+        goods: FactoryGoodsState,
+        #[serde(default)]
         business: BusinessFinance,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Factory-owned goods inventory. Reserved units are cargo promised to active
+/// shipments but not yet delivered or cancelled.
+pub struct FactoryGoodsState {
+    #[serde(default)]
+    pub stored_units: i32,
+    #[serde(default)]
+    pub reserved_outbound_units: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -186,9 +199,9 @@ pub struct Citizen {
     pub attended_since_daily_settlement: bool,
 }
 
-/// Owner-owned purpose for the active trip. P1 uses citizen work trips only;
-/// goods trucks add `DeliverGoods` in a later patch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Owner-owned purpose for the active trip. Citizens use `StartWorkShift`; goods
+/// trucks use `DeliverGoods`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ArrivalAction {
     StartWorkShift,
     DeliverGoods,
@@ -337,7 +350,7 @@ pub struct TravelerId {
 /// A building address — what region the building lives in (a city-wide `Entity`
 /// already packs its birth region, but the `region` field is kept explicit so a
 /// foreign PlaceRef can be compared without re-decoding the entity).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaceRef {
     pub region: RegionId,
     pub building: Entity,
@@ -365,20 +378,82 @@ pub struct TravelToken {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TravelKind {
     Citizen { work: Option<PlaceRef> },
+    Truck { shipment: Shipment },
 }
 
 impl TravelToken {
     pub(crate) fn citizen_work(&self) -> Option<PlaceRef> {
         match &self.kind {
             TravelKind::Citizen { work } => *work,
+            TravelKind::Truck { .. } => None,
         }
     }
 
     pub(crate) fn set_citizen_work(&mut self, next_work: Option<PlaceRef>) {
-        match &mut self.kind {
-            TravelKind::Citizen { work } => *work = next_work,
+        if let TravelKind::Citizen { work } = &mut self.kind {
+            *work = next_work;
         }
     }
+
+    pub(crate) fn target_for_phase(
+        &self,
+        phase: crate::core::systems::schedule::SchedulePhase,
+    ) -> PlaceRef {
+        match &self.kind {
+            TravelKind::Citizen { work } => {
+                if phase == crate::core::systems::schedule::SchedulePhase::Work {
+                    work.unwrap_or(self.home)
+                } else {
+                    self.home
+                }
+            }
+            TravelKind::Truck { shipment } => {
+                if self.state.building == Some(shipment.commercial.building) {
+                    self.home
+                } else {
+                    shipment.commercial
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct GoodsOrderId {
+    pub commercial: Entity,
+    pub request_id: UiRequestId,
+    pub token: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoodsOrder {
+    pub id: GoodsOrderId,
+    pub commercial: Entity,
+    pub requested_units: i32,
+    pub inbound_reserved_units: i32,
+    pub remaining_units: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Shipment {
+    pub order: GoodsOrderId,
+    pub allocation_key: ExportAllocationKey,
+    pub producer_network: RegionRoadNetworkId,
+    pub commercial: PlaceRef,
+    pub units: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Truck {
+    pub id: Entity,
+    pub factory: Entity,
+    pub cargo_capacity: i32,
+    #[serde(default)]
+    pub arrival_action: ArrivalAction,
+    #[serde(default)]
+    pub trip_generation: u32,
+    #[serde(default)]
+    pub shipment: Option<Shipment>,
 }
 
 /// P3 movement: one citizen's per-tick trip state.

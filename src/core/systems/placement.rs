@@ -94,6 +94,7 @@ fn building_data_for_kind(kind: BuildingKind) -> BuildingData {
             business: BusinessFinance::default(),
         },
         BuildingKind::Industrial => BuildingData::Industrial {
+            goods: Default::default(),
             business: BusinessFinance::default(),
         },
         BuildingKind::Road

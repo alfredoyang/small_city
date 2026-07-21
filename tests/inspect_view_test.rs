@@ -188,9 +188,10 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
     assert!(game.build(0, 1, BuildingKind::Road).success);
     assert!(game.build(1, 1, BuildingKind::Road).success);
     assert!(game.build(2, 1, BuildingKind::Road).success);
-    // Phase A time cadence moved goods flow from every tick to the daily boundary.
-    for _ in 0..24 {
-        assert!(game.tick().success);
+    // P2 goods trucks: the daily goods phase plans supply, then travel subticks
+    // deliver the level-1 factory's single 3-unit cargo.
+    for _ in 0..24 * 6 {
+        let _ = game.advance();
     }
 
     let commercial = game.inspect(1, 0);
@@ -208,7 +209,7 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
             upgrade_level: 1,
             maintenance_cost: 1,
             sales_tax_per_shopper: 1,
-            goods_stored: 4,
+            goods_stored: 3,
             goods_capacity: 8,
             business_cash: 0,
             upgrade_threshold: Some(8),
@@ -240,7 +241,7 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
     let commercial_format = format_inspect(&commercial);
     let industrial_format = format_inspect(&industrial);
     assert!(commercial_format.contains("COMMERCIAL"));
-    assert!(commercial_format.contains("Goods   [#####.....] 4/8"));
+    assert!(commercial_format.contains("3/8"));
     assert!(commercial_format.contains("Sales   1 per shopper  Jobs 2"));
     assert!(industrial_format.contains("INDUSTRIAL"));
     assert!(industrial_format.contains("Output  4 goods/turn"));

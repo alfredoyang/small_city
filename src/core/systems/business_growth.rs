@@ -262,7 +262,8 @@ mod tests {
     ) {
         let building = world.buildings.get_mut(&entity).expect("business building");
         match &mut building.data {
-            BuildingData::Commercial { business, .. } | BuildingData::Industrial { business } => {
+            BuildingData::Commercial { business, .. }
+            | BuildingData::Industrial { business, .. } => {
                 *business = BusinessFinance {
                     business_cash,
                     last_period_profit,
@@ -275,9 +276,8 @@ mod tests {
 
     fn business_cash(world: &World, entity: crate::core::entity::Entity) -> i32 {
         match world.buildings.get(&entity).unwrap().data {
-            BuildingData::Commercial { business, .. } | BuildingData::Industrial { business } => {
-                business.business_cash
-            }
+            BuildingData::Commercial { business, .. }
+            | BuildingData::Industrial { business, .. } => business.business_cash,
             BuildingData::None => 0,
         }
     }
