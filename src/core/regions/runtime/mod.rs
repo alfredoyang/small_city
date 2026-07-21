@@ -898,8 +898,8 @@ impl RegionRuntime {
                     );
                 }
                 self.state.step_travel();
-                outbound.extend(self.drained_traveler_handoff_messages(step));
-                outbound.extend(self.drained_destination_arrival_messages());
+                outbound.extend(self.route_traveler_handoffs(step));
+                outbound.extend(self.route_destination_arrivals());
                 outbound
             }
             RegionEvent::DestinationArrived {
@@ -980,10 +980,10 @@ impl RegionRuntime {
         handoffs
     }
 
-    /// This step's buffered crossings, eligible only on the following step.
-    fn drained_traveler_handoff_messages(&mut self, step: TravelStepId) -> Vec<OutboundMessage> {
+    /// Routes this step's resolved crossings for delivery on the following step.
+    fn route_traveler_handoffs(&mut self, step: TravelStepId) -> Vec<OutboundMessage> {
         self.state
-            .drain_traveler_handoffs()
+            .resolve_pending_traveler_handoffs()
             .into_iter()
             .map(|handoff| self.traveler_handoff_route(step, handoff))
             .collect()
@@ -991,9 +991,9 @@ impl RegionRuntime {
 
     /// Routes this movement step's core-produced work-arrival facts through the
     /// same coordinator/FIFO path for local and cross-region commuters.
-    fn drained_destination_arrival_messages(&mut self) -> Vec<OutboundMessage> {
+    fn route_destination_arrivals(&mut self) -> Vec<OutboundMessage> {
         self.state
-            .drain_destination_arrivals()
+            .take_pending_destination_arrivals()
             .into_iter()
             .map(|arrival| self.destination_arrival_route(arrival.traveler, arrival.destination))
             .collect()

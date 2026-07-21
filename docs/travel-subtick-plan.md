@@ -350,7 +350,7 @@ the Outbound handoff + marks `Away`) moves into `step_travel`. `routes_to`, the 
 // order within a sub-tick — see the budget note below.
 RegionEvent::StepTravel => {
     self.state.step_travel();                       // move + buffer crossings
-    self.drained_traveler_handoff_messages()        // drain → TravelerHandedOff (reused P5b)
+    self.route_traveler_handoffs(step)              // route handoffs (reused P5b)
 }
 
 // regional_game_runner.rs — NEW runner method; the ONLY new code on the worker path.

@@ -1704,7 +1704,7 @@ model. Direct-neighbor only (multi-hop §5f still deferred). Fire-and-forget —
      neighbors excluded)
   RegionState.set_border_neighbor_map → rebuilds remote_exit_cells (P5a input)
   tick: travel::run walks W to an exit cell, buffers PendingHandoff::Outbound, Away
-  tick completes → drain_traveler_handoffs:
+  tick completes → resolve_pending_traveler_handoffs:
      Outbound: exit_cell ─exit_link_for─► BorderLinkId (faces to_region)
                return_path = [ReturnHop{A, link}]
                (no facing link → apply_traveler_return rollback, never strands)

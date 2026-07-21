@@ -425,14 +425,14 @@ impl RegionState {
     /// P7c: advances movement by one 10-minute sub-tick (no economy). Driven 6×
     /// per game hour by the runner, separately from `tick_local`/the hourly tick.
     /// Buffers any cross-region crossings into `outgoing_handoffs` for the regions
-    /// layer to drain (`drain_traveler_handoffs`).
+    /// layer to resolve into routed handoffs (`resolve_pending_traveler_handoffs`).
     pub(crate) fn step_travel(&mut self) {
         travel::step_tokens(&mut self.world);
     }
 
-    /// Drains work-arrival facts produced by the core movement step. The runtime
+    /// Takes work-arrival facts produced by the core movement step. The runtime
     /// owns coordinator routing; this state layer owns the World buffer.
-    pub(crate) fn drain_destination_arrivals(&mut self) -> Vec<PendingDestinationArrival> {
+    pub(crate) fn take_pending_destination_arrivals(&mut self) -> Vec<PendingDestinationArrival> {
         std::mem::take(&mut self.world.outgoing_destination_arrivals)
     }
 
@@ -832,12 +832,12 @@ impl RegionState {
         self.world.remote_exit_cells = map;
     }
 
-    /// P5b: drain this tick's buffered crossings into routed handoffs. A `Move`
+    /// P5b: resolve this tick's buffered crossings into routed handoffs. A `Move`
     /// whose carried exit link no longer resolves to its exit cell is rolled back
     /// home (never strands the citizen).
     /// `Rollback` handoffs are emitted by a neighbour that could not place an
     /// inbound token — we route them back to the home region.
-    pub(crate) fn drain_traveler_handoffs(&mut self) -> Vec<TravelerHandoff> {
+    pub(crate) fn resolve_pending_traveler_handoffs(&mut self) -> Vec<TravelerHandoff> {
         let pending = std::mem::take(&mut self.world.outgoing_handoffs);
         let mut handoffs = Vec::new();
         for handoff in pending {
@@ -3554,7 +3554,7 @@ mod tests {
             exit_link: link,
         });
 
-        let handoffs = a.drain_traveler_handoffs();
+        let handoffs = a.resolve_pending_traveler_handoffs();
         assert_eq!(handoffs.len(), 1);
         let handoff = &handoffs[0];
         assert_eq!(handoff.to_region, RegionId(2));
@@ -3617,7 +3617,7 @@ mod tests {
             },
         });
 
-        let handoffs = a.drain_traveler_handoffs();
+        let handoffs = a.resolve_pending_traveler_handoffs();
         assert!(handoffs.is_empty(), "nothing routed");
         assert!(
             !a.world.away_residents.contains(&citizen),

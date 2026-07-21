@@ -530,7 +530,7 @@ Cross the border:
 
 ```rust
 // Sender region
-drain_traveler_handoffs:
+resolve_pending_traveler_handoffs:
     assert exit_link still resolves to exit_cell;
     send TravelerHandoff {
         to_region,

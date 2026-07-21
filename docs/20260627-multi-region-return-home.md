@@ -66,8 +66,8 @@ routing** and **keeps the transport**. Audit and excise the direct-neighbour-onl
   resolve_target: Target::BorderExit.to_region =            PendingHandoff / TravelerHandoff carriers
     workplace.region() (assumes direct neighbour)             (shape changes: drop return_path, add
   return_path / ReturnHop stack + drain/receive popping       exit_link / Rollback — flow unchanged)
-    it (the stale stored route — components.rs, mod.rs)      drain_traveler_handoffs flow + OutboundMessage::
-  border_neighbor_map as a ROUTING source (its only            TravelerHandedOff / drained_*_messages
+    it (the stale stored route — components.rs, mod.rs)      resolve_pending_traveler_handoffs flow + OutboundMessage::
+  border_neighbor_map as a ROUTING source (its only            CoordinatorRoute / route_* helpers
     consumer was the direct exit map)                        cell_at_border_link / exit_link_for /
                                                                matching_neighbor_link / border_road_links
                                                              apply_traveler_return (clears the Away marker)
@@ -387,7 +387,7 @@ destination; the token follows a *chain* of them, one per region.
 ```
 
 It exists because the bare `HashMap<RegionId, Vec<Entity>>` (cells only) is **not enough**:
-`drain_traveler_handoffs` needs the immediate next-hop neighbour *and* link, and a
+`resolve_pending_traveler_handoffs` needs the immediate next-hop neighbour *and* link, and a
 border/corner road cell can carry multiple links — so `exit_link_for(cell, region)` would
 be ambiguous. `RouteExit` keeps the `link` and `to_region` the Layer-1 router already chose,
 so nothing is re-derived. `RegionState::refresh_remote_exit_cells` resolves the directory's
@@ -399,7 +399,7 @@ pub struct RouteExit { pub cell: Entity, pub link: BorderLinkId, pub to_region: 
 // world.remote_exit_cells: HashMap<RegionId /*final destination T*/, Vec<RouteExit>>
 ```
 
-`resolve_target`/`advance_to_exit` walk to `route_exit.cell`; `drain` reads
+`resolve_target`/`advance_to_exit` walk to `route_exit.cell`; the resolver reads
 `route_exit.link`/`route_exit.to_region` directly (no ambiguous `exit_link_for`).
 
 ### Token model & movement — see the refactor (prerequisite)
@@ -417,13 +417,13 @@ and emitting `PendingHandoff::Move`. **The only thing this plan changes is what
 - `refresh_remote_exit_cells` — instead of the direct `border_neighbor_map`, resolve the
   worker's `region_routes.exits_from(self.id)` (`ExitLink`s) into cell-level `RouteExit`s via
   `cell_at_border_link` / `border_road_links` (sorted). The stepper and handoff are unchanged.
-- `drain_traveler_handoffs` — a `Move` already carries `RouteExit.{link, to_region}` from the
+- `resolve_pending_traveler_handoffs` — a `Move` already carries `RouteExit.{link, to_region}` from the
   stepper, so drain emits the `TravelerHandoff` directly (no `exit_link_for(cell, region)`
   re-derivation, which is ambiguous on a multi-link cell). Unchanged otherwise.
 
 ### `src/core/regions/runtime/mod.rs`, `src/core/regional_game_runner.rs`
 
-- Reuse `RegionEvent::ReceiveTraveler` / `StepTravel`, `drained_traveler_handoff_messages`,
+- Reuse `RegionEvent::ReceiveTraveler` / `StepTravel`, `route_traveler_handoffs`,
   and `step_travel_city` unchanged.
 
 ## 4. Pseudocode / integration

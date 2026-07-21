@@ -230,15 +230,15 @@ pub struct PendingDestinationArrival {
 pub(crate) outgoing_destination_arrivals: Vec<PendingDestinationArrival>,
 
 impl RegionState {
-    fn drain_destination_arrivals(&mut self) -> Vec<PendingDestinationArrival> {
+    fn take_pending_destination_arrivals(&mut self) -> Vec<PendingDestinationArrival> {
         std::mem::take(&mut self.world.outgoing_destination_arrivals)
     }
 }
 
-fn drained_destination_arrival_messages(
+fn route_destination_arrivals(
     runtime: &mut RegionRuntime,
 ) -> Vec<OutboundMessage> {
-    runtime.state.drain_destination_arrivals()
+    runtime.state.take_pending_destination_arrivals()
         .into_iter()
         .map(|arrival| route_destination_arrived(arrival.traveler, arrival.destination))
         .collect()
@@ -246,8 +246,7 @@ fn drained_destination_arrival_messages(
 ```
 
 The `RegionEvent::StepTravel` arm calls `state.step_travel()`, then drains both
-`drained_traveler_handoff_messages(step)` and
-`drained_destination_arrival_messages()`. The duplicate-step early return is
+`route_traveler_handoffs(step)` and `route_destination_arrivals()`. The duplicate-step early return is
 safe: it happens before `state.step_travel()`, so it cannot leave a newly
 produced arrival buffered.
 

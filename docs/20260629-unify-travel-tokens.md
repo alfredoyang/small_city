@@ -169,7 +169,7 @@ pub struct TravelToken {
   duplicate, present token, or stale older trip → no ghost, no clobber). Stale entry cell →
   bounce a `Rollback` home (never drop). `away_residents` is cleared on the eventual home-arrival,
   not on receive (a returning `Move` is placed at the border and still walks home).
-- `drain_traveler_handoffs`: `Move`/`Rollback`, no `return_path` push/pop.
+- `resolve_pending_traveler_handoffs`: `Move`/`Rollback`, no `return_path` push/pop.
 
 ### Adapter (`interface/adapter.rs`)
 

@@ -550,7 +550,7 @@ fn run_tick(&mut self, request_id: UiRequestId) -> Vec<OutboundMessage> {
     outbound.push(OutboundMessage::RegionTickCompleted(
         RegionTickResponse { request_id, region_id: self.region_id(), result }
     ));
-    outbound.extend(self.drained_traveler_handoff_messages()); // unchanged
+    outbound.extend(self.route_traveler_handoffs(step)); // unchanged
     outbound
 }
 
