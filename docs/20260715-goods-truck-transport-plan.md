@@ -757,6 +757,8 @@ Scope
 
 Forbidden
   no Truck variant, goods reservation, UI, or citizen behaviour change.
+  no behavior that matches or emits ArrivalAction::DeliverGoods; P1 only adds
+  the placeholder enum item for the later truck patch.
 
 Tests
   existing local and cross-region citizen travel is unchanged

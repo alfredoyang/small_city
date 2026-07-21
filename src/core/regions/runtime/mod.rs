@@ -970,7 +970,7 @@ impl RegionRuntime {
             .collect::<Vec<_>>();
         handoffs.sort_by_key(|handoff| {
             (
-                handoff.traveler.citizen,
+                handoff.traveler.entity,
                 handoff.traveler.generation,
                 match handoff.kind {
                     crate::core::components::HandoffKind::Move => 0,
@@ -1006,7 +1006,7 @@ impl RegionRuntime {
         destination: PlaceRef,
     ) -> OutboundMessage {
         OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
-            recipients: RegionRecipients::One(traveler.citizen.region()),
+            recipients: RegionRecipients::One(traveler.entity.region()),
             event: RegionEvent::DestinationArrived {
                 traveler,
                 destination,
@@ -2202,7 +2202,7 @@ mod tick_state_tests {
     #[test]
     fn inbound_traveler_handoff_waits_for_its_eligible_step() {
         use crate::core::components::{
-            HandoffKind, PlaceRef, TravelState, TravelToken, TravelerId,
+            HandoffKind, PlaceRef, TravelKind, TravelState, TravelToken, TravelerId,
         };
 
         let mut runtime = RegionRuntime::new(RegionState::new(RegionId(2), 2, 2));
@@ -2213,11 +2213,11 @@ mod tick_state_tests {
                     region: RegionId(1),
                     building: Entity::new(RegionId(1), 1),
                 },
-                work: None,
+                kind: TravelKind::Citizen { work: None },
                 trip_gen: 7,
             },
             traveler: TravelerId {
-                citizen: Entity::new(RegionId(1), 9),
+                entity: Entity::new(RegionId(1), 9),
                 generation: 7,
             },
             to_region: RegionId(2),
@@ -2242,7 +2242,7 @@ mod tick_state_tests {
     #[test]
     fn eligible_traveler_handoffs_are_ordered_by_traveler_identity() {
         use crate::core::components::{
-            HandoffKind, PlaceRef, TravelState, TravelToken, TravelerId,
+            HandoffKind, PlaceRef, TravelKind, TravelState, TravelToken, TravelerId,
         };
 
         let mut runtime = RegionRuntime::new(RegionState::new(RegionId(2), 2, 2));
@@ -2256,11 +2256,11 @@ mod tick_state_tests {
                             region: RegionId(1),
                             building: Entity::new(RegionId(1), 1),
                         },
-                        work: None,
+                        kind: TravelKind::Citizen { work: None },
                         trip_gen: 7,
                     },
                     traveler: TravelerId {
-                        citizen,
+                        entity: citizen,
                         generation: 7,
                     },
                     to_region: RegionId(2),
@@ -2271,8 +2271,8 @@ mod tick_state_tests {
         }
 
         let handoffs = runtime.take_handoffs_eligible_at(TravelStepId(2));
-        assert_eq!(handoffs[0].traveler.citizen.local(), 3);
-        assert_eq!(handoffs[1].traveler.citizen.local(), 9);
+        assert_eq!(handoffs[0].traveler.entity.local(), 3);
+        assert_eq!(handoffs[1].traveler.entity.local(), 9);
     }
 
     #[test]
@@ -2293,7 +2293,7 @@ mod tick_state_tests {
 
         let mut runtime = RegionRuntime::new(RegionState::new(RegionId(2), 2, 2));
         let traveler = TravelerId {
-            citizen: Entity::new(RegionId(1), 7),
+            entity: Entity::new(RegionId(1), 7),
             generation: 3,
         };
         let destination = PlaceRef {
@@ -2328,7 +2328,7 @@ mod tick_state_tests {
     #[test]
     fn destination_arrival_records_attendance_once_for_the_current_work_trip() {
         use crate::core::city_refs::CityCellRef;
-        use crate::core::components::{Citizen, CitizenArrivalAction, Morale, WorkplaceAssignment};
+        use crate::core::components::{ArrivalAction, Citizen, Morale, WorkplaceAssignment};
 
         let citizen_id = Entity::new(RegionId(1), 7);
         let workplace = Entity::new(RegionId(2), 4);
@@ -2346,14 +2346,14 @@ mod tick_state_tests {
                 }),
                 morale: Morale::default(),
                 money: 0,
-                arrival_action: CitizenArrivalAction::StartWorkShift,
+                arrival_action: ArrivalAction::StartWorkShift,
                 work_trip_generation: 3,
                 attended_since_daily_settlement: false,
             },
         );
         let event = RegionEvent::DestinationArrived {
             traveler: TravelerId {
-                citizen: citizen_id,
+                entity: citizen_id,
                 generation: 3,
             },
             destination: PlaceRef {
@@ -2366,7 +2366,7 @@ mod tick_state_tests {
         runtime.process_event(event);
         let citizen = &runtime.state().world.citizens[&citizen_id];
         assert!(citizen.attended_since_daily_settlement);
-        assert_eq!(citizen.arrival_action, CitizenArrivalAction::ReturnHome);
+        assert_eq!(citizen.arrival_action, ArrivalAction::ReturnHome);
 
         {
             let citizen = runtime
@@ -2376,11 +2376,11 @@ mod tick_state_tests {
                 .get_mut(&citizen_id)
                 .expect("citizen remains present");
             citizen.attended_since_daily_settlement = false;
-            citizen.arrival_action = CitizenArrivalAction::StartWorkShift;
+            citizen.arrival_action = ArrivalAction::StartWorkShift;
         }
         runtime.process_event(RegionEvent::DestinationArrived {
             traveler: TravelerId {
-                citizen: citizen_id,
+                entity: citizen_id,
                 generation: 2,
             },
             destination: PlaceRef {

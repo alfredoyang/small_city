@@ -176,7 +176,7 @@ pub struct Citizen {
     /// Home-owned action for the current commute. This is transient because travel
     /// tokens are transient too; a loaded citizen starts in the safe home state.
     #[serde(skip, default)]
-    pub arrival_action: CitizenArrivalAction,
+    pub arrival_action: ArrivalAction,
     /// Monotonic stamp minted by the home region when a work commute begins.
     #[serde(default)]
     pub work_trip_generation: u32,
@@ -186,10 +186,12 @@ pub struct Citizen {
     pub attended_since_daily_settlement: bool,
 }
 
-/// Home-owned purpose for the active work commute.
+/// Owner-owned purpose for the active trip. P1 uses citizen work trips only;
+/// goods trucks add `DeliverGoods` in a later patch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CitizenArrivalAction {
+pub enum ArrivalAction {
     StartWorkShift,
+    DeliverGoods,
     #[default]
     ReturnHome,
 }
@@ -313,7 +315,7 @@ pub struct HappinessEffect {
 /// road graph); `Traveling` means the citizen is on a road cell stepping toward
 /// its destination. A token does NOT exist when the citizen is idle-at-home or
 /// away in another region — absence of a token IS the "idle at home" state, and
-/// `world.away_residents` IS the "away" state.
+/// `world.active_travelers` IS the "away" state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TravelStatus {
     AtWork,
@@ -321,14 +323,14 @@ pub enum TravelStatus {
 }
 
 /// P5 cross-region travel: round-trip identity for a traveler whose token is out
-/// in a neighbor region. `citizen.region()` is the home region; the neighbor
+/// in a neighbor region. `entity.region()` is the owner/home region; the neighbor
 /// echoes the whole id back on the return handoff and never dereferences the
 /// `Entity` as an ECS key (the same opaque-id trust boundary as a remote
 /// `WorkplaceAssignment.workplace`). `generation` is the active home-issued trip
 /// stamp — copied unchanged across crossings, so a stale older trip cannot match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TravelerId {
-    pub citizen: Entity,
+    pub entity: Entity,
     pub generation: u32,
 }
 
@@ -341,10 +343,10 @@ pub struct PlaceRef {
     pub building: Entity,
 }
 
-/// The unified travel token — one per citizen *while away from home* (in the
-/// region where the body physically is; idle-at-home = no token). Carries the
-/// citizen's two endpoints (home, work) so the symmetric stepper can re-target
-/// without consulting `Citizen` mid-step; the home region mints `gen` on work
+/// The unified travel token — one per traveler *while away from home* (in the
+/// region where the body physically is; idle-at-home/factory = no token).
+/// Carries the owner's endpoints so the symmetric stepper can re-target without
+/// consulting owner-private state mid-step; the owner region mints `gen` on
 /// departure so a stale older return handoff can never match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TravelToken {
@@ -353,12 +355,30 @@ pub struct TravelToken {
     pub state: TravelState,
     /// The citizen's home (a building in the home region).
     pub home: PlaceRef,
-    /// The citizen's workplace (`None` for jobless — always targets home).
-    pub work: Option<PlaceRef>,
+    /// The owner-specific travel behavior. P1 keeps only citizens active.
+    pub kind: TravelKind,
     /// The active-trip stamp. The home region mints it on work departure; hosts
-    /// carry it unchanged. `TravelerId` on the wire is
-    /// `{citizen, generation}`.
+    /// carry it unchanged. `TravelerId` on the wire is `{entity, generation}`.
     pub trip_gen: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TravelKind {
+    Citizen { work: Option<PlaceRef> },
+}
+
+impl TravelToken {
+    pub(crate) fn citizen_work(&self) -> Option<PlaceRef> {
+        match &self.kind {
+            TravelKind::Citizen { work } => *work,
+        }
+    }
+
+    pub(crate) fn set_citizen_work(&mut self, next_work: Option<PlaceRef>) {
+        match &mut self.kind {
+            TravelKind::Citizen { work } => *work = next_work,
+        }
+    }
 }
 
 /// P3 movement: one citizen's per-tick trip state.
@@ -428,7 +448,7 @@ pub enum PendingHandoff {
         exit_link: BorderLinkId,
     },
     /// A neighbour bounced this citizen home (its outbound could not place) —
-    /// `apply_traveler_return` at the home region clears `away_residents`.
+    /// `apply_traveler_return` at the home region clears `active_travelers`.
     Rollback {
         traveler: TravelerId,
         to_region: RegionId,
@@ -447,7 +467,7 @@ pub struct PendingDestinationArrival {
 /// `RegionNeighborLink` flow that carries power/job/goods exports). Built by the
 /// regions layer from a [`PendingHandoff`] — it adds the `BorderLinkId` routing
 /// the core left out. The *only* thing that crosses a border; the citizen
-/// entity never migrates and the receiver treats `traveler.citizen` as opaque
+/// entity never migrates and the receiver treats `traveler.entity` as opaque
 /// id data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TravelerHandoff {
@@ -500,7 +520,7 @@ mod tests {
             workplace_assignment: None,
             morale: Morale::default(),
             money: 5,
-            arrival_action: CitizenArrivalAction::ReturnHome,
+            arrival_action: ArrivalAction::ReturnHome,
             work_trip_generation: 0,
             attended_since_daily_settlement: false,
         };
@@ -526,7 +546,7 @@ mod tests {
             workplace_assignment: None,
             morale: Morale::default(),
             money: 5,
-            arrival_action: CitizenArrivalAction::StartWorkShift,
+            arrival_action: ArrivalAction::StartWorkShift,
             work_trip_generation: 8,
             attended_since_daily_settlement: true,
         };
@@ -534,7 +554,7 @@ mod tests {
         let json = serde_json::to_value(citizen).expect("serialize citizen");
         assert!(json.get("arrival_action").is_none());
         let loaded: Citizen = serde_json::from_value(json).expect("deserialize citizen");
-        assert_eq!(loaded.arrival_action, CitizenArrivalAction::ReturnHome);
+        assert_eq!(loaded.arrival_action, ArrivalAction::ReturnHome);
         assert_eq!(loaded.work_trip_generation, 8);
         assert!(loaded.attended_since_daily_settlement);
     }

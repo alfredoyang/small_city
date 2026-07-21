@@ -13,13 +13,13 @@
 //!
 //! ```text
 //!   step_tokens (one 10-min sub-tick), per region:
-//!     DEPART pass: world.citizens resident, idle at home (no token, not in away_residents)
+//!     DEPART pass: world.citizens resident, idle at home (no token, not in active_travelers)
 //!                  whose schedule phase points elsewhere → first-step toward target.
 //!                  Token created ONLY if a route exists (no route ⇒ no token).
 //!     MOVE pass:   every present token (sorted by citizen.0):
 //!                  local target   → advance_to_building → TokenArrival
 //!                  remote target  → advance_to_exit    → Reached(exit_cell) → emit Move
-//!                  ArrivedHome   → remove token, remove away_residents (idle-at-home = no token)
+//!                  ArrivedHome   → remove token, remove active_travelers (idle-at-home = no token)
 //!                  ArrivedWork   → keep, idle AtWork
 //!                  Reached(exit) → buffer PendingHandoff::Move, remove local token
 //! ```
@@ -28,14 +28,15 @@
 //! deterministically; `routes_to` is a deterministic Dijkstra tree; entry cells are
 //! sorted by position. Same inputs → same movement.
 //!
-//! Persistence: `World::tokens` and `World::away_residents` are `#[serde(skip)]`;
+//! Persistence: `World::tokens` and `World::active_travelers` are `#[serde(skip)]`;
 //! trips are not saved. On load the first sub-tick re-derives placement from the
 //! schedule.
 
 use std::collections::HashSet;
 
 use crate::core::components::{
-    PendingDestinationArrival, PendingHandoff, PlaceRef, TravelState, TravelToken, TravelerId,
+    PendingDestinationArrival, PendingHandoff, PlaceRef, TravelKind, TravelState, TravelToken,
+    TravelerId,
 };
 use crate::core::entity::Entity;
 use crate::core::regions::RouteExit;
@@ -52,7 +53,7 @@ enum TokenArrival {
     /// Arrived at the workplace — idle `AtWork`, `building = work.building`.
     ArrivedWork,
     /// Arrived at home — the token should be removed and the citizen cleared from
-    /// `away_residents` (if present).
+    /// `active_travelers` (if present).
     ArrivedHome,
 }
 
@@ -82,7 +83,7 @@ pub(crate) fn step_tokens(world: &mut World) {
     //    idle-at-home resident whose phase target is elsewhere tries to leave NOW.
     //    ("Home region" only in the sense that a region holds the Citizen for its
     //    own residents.)
-    //    "Idle at home" = no token here AND not in away_residents (so an away
+    //    "Idle at home" = no token here AND not in active_travelers (so an away
     //    resident — body in the neighbour — is NOT re-spawned; a brand-new/just-
     //    returned one IS). The token is created ONLY if its FIRST step succeeds (a
     //    route exists) — matching today: an unreachable workplace = idle at home,
@@ -91,7 +92,7 @@ pub(crate) fn step_tokens(world: &mut World) {
     let mut just_departed: HashSet<Entity> = HashSet::new();
     let mut planned_work_departures: Vec<(Entity, TravelState, PlaceRef, PlaceRef)> = Vec::new();
     for (id, citizen) in world.citizens.iter() {
-        if world.tokens.contains_key(id) || world.away_residents.contains(id) {
+        if world.tokens.contains_key(id) || world.active_travelers.contains(id) {
             continue; // busy (token here) or away (body in neighbour)
         }
         let home = PlaceRef {
@@ -152,7 +153,7 @@ pub(crate) fn step_tokens(world: &mut World) {
             // citizen is not in this region's `world.citizens`.
             refresh_endpoints_from(&mut token, world.citizens.get_mut(&citizen));
             let target = if phase == phase_work() {
-                token.work.unwrap_or(token.home)
+                token.citizen_work().unwrap_or(token.home)
             } else {
                 token.home
             };
@@ -179,7 +180,7 @@ pub(crate) fn step_tokens(world: &mut World) {
                     RemoteStep::CrossOut { exit, token: moved } => {
                         handoffs.push(PendingHandoff::Move {
                             traveler: TravelerId {
-                                citizen,
+                                entity: citizen,
                                 generation: moved.trip_gen,
                             },
                             token: moved,
@@ -217,9 +218,9 @@ pub(crate) fn step_tokens(world: &mut World) {
     for (c, arrived_home, trip_gen) in removes {
         world.tokens.remove(&c);
         if arrived_home && home_accepts(world, c, trip_gen) {
-            world.away_residents.remove(&c);
+            world.active_travelers.remove(&c);
             if let Some(citizen) = world.citizens.get_mut(&c) {
-                citizen.arrival_action = crate::core::components::CitizenArrivalAction::ReturnHome;
+                citizen.arrival_action = crate::core::components::ArrivalAction::ReturnHome;
             }
         }
     }
@@ -231,7 +232,7 @@ pub(crate) fn step_tokens(world: &mut World) {
     // local token intentionally leaves its record: it can only be stale against
     // a newer trip stamp, whose body is still away in another region.
     world
-        .away_residents
+        .active_travelers
         .retain(|c| world.citizens.contains_key(c));
 }
 
@@ -241,7 +242,7 @@ fn phase_work() -> crate::core::systems::schedule::SchedulePhase {
     crate::core::systems::schedule::SchedulePhase::Work
 }
 
-/// Refresh `token.home` and `token.work` from the current `Citizen`. For a
+/// Refresh `token.home` and the citizen work endpoint from the current `Citizen`. For a
 /// foreign token (`citizen` is not in this region's `world.citizens`), this is a
 /// no-op (the moved `home`/`work` are preserved as-is). Hosts must not create a
 /// Citizen record for visitors: their carried endpoint remains authoritative.
@@ -254,12 +255,13 @@ fn refresh_endpoints_from(
         region: token.home.region,
         building: citizen.home,
     };
-    token.work = citizen.workplace_assignment.as_ref().map(|a| PlaceRef {
+    let work = citizen.workplace_assignment.as_ref().map(|a| PlaceRef {
         region: a.workplace.region(),
         building: a.workplace,
     });
-    if token.work.is_none() {
-        citizen.arrival_action = crate::core::components::CitizenArrivalAction::ReturnHome;
+    token.set_citizen_work(work);
+    if work.is_none() {
+        citizen.arrival_action = crate::core::components::ArrivalAction::ReturnHome;
     }
 }
 
@@ -275,14 +277,14 @@ fn begin_work_trip(
 ) -> Option<TravelToken> {
     let citizen = world.citizens.get_mut(&citizen_id)?;
     citizen.work_trip_generation += 1;
-    citizen.arrival_action = crate::core::components::CitizenArrivalAction::StartWorkShift;
+    citizen.arrival_action = crate::core::components::ArrivalAction::StartWorkShift;
     let trip_gen = citizen.work_trip_generation;
-    world.away_residents.insert(citizen_id);
+    world.active_travelers.insert(citizen_id);
 
     Some(TravelToken {
         state,
         home,
-        work: Some(work),
+        kind: TravelKind::Citizen { work: Some(work) },
         trip_gen,
     })
 }
@@ -296,7 +298,7 @@ fn destination_arrived_after_step(
     next_state: TravelState,
     arrival: TokenArrival,
 ) -> Option<PendingDestinationArrival> {
-    let work = token.work?;
+    let work = token.citizen_work()?;
     let was_parked_at_work = token.state.status == crate::core::components::TravelStatus::AtWork
         && token.state.building == Some(work.building);
     let reached_current_work = next_state.status == crate::core::components::TravelStatus::AtWork
@@ -305,7 +307,7 @@ fn destination_arrived_after_step(
     (arrival == TokenArrival::ArrivedWork && !was_parked_at_work && reached_current_work).then_some(
         PendingDestinationArrival {
             traveler: TravelerId {
-                citizen,
+                entity: citizen,
                 generation: token.trip_gen,
             },
             destination: work,
@@ -314,25 +316,25 @@ fn destination_arrived_after_step(
 }
 
 /// The teleport-home fallback: if `home_accepts(c, gen)` → remove the citizen from
-/// `away_residents` (the citizen is now home, idle, no token, no body placed).
+/// `active_travelers` (the citizen is now home, idle, no token, no body placed).
 /// Else no-op (drop).
 pub(crate) fn apply_traveler_return(world: &mut World, traveler: TravelerId) {
-    if home_accepts(world, traveler.citizen, traveler.generation) {
-        world.away_residents.remove(&traveler.citizen);
-        if let Some(citizen) = world.citizens.get_mut(&traveler.citizen) {
-            citizen.arrival_action = crate::core::components::CitizenArrivalAction::ReturnHome;
+    if home_accepts(world, traveler.entity, traveler.generation) {
+        world.active_travelers.remove(&traveler.entity);
+        if let Some(citizen) = world.citizens.get_mut(&traveler.entity) {
+            citizen.arrival_action = crate::core::components::ArrivalAction::ReturnHome;
         }
     }
 }
 
 /// The home-completion guard. Accepts a returning Move / Rollback only if all of:
 /// - the citizen is still alive (no ghost from a dead-while-away),
-/// - the citizen is in `away_residents` (an active trip, not a post-completion
+/// - the citizen is in `active_travelers` (an active trip, not a post-completion
 ///   duplicate that already arrived),
 /// - the handoff's `generation` matches the home-owned work-trip stamp.
 pub(crate) fn home_accepts(world: &World, citizen: Entity, trip_gen: u32) -> bool {
     world.citizens.contains_key(&citizen)
-        && world.away_residents.contains(&citizen)
+        && world.active_travelers.contains(&citizen)
         && world.citizens[&citizen].work_trip_generation == trip_gen
 }
 
@@ -356,7 +358,7 @@ pub(crate) fn receive_traveler(
         dwell: 0,
         prev_cell: None,
     };
-    world.tokens.insert(traveler.citizen, token);
+    world.tokens.insert(traveler.entity, token);
 }
 
 // ─── walk primitives (P5a / P5b, reused unchanged) ─────────────────────────────
@@ -745,7 +747,7 @@ mod tests {
     use super::{PlaceRef, TravelerId, apply_traveler_return, step_tokens};
     use crate::core::city_refs::CityCellRef;
     use crate::core::components::{
-        Citizen, Morale, TravelState, TravelStatus, TravelToken, WorkplaceAssignment,
+        Citizen, Morale, TravelKind, TravelState, TravelStatus, TravelToken, WorkplaceAssignment,
     };
     use crate::core::entity::Entity;
     use crate::core::regions::{BorderEdge, BorderLinkId, RegionId, RouteExit};
@@ -781,7 +783,7 @@ mod tests {
                 workplace_assignment,
                 morale: Morale::default(),
                 money: 0,
-                arrival_action: crate::core::components::CitizenArrivalAction::ReturnHome,
+                arrival_action: crate::core::components::ArrivalAction::ReturnHome,
                 work_trip_generation: 0,
                 attended_since_daily_settlement: false,
             },
@@ -856,10 +858,10 @@ mod tests {
         assert_eq!(world.citizens[&id].work_trip_generation, 1);
         assert_eq!(
             world.citizens[&id].arrival_action,
-            crate::core::components::CitizenArrivalAction::StartWorkShift
+            crate::core::components::ArrivalAction::StartWorkShift
         );
         assert_eq!(world.outgoing_destination_arrivals.len(), 1);
-        assert_eq!(world.outgoing_destination_arrivals[0].traveler.citizen, id);
+        assert_eq!(world.outgoing_destination_arrivals[0].traveler.entity, id);
         assert_eq!(
             world.outgoing_destination_arrivals[0].destination.building,
             work
@@ -889,7 +891,7 @@ mod tests {
         assert!(world.outgoing_destination_arrivals.is_empty());
         assert_eq!(
             world.citizens[&id].arrival_action,
-            crate::core::components::CitizenArrivalAction::ReturnHome
+            crate::core::components::ArrivalAction::ReturnHome
         );
     }
 
@@ -912,21 +914,23 @@ mod tests {
                     region: world.region_id,
                     building: home,
                 },
-                work: Some(PlaceRef {
-                    region: world.region_id,
-                    building: work,
-                }),
+                kind: TravelKind::Citizen {
+                    work: Some(PlaceRef {
+                        region: world.region_id,
+                        building: work,
+                    }),
+                },
                 trip_gen: 1,
             },
         );
-        world.away_residents.insert(id);
+        world.active_travelers.insert(id);
         world.citizens.remove(&id);
         set_hour(&mut world, 16);
 
         step_tokens(&mut world);
 
         assert!(!world.tokens.contains_key(&id));
-        assert!(!world.away_residents.contains(&id));
+        assert!(!world.active_travelers.contains(&id));
     }
 
     #[test]
@@ -949,28 +953,30 @@ mod tests {
                     region: world.region_id,
                     building: home,
                 },
-                work: Some(PlaceRef {
-                    region: world.region_id,
-                    building: work,
-                }),
+                kind: TravelKind::Citizen {
+                    work: Some(PlaceRef {
+                        region: world.region_id,
+                        building: work,
+                    }),
+                },
                 trip_gen: 1,
             },
         );
-        world.away_residents.insert(id);
+        world.active_travelers.insert(id);
         set_hour(&mut world, 16);
 
         step_tokens(&mut world);
 
         assert!(!world.tokens.contains_key(&id));
-        assert!(world.away_residents.contains(&id));
+        assert!(world.active_travelers.contains(&id));
         apply_traveler_return(
             &mut world,
             TravelerId {
-                citizen: id,
+                entity: id,
                 generation: 2,
             },
         );
-        assert!(!world.away_residents.contains(&id));
+        assert!(!world.active_travelers.contains(&id));
     }
 
     /// After the workday the citizen walks back home (animated return).
@@ -1010,7 +1016,7 @@ mod tests {
             step_tokens(&mut world);
         }
         assert!(!world.tokens.contains_key(&id), "no token, idle at home");
-        assert!(!world.away_residents.contains(&id));
+        assert!(!world.active_travelers.contains(&id));
     }
 
     /// A job-less citizen goes home in the Work phase (matches schedule_intent today).
@@ -1085,9 +1091,9 @@ mod tests {
         );
     }
 
-    /// A resident that dies WHILE away has its `away_residents` record dropped.
+    /// A resident that dies WHILE away has its `active_travelers` record dropped.
     #[test]
-    fn dead_while_away_prunes_away_residents() {
+    fn dead_while_away_prunes_active_travelers() {
         let (mut world, _roads, home, work) = commute_world();
         let id = add_citizen(&mut world, 100, home, Some(work));
         set_hour(&mut world, 9);
@@ -1096,14 +1102,14 @@ mod tests {
         }
         // Simulate the citizen being away (token removed on arrival, but suppose
         // the citizen died between two ticks before arrival). We can simulate by
-        // setting away_residents manually.
-        world.away_residents.insert(id);
+        // setting active_travelers manually.
+        world.active_travelers.insert(id);
         // Now kill the citizen.
         world.citizens.remove(&id);
         step_tokens(&mut world);
         assert!(
-            !world.away_residents.contains(&id),
-            "away_residents pruned for a dead citizen"
+            !world.active_travelers.contains(&id),
+            "active_travelers pruned for a dead citizen"
         );
     }
 
@@ -1125,14 +1131,14 @@ mod tests {
         // No token — no route from r0/r1 network to r3 network.
         assert!(!world.tokens.contains_key(&id));
         // An away resident is NOT re-spawned — the depart pass skips it.
-        world.away_residents.insert(id);
+        world.active_travelers.insert(id);
         step_tokens(&mut world);
         assert!(!world.tokens.contains_key(&id));
     }
 
-    /// ArrivedHome removes the token and clears `away_residents`.
+    /// ArrivedHome removes the token and clears `active_travelers`.
     #[test]
-    fn arrive_home_removes_token_and_away_residents() {
+    fn arrive_home_removes_token_and_active_travelers() {
         let (mut world, _roads, home, work) = commute_world();
         let id = add_citizen(&mut world, 100, home, Some(work));
         set_hour(&mut world, 9);
@@ -1147,12 +1153,12 @@ mod tests {
         // Token should be removed on home-arrival.
         assert!(!world.tokens.contains_key(&id));
         // If the citizen was marked away, that should be cleared.
-        assert!(!world.away_residents.contains(&id));
+        assert!(!world.active_travelers.contains(&id));
     }
 
     /// `apply_traveler_return` is the home-arrival fallback. With `home_accepts`
-    /// true (citizen exists, is in away_residents, generation matches),
-    /// the citizen is cleared from `away_residents`.
+    /// true (citizen exists, is in active_travelers, generation matches),
+    /// the citizen is cleared from `active_travelers`.
     #[test]
     fn rollback_re_homes_by_presence_and_generation() {
         use super::apply_traveler_return;
@@ -1162,18 +1168,18 @@ mod tests {
         for _ in 0..6 {
             step_tokens(&mut world);
         }
-        // Simulate the cross-out state: token gone, away_residents set, gen=1.
+        // Simulate the cross-out state: token gone, active_travelers set, gen=1.
         world.tokens.remove(&id);
-        world.away_residents.insert(id);
-        // Rollback with matching gen → home_accepts true → away_residents cleared.
+        world.active_travelers.insert(id);
+        // Rollback with matching gen → home_accepts true → active_travelers cleared.
         apply_traveler_return(
             &mut world,
             crate::core::components::TravelerId {
-                citizen: id,
+                entity: id,
                 generation: 1,
             },
         );
-        assert!(!world.away_residents.contains(&id));
+        assert!(!world.active_travelers.contains(&id));
     }
 
     /// The token's `gen` is set by the home region on departure and carried
@@ -1196,20 +1202,22 @@ mod tests {
                 region: world.region_id,
                 building: home,
             },
-            work: Some(crate::core::components::PlaceRef {
-                region: work.region(),
-                building: work,
-            }),
+            kind: TravelKind::Citizen {
+                work: Some(crate::core::components::PlaceRef {
+                    region: work.region(),
+                    building: work,
+                }),
+            },
             trip_gen: 1,
         };
         let entry = world.grid.get(0, 0).expect("r0");
         // Set up active-commute state for the home side.
         world.tokens.remove(&id);
-        world.away_residents.insert(id);
+        world.active_travelers.insert(id);
         receive_traveler(
             &mut world,
             TravelerId {
-                citizen: id,
+                entity: id,
                 generation: 1,
             },
             token,
@@ -1252,19 +1260,21 @@ mod tests {
                 region: world.region_id,
                 building: home,
             },
-            work: Some(crate::core::components::PlaceRef {
-                region: work.region(),
-                building: work,
-            }),
+            kind: TravelKind::Citizen {
+                work: Some(crate::core::components::PlaceRef {
+                    region: work.region(),
+                    building: work,
+                }),
+            },
             trip_gen: 1,
         };
         // Insert active-commute state for the home side.
         world.tokens.remove(&id);
-        world.away_residents.insert(id);
+        world.active_travelers.insert(id);
         receive_traveler(
             &mut world,
             TravelerId {
-                citizen: id,
+                entity: id,
                 generation: 1,
             },
             token,
@@ -1288,8 +1298,8 @@ mod tests {
             "eventual home-arrival: token removed"
         );
         assert!(
-            !world.away_residents.contains(&id),
-            "away_residents cleared"
+            !world.active_travelers.contains(&id),
+            "active_travelers cleared"
         );
     }
 
@@ -1458,10 +1468,12 @@ mod tests {
                     region: world.region_id,
                     building: home,
                 },
-                work: Some(PlaceRef {
-                    region: RegionId(7),
-                    building: workplace,
-                }),
+                kind: TravelKind::Citizen {
+                    work: Some(PlaceRef {
+                        region: RegionId(7),
+                        building: workplace,
+                    }),
+                },
                 trip_gen: 1,
             },
         );
@@ -1485,7 +1497,7 @@ mod tests {
     /// committed one is missing or no longer reachable.
     #[test]
     fn remote_exit_keeps_committed_exit_when_still_valid() {
-        use crate::core::components::{PlaceRef, TravelState, TravelToken};
+        use crate::core::components::{PlaceRef, TravelKind, TravelState, TravelToken};
         // 5-cell linear road so the token walks 2+ cells before the
         // next exit, giving the cheaper alternative time to "appear"
         // (it was always in the candidate list, but the test verifies
@@ -1540,10 +1552,12 @@ mod tests {
                     region: world.region_id,
                     building: home,
                 },
-                work: Some(PlaceRef {
-                    region: RegionId(7),
-                    building: workplace,
-                }),
+                kind: TravelKind::Citizen {
+                    work: Some(PlaceRef {
+                        region: RegionId(7),
+                        building: workplace,
+                    }),
+                },
                 trip_gen: 1,
             },
         );
@@ -1583,12 +1597,12 @@ mod tests {
         let mut ta: Vec<_> = a
             .tokens
             .iter()
-            .map(|(k, v)| (*k, v.state, v.home, v.work, v.trip_gen))
+            .map(|(k, v)| (*k, v.state, v.home, v.citizen_work(), v.trip_gen))
             .collect();
         let mut tb: Vec<_> = b
             .tokens
             .iter()
-            .map(|(k, v)| (*k, v.state, v.home, v.work, v.trip_gen))
+            .map(|(k, v)| (*k, v.state, v.home, v.citizen_work(), v.trip_gen))
             .collect();
         ta.sort_by_key(|(k, _, _, _, _)| k.0);
         tb.sort_by_key(|(k, _, _, _, _)| k.0);
@@ -1674,10 +1688,12 @@ mod tests {
                 region: RegionId(7),
                 building: home,
             },
-            work: Some(PlaceRef {
-                region: RegionId(0),
-                building: workplace,
-            }),
+            kind: TravelKind::Citizen {
+                work: Some(PlaceRef {
+                    region: RegionId(0),
+                    building: workplace,
+                }),
+            },
             trip_gen: 1,
         };
         // Use a unique key for the foreign token.
@@ -1705,7 +1721,7 @@ mod tests {
         // r3 → r2 → r1 → r0 then a Move is emitted.
         assert!(!walked.is_empty(), "the visitor walked at least one cell");
         // Eventually the token is removed (a Move was emitted and a host-only
-        // foreign token in B doesn't have away_residents in B to clear).
+        // foreign token in B doesn't have active_travelers in B to clear).
         assert!(
             !world.tokens.contains_key(&key),
             "token removed when Move was emitted"
@@ -1736,10 +1752,12 @@ mod tests {
                     region: RegionId(1),
                     building: Entity::new(RegionId(1), 1),
                 },
-                work: Some(PlaceRef {
-                    region: RegionId(7),
-                    building: Entity::new(RegionId(7), 2),
-                }),
+                kind: TravelKind::Citizen {
+                    work: Some(PlaceRef {
+                        region: RegionId(7),
+                        building: Entity::new(RegionId(7), 2),
+                    }),
+                },
                 trip_gen: 1,
             },
         );
@@ -1788,10 +1806,12 @@ mod tests {
                 region: RegionId(7),
                 building: Entity::new(RegionId(7), 0),
             },
-            work: Some(PlaceRef {
-                region: RegionId(8),
-                building: Entity::new(RegionId(8), 0),
-            }),
+            kind: TravelKind::Citizen {
+                work: Some(PlaceRef {
+                    region: RegionId(8),
+                    building: Entity::new(RegionId(8), 0),
+                }),
+            },
             trip_gen: 1,
         };
         let key = Entity::new(world.region_id, 77);

@@ -929,7 +929,9 @@ mod tests {
     /// destination region's inbox.
     #[test]
     fn traveler_handoff_routes_to_destination_inbox() {
-        use crate::core::components::{HandoffKind, TravelState, TravelToken, TravelerId};
+        use crate::core::components::{
+            HandoffKind, TravelKind, TravelState, TravelToken, TravelerId,
+        };
         use crate::core::entity::Entity;
 
         let mut worker = RegionWorker::new(WorkerId(7));
@@ -947,11 +949,11 @@ mod tests {
                     region: RegionId(1),
                     building: Entity::new(RegionId(1), 0),
                 },
-                work: None,
+                kind: TravelKind::Citizen { work: None },
                 trip_gen: 1,
             },
             traveler: TravelerId {
-                citizen: Entity::new(RegionId(1), 5),
+                entity: Entity::new(RegionId(1), 5),
                 generation: 1,
             },
             to_region: RegionId(2),

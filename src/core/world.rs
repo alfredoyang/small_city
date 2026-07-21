@@ -99,7 +99,7 @@ pub(crate) struct World {
     // commute. Inserted when a work token is created and removed when the token
     // returns home. `#[serde(skip)]` like `tokens`.
     #[serde(skip, default)]
-    pub(crate) away_residents: std::collections::HashSet<Entity>,
+    pub(crate) active_travelers: std::collections::HashSet<Entity>,
     // P5: crossings this region decided on this tick (moves and rollbacks),
     // drained by the regions layer, which adds border-link routing and sends
     // them. The core only produces them; it never routes.
@@ -236,7 +236,7 @@ impl World {
             cross_region_goods_routes: CrossRegionGoodsRoutes::default(),
             route_cache: RefCell::default(),
             tokens: HashMap::new(),
-            away_residents: std::collections::HashSet::new(),
+            active_travelers: std::collections::HashSet::new(),
             outgoing_handoffs: Vec::new(),
             outgoing_destination_arrivals: Vec::new(),
             remote_exit_cells: HashMap::new(),
@@ -716,7 +716,7 @@ mod tests {
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,
-                arrival_action: crate::core::components::CitizenArrivalAction::ReturnHome,
+                arrival_action: crate::core::components::ArrivalAction::ReturnHome,
                 work_trip_generation: 0,
                 attended_since_daily_settlement: false,
             },
@@ -746,7 +746,7 @@ mod tests {
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,
-                arrival_action: crate::core::components::CitizenArrivalAction::ReturnHome,
+                arrival_action: crate::core::components::ArrivalAction::ReturnHome,
                 work_trip_generation: 0,
                 attended_since_daily_settlement: false,
             },

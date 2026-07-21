@@ -225,7 +225,7 @@ fn road_traveler_count(world: &World, x: usize, y: usize) -> usize {
 /// Enter-panel detail for the travelers standing on the road cell at `(x, y)`.
 /// Local travelers (home is this region) get full `CitizenDetailView` rows, same
 /// perspective as a residential roster. Visitors (home elsewhere) get endpoint
-/// summary rows built only from `token.home`/`token.work` — no cross-region query.
+/// summary rows built only from `token.home`/citizen-work endpoint — no cross-region query.
 /// Empty for a non-road cell or an out-of-bounds coordinate. Order: local rows by
 /// `Entity` id, then visitor rows grouped by endpoint (see `RoadTravelerEndpointView`).
 pub(crate) fn road_traveler_panel_seed(
@@ -266,14 +266,14 @@ pub(crate) fn road_traveler_panel_seed(
             continue;
         }
 
-        let local_workplace = token
-            .work
+        let work = token.citizen_work();
+        let local_workplace = work
             .filter(|workplace| workplace.region == world.region_id)
             .and_then(|workplace| world.positions.get(&workplace.building))
             .map(|position| CityCellRef::local(world.region_id, position.x, position.y));
         visitor_keys.push((
             token.home.region,
-            token.work.map(|workplace| workplace.region),
+            work.map(|workplace| workplace.region),
             local_workplace,
         ));
     }
@@ -1112,7 +1112,7 @@ mod tests {
     use super::{calculate_demand, traveler_views, view_world};
     use crate::core::city_refs::CityCellRef;
     use crate::core::components::{
-        Citizen, Morale, PlaceRef, TravelState, TravelStatus, TravelToken,
+        Citizen, Morale, PlaceRef, TravelKind, TravelState, TravelStatus, TravelToken,
     };
     use crate::core::entity::Entity;
     use crate::core::systems::placement::place_building;
@@ -1135,7 +1135,7 @@ mod tests {
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,
-                arrival_action: crate::core::components::CitizenArrivalAction::ReturnHome,
+                arrival_action: crate::core::components::ArrivalAction::ReturnHome,
                 work_trip_generation: 0,
                 attended_since_daily_settlement: false,
             },
@@ -1156,7 +1156,7 @@ mod tests {
                         region: world.region_id,
                         building: id,
                     },
-                    work: None,
+                    kind: TravelKind::Citizen { work: None },
                     trip_gen: 0,
                 },
             );
@@ -1248,7 +1248,7 @@ mod tests {
                 region: RegionId(3),
                 building: Entity::new(RegionId(3), 0),
             },
-            work: None,
+            kind: TravelKind::Citizen { work: None },
             trip_gen: 1,
         };
         let _ = add_citizen(&mut world, 2, Some(r0)); // local on r0 too
@@ -1322,7 +1322,7 @@ mod tests {
                     region: RegionId(3),
                     building: Entity::new(RegionId(3), 0),
                 },
-                work: None,
+                kind: TravelKind::Citizen { work: None },
                 trip_gen: 1,
             },
         );
@@ -1357,7 +1357,7 @@ mod tests {
                     region: RegionId(3),
                     building: Entity::new(RegionId(3), 0),
                 },
-                work: None,
+                kind: TravelKind::Citizen { work: None },
                 trip_gen: 1,
             },
         );
@@ -1398,7 +1398,7 @@ mod tests {
         assert!(seed.visitor_endpoints.is_empty());
     }
 
-    /// A visitor's endpoint row is built only from `token.home`/`token.work` —
+    /// A visitor's endpoint row is built only from `token.home`/citizen-work endpoint —
     /// no remote-region query. A workplace outside this region has no resolvable
     /// local coordinates.
     #[test]
@@ -1423,10 +1423,12 @@ mod tests {
                     region: RegionId(3),
                     building: Entity::new(RegionId(3), 0),
                 },
-                work: Some(PlaceRef {
-                    region: RegionId(5),
-                    building: Entity::new(RegionId(5), 9),
-                }),
+                kind: TravelKind::Citizen {
+                    work: Some(PlaceRef {
+                        region: RegionId(5),
+                        building: Entity::new(RegionId(5), 9),
+                    }),
+                },
                 trip_gen: 1,
             },
         );
@@ -1473,10 +1475,12 @@ mod tests {
                     region: RegionId(3),
                     building: Entity::new(RegionId(3), 0),
                 },
-                work: Some(PlaceRef {
-                    region: region_id,
-                    building: workplace,
-                }),
+                kind: TravelKind::Citizen {
+                    work: Some(PlaceRef {
+                        region: region_id,
+                        building: workplace,
+                    }),
+                },
                 trip_gen: 1,
             },
         );
@@ -1518,7 +1522,7 @@ mod tests {
                     region: RegionId(3),
                     building: Entity::new(RegionId(3), 0),
                 },
-                work: None,
+                kind: TravelKind::Citizen { work: None },
                 trip_gen: 1,
             },
         );
@@ -1561,7 +1565,7 @@ mod tests {
                 region: home_region,
                 building: Entity::new(home_region, local),
             },
-            work: None,
+            kind: TravelKind::Citizen { work: None },
             trip_gen: 1,
         };
         world

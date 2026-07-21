@@ -29,8 +29,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::core::city_refs::CityCellRef;
 use crate::core::components::{
-    CitizenArrivalAction, HandoffKind, PendingDestinationArrival, PendingHandoff, PlaceRef,
-    Position, PowerSource, TravelState, TravelToken, TravelerHandoff, TravelerId,
+    ArrivalAction, HandoffKind, PendingDestinationArrival, PendingHandoff, PlaceRef, Position,
+    PowerSource, TravelKind, TravelState, TravelToken, TravelerHandoff, TravelerId,
     WorkplaceAssignment,
 };
 use crate::core::entity::Entity;
@@ -444,13 +444,13 @@ impl RegionState {
         traveler: TravelerId,
         destination: PlaceRef,
     ) {
-        let Some(citizen) = self.world.citizens.get_mut(&traveler.citizen) else {
+        let Some(citizen) = self.world.citizens.get_mut(&traveler.entity) else {
             return;
         };
         let Some(assignment) = citizen.workplace_assignment else {
             return;
         };
-        if citizen.arrival_action != CitizenArrivalAction::StartWorkShift
+        if citizen.arrival_action != ArrivalAction::StartWorkShift
             || citizen.work_trip_generation != traveler.generation
             || assignment.workplace != destination.building
         {
@@ -458,7 +458,7 @@ impl RegionState {
         }
 
         citizen.attended_since_daily_settlement = true;
-        citizen.arrival_action = CitizenArrivalAction::ReturnHome;
+        citizen.arrival_action = ArrivalAction::ReturnHome;
     }
 
     /// Applies one player build command through the core systems.
@@ -863,12 +863,12 @@ impl RegionState {
                         // the outbound can't route. Two cases:
                         //   - Home-side: the home just lost its border link (or
                         //     the route went stale). Apply `apply_traveler_return`
-                        //     locally — it clears `away_residents` (the citizen
+                        //     locally — it clears `active_travelers` (the citizen
                         //     wasn't really away).
                         //   - Host-side: a foreign visitor's exit became
                         //     unroutable. B has no home record, so a local
                         //     `apply_traveler_return` would no-op. Emit a `Rollback`
-                        //     to the home region so it can clear `away_residents`
+                        //     to the home region so it can clear `active_travelers`
                         //     there.
                         if token.home.region == self.id {
                             travel::apply_traveler_return(&mut self.world, traveler);
@@ -898,7 +898,7 @@ impl RegionState {
                                 region: to_region,
                                 building: crate::core::entity::Entity::default(),
                             },
-                            work: None,
+                            kind: TravelKind::Citizen { work: None },
                             trip_gen: traveler.generation,
                         },
                         traveler,
@@ -926,7 +926,7 @@ impl RegionState {
                 if handoff.token.home.region == self.id
                     && !travel::home_accepts(
                         &self.world,
-                        handoff.traveler.citizen,
+                        handoff.traveler.entity,
                         handoff.traveler.generation,
                     )
                 {
@@ -952,7 +952,7 @@ impl RegionState {
                         // Entry road gone (stale route snapshot) — bounce a Rollback
                         // home. If THIS is the home region (its own entry vanished),
                         // it self-bounces: next sub-tick `apply_traveler_return`
-                        // clears `away_residents`, so the abandoned trip is
+                        // clears `active_travelers`, so the abandoned trip is
                         // re-departable. (Never drop the traveller.)
                         self.bounce_to_home(&handoff)
                     }
@@ -3546,7 +3546,7 @@ mod tests {
             offset: 0,
         };
         let traveler = TravelerId {
-            citizen: Entity::new(RegionId(1), 5),
+            entity: Entity::new(RegionId(1), 5),
             generation: 1,
         };
         let home = Entity::new(RegionId(1), 0);
@@ -3564,10 +3564,12 @@ mod tests {
                 region: RegionId(1),
                 building: home,
             },
-            work: Some(crate::core::components::PlaceRef {
-                region: RegionId(2),
-                building: workplace,
-            }),
+            kind: TravelKind::Citizen {
+                work: Some(crate::core::components::PlaceRef {
+                    region: RegionId(2),
+                    building: workplace,
+                }),
+            },
             trip_gen: 1,
         };
         a.world.outgoing_handoffs.push(PendingHandoff::Move {
@@ -3607,12 +3609,12 @@ mod tests {
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,
-                arrival_action: CitizenArrivalAction::ReturnHome,
+                arrival_action: ArrivalAction::ReturnHome,
                 work_trip_generation: 1,
                 attended_since_daily_settlement: false,
             },
         );
-        a.world.away_residents.insert(citizen);
+        a.world.active_travelers.insert(citizen);
         let home = Entity::new(RegionId(1), 0);
         let workplace = Entity::new(RegionId(2), 9);
         let token = TravelToken {
@@ -3621,15 +3623,17 @@ mod tests {
                 region: RegionId(1),
                 building: home,
             },
-            work: Some(crate::core::components::PlaceRef {
-                region: RegionId(2),
-                building: workplace,
-            }),
+            kind: TravelKind::Citizen {
+                work: Some(crate::core::components::PlaceRef {
+                    region: RegionId(2),
+                    building: workplace,
+                }),
+            },
             trip_gen: 1,
         };
         a.world.outgoing_handoffs.push(PendingHandoff::Move {
             traveler: TravelerId {
-                citizen,
+                entity: citizen,
                 generation: 1,
             },
             token,
@@ -3644,7 +3648,7 @@ mod tests {
         let handoffs = a.resolve_pending_traveler_handoffs();
         assert!(handoffs.is_empty(), "nothing routed");
         assert!(
-            !a.world.away_residents.contains(&citizen),
+            !a.world.active_travelers.contains(&citizen),
             "rolled back home"
         );
     }
@@ -3658,7 +3662,7 @@ mod tests {
         let entry = b.world.grid.get(0, 0).expect("road");
 
         let traveler = TravelerId {
-            citizen: Entity::new(RegionId(1), 5),
+            entity: Entity::new(RegionId(1), 5),
             generation: 1,
         };
         let home = Entity::new(RegionId(1), 0);
@@ -3670,10 +3674,12 @@ mod tests {
                     region: RegionId(1),
                     building: home,
                 },
-                work: Some(crate::core::components::PlaceRef {
-                    region: RegionId(2),
-                    building: workplace,
-                }),
+                kind: TravelKind::Citizen {
+                    work: Some(crate::core::components::PlaceRef {
+                        region: RegionId(2),
+                        building: workplace,
+                    }),
+                },
                 trip_gen: 1,
             },
             traveler,
@@ -3686,11 +3692,11 @@ mod tests {
         };
         let bounce = b.receive_traveler_handoff(handoff);
         assert!(bounce.is_empty(), "placed, no bounce");
-        let token = b.world.tokens.get(&traveler.citizen).expect("token placed");
+        let token = b.world.tokens.get(&traveler.entity).expect("token placed");
         assert_eq!(token.state.current_cell, Some(entry));
     }
 
-    /// Receiving a Rollback clears the home citizen's `away_residents` record.
+    /// Receiving a Rollback clears the home citizen's `active_travelers` record.
     #[test]
     fn receive_rollback_clears_away() {
         let mut a = RegionState::new(RegionId(1), 1, 1);
@@ -3705,12 +3711,12 @@ mod tests {
                 workplace_assignment: None,
                 morale: Morale::default(),
                 money: 0,
-                arrival_action: CitizenArrivalAction::ReturnHome,
+                arrival_action: ArrivalAction::ReturnHome,
                 work_trip_generation: 1,
                 attended_since_daily_settlement: false,
             },
         );
-        a.world.away_residents.insert(citizen);
+        a.world.active_travelers.insert(citizen);
 
         let bounce = a.receive_traveler_handoff(TravelerHandoff {
             token: TravelToken {
@@ -3719,11 +3725,11 @@ mod tests {
                     region: RegionId(1),
                     building: Entity::new(RegionId(1), 0),
                 },
-                work: None,
+                kind: TravelKind::Citizen { work: None },
                 trip_gen: 1,
             },
             traveler: TravelerId {
-                citizen,
+                entity: citizen,
                 generation: 1,
             },
             to_region: RegionId(1),
@@ -3731,7 +3737,7 @@ mod tests {
             kind: HandoffKind::Rollback,
         });
         assert!(bounce.is_empty());
-        assert!(!a.world.away_residents.contains(&citizen));
+        assert!(!a.world.active_travelers.contains(&citizen));
     }
 
     /// P-a: the per-region report prices entry → exit crossings on the
@@ -3816,7 +3822,7 @@ mod tests {
                     rent_stress: 0,
                 },
                 money: 0,
-                arrival_action: CitizenArrivalAction::ReturnHome,
+                arrival_action: ArrivalAction::ReturnHome,
                 work_trip_generation: 0,
                 attended_since_daily_settlement: false,
             },
