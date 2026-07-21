@@ -79,13 +79,14 @@ pub(crate) fn assign_local_jobs(world: &mut World, local_region: RegionId) {
 /// accrues their workplace tax here; the home region only pays salary and rent.
 #[cfg(test)]
 pub(crate) fn run(world: &mut World, exported_job_slots: &[Entity]) -> EconomyBreakdown {
-    run_with_goods_exports(world, exported_job_slots, 0)
+    run_with_prepared_goods_flow(world, exported_job_slots, 0, None)
 }
 
-pub(crate) fn run_with_goods_exports(
+pub(crate) fn run_with_prepared_goods_flow(
     world: &mut World,
     exported_job_slots: &[Entity],
     exported_goods_units: u32,
+    prepared_goods_flow: Option<PreparedGoodsFlow>,
 ) -> EconomyBreakdown {
     // Workplaces and shops are recalculated every tick from powered,
     // road-connected buildings. This keeps employment and shopping deterministic
@@ -105,12 +106,17 @@ pub(crate) fn run_with_goods_exports(
     // This encourages local production without introducing individual cargo
     // entities or pathfinding. Existing powered + road-connected rules decide
     // which industrial and commercial buildings can participate.
-    let goods_flow = distribute_local_goods(
-        world,
-        &index.productive_industrials,
-        &index.productive_commercials,
-        exported_goods_units,
-    );
+    let goods_flow = if let Some(prepared) = prepared_goods_flow {
+        apply_prepared_goods_flow(world, &prepared, false);
+        prepared.flow
+    } else {
+        distribute_local_goods(
+            world,
+            &index.productive_industrials,
+            &index.productive_commercials,
+            exported_goods_units,
+        )
+    };
 
     let mut shopping_slots = index.shopping_slots.clone();
     let mut salaries_paid = 0;
@@ -337,12 +343,32 @@ impl EconomyIndex {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct GoodsFlow {
+pub(crate) struct GoodsFlow {
     local_goods_produced: i32,
     local_goods_stored: i32,
     exported_goods: i32,
     manufacturing_tax: i32,
     export_tax: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalGoodsGrant {
+    pub commercial: Entity,
+    pub caller_network: u32,
+    pub units: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PreparedGoodsFlow {
+    flow: GoodsFlow,
+    local_grants: Vec<LocalGoodsGrant>,
+    industrial_profits: Vec<(Entity, i32)>,
+}
+
+impl PreparedGoodsFlow {
+    pub(crate) fn local_grants(&self) -> &[LocalGoodsGrant] {
+        &self.local_grants
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -387,11 +413,52 @@ fn distribute_local_goods(
     productive_commercials: &[Entity],
     exported_goods_units: u32,
 ) -> GoodsFlow {
+    let prepared = prepare_goods_flow(
+        world,
+        productive_industrials,
+        productive_commercials,
+        exported_goods_units,
+    );
+    apply_prepared_goods_flow(world, &prepared, true);
+    prepared.flow
+}
+
+pub(crate) fn prepare_goods_flow_for_current_world(
+    world: &mut World,
+    exported_goods_units: u32,
+) -> PreparedGoodsFlow {
+    ensure_business_building_data(world);
+    let job_resolution = world.cached_job_resolution();
+    let index = EconomyIndex::from_world(world, &job_resolution.workplace_slots);
+    prepare_goods_flow(
+        world,
+        &index.productive_industrials,
+        &index.productive_commercials,
+        exported_goods_units,
+    )
+}
+
+fn prepare_goods_flow(
+    world: &World,
+    productive_industrials: &[Entity],
+    productive_commercials: &[Entity],
+    exported_goods_units: u32,
+) -> PreparedGoodsFlow {
     let mut local_goods_produced = 0;
     let mut local_goods_stored = 0;
     let mut exported_goods = 0;
     let mut manufacturing_tax = 0;
     let mut export_tax = 0;
+    let mut local_grants = Vec::new();
+    let mut industrial_profits = Vec::new();
+    let mut commercial_free_capacity = productive_commercials
+        .iter()
+        .map(|commercial| {
+            let capacity = commercial_goods_capacity_for_entity(world, *commercial);
+            let stored = commercial_goods_stored(world, *commercial);
+            (*commercial, (capacity - stored).max(0))
+        })
+        .collect::<HashMap<_, _>>();
     let mut regional_export_units_remaining = exported_goods_units as i32;
     for industrial in productive_industrials {
         let mut industrial_profit = 0;
@@ -401,16 +468,24 @@ fn distribute_local_goods(
 
         for commercial in nearest_commercials_for_goods(world, *industrial, productive_commercials)
         {
-            let capacity = commercial_goods_capacity_for_entity(world, commercial);
-            let stored = commercial_goods_stored(world, commercial);
-            let free_capacity = (capacity - stored).max(0);
-            let supplied = free_capacity.min(remaining_goods);
+            let Some(free_capacity) = commercial_free_capacity.get_mut(&commercial) else {
+                continue;
+            };
+            let supplied = (*free_capacity).min(remaining_goods);
             if supplied <= 0 {
                 continue;
             }
-            add_commercial_goods(world, commercial, supplied);
+            *free_capacity -= supplied;
             remaining_goods -= supplied;
             local_goods_stored += supplied;
+            let caller_network = road_network_analysis::access_for(world, commercial)
+                .network_id
+                .unwrap_or_default();
+            local_grants.push(LocalGoodsGrant {
+                commercial,
+                caller_network,
+                units: supplied as u32,
+            });
             let distance =
                 road_network_analysis::distance_between_buildings(world, *industrial, commercial);
             let margin = supplied * margin_per_good(MANUFACTURING_TAX_PER_GOOD, distance);
@@ -426,7 +501,7 @@ fn distribute_local_goods(
             // ponytail: proxy distance. The grant does not carry the exact
             // producer-to-consumer route yet, so regional goods use the existing
             // producer-to-edge distance for manufacturing margin. Add route
-            // distance to GoodsExportGrant if balance needs that precision.
+            // distance to GoodsSupplyGrant if balance needs that precision.
             let distance =
                 road_network_analysis::access_for(world, *industrial).import_export_distance;
             let manufacturing_margin =
@@ -448,15 +523,34 @@ fn distribute_local_goods(
             manufacturing_tax += manufacturing_margin;
             industrial_profit += export_margin + manufacturing_margin;
         }
-        record_business_profit(world, *industrial, industrial_profit);
+        industrial_profits.push((*industrial, industrial_profit));
     }
 
-    GoodsFlow {
-        local_goods_produced,
-        local_goods_stored,
-        exported_goods,
-        manufacturing_tax,
-        export_tax,
+    PreparedGoodsFlow {
+        flow: GoodsFlow {
+            local_goods_produced,
+            local_goods_stored,
+            exported_goods,
+            manufacturing_tax,
+            export_tax,
+        },
+        local_grants,
+        industrial_profits,
+    }
+}
+
+fn apply_prepared_goods_flow(
+    world: &mut World,
+    prepared: &PreparedGoodsFlow,
+    apply_local_goods: bool,
+) {
+    if apply_local_goods {
+        for grant in &prepared.local_grants {
+            add_commercial_goods(world, grant.commercial, grant.units as i32);
+        }
+    }
+    for (industrial, profit) in &prepared.industrial_profits {
+        record_business_profit(world, *industrial, *profit);
     }
 }
 

@@ -257,12 +257,32 @@ pub(crate) fn finish_tick_after_goods_phase(
     exported_job_slots: &[Entity],
     exported_goods_units: u32,
 ) -> CommandResult {
+    finish_tick_after_goods_phase_with_prepared_goods(
+        world,
+        phase,
+        exported_job_slots,
+        exported_goods_units,
+        None,
+    )
+}
+
+pub(crate) fn finish_tick_after_goods_phase_with_prepared_goods(
+    world: &mut World,
+    phase: TickJobPhase,
+    exported_job_slots: &[Entity],
+    exported_goods_units: u32,
+    prepared_goods_flow: Option<economy::PreparedGoodsFlow>,
+) -> CommandResult {
     let economy = if phase.is_daily {
-        let economy =
-            economy::run_with_goods_exports(world, exported_job_slots, exported_goods_units);
-        // Event-driven plan, P-1: daily settlement writes goods stock directly
-        // (distribute_local_goods -> add_commercial_goods, consume_local_good) and
-        // bypasses every invalidate_*/mark_* chokepoint — mark explicitly so a
+        let economy = economy::run_with_prepared_goods_flow(
+            world,
+            exported_job_slots,
+            exported_goods_units,
+            prepared_goods_flow,
+        );
+        // Event-driven plan, P-1: daily settlement writes goods stock through
+        // prepared local grants/imports and `consume_local_good`, bypassing
+        // the ordinary building mutation chokepoints. Mark explicitly so a
         // goods-only change still republishes this region's availability hints.
         world.mark_hints_dirty();
         // Event-driven plan, P-5: same bypass applies to the goods export

@@ -91,10 +91,11 @@ use crate::core::regions::worker::{
     cross_region_goods_routes_for_region, importable_remote_jobs_for_region,
 };
 use crate::core::regions::{
-    ExitLink, GoodsExportGrant, PendingGoodsDemand, PendingPowerDemand, PowerExportGrant, RegionId,
+    ExitLink, GoodsSupplyGrant, PendingGoodsDemand, PendingPowerDemand, PowerExportGrant, RegionId,
     RegionRoadNetworkId, RegionState, RegionalTickGoodsPhase, RegionalTickJobPhase,
     RegionalTickPowerPhase,
 };
+use crate::core::systems::economy;
 use crate::core::world::CrossRegionGoodsRoutes;
 use crate::interface::input::MapOverlayInput;
 
@@ -162,17 +163,17 @@ pub enum RegionEvent {
         request: PowerExportAllocationRequest,
         grant: PowerExportGrant,
     },
-    /// Authoritative producer-side goods export allocation request.
-    ProcessGoodsExportRequest(GoodsExportAllocationRequest),
-    /// Producer-side release for a caller's previous goods export allocations.
-    ReleaseGoodsExportAllocations(GoodsExportAllocationRelease),
-    /// Caller-side goods export grant result.
+    /// Authoritative producer-side goods supply allocation request.
+    ProcessGoodsSupplyRequest(GoodsSupplyAllocationRequest),
+    /// Producer-side release for a caller's previous goods supply allocations.
+    ReleaseGoodsSupplyAllocations(GoodsSupplyAllocationRelease),
+    /// Caller-side goods supply grant result.
     ///
     /// Retire-tickstate, P-d: the reply carries the request it answers,
     /// same shape as power/jobs.
-    ApplyGoodsExportGrant {
-        request: GoodsExportAllocationRequest,
-        grant: GoodsExportGrant,
+    ApplyGoodsSupplyGrant {
+        request: GoodsSupplyAllocationRequest,
+        grant: GoodsSupplyGrant,
     },
     /// P5b: a cross-region travel token handed in by a neighbor region (fire and
     /// forget — no grant, no tick pause).
@@ -224,8 +225,8 @@ pub struct PowerExportRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Consumer request for a producer to export a whole batch of goods units.
-pub struct GoodsExportRequest {
+/// Consumer request for a producer to supply a whole batch of goods units.
+pub struct GoodsSupplyRequest {
     pub request_id: UiRequestId,
     pub caller_region: RegionId,
     pub caller_network: RegionRoadNetworkId,
@@ -250,8 +251,8 @@ pub struct ExportAllocationRequest<R> {
 
 /// Producer-side power allocation request (one consumer request + candidates).
 pub type PowerExportAllocationRequest = ExportAllocationRequest<PowerExportRequest>;
-/// Producer-side goods allocation request (one consumer request + candidates).
-pub type GoodsExportAllocationRequest = ExportAllocationRequest<GoodsExportRequest>;
+/// Producer-side goods supply allocation request (one consumer request + candidates).
+pub type GoodsSupplyAllocationRequest = ExportAllocationRequest<GoodsSupplyRequest>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Producer-side marker that a caller started a new tick export-resolution
@@ -271,8 +272,8 @@ pub struct ExportAllocationRelease {
 
 /// Power flavor of the shared export allocation release.
 pub type PowerExportAllocationRelease = ExportAllocationRelease;
-/// Goods flavor of the shared export allocation release.
-pub type GoodsExportAllocationRelease = ExportAllocationRelease;
+/// Goods supply flavor of the shared export allocation release.
+pub type GoodsSupplyAllocationRelease = ExportAllocationRelease;
 
 /// A consumer export request that can name the producer-side reservation key it
 /// belongs to. Both power and job requests carry the same `(caller, gen, token)`.
@@ -290,7 +291,7 @@ impl ExportRequestKey for PowerExportRequest {
     }
 }
 
-impl ExportRequestKey for GoodsExportRequest {
+impl ExportRequestKey for GoodsSupplyRequest {
     fn allocation_key(&self) -> ExportAllocationKey {
         ExportAllocationKey {
             caller_region: self.caller_region,
@@ -388,9 +389,9 @@ pub enum RuntimeReply {
 pub struct RegionRuntime {
     state: RegionState,
     power_export_allocations: ExportAllocations<i32>,
-    goods_export_allocations: ExportAllocations<u32>,
+    goods_supply_allocations: ExportAllocations<u32>,
     power_export_producers: Vec<RegionId>,
-    goods_export_producers: Vec<RegionId>,
+    goods_supply_producers: Vec<RegionId>,
     pending_goods_stock: Vec<(Entity, u32)>,
     // Retire-tickstate, P-a: the only caller-side memory power needs now that
     // nothing pauses. A reply echoes the request it answers (its own
@@ -463,7 +464,7 @@ pub struct RegionRuntime {
 //   └───────────────────────────────────────────────────────────────────────┘
 //          ▲ instantiated as                          ▲ instantiated as
 //          power_export_allocations:  ExportAllocations<i32>
-//          goods_export_allocations:  ExportAllocations<u32>
+//          goods_supply_allocations:  ExportAllocations<u32>
 //
 //   resource-specific (NOT shared) — how units become "available capacity":
 //     power → sum reserved demand, subtract from per-network remaining
@@ -586,9 +587,9 @@ impl RegionRuntime {
         Self {
             state,
             power_export_allocations: ExportAllocations::new(),
-            goods_export_allocations: ExportAllocations::new(),
+            goods_supply_allocations: ExportAllocations::new(),
             power_export_producers: Vec::new(),
-            goods_export_producers: Vec::new(),
+            goods_supply_producers: Vec::new(),
             pending_goods_stock: Vec::new(),
             current_power_request_id: UiRequestId(0),
             current_goods_request_id: UiRequestId(0),
@@ -856,20 +857,20 @@ impl RegionRuntime {
             RegionEvent::ApplyPowerExportGrant { request, grant } => {
                 self.apply_power_export_result(request, grant)
             }
-            RegionEvent::ProcessGoodsExportRequest(request) => {
-                let grant = self.process_goods_export_request(&request);
+            RegionEvent::ProcessGoodsSupplyRequest(request) => {
+                let grant = self.process_goods_supply_request(&request);
                 vec![OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
                     recipients: RegionRecipients::One(request.request.caller_region),
-                    event: RegionEvent::ApplyGoodsExportGrant { request, grant },
+                    event: RegionEvent::ApplyGoodsSupplyGrant { request, grant },
                 })]
             }
-            RegionEvent::ReleaseGoodsExportAllocations(release) => {
-                self.goods_export_allocations
+            RegionEvent::ReleaseGoodsSupplyAllocations(release) => {
+                self.goods_supply_allocations
                     .release_stale_for_caller(release.caller_region, release.request_id);
                 Vec::new()
             }
-            RegionEvent::ApplyGoodsExportGrant { request, grant } => {
-                self.apply_goods_export_result(request, grant)
+            RegionEvent::ApplyGoodsSupplyGrant { request, grant } => {
+                self.apply_goods_supply_result(request, grant)
             }
             RegionEvent::ReceiveTraveler {
                 eligible_step,
@@ -1035,11 +1036,11 @@ impl RegionRuntime {
         }
     }
 
-    fn remember_goods_export_producer(&mut self, grant: &GoodsExportGrant) {
+    fn remember_goods_supply_producer(&mut self, grant: &GoodsSupplyGrant) {
         if grant.granted
             && let Some(source_region) = grant.source_region
         {
-            insert_sorted_unique(&mut self.goods_export_producers, source_region);
+            insert_sorted_unique(&mut self.goods_supply_producers, source_region);
         }
     }
 
@@ -1326,18 +1327,51 @@ impl RegionRuntime {
         let phase = self.state.continue_tick_to_goods_demand_phase(job_phase);
         let dirty = self.state.is_goods_exports_dirty()
             || self.discovery_generation > self.seen_goods_generation;
+        let prepared_goods_flow = self.prepare_and_apply_local_goods_exports(&phase);
         if !dirty {
             // Quiet: existing grants + the producer's ledger persist; no
             // release, no requests.
-            let response = self.finish_goods_phase(request_id, phase);
+            let response = self.finish_goods_phase(request_id, phase, prepared_goods_flow);
             return vec![OutboundMessage::RegionTickCompleted(response)];
         }
         self.seen_goods_generation = self.discovery_generation;
         self.state.clear_goods_exports_dirty();
         let mut outbound = self.release_and_request_goods(request_id, &phase.goods_demands);
-        let response = self.finish_goods_phase(request_id, phase);
+        let response = self.finish_goods_phase(request_id, phase, prepared_goods_flow);
         outbound.push(OutboundMessage::RegionTickCompleted(response));
         outbound
+    }
+
+    fn prepare_and_apply_local_goods_exports(
+        &mut self,
+        phase: &RegionalTickGoodsPhase,
+    ) -> Option<economy::PreparedGoodsFlow> {
+        if !phase.phase.is_daily() {
+            return None;
+        }
+        let exported_goods_units = self.goods_supply_allocations.units().sum();
+        let prepared = self.state.prepare_goods_flow(exported_goods_units);
+        for (token, grant) in prepared.local_grants().iter().enumerate() {
+            let request = GoodsSupplyRequest {
+                request_id: self.current_goods_request_id,
+                caller_region: self.region_id(),
+                caller_network: RegionRoadNetworkId {
+                    region: self.region_id(),
+                    road_network: grant.caller_network,
+                },
+                token: token as u32,
+                units: grant.units,
+                commercial: grant.commercial,
+            };
+            let local_grant = GoodsSupplyGrant {
+                token: request.token,
+                granted: true,
+                source_region: Some(self.region_id()),
+                units: grant.units,
+            };
+            self.apply_goods_supply_grant(request, local_grant);
+        }
+        Some(prepared)
     }
 
     fn apply_pending_goods_stock(&mut self) {
@@ -1355,15 +1389,15 @@ impl RegionRuntime {
         demands: &[PendingGoodsDemand],
     ) -> Vec<OutboundMessage> {
         self.current_goods_request_id = request_id;
-        let producer_regions = std::mem::take(&mut self.goods_export_producers);
-        let release = GoodsExportAllocationRelease {
+        let producer_regions = std::mem::take(&mut self.goods_supply_producers);
+        let release = GoodsSupplyAllocationRelease {
             caller_region: self.region_id(),
             request_id,
             producer_regions,
         };
-        let mut outbound = self.goods_release_routes(release);
+        let mut outbound = self.goods_supply_release_routes(release);
         for demand in demands {
-            outbound.extend(self.begin_goods_export(GoodsExportRequest {
+            outbound.extend(self.begin_goods_supply(GoodsSupplyRequest {
                 request_id,
                 caller_region: self.region_id(),
                 caller_network: demand.caller_network,
@@ -1375,18 +1409,18 @@ impl RegionRuntime {
         outbound
     }
 
-    fn begin_goods_export(&mut self, request: GoodsExportRequest) -> Vec<OutboundMessage> {
+    fn begin_goods_supply(&mut self, request: GoodsSupplyRequest) -> Vec<OutboundMessage> {
         let candidates = self.goods_candidates(request.caller_network);
-        let attempt = GoodsExportAllocationRequest {
+        let attempt = GoodsSupplyAllocationRequest {
             request,
             candidates,
             candidate_index: 0,
         };
         let Some(network) = attempt.candidates.first() else {
             let token = attempt.request.token;
-            return self.apply_goods_export_result(
+            return self.apply_goods_supply_result(
                 attempt,
-                GoodsExportGrant {
+                GoodsSupplyGrant {
                     token,
                     granted: false,
                     source_region: None,
@@ -1396,7 +1430,7 @@ impl RegionRuntime {
         };
         vec![OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
             recipients: RegionRecipients::One(network.region),
-            event: RegionEvent::ProcessGoodsExportRequest(attempt),
+            event: RegionEvent::ProcessGoodsSupplyRequest(attempt),
         })]
     }
 
@@ -1404,22 +1438,32 @@ impl RegionRuntime {
         let Some(discovery) = self.discovery.as_ref() else {
             return Vec::new();
         };
-        discovery
+        let mut candidates = discovery
             .component_of(caller)
             .unwrap_or(&[])
             .iter()
             .copied()
-            .filter(|network| network.region != self.region_id())
             .filter(|network| {
                 discovery
                     .availability_hints
                     .iter()
                     .any(|hint| hint.network == *network && hint.spare_goods_units > 0)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|network| {
+            (
+                network.region != self.region_id(),
+                network.region.0,
+                network.road_network,
+            )
+        });
+        candidates
     }
 
-    fn goods_release_routes(&self, release: GoodsExportAllocationRelease) -> Vec<OutboundMessage> {
+    fn goods_supply_release_routes(
+        &self,
+        release: GoodsSupplyAllocationRelease,
+    ) -> Vec<OutboundMessage> {
         release
             .producer_regions
             .iter()
@@ -1427,7 +1471,7 @@ impl RegionRuntime {
             .map(|region| {
                 OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
                     recipients: RegionRecipients::One(region),
-                    event: RegionEvent::ReleaseGoodsExportAllocations(release.clone()),
+                    event: RegionEvent::ReleaseGoodsSupplyAllocations(release.clone()),
                 })
             })
             .collect()
@@ -1466,19 +1510,30 @@ impl RegionRuntime {
         &mut self,
         request_id: UiRequestId,
         phase: RegionalTickGoodsPhase,
+        prepared_goods_flow: Option<economy::PreparedGoodsFlow>,
     ) -> RegionTickResponse {
         // Producer-owned workplace tax comes from EmploymentContract state (one
         // slot per contracted seat).
         let exported_job_slots = self.state.contracted_workplace_tax_slots();
-        let exported_goods_units = self.goods_export_allocations.units().sum();
+        let exported_goods_units = self.goods_supply_allocations.units().sum();
         RegionTickResponse {
             request_id,
             region_id: self.region_id(),
-            result: self.state.finish_tick_goods_demand_phase(
-                phase,
-                &exported_job_slots,
-                exported_goods_units,
-            ),
+            result: if let Some(prepared_goods_flow) = prepared_goods_flow {
+                self.state
+                    .finish_tick_goods_demand_phase_with_prepared_goods(
+                        phase,
+                        &exported_job_slots,
+                        exported_goods_units,
+                        prepared_goods_flow,
+                    )
+            } else {
+                self.state.finish_tick_goods_demand_phase(
+                    phase,
+                    &exported_job_slots,
+                    exported_goods_units,
+                )
+            },
         }
     }
 
@@ -1534,13 +1589,13 @@ impl RegionRuntime {
         }
     }
 
-    fn process_goods_export_request(
+    fn process_goods_supply_request(
         &mut self,
-        request: &GoodsExportAllocationRequest,
-    ) -> GoodsExportGrant {
+        request: &GoodsSupplyAllocationRequest,
+    ) -> GoodsSupplyGrant {
         let Some(producer_network) = request.candidates.get(request.candidate_index).copied()
         else {
-            return GoodsExportGrant {
+            return GoodsSupplyGrant {
                 token: request.request.token,
                 granted: false,
                 source_region: None,
@@ -1548,10 +1603,10 @@ impl RegionRuntime {
             };
         };
         let allocation_key = export_allocation_key(&request.request);
-        self.goods_export_allocations
+        self.goods_supply_allocations
             .release_stale_for_caller(request.request.caller_region, request.request.request_id);
         let active_export_allocations: u32 = self
-            .goods_export_allocations
+            .goods_supply_allocations
             .reserved_units_excluding(allocation_key, producer_network)
             .sum();
         let remaining = self
@@ -1560,7 +1615,7 @@ impl RegionRuntime {
             .saturating_sub(active_export_allocations);
 
         if remaining < request.request.units {
-            return GoodsExportGrant {
+            return GoodsSupplyGrant {
                 token: request.request.token,
                 granted: false,
                 source_region: None,
@@ -1568,14 +1623,14 @@ impl RegionRuntime {
             };
         }
 
-        self.goods_export_allocations.upsert(
+        self.goods_supply_allocations.upsert(
             allocation_key,
             producer_network,
             request.request.units,
             request.request.request_id,
         );
 
-        GoodsExportGrant {
+        GoodsSupplyGrant {
             token: request.request.token,
             granted: true,
             source_region: Some(self.region_id()),
@@ -1669,12 +1724,12 @@ impl RegionRuntime {
     /// Retire-tickstate, P-d: same shape as power/jobs. The reply carries
     /// the request it answers, so a single request-id check replaces the
     /// old goods continuation and pending demand list.
-    fn apply_goods_export_grant(
+    fn apply_goods_supply_grant(
         &mut self,
-        request: GoodsExportRequest,
-        grant: GoodsExportGrant,
+        request: GoodsSupplyRequest,
+        grant: GoodsSupplyGrant,
     ) -> Vec<OutboundMessage> {
-        self.remember_goods_export_producer(&grant);
+        self.remember_goods_supply_producer(&grant);
         if request.request_id != self.current_goods_request_id {
             // A stale but granted goods reply reserved producer inventory
             // after this caller already moved to a newer generation. Clear
@@ -1686,27 +1741,32 @@ impl RegionRuntime {
             );
         }
         if grant.granted && grant.units > 0 {
-            self.pending_goods_stock
-                .push((request.commercial, grant.units));
+            if grant.source_region == Some(self.region_id()) {
+                self.state
+                    .add_commercial_goods(request.commercial, grant.units);
+            } else {
+                self.pending_goods_stock
+                    .push((request.commercial, grant.units));
+            }
         }
         Vec::new()
     }
 
-    fn apply_goods_export_result(
+    fn apply_goods_supply_result(
         &mut self,
-        mut attempt: GoodsExportAllocationRequest,
-        grant: GoodsExportGrant,
+        mut attempt: GoodsSupplyAllocationRequest,
+        grant: GoodsSupplyGrant,
     ) -> Vec<OutboundMessage> {
         if grant.granted || attempt.request.request_id != self.current_goods_request_id {
-            return self.apply_goods_export_grant(attempt.request, grant);
+            return self.apply_goods_supply_grant(attempt.request, grant);
         }
         attempt.candidate_index += 1;
         let Some(network) = attempt.candidates.get(attempt.candidate_index) else {
-            return self.apply_goods_export_grant(attempt.request, grant);
+            return self.apply_goods_supply_grant(attempt.request, grant);
         };
         vec![OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
             recipients: RegionRecipients::One(network.region),
-            event: RegionEvent::ProcessGoodsExportRequest(attempt),
+            event: RegionEvent::ProcessGoodsSupplyRequest(attempt),
         })]
     }
 
@@ -1716,18 +1776,18 @@ impl RegionRuntime {
     fn release_stale_granted_goods(
         caller_region: RegionId,
         current_request_id: UiRequestId,
-        grant: &GoodsExportGrant,
+        grant: &GoodsSupplyGrant,
     ) -> Vec<OutboundMessage> {
         match grant.source_region {
             Some(producer) if grant.granted => {
-                let release = GoodsExportAllocationRelease {
+                let release = GoodsSupplyAllocationRelease {
                     caller_region,
                     request_id: current_request_id,
                     producer_regions: vec![producer],
                 };
                 vec![OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
                     recipients: RegionRecipients::One(producer),
-                    event: RegionEvent::ReleaseGoodsExportAllocations(release),
+                    event: RegionEvent::ReleaseGoodsSupplyAllocations(release),
                 })]
             }
             _ => Vec::new(),
@@ -2094,12 +2154,12 @@ mod tick_state_tests {
             .collect()
     }
 
-    fn goods_export_requests(outbound: &[OutboundMessage]) -> Vec<&GoodsExportRequest> {
+    fn goods_supply_requests(outbound: &[OutboundMessage]) -> Vec<&GoodsSupplyRequest> {
         outbound
             .iter()
             .filter_map(|message| match message {
                 OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
-                    event: RegionEvent::ProcessGoodsExportRequest(attempt),
+                    event: RegionEvent::ProcessGoodsSupplyRequest(attempt),
                     ..
                 }) => Some(&attempt.request),
                 _ => None,
@@ -2115,8 +2175,8 @@ mod tick_state_tests {
         }
     }
 
-    fn goods_attempt(request: GoodsExportRequest) -> GoodsExportAllocationRequest {
-        GoodsExportAllocationRequest {
+    fn goods_supply_attempt(request: GoodsSupplyRequest) -> GoodsSupplyAllocationRequest {
+        GoodsSupplyAllocationRequest {
             request,
             candidates: Vec::new(),
             candidate_index: 0,
@@ -2439,8 +2499,8 @@ mod tick_state_tests {
             !last_outbound.iter().any(|message| matches!(
                 message,
                 OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
-                    event: RegionEvent::ReleaseGoodsExportAllocations(_)
-                        | RegionEvent::ProcessGoodsExportRequest(_),
+                    event: RegionEvent::ReleaseGoodsSupplyAllocations(_)
+                        | RegionEvent::ProcessGoodsSupplyRequest(_),
                     ..
                 })
             )),
@@ -2463,8 +2523,8 @@ mod tick_state_tests {
                 !outbound.iter().any(|message| matches!(
                     message,
                     OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
-                        event: RegionEvent::ReleaseGoodsExportAllocations(_)
-                            | RegionEvent::ProcessGoodsExportRequest(_),
+                        event: RegionEvent::ReleaseGoodsSupplyAllocations(_)
+                            | RegionEvent::ProcessGoodsSupplyRequest(_),
                         ..
                     })
                 )),
@@ -2569,7 +2629,7 @@ mod tick_state_tests {
             ..Default::default()
         }));
         let commercial = runtime.state().world.grid.get(1, 1).expect("commercial");
-        let outbound = runtime.begin_goods_export(GoodsExportRequest {
+        let outbound = runtime.begin_goods_supply(GoodsSupplyRequest {
             request_id: UiRequestId(0),
             caller_region: RegionId(1),
             caller_network: RegionRoadNetworkId {
@@ -2583,6 +2643,101 @@ mod tick_state_tests {
 
         assert!(outbound.is_empty());
         assert!(runtime.pending_goods_stock.is_empty());
+    }
+
+    #[test]
+    fn goods_candidates_try_local_network_before_foreign_networks() {
+        let mut runtime = RegionRuntime::new(goods_seeker_region(RegionId(1)));
+        let caller_network = runtime.state().network_border_links()[0].network;
+        let foreign_network = RegionRoadNetworkId {
+            region: RegionId(2),
+            road_network: 0,
+        };
+        runtime.set_discovery_snapshot(Arc::new(CrossRegionDiscovery {
+            components: vec![vec![foreign_network, caller_network]],
+            availability_hints: vec![
+                RegionalAvailabilityHint {
+                    network: foreign_network,
+                    has_spare_power: false,
+                    spare_job_slot_ids: Vec::new(),
+                    spare_goods_units: 1,
+                },
+                RegionalAvailabilityHint {
+                    network: caller_network,
+                    has_spare_power: false,
+                    spare_job_slot_ids: Vec::new(),
+                    spare_goods_units: 1,
+                },
+            ],
+            ..Default::default()
+        }));
+        let commercial = runtime.state().world.grid.get(1, 1).expect("commercial");
+
+        let outbound = runtime.begin_goods_supply(GoodsSupplyRequest {
+            request_id: UiRequestId(0),
+            caller_region: RegionId(1),
+            caller_network,
+            token: 2,
+            units: 1,
+            commercial,
+        });
+
+        assert!(
+            matches!(
+                outbound.as_slice(),
+                [OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
+                    recipients: RegionRecipients::One(RegionId(1)),
+                    event: RegionEvent::ProcessGoodsSupplyRequest(attempt),
+                })] if attempt.candidates == vec![caller_network, foreign_network]
+                    && attempt.candidate_index == 0
+            ),
+            "same-region goods supply should use the existing candidate walk before foreign supply"
+        );
+    }
+
+    #[test]
+    fn local_goods_grant_applies_immediately_without_pending_stock() {
+        let mut runtime = RegionRuntime::new(goods_seeker_region(RegionId(1)));
+        let commercial = runtime.state().world.grid.get(1, 1).expect("commercial");
+        assert_eq!(
+            crate::core::systems::economy::commercial_goods_stored(
+                &runtime.state().world,
+                commercial
+            ),
+            0
+        );
+
+        runtime.push_event(RegionEvent::ApplyGoodsSupplyGrant {
+            request: goods_supply_attempt(GoodsSupplyRequest {
+                request_id: UiRequestId(0),
+                caller_region: RegionId(1),
+                caller_network: RegionRoadNetworkId {
+                    region: RegionId(1),
+                    road_network: 0,
+                },
+                token: 7,
+                units: 1,
+                commercial,
+            }),
+            grant: GoodsSupplyGrant {
+                token: 7,
+                granted: true,
+                source_region: Some(RegionId(1)),
+                units: 1,
+            },
+        });
+        let outbound = runtime.process_next_event();
+
+        assert!(outbound.is_empty());
+        assert!(runtime.pending_goods_stock.is_empty());
+        assert_eq!(
+            crate::core::systems::economy::commercial_goods_stored(
+                &runtime.state().world,
+                commercial
+            ),
+            1,
+            "same-region goods grants preserve local immediate settlement"
+        );
     }
 
     #[test]
@@ -2603,8 +2758,8 @@ mod tick_state_tests {
             candidates: Vec::new(),
             candidate_index: 0,
         });
-        let goods = runtime.process_goods_export_request(&GoodsExportAllocationRequest {
-            request: GoodsExportRequest {
+        let goods = runtime.process_goods_supply_request(&GoodsSupplyAllocationRequest {
+            request: GoodsSupplyRequest {
                 request_id: UiRequestId(1),
                 caller_region: RegionId(1),
                 caller_network: RegionRoadNetworkId {
@@ -2731,7 +2886,7 @@ mod tick_state_tests {
                 matches!(
                     message,
                     OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
-                        event: RegionEvent::ProcessGoodsExportRequest(_),
+                        event: RegionEvent::ProcessGoodsSupplyRequest(_),
                         ..
                     })
                 )
@@ -2740,7 +2895,7 @@ mod tick_state_tests {
                     matches!(
                         message,
                         OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
-                            event: RegionEvent::ProcessGoodsExportRequest(_),
+                            event: RegionEvent::ProcessGoodsSupplyRequest(_),
                             ..
                         })
                     )
@@ -2778,7 +2933,7 @@ mod tick_state_tests {
             });
             day1_outbound = runtime.process_next_event();
         }
-        let request = goods_export_requests(&day1_outbound)[0].clone();
+        let request = goods_supply_requests(&day1_outbound)[0].clone();
         let commercial = request.commercial;
         assert_eq!(
             crate::core::systems::economy::commercial_goods_stored(
@@ -2788,9 +2943,9 @@ mod tick_state_tests {
             0
         );
 
-        runtime.push_event(RegionEvent::ApplyGoodsExportGrant {
-            request: goods_attempt(request.clone()),
-            grant: GoodsExportGrant {
+        runtime.push_event(RegionEvent::ApplyGoodsSupplyGrant {
+            request: goods_supply_attempt(request.clone()),
+            grant: GoodsSupplyGrant {
                 token: request.token,
                 granted: true,
                 source_region: Some(RegionId(2)),
@@ -2842,7 +2997,7 @@ mod tick_state_tests {
             });
             day1_outbound = runtime.process_next_event();
         }
-        let stale_request = goods_export_requests(&day1_outbound)[0].clone();
+        let stale_request = goods_supply_requests(&day1_outbound)[0].clone();
 
         runtime.set_discovery_generation(1);
         for request_id in 25..=48 {
@@ -2853,9 +3008,9 @@ mod tick_state_tests {
         }
 
         let producer = RegionId(9);
-        runtime.push_event(RegionEvent::ApplyGoodsExportGrant {
-            request: goods_attempt(stale_request.clone()),
-            grant: GoodsExportGrant {
+        runtime.push_event(RegionEvent::ApplyGoodsSupplyGrant {
+            request: goods_supply_attempt(stale_request.clone()),
+            grant: GoodsSupplyGrant {
                 token: stale_request.token,
                 granted: true,
                 source_region: Some(producer),
@@ -2869,7 +3024,7 @@ mod tick_state_tests {
                 outbound.as_slice(),
                 [OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
                     recipients: RegionRecipients::One(target),
-                    event: RegionEvent::ReleaseGoodsExportAllocations(release),
+                    event: RegionEvent::ReleaseGoodsSupplyAllocations(release),
                 })] if *target == producer && release.producer_regions == vec![producer]
             ),
             "a stale but granted goods reply must release the producer's reservation"
@@ -2877,12 +3032,12 @@ mod tick_state_tests {
     }
 
     #[test]
-    fn goods_export_request_reserves_producer_surplus_units() {
+    fn goods_supply_request_reserves_producer_surplus_units() {
         let mut runtime = RegionRuntime::new(goods_producer_region(RegionId(2)));
         runtime.ensure_derived_state();
         let network = region_network(2, 0);
 
-        let grant_a = runtime.process_goods_export_request(&goods_export_request(
+        let grant_a = runtime.process_goods_supply_request(&goods_supply_request(
             RegionId(10),
             0,
             3,
@@ -2890,7 +3045,7 @@ mod tick_state_tests {
         ));
         assert_eq!(
             grant_a,
-            GoodsExportGrant {
+            GoodsSupplyGrant {
                 token: 0,
                 granted: true,
                 source_region: Some(RegionId(2)),
@@ -2898,7 +3053,7 @@ mod tick_state_tests {
             }
         );
 
-        let grant_b = runtime.process_goods_export_request(&goods_export_request(
+        let grant_b = runtime.process_goods_supply_request(&goods_supply_request(
             RegionId(11),
             1,
             2,
@@ -2906,7 +3061,7 @@ mod tick_state_tests {
         ));
         assert_eq!(
             grant_b,
-            GoodsExportGrant {
+            GoodsSupplyGrant {
                 token: 1,
                 granted: false,
                 source_region: None,
@@ -2915,14 +3070,14 @@ mod tick_state_tests {
         );
     }
 
-    fn goods_export_request(
+    fn goods_supply_request(
         caller: RegionId,
         token: u32,
         units: u32,
         producer_network: RegionRoadNetworkId,
-    ) -> GoodsExportAllocationRequest {
+    ) -> GoodsSupplyAllocationRequest {
         ExportAllocationRequest {
-            request: GoodsExportRequest {
+            request: GoodsSupplyRequest {
                 request_id: UiRequestId(1),
                 caller_region: caller,
                 caller_network: producer_network,

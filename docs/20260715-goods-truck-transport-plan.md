@@ -15,7 +15,7 @@ industrial_goods_production(factory, level)
 
 cross-region:
 commercial free storage
-    -> one-unit GoodsExportRequest
+    -> one-unit GoodsSupplyRequest
     -> producer-network reservation
     -> pending_goods_stock
     -> add_commercial_goods immediately
@@ -35,10 +35,10 @@ unchanged.
 ```text
 commercial shortage
   -> PendingGoodsDemand
-  -> GoodsExportRequest
-  -> GoodsExportAllocationRequest
-  -> ProcessGoodsExportRequest
-  -> GoodsExportGrant
+  -> GoodsSupplyRequest
+  -> GoodsSupplyAllocationRequest
+  -> ProcessGoodsSupplyRequest
+  -> GoodsSupplyGrant
 
 candidate producer networks
   local network first
@@ -47,11 +47,11 @@ candidate producer networks
 
 No new request, attempt, candidate, allocation, or release type is introduced.
 The local candidate is an existing `RegionRoadNetworkId` whose `region` equals
-the caller region. It is delivered through the existing `ProcessGoodsExportRequest`
+the caller region. It is delivered through the existing `ProcessGoodsSupplyRequest`
 event to the same runtime; a foreign candidate uses the existing coordinator route.
 
 The candidate walk keeps the current full-grant-or-deny rule. Goods requests stay
-one-unit batches in P0, using distinct existing `GoodsExportRequest.token` values.
+one-unit batches in P0, using distinct existing `GoodsSupplyRequest.token` values.
 This is still the existing request/grant mechanism: the refactor only lets the
 same mechanism target a local producer network before continuing to foreign
 candidates.
@@ -67,6 +67,26 @@ This temporary adapter is the only local/foreign distinction. It preserves the
 current immediate local credit and staged foreign credit while all request,
 allocation, retry, and release decisions become one path. The truck phases replace
 both credit branches with arrival-gated delivery.
+
+Coordinator-loop simplification target:
+
+```text
+P0 bridge
+  local grant    -> synchronous stock credit, so today's economy output matches
+  foreign grant  -> pending_goods_stock, so today's one-phase delay remains
+
+truck delivery
+  local grant    -> dispatch truck, no stock credit
+  foreign grant  -> dispatch truck, no stock credit
+  truck arrival  -> one shared arrival event credits commercial stock
+```
+
+The coordinator already routes same-region and cross-region `RegionEvent`s. Once
+goods are truck-delivered, the architecture should stop special-casing local
+stock timing: every accepted goods supply becomes a producer-owned shipment, and
+commercial storage changes only from the delivery-arrival path. P0 keeps the
+synchronous local shortcut only as a compatibility bridge until that arrival
+semantics exists.
 
 ## Goal
 
@@ -365,7 +385,7 @@ daily goods phase
   1. consume commercial goods as today
   2. compute commercial free capacity excluding inbound reservations
   3. create / extend GoodsOrder
-  4. create existing GoodsExportRequest batches from order.remaining_units
+  4. create existing GoodsSupplyRequest batches from order.remaining_units
   5. use the existing candidate walk: local networks, then foreign networks
   6. accepted producer reserves factory stock and an idle truck; consumer marks
      the accepted batch as dispatched against its inbound reservation
@@ -383,9 +403,9 @@ fn create_goods_orders(world: &mut World) {
     }
 }
 
-fn dispatch_goods_export(request: GoodsExportRequest) {
+fn dispatch_goods_supply(request: GoodsSupplyRequest) {
     // Existing candidate walk; local target is routed to this runtime.
-    begin_goods_export(request);
+    begin_goods_supply(request);
 }
 ```
 
@@ -492,20 +512,20 @@ removed when their corresponding truck phase becomes live.
 ## Producer dispatch through the existing goods-export protocol
 
 The current protocol reserves aggregate producer-network surplus and immediately
-applies `GoodsExportGrant` to consumer stock. Keep producer authority and the
+applies `GoodsSupplyGrant` to consumer stock. Keep producer authority and the
 same request/grant types, but turn an accepted grant into a producer truck
 dispatch instead.
 
 ```text
 consumer commercial
-  -> reserve inbound capacity / send existing GoodsExportRequest batch
+  -> reserve inbound capacity / send existing GoodsSupplyRequest batch
   -> candidate producer networks
 
 producer region
   -> validate network capacity
   -> choose a reachable physical factory and idle truck
   -> reserve network capacity and factory cargo
-  -> send existing GoodsExportGrant as an acknowledgement only
+  -> send existing GoodsSupplyGrant as an acknowledgement only
   -> move loaded truck across RegionEvent::ReceiveTraveler handoffs
 
 commercial region
@@ -513,7 +533,7 @@ commercial region
 ```
 
 ```rust
-fn process_goods_export_request(request: GoodsExportAllocationRequest) -> Option<GoodsExportGrant> {
+fn process_goods_supply_request(request: GoodsSupplyAllocationRequest) -> Option<GoodsSupplyGrant> {
     let export = request.request;
     let allocation_key = export.allocation_key();
     let producer_network = request.candidates[request.candidate_index];
@@ -525,7 +545,7 @@ fn process_goods_export_request(request: GoodsExportAllocationRequest) -> Option
     reserve_network_capacity(request, export.units)?;
     reserve_factory_stock(factory, export.units);
     dispatch_loaded_truck(factory, truck, allocation_key, producer_network, export);
-    Some(GoodsExportGrant { granted: true, units: export.units, ..from(export) })
+    Some(GoodsSupplyGrant { granted: true, units: export.units, ..from(export) })
 }
 ```
 
@@ -643,6 +663,11 @@ Forbidden
   no change to commercial consumption, industrial production formula, or
   external-import fallback balance.
 
+Architecture rule
+  P0 may keep the temporary local synchronous-credit adapter.
+  P1+ should not build more logic on that adapter.
+  Truck activation deletes it and makes local/foreign goods differ only by route.
+
 Tests
   local commercial stock result matches the pre-refactor distributor
   foreign commercial stock timing matches the pre-refactor pending_goods_stock
@@ -656,7 +681,7 @@ Structures
 
 PendingGoodsDemand                    existing consumer-side shortage record
 
-GoodsExportRequest                    existing batch request
+GoodsSupplyRequest                    existing batch request
   request_id: UiRequestId
   caller_region: RegionId
   caller_network: RegionRoadNetworkId
@@ -664,12 +689,12 @@ GoodsExportRequest                    existing batch request
   units: u32                           convert at stock mutation boundary
   commercial: Entity
 
-GoodsExportAllocationRequest          existing candidate-walk envelope
-  request: GoodsExportRequest
+GoodsSupplyAllocationRequest          existing candidate-walk envelope
+  request: GoodsSupplyRequest
   candidates: Vec<RegionRoadNetworkId>
   candidate_index: usize
 
-GoodsExportGrant                      existing producer reply
+GoodsSupplyGrant                      existing producer reply
   token: u32
   granted: bool
   source_region: Option<RegionId>
@@ -687,7 +712,7 @@ daily goods phase:
 
     for demand in demands.sorted_by_commercial():
         for batch in split_into_request_tokens(demand):
-            request = GoodsExportRequest {
+            request = GoodsSupplyRequest {
                 request_id,
                 caller_region,
                 caller_network: demand.consumer_network,
@@ -697,21 +722,26 @@ daily goods phase:
             }
             candidates = local_producer_networks(caller_region)
                        + connected_foreign_producer_networks(discovery)
-            route ProcessGoodsExportRequest { request, candidates }
+            route ProcessGoodsSupplyRequest { request, candidates }
 
-producer receives ProcessGoodsExportRequest:
+producer receives ProcessGoodsSupplyRequest:
     if available_units_for(candidate_network) >= request.units:
         reserve allocation by ExportAllocationKey for request.units
-        return GoodsExportGrant { granted: true, units: request.units }
+        return GoodsSupplyGrant { granted: true, units: request.units }
     else:
         continue to next candidate using the existing allocation request
 
 consumer applies grant:
     request = pending request matched by request_id/token
     if grant.source_region == Some(caller_region):
-        add_commercial_goods(request.commercial, grant.units) now
+        add_commercial_goods(request.commercial, grant.units) now  // P0 bridge only
     else:
         pending_goods_stock.push(grant)
+
+truck phases replace both branches with:
+    record accepted order/shipment
+    wait for DestinationArrived / ApplyGoodsDelivery
+    add_commercial_goods only after arrival
 ```
 
 ### P1: Generalize travel identity
@@ -904,10 +934,10 @@ daily goods phase:
         missing = capacity - stored - inbound_reserved
         if missing > 0:
             order.reserve_inbound(commercial, missing)
-            create GoodsExportRequest batches using order.id request_id/token
+            create GoodsSupplyRequest batches using order.id request_id/token
             use P0 candidate walk: local candidates, then foreign candidates
 
-local producer receives ProcessGoodsExportRequest:
+local producer receives ProcessGoodsSupplyRequest:
     factory = nearest_reachable_factory_with_idle_truck(request)
     if no factory:
         continue to next candidate
@@ -926,9 +956,9 @@ local producer receives ProcessGoodsExportRequest:
     }
     truck.arrival_action = DeliverGoods
     spawn_truck_token(truck)
-    return GoodsExportGrant acknowledgement only
+    return GoodsSupplyGrant acknowledgement only
 
-consumer receives local GoodsExportGrant:
+consumer receives local GoodsSupplyGrant:
     record grant/release bookkeeping
     order.remaining -= grant.units as i32
     do not add stock now
@@ -951,8 +981,8 @@ commercial applies delivery:
 
 ```text
 Scope
-  Foreign candidate batches use the same GoodsExportRequest,
-  GoodsExportAllocationRequest, GoodsExportGrant, and ExportAllocationKey as P0.
+  Foreign candidate batches use the same GoodsSupplyRequest,
+  GoodsSupplyAllocationRequest, GoodsSupplyGrant, and ExportAllocationKey as P0.
   Producer-side factory selection, cargo/network reservation, truck handoff,
   factory-authorized ApplyGoodsDelivery event, release/cancel paths.
 
@@ -969,15 +999,15 @@ Tests
 ```text
 Structures
 
-GoodsExportRequest                  existing consumer batch identity
+GoodsSupplyRequest                  existing consumer batch identity
   request_id / caller_region / caller_network / token / units / commercial
 
-GoodsExportAllocationRequest        existing candidate-walk envelope
+GoodsSupplyAllocationRequest        existing candidate-walk envelope
   request
   candidates
   candidate_index
 
-GoodsExportGrant                    existing producer acknowledgement
+GoodsSupplyGrant                    existing producer acknowledgement
   token
   granted
   source_region                    Option<RegionId>
@@ -996,10 +1026,10 @@ TravelerHandoff                     existing transient cross-region carrier
 
 ```text
 commercial order has remaining units:
-    create existing GoodsExportRequest batch
-    route existing GoodsExportAllocationRequest through candidate walk
+    create existing GoodsSupplyRequest batch
+    route existing GoodsSupplyAllocationRequest through candidate walk
 
-producer receives ProcessGoodsExportRequest:
+producer receives ProcessGoodsSupplyRequest:
     if network reservation or factory/truck capacity is unavailable:
         continue to next candidate or reject
     else:
@@ -1008,9 +1038,9 @@ producer receives ProcessGoodsExportRequest:
         reserve network + factory cargo
         assign Truck.shipment
         spawn loaded token
-        return existing GoodsExportGrant as acknowledgement only
+        return existing GoodsSupplyGrant as acknowledgement only
 
-consumer receives GoodsExportGrant:
+consumer receives GoodsSupplyGrant:
     record producer/release bookkeeping
     do not add stock and do not push pending_goods_stock
     wait for ApplyGoodsDelivery after truck arrival

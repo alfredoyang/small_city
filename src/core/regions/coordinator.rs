@@ -18,7 +18,7 @@ use crate::core::regional_types::{
 use crate::core::regions::runtime::{RegionEvent, RuntimeReply};
 use crate::core::regions::threaded::{ThreadedWorkerCommand, WorkerIdleReport};
 use crate::core::regions::worker::{RegionOwnerDirectory, WorkerId};
-use crate::core::regions::{GoodsExportGrant, PowerExportGrant, RegionId};
+use crate::core::regions::{GoodsSupplyGrant, PowerExportGrant, RegionId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Coordinator-routable recipients for one region event.
@@ -483,7 +483,7 @@ fn is_export_release(event: &RegionEvent) -> bool {
     matches!(
         event,
         RegionEvent::ReleasePowerExportAllocations(_)
-            | RegionEvent::ReleaseGoodsExportAllocations(_)
+            | RegionEvent::ReleaseGoodsSupplyAllocations(_)
     )
 }
 
@@ -504,11 +504,11 @@ fn missing_export_target_denial(event: &RegionEvent) -> Option<MissingExportTarg
                 },
             },
         }),
-        RegionEvent::ProcessGoodsExportRequest(request) => Some(MissingExportTargetDenial {
+        RegionEvent::ProcessGoodsSupplyRequest(request) => Some(MissingExportTargetDenial {
             caller_region: request.request.caller_region,
-            event: RegionEvent::ApplyGoodsExportGrant {
+            event: RegionEvent::ApplyGoodsSupplyGrant {
                 request: request.clone(),
-                grant: GoodsExportGrant {
+                grant: GoodsSupplyGrant {
                     token: request.request.token,
                     granted: false,
                     source_region: None,

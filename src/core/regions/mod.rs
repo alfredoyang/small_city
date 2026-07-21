@@ -42,8 +42,9 @@ use crate::core::resources::CityStats;
 use crate::core::simulation::{
     TickJobPhase, TickPowerPhase, begin_tick_power_phase, begin_tick_power_phase_quiet,
     clear_imported_power, continue_to_job_phase, ensure_derived_state,
-    finish_tick_after_goods_phase, finish_tick_after_job_phase, imported_power_grants,
-    reapply_imported_power, refresh_derived_state_for_world,
+    finish_tick_after_goods_phase, finish_tick_after_goods_phase_with_prepared_goods,
+    finish_tick_after_job_phase, imported_power_grants, reapply_imported_power,
+    refresh_derived_state_for_world,
 };
 use crate::core::systems::{
     build, bulldoze, economy, power, replace, road_connectivity, travel, upgrade,
@@ -345,8 +346,8 @@ pub struct PowerExportGrant {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Result of an authoritative producer-owned goods export allocation request.
-pub struct GoodsExportGrant {
+/// Result of an authoritative producer-owned goods supply request.
+pub struct GoodsSupplyGrant {
     pub token: u32,
     pub granted: bool,
     pub source_region: Option<RegionId>,
@@ -1260,6 +1261,29 @@ impl RegionState {
             phase.phase.phase,
             exported_job_slots,
             exported_goods_units,
+        )
+    }
+
+    pub(crate) fn prepare_goods_flow(
+        &mut self,
+        exported_goods_units: u32,
+    ) -> economy::PreparedGoodsFlow {
+        economy::prepare_goods_flow_for_current_world(&mut self.world, exported_goods_units)
+    }
+
+    pub(crate) fn finish_tick_goods_demand_phase_with_prepared_goods(
+        &mut self,
+        phase: RegionalTickGoodsPhase,
+        exported_job_slots: &[Entity],
+        exported_goods_units: u32,
+        prepared_goods_flow: economy::PreparedGoodsFlow,
+    ) -> CommandResult {
+        finish_tick_after_goods_phase_with_prepared_goods(
+            &mut self.world,
+            phase.phase.phase,
+            exported_job_slots,
+            exported_goods_units,
+            Some(prepared_goods_flow),
         )
     }
 
