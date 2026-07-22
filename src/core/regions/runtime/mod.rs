@@ -896,95 +896,15 @@ impl RegionRuntime {
             RegionEvent::ReceiveTraveler {
                 eligible_step,
                 handoff,
-            } => {
-                self.pending_traveler_handoffs
-                    .push((eligible_step, handoff));
-                Vec::new()
-            }
+            } => self.handle_receive_traveler(eligible_step, handoff),
             RegionEvent::PowerCapacityRecheck { request_id, .. } => {
                 self.power_capacity_recheck(request_id)
             }
-            RegionEvent::StepTravel { step } => {
-                if self.last_travel_step.is_some_and(|last| step <= last) {
-                    return Vec::new();
-                }
-                self.last_travel_step = Some(step);
-                let inbound = self.take_handoffs_eligible_at(step);
-                let mut outbound = Vec::new();
-                for handoff in inbound {
-                    let traveler = handoff.traveler;
-                    let rejected_shipment = (handoff.kind == HandoffKind::Rollback)
-                        .then(|| self.state.goods_truck_shipment(traveler))
-                        .flatten();
-                    outbound.extend(
-                        self.state
-                            .receive_traveler_handoff(handoff)
-                            .into_iter()
-                            .map(|handoff| self.traveler_handoff_route(step, handoff)),
-                    );
-                    if let Some(shipment) = rejected_shipment {
-                        self.goods_supply_allocations
-                            .release_key(shipment.allocation_key);
-                        outbound.push(OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
-                            recipients: RegionRecipients::One(shipment.commercial.region),
-                            event: RegionEvent::RejectGoodsDelivery {
-                                traveler,
-                                order: shipment.order,
-                                allocation_key: shipment.allocation_key,
-                                units: shipment.units,
-                            },
-                        }));
-                    }
-                }
-                self.state.step_travel();
-                outbound.extend(self.route_traveler_handoffs(step));
-                outbound.extend(self.route_destination_arrivals());
-                outbound
-            }
+            RegionEvent::StepTravel { step } => self.handle_step_travel(step),
             RegionEvent::DestinationArrived {
                 traveler,
                 destination,
-            } => {
-                // Keep truck validation first. Citizen and truck ids are unique
-                // today, but this shared event must not grow a citizen-side
-                // payroll effect before truck delivery handling.
-                if let Some(arrival) = self
-                    .state
-                    .validate_goods_truck_arrival(traveler, destination)
-                {
-                    let (recipient, event) = match arrival {
-                        GoodsTruckArrival::Deliver(shipment) => (
-                            shipment.commercial.region,
-                            RegionEvent::ApplyGoodsDelivery {
-                                traveler,
-                                order: shipment.order,
-                                allocation_key: shipment.allocation_key,
-                                commercial: shipment.commercial.building,
-                                units: shipment.units,
-                            },
-                        ),
-                        GoodsTruckArrival::Reject(shipment) => (
-                            {
-                                self.goods_supply_allocations
-                                    .release_key(shipment.allocation_key);
-                                shipment.commercial.region
-                            },
-                            RegionEvent::RejectGoodsDelivery {
-                                traveler,
-                                order: shipment.order,
-                                allocation_key: shipment.allocation_key,
-                                units: shipment.units,
-                            },
-                        ),
-                    };
-                    return vec![OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
-                        recipients: RegionRecipients::One(recipient),
-                        event,
-                    })];
-                }
-                self.state.apply_destination_arrived(traveler, destination);
-                Vec::new()
-            }
+            } => self.handle_destination_arrived(traveler, destination),
             RegionEvent::ApplyGoodsDelivery {
                 traveler,
                 order,
@@ -1105,6 +1025,103 @@ impl RegionRuntime {
                 })
             })
             .collect()
+    }
+
+    fn handle_receive_traveler(
+        &mut self,
+        eligible_step: TravelStepId,
+        handoff: TravelerHandoff,
+    ) -> Vec<OutboundMessage> {
+        self.pending_traveler_handoffs
+            .push((eligible_step, handoff));
+        Vec::new()
+    }
+
+    fn handle_step_travel(&mut self, step: TravelStepId) -> Vec<OutboundMessage> {
+        if self.last_travel_step.is_some_and(|last| step <= last) {
+            return Vec::new();
+        }
+        self.last_travel_step = Some(step);
+
+        let inbound = self.take_handoffs_eligible_at(step);
+        let mut outbound = Vec::new();
+        for handoff in inbound {
+            let traveler = handoff.traveler;
+            let rejected_shipment = (handoff.kind == HandoffKind::Rollback)
+                .then(|| self.state.goods_truck_shipment(traveler))
+                .flatten();
+            outbound.extend(
+                self.state
+                    .receive_traveler_handoff(handoff)
+                    .into_iter()
+                    .map(|handoff| self.traveler_handoff_route(step, handoff)),
+            );
+            if let Some(shipment) = rejected_shipment {
+                self.goods_supply_allocations
+                    .release_key(shipment.allocation_key);
+                outbound.push(OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
+                    recipients: RegionRecipients::One(shipment.commercial.region),
+                    event: RegionEvent::RejectGoodsDelivery {
+                        traveler,
+                        order: shipment.order,
+                        allocation_key: shipment.allocation_key,
+                        units: shipment.units,
+                    },
+                }));
+            }
+        }
+
+        self.state.step_travel();
+        outbound.extend(self.route_traveler_handoffs(step));
+        outbound.extend(self.route_destination_arrivals());
+        outbound
+    }
+
+    fn handle_destination_arrived(
+        &mut self,
+        traveler: TravelerId,
+        destination: PlaceRef,
+    ) -> Vec<OutboundMessage> {
+        // Keep truck validation first. Citizen and truck ids are unique today,
+        // but this shared event must not grow a citizen-side payroll effect
+        // before truck delivery handling.
+        if let Some(arrival) = self
+            .state
+            .validate_goods_truck_arrival(traveler, destination)
+        {
+            let (recipient, event) = match arrival {
+                GoodsTruckArrival::Deliver(shipment) => (
+                    shipment.commercial.region,
+                    RegionEvent::ApplyGoodsDelivery {
+                        traveler,
+                        order: shipment.order,
+                        allocation_key: shipment.allocation_key,
+                        commercial: shipment.commercial.building,
+                        units: shipment.units,
+                    },
+                ),
+                GoodsTruckArrival::Reject(shipment) => (
+                    {
+                        self.goods_supply_allocations
+                            .release_key(shipment.allocation_key);
+                        shipment.commercial.region
+                    },
+                    RegionEvent::RejectGoodsDelivery {
+                        traveler,
+                        order: shipment.order,
+                        allocation_key: shipment.allocation_key,
+                        units: shipment.units,
+                    },
+                ),
+            };
+            return vec![OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
+                recipients: RegionRecipients::One(recipient),
+                event,
+            })];
+        }
+
+        self.state.apply_destination_arrived(traveler, destination);
+        Vec::new()
     }
 
     fn take_handoffs_eligible_at(&mut self, step: TravelStepId) -> Vec<TravelerHandoff> {
