@@ -69,6 +69,8 @@
 //!                  West:offset 0
 //! ```
 
+mod goods_delivery;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -879,19 +881,13 @@ impl RegionRuntime {
                 self.apply_power_export_result(request, grant)
             }
             RegionEvent::ProcessGoodsSupplyRequest(request) => {
-                let grant = self.process_goods_supply_request(&request);
-                vec![OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
-                    recipients: RegionRecipients::One(request.request.caller_region),
-                    event: RegionEvent::ApplyGoodsSupplyGrant { request, grant },
-                })]
+                self.handle_process_goods_supply_request(request)
             }
             RegionEvent::ReleaseGoodsSupplyAllocations(release) => {
-                self.goods_supply_allocations
-                    .release_stale_for_caller(release.caller_region, release.request_id);
-                Vec::new()
+                self.handle_release_goods_supply_allocations(release)
             }
             RegionEvent::ApplyGoodsSupplyGrant { request, grant } => {
-                self.apply_goods_supply_result(request, grant)
+                self.handle_apply_goods_supply_grant(request, grant)
             }
             RegionEvent::ReceiveTraveler {
                 eligible_step,
@@ -912,73 +908,20 @@ impl RegionRuntime {
                 commercial,
                 units,
             } => {
-                let applied = commercial == order.commercial
-                    && self.state.apply_goods_delivery(traveler, order, units);
-                if !applied {
-                    self.state.retarget_goods_truck_home(traveler);
-                }
-                let event = if applied {
-                    RegionEvent::ConfirmGoodsDelivery {
-                        traveler,
-                        order,
-                        allocation_key,
-                        units,
-                    }
-                } else {
-                    RegionEvent::RejectGoodsDelivery {
-                        traveler,
-                        order,
-                        allocation_key,
-                        units,
-                    }
-                };
-                vec![OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
-                    recipients: RegionRecipients::One(traveler.entity.region()),
-                    event,
-                })]
+                self.handle_apply_goods_delivery(traveler, order, allocation_key, commercial, units)
             }
             RegionEvent::ConfirmGoodsDelivery {
                 traveler,
                 order: _,
                 allocation_key,
                 units,
-            } => {
-                // Producer-owned confirmation: release the producer allocation,
-                // queue delivery revenue, and clear factory shipment/stock. The
-                // commercial region already applied stock and retargeted the
-                // parked token.
-                self.goods_supply_allocations.release_key(allocation_key);
-                self.state.confirm_goods_delivery(traveler, units);
-                Vec::new()
-            }
+            } => self.handle_confirm_goods_delivery(traveler, allocation_key, units),
             RegionEvent::RejectGoodsDelivery {
                 traveler,
                 order,
                 allocation_key,
                 units,
-            } => {
-                // Allocations are producer-owned; this is a no-op in a consumer
-                // runtime, but keeps confirm/reject terminal handling uniform.
-                self.goods_supply_allocations.release_key(allocation_key);
-                if traveler.entity.region() == self.region_id() {
-                    // Factory side: clear shipment/reserved outbound goods and
-                    // retarget the local token if the truck is still here.
-                    self.state.cancel_goods_delivery(traveler, units);
-                    if order.commercial.region() == self.region_id() {
-                        // Same-region order: this runtime also owns the
-                        // consumer-side inbound reservation.
-                        self.state
-                            .reject_goods_delivery_at_host(traveler, order, units);
-                    }
-                } else {
-                    // Remote consumer side: release inbound reservation and
-                    // retarget the parked token; factory truth is owned by the
-                    // producer.
-                    self.state
-                        .reject_goods_delivery_at_host(traveler, order, units);
-                }
-                Vec::new()
-            }
+            } => self.handle_reject_goods_delivery(traveler, order, allocation_key, units),
             RegionEvent::EmploymentDirectoryReady => self.handle_employment_directory_ready(),
         }
     }

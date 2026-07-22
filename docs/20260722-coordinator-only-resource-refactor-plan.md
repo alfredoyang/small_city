@@ -322,8 +322,11 @@ no truck behavior change
 Create:
 
 ```text
-src/core/regions/goods_delivery.rs
+src/core/regions/runtime/goods_delivery.rs
 ```
+
+Use a `runtime` child module so the extracted handlers can keep using
+`RegionRuntime` internals without widening visibility.
 
 Move handler bodies:
 
