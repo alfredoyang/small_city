@@ -1023,6 +1023,10 @@ impl RegionRuntime {
                 allocation_key,
                 units,
             } => {
+                // Producer-owned confirmation: release the producer allocation,
+                // queue delivery revenue, and clear factory shipment/stock. The
+                // commercial region already applied stock and retargeted the
+                // parked token.
                 self.goods_supply_allocations.release_key(allocation_key);
                 self.state.confirm_goods_delivery(traveler, units);
                 Vec::new()
@@ -1033,14 +1037,23 @@ impl RegionRuntime {
                 allocation_key,
                 units,
             } => {
+                // Allocations are producer-owned; this is a no-op in a consumer
+                // runtime, but keeps confirm/reject terminal handling uniform.
                 self.goods_supply_allocations.release_key(allocation_key);
                 if traveler.entity.region() == self.region_id() {
+                    // Factory side: clear shipment/reserved outbound goods and
+                    // retarget the local token if the truck is still here.
                     self.state.cancel_goods_delivery(traveler, units);
                     if order.commercial.region() == self.region_id() {
+                        // Same-region order: this runtime also owns the
+                        // consumer-side inbound reservation.
                         self.state
                             .reject_goods_delivery_at_host(traveler, order, units);
                     }
                 } else {
+                    // Remote consumer side: release inbound reservation and
+                    // retarget the parked token; factory truth is owned by the
+                    // producer.
                     self.state
                         .reject_goods_delivery_at_host(traveler, order, units);
                 }
@@ -3396,6 +3409,78 @@ mod tick_state_tests {
                 commercial
             ),
             GOODS_PER_TRUCK
+        );
+    }
+
+    #[test]
+    fn duplicate_truck_destination_arrived_cannot_deliver_cargo_twice() {
+        let (mut runtime, _factory, commercial, network) = local_goods_runtime();
+        let request = GoodsSupplyRequest {
+            request_id: UiRequestId(22),
+            caller_region: RegionId(1),
+            caller_network: network,
+            token: 0,
+            units: GOODS_PER_TRUCK as u32,
+            commercial,
+        };
+        runtime.current_goods_request_id = request.request_id;
+        let attempt = GoodsSupplyAllocationRequest {
+            request,
+            candidates: vec![network],
+            candidate_index: 0,
+        };
+        let grant = runtime.process_goods_supply_request(&attempt);
+        assert!(grant.granted);
+        runtime.apply_goods_supply_grant(attempt.request, grant);
+
+        let arrival = routed_event(&runtime.process_event(RegionEvent::StepTravel {
+            step: TravelStepId(1),
+        }));
+        assert!(matches!(arrival, RegionEvent::DestinationArrived { .. }));
+
+        let delivery = routed_event(&runtime.process_event(arrival.clone()));
+        assert!(matches!(delivery, RegionEvent::ApplyGoodsDelivery { .. }));
+        let confirm = routed_event(&runtime.process_event(delivery));
+        assert!(matches!(confirm, RegionEvent::ConfirmGoodsDelivery { .. }));
+        assert_eq!(
+            crate::core::systems::economy::commercial_goods_stored(
+                &runtime.state().world,
+                commercial
+            ),
+            GOODS_PER_TRUCK,
+            "first arrival applies exactly one cargo"
+        );
+
+        let duplicate = runtime.process_event(arrival.clone());
+        assert!(
+            duplicate.is_empty(),
+            "the arrival action flips after validation, so a duplicate cannot route delivery"
+        );
+        // The empty outbound assertion above is the load-bearing guard. Stock
+        // also stays unchanged because the first delivery consumed the order.
+        assert_eq!(
+            crate::core::systems::economy::commercial_goods_stored(
+                &runtime.state().world,
+                commercial
+            ),
+            GOODS_PER_TRUCK,
+            "duplicate arrival must not add a second cargo"
+        );
+        assert!(runtime.state().world.goods_orders.is_empty());
+
+        runtime.process_event(confirm);
+        let post_confirm_duplicate = runtime.process_event(arrival);
+        assert!(
+            post_confirm_duplicate.is_empty(),
+            "a duplicate after factory confirmation also cannot route delivery"
+        );
+        assert_eq!(
+            crate::core::systems::economy::commercial_goods_stored(
+                &runtime.state().world,
+                commercial
+            ),
+            GOODS_PER_TRUCK,
+            "post-confirm duplicate must not add cargo either"
         );
     }
 
