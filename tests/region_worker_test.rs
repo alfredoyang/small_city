@@ -109,7 +109,11 @@ fn discovery_joins_complementary_border_road_networks() {
     let right = region_with_roads(RegionId(17), 2, 1, &[(0, 0)]);
     let worker = worker_with_region_states(WorkerId(9), vec![left, right]);
 
-    let discovery = worker.cross_region_discovery(&[neighbor(16, BorderEdge::East, 17)]);
+    let discovery = cross_region_discovery(
+        &worker,
+        &[RegionId(16), RegionId(17)],
+        &[neighbor(16, BorderEdge::East, 17)],
+    );
 
     assert_component(
         &discovery,
@@ -124,7 +128,11 @@ fn discovery_does_not_join_mismatched_border_offsets() {
     let right = region_with_roads(RegionId(19), 2, 2, &[(0, 1)]);
     let worker = worker_with_region_states(WorkerId(10), vec![left, right]);
 
-    let discovery = worker.cross_region_discovery(&[neighbor(18, BorderEdge::East, 19)]);
+    let discovery = cross_region_discovery(
+        &worker,
+        &[RegionId(18), RegionId(19)],
+        &[neighbor(18, BorderEdge::East, 19)],
+    );
 
     assert_component(&discovery, network(18, 0), &[network(18, 0)]);
     assert_component(&discovery, network(19, 0), &[network(19, 0)]);
@@ -137,10 +145,14 @@ fn discovery_keeps_one_regions_disconnected_networks_in_separate_components() {
     let right = region_with_roads(RegionId(22), 2, 5, &[(0, 3)]);
     let worker = worker_with_region_states(WorkerId(11), vec![left, middle, right]);
 
-    let discovery = worker.cross_region_discovery(&[
-        neighbor(20, BorderEdge::East, 21),
-        neighbor(21, BorderEdge::East, 22),
-    ]);
+    let discovery = cross_region_discovery(
+        &worker,
+        &[RegionId(20), RegionId(21), RegionId(22)],
+        &[
+            neighbor(20, BorderEdge::East, 21),
+            neighbor(21, BorderEdge::East, 22),
+        ],
+    );
 
     assert_component(
         &discovery,
@@ -161,7 +173,7 @@ fn discovery_publishes_owned_availability_hints() {
     assert!(source.build(0, 1, BuildingKind::Road).success);
     let worker = worker_with_region_states(WorkerId(12), vec![source]);
 
-    let discovery = worker.cross_region_discovery(&[]);
+    let discovery = cross_region_discovery(&worker, &[RegionId(23)], &[]);
 
     assert_eq!(discovery.availability_hints.len(), 1);
     assert_eq!(discovery.availability_hints[0].network, network(23, 0));
@@ -179,7 +191,7 @@ fn discovery_does_not_join_unrelated_regions_with_matching_border_links() {
     let right = region_with_roads(RegionId(25), 2, 1, &[(0, 0)]);
     let worker = worker_with_region_states(WorkerId(13), vec![left, right]);
 
-    let discovery = worker.cross_region_discovery(&[]);
+    let discovery = cross_region_discovery(&worker, &[RegionId(24), RegionId(25)], &[]);
 
     assert_component(&discovery, network(24, 0), &[network(24, 0)]);
     assert_component(&discovery, network(25, 0), &[network(25, 0)]);
@@ -197,8 +209,7 @@ fn discovery_reflects_authoritative_road_state_after_build_and_bulldoze() {
     worker.set_region_topology(topology.clone());
 
     assert!(
-        worker
-            .cross_region_discovery(&topology)
+        cross_region_discovery(&worker, &[left, right], &topology)
             .component_of(network(75, 0))
             .is_none()
     );
@@ -231,7 +242,7 @@ fn discovery_reflects_authoritative_road_state_after_build_and_bulldoze() {
         .unwrap();
     drain_worker(&mut worker);
 
-    let connected = worker.cross_region_discovery(&topology);
+    let connected = cross_region_discovery(&worker, &[left, right], &topology);
     assert_component(
         &connected,
         network(75, 0),
@@ -249,7 +260,7 @@ fn discovery_reflects_authoritative_road_state_after_build_and_bulldoze() {
         .unwrap();
     drain_worker(&mut worker);
 
-    let after_bulldoze = worker.cross_region_discovery(&topology);
+    let after_bulldoze = cross_region_discovery(&worker, &[left, right], &topology);
     assert_component(&after_bulldoze, network(75, 0), &[network(75, 0)]);
     assert!(after_bulldoze.component_of(network(76, 0)).is_none());
 }
@@ -1593,6 +1604,24 @@ fn assert_component(
     expected: &[RegionRoadNetworkId],
 ) {
     assert_eq!(discovery.component_of(member), Some(expected));
+}
+
+#[cfg(test)]
+fn cross_region_discovery(
+    worker: &RegionWorker,
+    region_ids: &[RegionId],
+    topology: &[RegionNeighborLink],
+) -> small_city::core::regions::worker::CrossRegionDiscovery {
+    let directory = RegionDirectory::new(topology.to_vec());
+    for region_id in region_ids {
+        let state = worker.region(*region_id).expect("region").state();
+        directory.publish_region(
+            *region_id,
+            state.network_border_links(),
+            state.availability_hints(),
+        );
+    }
+    (*directory.discovery_snapshot()).clone()
 }
 
 fn region_with_roads(

@@ -154,7 +154,7 @@ impl CoordinatorHandle {
         let _ = self.commands.send(CoordinatorCommand::RuntimeReply(reply));
     }
 
-    /// Test-only fence for coordinator-driven worker integration tests.
+    /// Fence that waits until coordinator-routed worker events reach quiescence.
     pub(crate) fn drain_until_idle(&self) -> Result<(), CoordinatorError> {
         let (reply, receiver) = mpsc::channel();
         self.commands

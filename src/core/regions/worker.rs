@@ -377,27 +377,6 @@ impl RegionWorker {
         self.directory.set_topology(topology);
     }
 
-    /// Builds discovery data only; availability hints are not allocations.
-    ///
-    /// The worker uses this component graph and stale-tolerant hints only to
-    /// route export requests. The producer runtime remains authoritative for
-    /// granting or denying export allocation.
-    pub fn cross_region_discovery(&self, topology: &[RegionNeighborLink]) -> CrossRegionDiscovery {
-        // Compatibility shim for the integration test suite. Production routing
-        // reads the shared directory snapshot instead of allocating this
-        // throwaway directory.
-        let directory = RegionDirectory::new(topology.to_vec());
-        for runtime in &self.regions {
-            let state = runtime.state();
-            directory.publish_region(
-                runtime.region_id(),
-                state.network_border_links(),
-                state.availability_hints(),
-            );
-        }
-        (*directory.discovery_snapshot()).clone()
-    }
-
     pub fn push_event(
         &mut self,
         target_region: RegionId,

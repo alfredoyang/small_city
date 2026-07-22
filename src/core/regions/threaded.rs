@@ -36,15 +36,13 @@ pub struct ThreadedWorkerShutdownResult {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-/// Test-only report of whether a coordinator-driven worker reached quiescence.
+/// Report of whether a coordinator-driven worker reached quiescence.
 pub(crate) struct WorkerIdleReport {
     pub pending_events: bool,
     pub dirty_hints: bool,
 }
 
-#[allow(dead_code)] // P2 test-only coordinator-driven worker loop.
 const MAX_AUTONOMOUS_ROUNDS: usize = 32;
-#[allow(dead_code)] // P2 test-only coordinator-driven worker loop.
 const MAX_EVENTS_PER_AUTONOMOUS_SLICE: usize = 32;
 
 #[derive(Debug)]
@@ -97,8 +95,7 @@ impl PreparedThreadedRegionWorker {
         }
     }
 
-    /// Starts the P2 test-only coordinator-driven worker loop.
-    #[allow(dead_code)] // P2 test-only coordinator-driven worker loop.
+    /// Starts the coordinator-driven worker loop.
     pub(crate) fn start_with_coordinator(
         self,
         coordinator: CoordinatorHandle,
@@ -194,17 +191,13 @@ impl ThreadedRegionWorker {
 ///
 /// Region events still enter regions through `RegionHandle`; this enum is only
 /// for scheduler/control operations that must run on the worker-owning thread.
-#[allow(dead_code)] // P1 adds inactive coordinator delivery; P2 produces it.
 pub(crate) enum ThreadedWorkerCommand {
     /// Deliver one coordinator-routed event to an owned region inbox.
-    ///
-    /// P1 wires this command channel only. The coordinator has no runtime
-    /// producer until P2, so normal game execution cannot issue this command.
     Deliver {
         target_region: RegionId,
         event: crate::core::regions::runtime::RegionEvent,
     },
-    /// Test-only quiescence report for coordinator-driven worker tests.
+    /// Quiescence report for the coordinator drain loop.
     DrainReport { reply: Sender<WorkerIdleReport> },
     /// Run the normal single-worker scheduler.
     Process {
@@ -258,7 +251,6 @@ fn run_worker(mut worker: RegionWorker, commands: Receiver<ThreadedWorkerCommand
     }
 }
 
-#[allow(dead_code)] // P2 test-only coordinator-driven worker loop.
 fn run_worker_with_coordinator(
     mut worker: RegionWorker,
     commands: Receiver<ThreadedWorkerCommand>,
@@ -346,7 +338,6 @@ enum AutonomousDriveResult {
     RoundLimit,
 }
 
-#[allow(dead_code)] // P2 test-only coordinator-driven worker loop.
 fn drive_autonomous_worker(
     worker: &mut RegionWorker,
     coordinator: &CoordinatorHandle,
