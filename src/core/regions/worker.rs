@@ -748,6 +748,18 @@ impl RegionWorker {
     }
 }
 
+#[cfg(test)]
+impl RegionWorker {
+    /// Test-only coordinator-shaped worker pass used while Immediate mode still
+    /// exists for legacy single-worker callers.
+    fn process_region_events_for_coordinator(
+        &mut self,
+        max_events_per_region: usize,
+    ) -> WorkerRunSummary {
+        self.process_region_events_with_mode(max_events_per_region, RegionRoutingMode::Coordinator)
+    }
+}
+
 /// P-a: builds the `BorderLinkId → neighbor RegionId` facts for one region's
 /// road report — "this border link faces this neighbor." Travel routing reads the
 /// Layer-1 `RegionRoutes`; this helper only prices/publishes the local road graph.
@@ -901,6 +913,144 @@ mod tests {
             region: RegionId(region),
             road_network,
         }
+    }
+
+    #[test]
+    fn route_region_event_preserves_immediate_and_coordinator_modes() {
+        let mut worker = RegionWorker::new(WorkerId(3));
+        worker
+            .add_region(RegionRuntime::new(RegionState::new(RegionId(1), 2, 1)))
+            .expect("region added");
+        let event = RegionEvent::PowerCapacityRecheck {
+            request_id: UiRequestId(1),
+            source_region: RegionId(2),
+        };
+
+        let immediate = worker
+            .route_region_event(RegionId(1), event.clone(), RegionRoutingMode::Immediate)
+            .expect("local immediate route");
+        assert!(
+            matches!(immediate, WorkerRoutedMessage::None),
+            "Immediate mode pushes directly into the local runtime inbox"
+        );
+        assert_eq!(worker.region(RegionId(1)).unwrap().pending_event_count(), 1);
+
+        let coordinated = worker
+            .route_region_event(RegionId(1), event, RegionRoutingMode::Coordinator)
+            .expect("coordinator route");
+        assert!(matches!(
+            coordinated,
+            WorkerRoutedMessage::Coordinator(RoutedRegionEvent {
+                recipients: crate::core::regions::coordinator::RegionRecipients::One(RegionId(1)),
+                event: RegionEvent::PowerCapacityRecheck { .. },
+            })
+        ));
+        assert_eq!(
+            worker.region(RegionId(1)).unwrap().pending_event_count(),
+            1,
+            "Coordinator mode must not also push locally"
+        );
+    }
+
+    #[test]
+    fn route_region_event_missing_immediate_target_stays_worker_routing_error() {
+        let mut worker = RegionWorker::new(WorkerId(4));
+        let error = match worker.route_region_event(
+            RegionId(99),
+            RegionEvent::PowerCapacityRecheck {
+                request_id: UiRequestId(1),
+                source_region: RegionId(1),
+            },
+            RegionRoutingMode::Immediate,
+        ) {
+            Ok(_) => panic!("missing immediate target should not become a coordinator route"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            WorkerRoutingError::MissingTargetRegion {
+                target_region: RegionId(99),
+            }
+        );
+    }
+
+    #[test]
+    fn unchanged_power_hint_republish_does_not_emit_recheck_route() {
+        use crate::interface::input::BuildingKind;
+
+        let consumer = RegionId(10);
+        let producer = RegionId(11);
+        let mut worker = RegionWorker::new(WorkerId(5));
+        worker
+            .add_region(RegionRuntime::new(RegionState::new(consumer, 2, 1)))
+            .expect("consumer added");
+        worker
+            .add_region(RegionRuntime::new(RegionState::new(producer, 2, 2)))
+            .expect("producer added");
+        worker.set_region_topology(vec![RegionNeighborLink::new(
+            consumer,
+            BorderEdge::East,
+            producer,
+        )]);
+        assert!(
+            worker
+                .region_mut(consumer)
+                .unwrap()
+                .state_mut()
+                .build(1, 0, BuildingKind::Road)
+                .success
+        );
+        assert!(
+            worker
+                .region_mut(producer)
+                .unwrap()
+                .state_mut()
+                .build(0, 0, BuildingKind::Road)
+                .success
+        );
+        assert!(
+            worker
+                .region_mut(producer)
+                .unwrap()
+                .state_mut()
+                .build(0, 1, BuildingKind::PowerPlant)
+                .success
+        );
+
+        let initial = worker.process_region_events(usize::MAX);
+        assert!(initial.routing_errors.is_empty());
+        for _ in 0..3 {
+            let drain = worker.process_region_events(usize::MAX);
+            assert!(drain.routing_errors.is_empty());
+            if worker.region(consumer).unwrap().pending_event_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            worker.region(consumer).unwrap().pending_event_count(),
+            0,
+            "setup should settle the initial publish"
+        );
+
+        worker
+            .region_mut(producer)
+            .unwrap()
+            .state_mut()
+            .world
+            .mark_hints_dirty();
+        let unchanged = worker.process_region_events_for_coordinator(usize::MAX);
+
+        assert!(unchanged.routing_errors.is_empty());
+        assert!(
+            unchanged.coordinator_events.is_empty(),
+            "dirty but unchanged producer hints must not emit a coordinator route"
+        );
+        assert_eq!(
+            worker.region(consumer).unwrap().pending_event_count(),
+            0,
+            "dirty but unchanged producer hints must not fan out a PowerCapacityRecheck"
+        );
     }
 
     /// P5b: the topology edge A-East→B maps A's East border link to neighbor B.
