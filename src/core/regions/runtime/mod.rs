@@ -2280,6 +2280,43 @@ mod tick_state_tests {
         panic!("expected routed travel event");
     }
 
+    fn collect_travel_events(
+        runtime: &mut RegionRuntime,
+        expected: usize,
+        predicate: impl Fn(&RegionEvent) -> bool,
+    ) -> Vec<RegionEvent> {
+        let mut events = Vec::new();
+        for step in 1..=32 {
+            let outbound = runtime.process_event(RegionEvent::StepTravel {
+                step: TravelStepId(step),
+            });
+            for message in outbound {
+                if let OutboundMessage::CoordinatorRoute(RoutedRegionEvent { event, .. }) = message
+                    && predicate(&event)
+                {
+                    events.push(event);
+                }
+            }
+            if events.len() == expected {
+                return events;
+            }
+        }
+        panic!(
+            "expected {expected} routed travel events, got {}",
+            events.len()
+        );
+    }
+
+    fn apply_local_goods_deliveries(runtime: &mut RegionRuntime, arrivals: Vec<RegionEvent>) {
+        for arrival in arrivals {
+            let delivery = routed_event(&runtime.process_event(arrival));
+            assert!(matches!(delivery, RegionEvent::ApplyGoodsDelivery { .. }));
+            let confirm = routed_event(&runtime.process_event(delivery));
+            assert!(matches!(confirm, RegionEvent::ConfirmGoodsDelivery { .. }));
+            runtime.process_event(confirm);
+        }
+    }
+
     fn step_travel_until(runtime: &mut RegionRuntime, predicate: impl Fn(&RegionRuntime) -> bool) {
         for step in 1..=64 {
             runtime.process_event(RegionEvent::StepTravel {
@@ -3462,32 +3499,10 @@ mod tick_state_tests {
             );
         }
 
-        let mut arrivals = Vec::new();
-        for step in 1..=32 {
-            let outbound = runtime.process_event(RegionEvent::StepTravel {
-                step: TravelStepId(step),
-            });
-            for message in outbound {
-                if let OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
-                    event: RegionEvent::DestinationArrived { .. },
-                    ..
-                }) = message
-                {
-                    arrivals.push(routed_event(&[message]));
-                }
-            }
-            if arrivals.len() == 2 {
-                break;
-            }
-        }
-        assert_eq!(arrivals.len(), 2);
-        for arrival in arrivals {
-            let delivery = routed_event(&runtime.process_event(arrival));
-            assert!(matches!(delivery, RegionEvent::ApplyGoodsDelivery { .. }));
-            let confirm = routed_event(&runtime.process_event(delivery));
-            assert!(matches!(confirm, RegionEvent::ConfirmGoodsDelivery { .. }));
-            runtime.process_event(confirm);
-        }
+        let arrivals = collect_travel_events(&mut runtime, 2, |event| {
+            matches!(event, RegionEvent::DestinationArrived { .. })
+        });
+        apply_local_goods_deliveries(&mut runtime, arrivals);
 
         assert_eq!(
             crate::core::systems::economy::commercial_goods_stored(
@@ -3613,32 +3628,10 @@ mod tick_state_tests {
             }
         );
 
-        let mut arrivals = Vec::new();
-        for step in 1..=32 {
-            let outbound = runtime.process_event(RegionEvent::StepTravel {
-                step: TravelStepId(step),
-            });
-            for message in outbound {
-                if let OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
-                    event: RegionEvent::DestinationArrived { .. },
-                    ..
-                }) = message
-                {
-                    arrivals.push(routed_event(&[message]));
-                }
-            }
-            if arrivals.len() == 2 {
-                break;
-            }
-        }
-        assert_eq!(arrivals.len(), 2);
-        for arrival in arrivals {
-            let delivery = routed_event(&runtime.process_event(arrival));
-            assert!(matches!(delivery, RegionEvent::ApplyGoodsDelivery { .. }));
-            let confirm = routed_event(&runtime.process_event(delivery));
-            assert!(matches!(confirm, RegionEvent::ConfirmGoodsDelivery { .. }));
-            runtime.process_event(confirm);
-        }
+        let arrivals = collect_travel_events(&mut runtime, 2, |event| {
+            matches!(event, RegionEvent::DestinationArrived { .. })
+        });
+        apply_local_goods_deliveries(&mut runtime, arrivals);
 
         assert_eq!(
             crate::core::systems::economy::commercial_goods_stored(
@@ -3821,25 +3814,9 @@ mod tick_state_tests {
             }
         );
 
-        let mut receives = Vec::new();
-        for step in 1..=32 {
-            let outbound = producer.process_event(RegionEvent::StepTravel {
-                step: TravelStepId(step),
-            });
-            for message in outbound {
-                if let OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
-                    event: RegionEvent::ReceiveTraveler { .. },
-                    ..
-                }) = message
-                {
-                    receives.push(routed_event(&[message]));
-                }
-            }
-            if receives.len() == 2 {
-                break;
-            }
-        }
-        assert_eq!(receives.len(), 2);
+        let receives = collect_travel_events(&mut producer, 2, |event| {
+            matches!(event, RegionEvent::ReceiveTraveler { .. })
+        });
         for receive in receives {
             consumer.process_event(receive);
         }
