@@ -435,8 +435,11 @@ no job allocation behavior change
 Create:
 
 ```text
-src/core/regions/employment_runtime.rs
+src/core/regions/runtime/employment.rs
 ```
+
+Use a `runtime` child module so the extraction does not expose runtime-owned
+directory handles, discovery snapshots, or request/wake routing helpers.
 
 Split this patch if the diff becomes hard to review:
 
