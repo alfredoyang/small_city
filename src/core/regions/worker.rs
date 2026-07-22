@@ -170,15 +170,6 @@ impl Default for RegionOwnerDirectory {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RegionRoutingMode {
-    /// Normal single-worker behavior: owned target inboxes receive events now.
-    Immediate,
-    /// Production coordinator behavior: every inter-region delivery is emitted
-    /// as a target-bearing coordinator route without worker-side merging.
-    Coordinator,
-}
-
 #[derive(Debug)]
 /// Owns and schedules multiple regional runtimes on one thread.
 pub struct RegionWorker {
@@ -426,7 +417,7 @@ impl RegionWorker {
     /// slice. This keeps one region from creating same-pass work for another
     /// region that has not yet had its turn.
     pub fn process_region_events(&mut self, max_events_per_region: usize) -> WorkerRunSummary {
-        self.process_region_events_with_mode(max_events_per_region, RegionRoutingMode::Immediate)
+        self.process_region_events_with_mode(max_events_per_region)
     }
 
     /// Runs one coordinator-driven scheduler round.
@@ -434,8 +425,7 @@ impl RegionWorker {
         &mut self,
         max_events_per_region: usize,
     ) -> AutonomousWorkerRound {
-        let summary = self
-            .process_region_events_with_mode(max_events_per_region, RegionRoutingMode::Coordinator);
+        let summary = self.process_region_events_with_mode(max_events_per_region);
         AutonomousWorkerRound {
             processed_regions: summary.processed_regions,
             routing_errors: summary.routing_errors,
@@ -462,7 +452,6 @@ impl RegionWorker {
     fn process_region_events_with_mode(
         &mut self,
         max_events_per_region: usize,
-        routing_mode: RegionRoutingMode,
     ) -> WorkerRunSummary {
         if max_events_per_region == 0 {
             return WorkerRunSummary::default();
@@ -584,7 +573,6 @@ impl RegionWorker {
                         request_id: recheck_id,
                         source_region: region_id,
                     },
-                    routing_mode,
                 ) {
                     coordinator_events.push(event);
                 }
@@ -604,13 +592,8 @@ impl RegionWorker {
                 Ok(WorkerRoutedMessage::SnapshotReply(reply)) => snapshot_replies.push(reply),
                 Ok(WorkerRoutedMessage::RuntimeReply(reply)) => runtime_replies.push(reply),
                 Ok(WorkerRoutedMessage::Coordinator(event)) => {
-                    if matches!(routing_mode, RegionRoutingMode::Immediate) {
-                        routing_errors.extend(self.deliver_coordinator_event_locally(event));
-                    } else {
-                        coordinator_events.push(event);
-                    }
+                    coordinator_events.push(event);
                 }
-                Ok(WorkerRoutedMessage::None) => {}
                 Err(error) => routing_errors.push(error),
             }
         }
@@ -700,42 +683,19 @@ impl RegionWorker {
         }
     }
 
-    fn deliver_coordinator_event_locally(
-        &mut self,
-        event: RoutedRegionEvent,
-    ) -> Vec<WorkerRoutingError> {
-        use crate::core::regions::coordinator::RegionRecipients;
-
-        let recipients = match event.recipients {
-            RegionRecipients::One(region) => vec![region],
-            RegionRecipients::Many(regions) => regions,
-            RegionRecipients::All => self.owners.region_ids(),
-        };
-        recipients
-            .into_iter()
-            .filter_map(|region| self.push_event(region, event.event.clone()).err())
-            .collect()
-    }
-
     fn route_region_event(
         &mut self,
         target_region: RegionId,
         event: RegionEvent,
-        routing_mode: RegionRoutingMode,
     ) -> Result<WorkerRoutedMessage, WorkerRoutingError> {
-        if routing_mode == RegionRoutingMode::Immediate && self.region(target_region).is_some() {
-            self.push_event(target_region, event)?;
-            return Ok(WorkerRoutedMessage::None);
+        if self.owners.owner_of(target_region).is_none() {
+            return Err(WorkerRoutingError::MissingTargetRegion { target_region });
         }
 
-        if routing_mode == RegionRoutingMode::Coordinator {
-            return Ok(WorkerRoutedMessage::Coordinator(RoutedRegionEvent {
-                recipients: crate::core::regions::coordinator::RegionRecipients::One(target_region),
-                event,
-            }));
-        }
-
-        Err(WorkerRoutingError::MissingTargetRegion { target_region })
+        Ok(WorkerRoutedMessage::Coordinator(RoutedRegionEvent {
+            recipients: crate::core::regions::coordinator::RegionRecipients::One(target_region),
+            event,
+        }))
     }
 
     fn publish_region_summary(
@@ -745,18 +705,6 @@ impl RegionWorker {
         hints: Vec<RegionalAvailabilityHint>,
     ) {
         self.directory.publish_region(region_id, links, hints);
-    }
-}
-
-#[cfg(test)]
-impl RegionWorker {
-    /// Test-only coordinator-shaped worker pass used while Immediate mode still
-    /// exists for legacy single-worker callers.
-    fn process_region_events_for_coordinator(
-        &mut self,
-        max_events_per_region: usize,
-    ) -> WorkerRunSummary {
-        self.process_region_events_with_mode(max_events_per_region, RegionRoutingMode::Coordinator)
     }
 }
 
@@ -858,7 +806,6 @@ pub(crate) fn cross_region_goods_routes_for_region(
 }
 
 enum WorkerRoutedMessage {
-    None,
     Coordinator(RoutedRegionEvent),
     CommandReply(RegionCommandResponse),
     TickReply(RegionTickResponse),
@@ -916,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn route_region_event_preserves_immediate_and_coordinator_modes() {
+    fn route_region_event_always_returns_coordinator_route() {
         let mut worker = RegionWorker::new(WorkerId(3));
         worker
             .add_region(RegionRuntime::new(RegionState::new(RegionId(1), 2, 1)))
@@ -926,17 +873,8 @@ mod tests {
             source_region: RegionId(2),
         };
 
-        let immediate = worker
-            .route_region_event(RegionId(1), event.clone(), RegionRoutingMode::Immediate)
-            .expect("local immediate route");
-        assert!(
-            matches!(immediate, WorkerRoutedMessage::None),
-            "Immediate mode pushes directly into the local runtime inbox"
-        );
-        assert_eq!(worker.region(RegionId(1)).unwrap().pending_event_count(), 1);
-
         let coordinated = worker
-            .route_region_event(RegionId(1), event, RegionRoutingMode::Coordinator)
+            .route_region_event(RegionId(1), event)
             .expect("coordinator route");
         assert!(matches!(
             coordinated,
@@ -947,13 +885,13 @@ mod tests {
         ));
         assert_eq!(
             worker.region(RegionId(1)).unwrap().pending_event_count(),
-            1,
-            "Coordinator mode must not also push locally"
+            0,
+            "route_region_event must not push directly into the local runtime inbox"
         );
     }
 
     #[test]
-    fn route_region_event_missing_immediate_target_stays_worker_routing_error() {
+    fn route_region_event_missing_target_stays_worker_routing_error() {
         let mut worker = RegionWorker::new(WorkerId(4));
         let error = match worker.route_region_event(
             RegionId(99),
@@ -961,9 +899,8 @@ mod tests {
                 request_id: UiRequestId(1),
                 source_region: RegionId(1),
             },
-            RegionRoutingMode::Immediate,
         ) {
-            Ok(_) => panic!("missing immediate target should not become a coordinator route"),
+            Ok(_) => panic!("missing target should not become a coordinator route"),
             Err(error) => error,
         };
 
@@ -1039,7 +976,7 @@ mod tests {
             .state_mut()
             .world
             .mark_hints_dirty();
-        let unchanged = worker.process_region_events_for_coordinator(usize::MAX);
+        let unchanged = worker.process_region_events(usize::MAX);
 
         assert!(unchanged.routing_errors.is_empty());
         assert!(

@@ -247,6 +247,7 @@ Review checks:
 ```text
 RegionRoutingMode removed
 deliver_coordinator_event_locally removed if unused
+P0-a process_region_events_for_coordinator test alias removed
 same-worker power nudge still eventually powers target through harness/coordinator
 worker-minted missing targets remain WorkerRoutingError before coordinator route creation
 runtime-emitted CoordinatorRoute messages still go through normal coordinator validation

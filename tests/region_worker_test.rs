@@ -1,12 +1,13 @@
 //! Integration tests for the shared single-threaded region worker.
 
 use small_city::core::regional_types::{RegionCommand, RegionTickResponse, UiRequestId};
+use small_city::core::regions::coordinator::{RegionRecipients, RoutedRegionEvent};
 use small_city::core::regions::directory::RegionDirectory;
 use small_city::core::regions::runtime::{
     ExportAllocationRequest, PowerExportRequest, RegionEvent, RegionRuntime, TravelStepId,
 };
 use small_city::core::regions::worker::{
-    RegionOwnerDirectory, RegionWorker, WorkerId, WorkerRoutingError,
+    RegionOwnerDirectory, RegionWorker, WorkerId, WorkerRoutingError, WorkerRunSummary,
 };
 use small_city::core::regions::{
     BorderEdge, BorderLinkId, NetworkBorderLink, PowerExportGrant, RegionId, RegionNeighborLink,
@@ -37,7 +38,7 @@ fn one_worker_processes_events_for_multiple_regions() {
         )
         .unwrap();
 
-    let summary = worker.process_region_events(1);
+    let summary = process_worker_events(&mut worker, 1);
 
     assert!(summary.routing_errors.is_empty());
     assert_eq!(summary.processed_regions, 2);
@@ -54,7 +55,7 @@ fn busy_region_cannot_starve_another_region_when_event_limit_is_set() {
     worker.push_event(RegionId(3), tick(5)).unwrap();
     worker.push_event(RegionId(4), tick(6)).unwrap();
 
-    let summary = worker.process_region_events(1);
+    let summary = process_worker_events(&mut worker, 1);
 
     assert!(summary.routing_errors.is_empty());
     assert_eq!(summary.processed_regions, 2);
@@ -92,7 +93,7 @@ fn process_region_events_with_zero_event_limit_reports_no_processed_regions() {
     worker.push_event(RegionId(10), tick(10)).unwrap();
     worker.push_event(RegionId(11), tick(11)).unwrap();
 
-    let summary = worker.process_region_events(0);
+    let summary = process_worker_events(&mut worker, 0);
 
     assert_eq!(summary.processed_regions, 0);
     assert!(summary.routing_errors.is_empty());
@@ -281,7 +282,7 @@ fn power_grant_continuation_runs_in_caller_region() {
 
     worker.push_event(caller, tick(1)).unwrap();
 
-    let request_pass = worker.process_region_events(1);
+    let request_pass = process_worker_events(&mut worker, 1);
     assert!(request_pass.routing_errors.is_empty());
     assert!(!cell_powered(&worker, caller, 0, 0));
     assert_eq!(pending_events(&worker, producer), 1);
@@ -292,13 +293,13 @@ fn power_grant_continuation_runs_in_caller_region() {
     );
     assert_eq!(turn(&worker, caller), 1);
 
-    let producer_pass = worker.process_region_events(1);
+    let producer_pass = process_worker_events(&mut worker, 1);
     assert!(producer_pass.routing_errors.is_empty());
     assert!(!cell_powered(&worker, caller, 0, 0));
     assert_eq!(pending_events(&worker, producer), 0);
     assert_eq!(pending_events(&worker, caller), 1);
 
-    let apply_pass = worker.process_region_events(1);
+    let apply_pass = process_worker_events(&mut worker, 1);
     assert!(apply_pass.routing_errors.is_empty());
     assert!(cell_powered(&worker, caller, 0, 0));
     assert_eq!(
@@ -355,7 +356,7 @@ fn stale_spare_power_hint_routes_to_producer_but_denies_cleanly() {
     // stale hint below — otherwise the sweep would immediately correct
     // producer's entry before `request_pass` ever reads it, defeating the
     // staleness this test exercises.
-    assert_eq!(worker.process_region_events(1).processed_regions, 0);
+    assert_eq!(process_worker_events(&mut worker, 1).processed_regions, 0);
     directory.publish_region(
         producer,
         vec![NetworkBorderLink {
@@ -375,7 +376,7 @@ fn stale_spare_power_hint_routes_to_producer_but_denies_cleanly() {
 
     worker.push_event(caller, tick(1)).unwrap();
 
-    let request_pass = worker.process_region_events(1);
+    let request_pass = process_worker_events(&mut worker, 1);
     assert!(request_pass.routing_errors.is_empty());
     assert_eq!(pending_events(&worker, producer), 1);
     // Retire-tickstate, P-a: the tick completes in this same pass now, not
@@ -383,11 +384,11 @@ fn stale_spare_power_hint_routes_to_producer_but_denies_cleanly() {
     assert_eq!(request_pass.tick_replies.len(), 1);
     assert_eq!(turn(&worker, caller), 1);
 
-    let producer_pass = worker.process_region_events(1);
+    let producer_pass = process_worker_events(&mut worker, 1);
     assert!(producer_pass.routing_errors.is_empty());
     assert_eq!(pending_events(&worker, caller), 1);
 
-    let apply_pass = worker.process_region_events(1);
+    let apply_pass = process_worker_events(&mut worker, 1);
     assert!(apply_pass.routing_errors.is_empty());
     assert_eq!(
         apply_pass.tick_replies.len(),
@@ -425,7 +426,11 @@ fn quiet_power_tick_skips_reconcile_after_first_grant() {
 
     worker.push_event(caller, tick(1)).unwrap();
     for _ in 0..3 {
-        assert!(worker.process_region_events(1).routing_errors.is_empty());
+        assert!(
+            process_worker_events(&mut worker, 1)
+                .routing_errors
+                .is_empty()
+        );
     }
     assert!(
         cell_powered(&worker, caller, 0, 0),
@@ -437,7 +442,7 @@ fn quiet_power_tick_skips_reconcile_after_first_grant() {
     // worker routing is immediate (`route_region_event`), so a request would
     // show up as a pending event on the producer within this single pass.
     worker.push_event(caller, tick(2)).unwrap();
-    let second_pass = worker.process_region_events(1);
+    let second_pass = process_worker_events(&mut worker, 1);
     assert!(second_pass.routing_errors.is_empty());
     assert_eq!(
         second_pass.tick_replies.len(),
@@ -479,7 +484,7 @@ fn eager_nudge_powers_neighbor_before_its_own_first_tick() {
 
     // Prime a no-op pass so the initial (no-spare-power) hints settle, same
     // setup as `stale_spare_power_hint_routes_to_producer_but_denies_cleanly`.
-    assert_eq!(worker.process_region_events(1).processed_regions, 0);
+    assert_eq!(process_worker_events(&mut worker, 1).processed_regions, 0);
     assert_eq!(turn(&worker, consumer), 0);
 
     // The producer builds a power plant -- its availability hint flips
@@ -499,7 +504,11 @@ fn eager_nudge_powers_neighbor_before_its_own_first_tick() {
         )
         .unwrap();
     for _ in 0..8 {
-        assert!(worker.process_region_events(1).routing_errors.is_empty());
+        assert!(
+            process_worker_events(&mut worker, 1)
+                .routing_errors
+                .is_empty()
+        );
     }
 
     assert!(
@@ -529,7 +538,7 @@ fn eager_nudge_does_not_refire_on_an_unchanged_pass() {
         ],
     );
     worker.set_region_topology(vec![neighbor(94, BorderEdge::East, 95)]);
-    assert_eq!(worker.process_region_events(1).processed_regions, 0);
+    assert_eq!(process_worker_events(&mut worker, 1).processed_regions, 0);
 
     // A real change: the producer builds a power plant, nudging the
     // consumer. Drain to a fixed point.
@@ -547,7 +556,11 @@ fn eager_nudge_does_not_refire_on_an_unchanged_pass() {
         )
         .unwrap();
     for _ in 0..8 {
-        assert!(worker.process_region_events(1).routing_errors.is_empty());
+        assert!(
+            process_worker_events(&mut worker, 1)
+                .routing_errors
+                .is_empty()
+        );
     }
     assert!(
         cell_powered(&worker, consumer, 0, 0),
@@ -558,8 +571,12 @@ fn eager_nudge_does_not_refire_on_an_unchanged_pass() {
     // additional pending events anywhere -- no repeated nudge, no repeated
     // request/release traffic.
     for _ in 0..3 {
-        let summary = worker.process_region_events(1);
+        let summary = process_worker_events(&mut worker, 1);
         assert!(summary.routing_errors.is_empty());
+        assert!(
+            summary.coordinator_events.is_empty(),
+            "nothing left to route"
+        );
         assert_eq!(summary.processed_regions, 0, "nothing left to process");
     }
 }
@@ -603,7 +620,7 @@ fn event_idle_region_republishes_dirty_hints_on_next_pass() {
     assert!(!directory.discovery_snapshot().availability_hints[0].has_spare_power);
 
     // No event pushed anywhere: the region is event-idle this pass.
-    let summary = worker.process_region_events(1);
+    let summary = process_worker_events(&mut worker, 1);
     assert_eq!(
         summary.processed_regions, 0,
         "region had zero pending events"
@@ -660,7 +677,7 @@ fn stale_granted_reply_immediately_releases_producer_reservation() {
             },
         )
         .unwrap();
-    let summary = worker.process_region_events(1);
+    let summary = process_worker_events(&mut worker, 1);
 
     assert!(summary.routing_errors.is_empty());
     assert_eq!(
@@ -699,7 +716,7 @@ fn missing_caller_for_power_grant_result_is_deterministic_routing_error() {
         )
         .unwrap();
 
-    let summary = worker.process_region_events(1);
+    let summary = process_worker_events(&mut worker, 1);
 
     assert_eq!(
         summary.routing_errors,
@@ -768,7 +785,7 @@ fn wrong_region_export_grants_are_ignored_without_mutating_state() {
         )
         .unwrap();
 
-    let summary = worker.process_region_events(1);
+    let summary = process_worker_events(&mut worker, 1);
 
     assert!(summary.routing_errors.is_empty());
     assert_eq!(turn(&worker, region), 0);
@@ -829,7 +846,8 @@ fn derived_read_during_a_paused_power_handshake_does_not_wipe_imported_power() {
         // Drain pass-by-pass, forcing a derived read between every pass so one lands
         // while the consumer tick is mid-handshake.
         for _ in 0..16 {
-            if worker.process_region_events(1).processed_regions == 0 {
+            let summary = process_worker_events(&mut worker, 1);
+            if summary.processed_regions == 0 && summary.coordinator_events.is_empty() {
                 break;
             }
             let _ = worker
@@ -861,12 +879,12 @@ fn cross_region_power_export_does_not_overwrite_a_paused_tick() {
 
     worker.push_event(RegionId(35), tick(1)).unwrap();
     worker.push_event(RegionId(35), tick(2)).unwrap();
-    let mut tick_replies = worker.process_region_events(2).tick_replies;
+    let mut tick_replies = process_worker_events(&mut worker, 2).tick_replies;
 
     for _ in 0..16 {
-        let summary = worker.process_region_events(2);
+        let summary = process_worker_events(&mut worker, 2);
         tick_replies.extend(summary.tick_replies);
-        if summary.processed_regions == 0 {
+        if summary.processed_regions == 0 && summary.coordinator_events.is_empty() {
             break;
         }
     }
@@ -1626,7 +1644,8 @@ fn pending_events(worker: &RegionWorker, region_id: RegionId) -> usize {
 
 fn drain_worker(worker: &mut RegionWorker) {
     for _ in 0..16 {
-        if worker.process_region_events(1).processed_regions == 0 {
+        let summary = process_worker_events(worker, 1);
+        if summary.processed_regions == 0 && summary.coordinator_events.is_empty() {
             return;
         }
     }
@@ -1637,12 +1656,45 @@ fn drain_worker(worker: &mut RegionWorker) {
 fn drain_worker_tick_replies(worker: &mut RegionWorker) -> Vec<RegionTickResponse> {
     let mut replies = Vec::new();
     for _ in 0..16 {
-        let summary = worker.process_region_events(1);
+        let summary = process_worker_events(worker, 1);
         replies.extend(summary.tick_replies);
-        if summary.processed_regions == 0 {
+        if summary.processed_regions == 0 && summary.coordinator_events.is_empty() {
             return replies;
         }
     }
 
     panic!("worker did not drain");
+}
+
+#[cfg(test)]
+fn process_worker_events(
+    worker: &mut RegionWorker,
+    max_events_per_region: usize,
+) -> WorkerRunSummary {
+    let mut summary = worker.process_region_events(max_events_per_region);
+    for route in summary.coordinator_events.clone() {
+        if let Err(error) = deliver_route_to_same_worker(worker, route) {
+            summary.routing_errors.push(error);
+        }
+    }
+    summary
+}
+
+#[cfg(test)]
+fn deliver_route_to_same_worker(
+    worker: &mut RegionWorker,
+    route: RoutedRegionEvent,
+) -> Result<(), WorkerRoutingError> {
+    match route.recipients {
+        RegionRecipients::One(region) => worker.push_event(region, route.event),
+        RegionRecipients::Many(regions) => {
+            for region in regions {
+                worker.push_event(region, route.event.clone())?;
+            }
+            Ok(())
+        }
+        RegionRecipients::All => {
+            panic!("single-worker tests do not emit broadcast coordinator routes")
+        }
+    }
 }
