@@ -376,8 +376,11 @@ no candidate ordering change
 Create:
 
 ```text
-src/core/regions/power_allocation.rs
+src/core/regions/runtime/power_allocation.rs
 ```
+
+Use a `runtime` child module so the extracted handlers keep access to runtime
+request ids, producer lists, and allocation ledgers without widening visibility.
 
 Move:
 
