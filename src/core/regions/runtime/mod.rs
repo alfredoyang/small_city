@@ -945,6 +945,9 @@ impl RegionRuntime {
                 traveler,
                 destination,
             } => {
+                // Keep truck validation first. Citizen and truck ids are unique
+                // today, but this shared event must not grow a citizen-side
+                // payroll effect before truck delivery handling.
                 if let Some(arrival) = self
                     .state
                     .validate_goods_truck_arrival(traveler, destination)
@@ -2587,6 +2590,83 @@ mod tick_state_tests {
         assert!(
             !runtime.state().world.citizens[&citizen_id].attended_since_daily_settlement,
             "a stale generation must not record attendance for the new trip"
+        );
+    }
+
+    #[test]
+    fn destination_arrived_dispatch_checks_goods_trucks_before_citizen_attendance() {
+        use crate::core::components::{ArrivalAction, Citizen, Morale, WorkplaceAssignment};
+
+        let (mut runtime, _factory, commercial, network) = local_goods_runtime();
+        let request = GoodsSupplyRequest {
+            request_id: UiRequestId(21),
+            caller_region: RegionId(1),
+            caller_network: network,
+            token: 0,
+            units: GOODS_PER_TRUCK as u32,
+            commercial,
+        };
+        runtime.current_goods_request_id = request.request_id;
+        let grant = runtime.process_goods_supply_request(&GoodsSupplyAllocationRequest {
+            request: request.clone(),
+            candidates: vec![network],
+            candidate_index: 0,
+        });
+        assert!(grant.granted);
+        runtime.apply_goods_supply_grant(request, grant);
+
+        let (truck_id, truck_generation) = runtime
+            .state()
+            .world
+            .trucks
+            .iter()
+            .next()
+            .map(|(id, truck)| (*id, truck.trip_generation))
+            .expect("truck was dispatched");
+        // Deliberately overlap the truck id with a citizen record to prove the
+        // shared DestinationArrived handler validates trucks before citizen
+        // attendance. Real saves do not model a truck as a citizen; this pins
+        // the structural dispatch order for future refactors.
+        runtime.state_mut().world.citizens.insert(
+            truck_id,
+            Citizen {
+                id: truck_id,
+                age: 1,
+                home: Entity::new(RegionId(1), 999),
+                workplace_assignment: Some(WorkplaceAssignment {
+                    workplace: commercial,
+                    location: CityCellRef::local(RegionId(1), 2, 0),
+                    salary: 100,
+                }),
+                morale: Morale::default(),
+                money: 0,
+                arrival_action: ArrivalAction::StartWorkShift,
+                work_trip_generation: truck_generation,
+                attended_since_daily_settlement: false,
+            },
+        );
+
+        let outbound = runtime.process_event(RegionEvent::DestinationArrived {
+            traveler: TravelerId {
+                entity: truck_id,
+                generation: truck_generation,
+            },
+            destination: PlaceRef {
+                region: RegionId(1),
+                building: commercial,
+            },
+        });
+
+        assert!(matches!(
+            outbound.as_slice(),
+            [OutboundMessage::CoordinatorRoute(RoutedRegionEvent {
+                recipients: RegionRecipients::One(RegionId(1)),
+                event: RegionEvent::ApplyGoodsDelivery { traveler, commercial: routed_commercial, .. },
+            })] if traveler.entity == truck_id && *routed_commercial == commercial
+        ));
+        assert!(
+            !runtime.state().world.citizens[&truck_id].attended_since_daily_settlement,
+            "truck arrivals must not fall through to citizen payroll attendance"
         );
     }
 
