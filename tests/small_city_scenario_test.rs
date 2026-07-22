@@ -220,9 +220,9 @@ fn connected_economy_loop_runs_over_many_turns_after_upgrade_and_save_load() {
     assert!(total_economy.rent_income > 0);
     assert!(total_economy.commercial_sales_tax > 0);
     assert!(total_economy.shoppers_served > 0);
-    // The long scenario now also proves the added goods economy remains active
-    // across upgrades and save/load: factories produce local goods, commercial
-    // buildings store/sell them, and manufacturing tax contributes to the budget.
+    // The long scenario proves the goods economy remains active across upgrades
+    // and save/load: factories produce local goods, commercial buildings sell
+    // delivered goods, and manufacturing/export tax contributes to the budget.
     assert!(total_economy.local_goods_produced > 0);
     assert!(total_economy.local_goods_stored > 0);
     assert!(total_economy.local_goods_sold > 0);
@@ -255,33 +255,37 @@ fn stable_starter_city_stays_in_sane_ranges_and_locks_reinvestment_pacing() {
     let starting_money = game.view().status.money;
     let first_week = advance_one_week(&mut game);
     assert_eq!(
-        building_upgrade_level(&game, 4, 0),
+        building_upgrade_level(&game, 4, 1),
         2,
-        "daily population growth should let commercial reach level 2 in the first starter-city week"
+        "commercial should reach level 2 after the first week"
     );
     assert_eq!(
-        building_upgrade_level(&game, 7, 0),
+        building_upgrade_level(&game, 7, 1),
         2,
         "industrial should reach level 2 after one profitable starter-city week"
     );
     let second_week = advance_one_week(&mut game);
     assert_eq!(
-        building_upgrade_level(&game, 4, 0),
+        building_upgrade_level(&game, 4, 1),
         3,
-        "commercial should reach the current reinvestment cap after two starter-city weeks"
+        "commercial should reach level 3 after the second week"
     );
     assert_eq!(
-        building_upgrade_level(&game, 7, 0),
+        building_upgrade_level(&game, 7, 1),
         3,
-        "industrial should reach the current reinvestment cap after two profitable weeks"
+        "industrial should reach level 3 after the second week"
     );
     let third_week = advance_one_week(&mut game);
     assert_eq!(
-        building_upgrade_level(&game, 4, 0),
+        building_upgrade_level(&game, 4, 1),
         3,
-        "commercial should stay at the current reinvestment cap after three starter-city weeks"
+        "commercial should stay level 3 after the third week"
     );
-    assert_eq!(building_upgrade_level(&game, 7, 0), 3);
+    assert_eq!(
+        building_upgrade_level(&game, 7, 1),
+        3,
+        "industrial should stay level 3 after the third week"
+    );
     let economy = first_week.plus(second_week).plus(third_week);
     let view = game.view();
 

@@ -91,8 +91,8 @@ fn tick_returns_structured_summary_events() {
                 after: 5
             },
             money: MetricChange {
-                before: 193,
-                after: 226
+                before: 188,
+                after: 221
             },
             happiness: MetricChange {
                 before: 90,
@@ -169,7 +169,7 @@ fn tick_summary_message_includes_metric_changes() {
 
     assert!(message.contains("population 5 (+0)"));
     assert!(message.contains("Year 1, Month 1, Week 2, Day 1, 00:00"));
-    assert!(message.contains("money 237 (+34)"));
+    assert!(message.contains("money 232 (+34)"));
     assert!(message.contains("powered buildings 3 (+0)"));
     // The message expectation changed because tick feedback now explains goods
     // production, local/imported sales, export flow, and related taxes.

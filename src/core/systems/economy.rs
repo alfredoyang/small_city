@@ -95,18 +95,18 @@ pub(crate) fn run_with_prepared_goods_flow(
     let job_resolution = world.cached_job_resolution();
     let index = EconomyIndex::from_world(world, &job_resolution.workplace_slots);
     reset_business_periods(world, &index.business_entities);
+    let delivered_goods_flow = apply_pending_goods_delivery_revenue(world);
 
     // Industry flow:
-    // 1. Productive industrial buildings create local goods.
-    // 2. Local goods fill productive commercial storage in map order.
-    // 3. Surplus local goods are exported for export tax.
-    // 4. Citizens shopping later consume stored local goods first; empty shops
+    // 1. Confirmed truck deliveries from earlier travel settle into this
+    //    period's manufacturing tax/profit.
+    // 2. Productive industrial buildings create new goods.
+    // 3. New local supply becomes truck grants; commercial storage changes only
+    //    when those trucks arrive.
+    // 4. Surplus local goods are exported for export tax.
+    // 5. Citizens shopping later consume stored local goods first; empty shops
     //    import goods at a higher citizen price and lower happiness gain.
-    //
-    // This encourages local production without introducing individual cargo
-    // entities or pathfinding. Existing powered + road-connected rules decide
-    // which industrial and commercial buildings can participate.
-    let goods_flow = if let Some(prepared) = prepared_goods_flow {
+    let mut goods_flow = if let Some(prepared) = prepared_goods_flow {
         apply_prepared_goods_flow(world, &prepared, false);
         prepared.flow
     } else {
@@ -117,6 +117,8 @@ pub(crate) fn run_with_prepared_goods_flow(
             exported_goods_units,
         )
     };
+    goods_flow.local_goods_stored += delivered_goods_flow.local_goods_stored;
+    goods_flow.manufacturing_tax += delivered_goods_flow.manufacturing_tax;
 
     let mut shopping_slots = index.shopping_slots.clone();
     let mut salaries_paid = 0;
@@ -353,6 +355,7 @@ pub(crate) struct GoodsFlow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LocalGoodsGrant {
+    pub industrial: Entity,
     pub commercial: Entity,
     pub caller_network: u32,
     pub units: u32,
@@ -445,7 +448,7 @@ fn prepare_goods_flow(
     exported_goods_units: u32,
 ) -> PreparedGoodsFlow {
     let mut local_goods_produced = 0;
-    let mut local_goods_stored = 0;
+    let local_goods_stored = 0;
     let mut exported_goods = 0;
     let mut manufacturing_tax = 0;
     let mut export_tax = 0;
@@ -478,26 +481,15 @@ fn prepare_goods_flow(
             }
             *free_capacity -= supplied;
             remaining_goods -= supplied;
-            // TODO(goods-trucks): this books local storage/revenue from the
-            // virtual goods plan before a factory truck has actually accepted
-            // and completed the dispatch. Move manufacturing tax/profit and
-            // local_goods_stored credit to the successful delivery path, or add
-            // an explicit dispatched-goods ledger so denied shipments cannot
-            // generate revenue.
-            local_goods_stored += supplied;
             let caller_network = road_network_analysis::access_for(world, commercial)
                 .network_id
                 .unwrap_or_default();
             local_grants.push(LocalGoodsGrant {
+                industrial: *industrial,
                 commercial,
                 caller_network,
                 units: supplied as u32,
             });
-            let distance =
-                road_network_analysis::distance_between_buildings(world, *industrial, commercial);
-            let margin = supplied * margin_per_good(MANUFACTURING_TAX_PER_GOOD, distance);
-            manufacturing_tax += margin;
-            industrial_profit += margin;
             if remaining_goods == 0 {
                 break;
             }
@@ -505,16 +497,6 @@ fn prepare_goods_flow(
 
         if remaining_goods > 0 && regional_export_units_remaining > 0 {
             let regional_exported = remaining_goods.min(regional_export_units_remaining);
-            // ponytail: proxy distance. The grant does not carry the exact
-            // producer-to-consumer route yet, so regional goods use the existing
-            // producer-to-edge distance for manufacturing margin. Add route
-            // distance to GoodsSupplyGrant if balance needs that precision.
-            let distance =
-                road_network_analysis::access_for(world, *industrial).import_export_distance;
-            let manufacturing_margin =
-                regional_exported * margin_per_good(MANUFACTURING_TAX_PER_GOOD, distance);
-            manufacturing_tax += manufacturing_margin;
-            industrial_profit += manufacturing_margin;
             remaining_goods -= regional_exported;
             regional_export_units_remaining -= regional_exported;
         }
@@ -554,6 +536,12 @@ fn apply_prepared_goods_flow(
     if apply_local_goods {
         for grant in &prepared.local_grants {
             add_commercial_goods(world, grant.commercial, grant.units as i32);
+            record_local_goods_period_revenue(
+                world,
+                grant.industrial,
+                grant.commercial,
+                grant.units as i32,
+            );
         }
     }
     for (industrial, profit) in &prepared.industrial_profits {
@@ -879,6 +867,71 @@ pub(crate) fn add_commercial_goods(world: &mut World, commercial: Entity, amount
             *local_goods_stored = (*local_goods_stored + amount).clamp(0, capacity);
         }
     }
+}
+
+pub(crate) fn record_local_goods_delivery_revenue(
+    world: &mut World,
+    industrial: Entity,
+    commercial: Entity,
+    units: i32,
+) -> i32 {
+    let manufacturing_tax = local_goods_delivery_margin(world, industrial, commercial, units);
+    if manufacturing_tax <= 0 {
+        return 0;
+    }
+    let entry = world
+        .pending_goods_delivery_revenue
+        .entry(industrial)
+        .or_default();
+    if commercial.region() == world.region_id {
+        entry.local_stored_units += units;
+    }
+    entry.manufacturing_tax += manufacturing_tax;
+    manufacturing_tax
+}
+
+fn apply_pending_goods_delivery_revenue(world: &mut World) -> GoodsFlow {
+    let pending = std::mem::take(&mut world.pending_goods_delivery_revenue);
+    let mut flow = GoodsFlow::default();
+    for (industrial, revenue) in pending {
+        flow.local_goods_stored += revenue.local_stored_units;
+        flow.manufacturing_tax += revenue.manufacturing_tax;
+        record_business_profit(world, industrial, revenue.manufacturing_tax);
+    }
+    flow
+}
+
+fn record_local_goods_period_revenue(
+    world: &mut World,
+    industrial: Entity,
+    commercial: Entity,
+    units: i32,
+) -> i32 {
+    let manufacturing_tax = local_goods_delivery_margin(world, industrial, commercial, units);
+    if manufacturing_tax > 0 {
+        record_business_profit(world, industrial, manufacturing_tax);
+    }
+    manufacturing_tax
+}
+
+fn local_goods_delivery_margin(
+    world: &World,
+    industrial: Entity,
+    commercial: Entity,
+    units: i32,
+) -> i32 {
+    if units <= 0 {
+        return 0;
+    }
+    let distance = if commercial.region() == world.region_id {
+        road_network_analysis::distance_between_buildings(world, industrial, commercial)
+    } else {
+        // Cross-region confirms do not carry the full producer-to-consumer route.
+        // Use the same producer-to-edge proxy as outside exports until grants
+        // carry a route distance.
+        road_network_analysis::access_for(world, industrial).import_export_distance
+    };
+    units * margin_per_good(MANUFACTURING_TAX_PER_GOOD, distance)
 }
 
 pub(crate) fn ensure_business_building_data(world: &mut World) {

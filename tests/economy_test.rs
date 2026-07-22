@@ -144,19 +144,19 @@ fn citizen_salary_rent_and_shopping_create_city_tax_income() {
             commercial_sales_tax: 1,
             shoppers_served: 1,
             local_goods_produced: 4,
-            local_goods_stored: 4,
+            local_goods_stored: 3,
             local_goods_sold: 1,
             imported_goods_sold: 0,
             exported_goods: 0,
-            manufacturing_tax: 4,
+            manufacturing_tax: 3,
             export_tax: 0,
             rent_failures: 2,
             maintenance_cost: 3,
-            net: 8,
+            net: 7,
         }
     );
     assert_eq!(game.view().status.citizens, 3);
-    assert_eq!(game.view().status.money, 63);
+    assert_eq!(game.view().status.money, 58);
 }
 
 #[test]
@@ -391,9 +391,8 @@ fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
     assert!(matches!(
         first_tick.event,
         GameEventView::TickSummary {
-            // The pre-bulldoze tick uses local goods because industrial and
-            // commercial are both connected. This locks in the intended baseline
-            // before removing the commercial road connection.
+            // The pre-bulldoze tick settles the goods that arrived by truck
+            // before this payroll boundary.
             economy: EconomyBreakdownView {
                 salaries_paid: 3,
                 workplace_tax: 4,
@@ -401,15 +400,15 @@ fn bulldozing_workplace_road_stops_future_salary_and_shopping() {
                 commercial_sales_tax: 1,
                 shoppers_served: 1,
                 local_goods_produced: 4,
-                local_goods_stored: 4,
+                local_goods_stored: 3,
                 local_goods_sold: 1,
                 imported_goods_sold: 0,
                 exported_goods: 0,
-                manufacturing_tax: 4,
+                manufacturing_tax: 3,
                 export_tax: 0,
                 rent_failures: 2,
                 maintenance_cost: 3,
-                net: 8,
+                net: 7,
             },
             ..
         }
@@ -611,9 +610,9 @@ fn industrial_goods_plan_local_storage_then_trucks_deliver_part_of_it() {
     let economy = tick_economy(&advance_one_working_day(&mut game).event);
 
     assert_eq!(economy.local_goods_produced, 12);
-    assert_eq!(economy.local_goods_stored, 8);
+    assert_eq!(economy.local_goods_stored, 0);
     assert_eq!(economy.exported_goods, 4);
-    assert_eq!(economy.manufacturing_tax, 12);
+    assert_eq!(economy.manufacturing_tax, 4);
     assert_eq!(economy.export_tax, 4);
     assert_eq!(
         commercial_goods(&game, 4, 0),

@@ -231,9 +231,9 @@ fn inspect_commercial_and_industrial_show_powered_state_and_jobs() {
             upgrade_level: 1,
             maintenance_cost: 1,
             goods_production: 4,
-            business_cash: 3,
+            business_cash: 0,
             upgrade_threshold: Some(14),
-            recent_profit: 3,
+            recent_profit: -1,
             upgrade_ready: false,
             jobs: 3
         })

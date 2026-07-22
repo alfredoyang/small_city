@@ -208,6 +208,12 @@ pub(crate) struct World {
         deserialize_with = "deserialize_goods_orders"
     )]
     pub(crate) goods_orders: BTreeMap<crate::core::components::GoodsOrderId, GoodsOrder>,
+    // Confirmed factory-truck deliveries waiting for the next economy
+    // settlement. Delivery confirms ownership of the revenue; settlement applies
+    // it through the normal business period lifecycle so maintenance, UI
+    // breakdowns, and reinvestment all see one consistent ledger.
+    #[serde(default)]
+    pub(crate) pending_goods_delivery_revenue: BTreeMap<Entity, GoodsDeliveryRevenue>,
     pub power_providers: HashMap<Entity, PowerProvider>,
     pub power_consumers: HashMap<Entity, PowerConsumer>,
     pub pollution_sources: HashMap<Entity, PollutionSource>,
@@ -225,6 +231,12 @@ pub(crate) struct EntityRecord {
     pub has_power_consumer: bool,
     pub has_pollution_source: bool,
     pub has_happiness_effect: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub(crate) struct GoodsDeliveryRevenue {
+    pub(crate) local_stored_units: i32,
+    pub(crate) manufacturing_tax: i32,
 }
 
 impl World {
@@ -261,6 +273,7 @@ impl World {
             citizens: HashMap::new(),
             trucks: BTreeMap::new(),
             goods_orders: BTreeMap::new(),
+            pending_goods_delivery_revenue: BTreeMap::new(),
             power_providers: HashMap::new(),
             power_consumers: HashMap::new(),
             pollution_sources: HashMap::new(),

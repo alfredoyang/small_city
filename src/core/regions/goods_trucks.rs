@@ -508,6 +508,12 @@ impl RegionState {
         if shipment.units != units {
             return;
         }
+        economy::record_local_goods_delivery_revenue(
+            &mut self.world,
+            factory,
+            shipment.commercial.building,
+            units,
+        );
         if let Some(goods) = self.factory_goods_mut(factory) {
             goods.stored_units = goods.stored_units.saturating_sub(units);
             goods.reserved_outbound_units = goods.reserved_outbound_units.saturating_sub(units);

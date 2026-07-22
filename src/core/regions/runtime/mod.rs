@@ -2725,6 +2725,68 @@ mod tick_state_tests {
     }
 
     #[test]
+    fn in_flight_remote_goods_allocation_does_not_book_manufacturing_tax_before_delivery() {
+        let mut region = RegionState::new(RegionId(2), 5, 3);
+        assert!(region.build(1, 0, BuildingKind::Industrial).success);
+        assert!(region.build(0, 1, BuildingKind::Road).success);
+        assert!(region.build(1, 1, BuildingKind::Road).success);
+        assert!(region.build(0, 0, BuildingKind::PowerPlant).success);
+        region.ensure_derived_state();
+        let factory = region.world.grid.get(1, 0).expect("factory");
+        let producer_network =
+            crate::core::systems::road_network_analysis::access_for(&region.world, factory)
+                .network_id
+                .expect("factory road network");
+        let producer_network = RegionRoadNetworkId {
+            region: RegionId(2),
+            road_network: producer_network,
+        };
+
+        let mut runtime = RegionRuntime::new(region);
+        let request_id = UiRequestId(9);
+        runtime.goods_supply_allocations.upsert(
+            ExportAllocationKey {
+                caller_region: RegionId(1),
+                request_id,
+                token: 0,
+            },
+            producer_network,
+            GOODS_PER_TRUCK as u32,
+            request_id,
+        );
+
+        let mut last_outbound = Vec::new();
+        for request in 1..=24 {
+            runtime.push_event(RegionEvent::Tick {
+                request_id: UiRequestId(request),
+            });
+            last_outbound = runtime.process_next_event();
+        }
+
+        let response = last_outbound
+            .iter()
+            .find_map(|message| match message {
+                OutboundMessage::RegionTickCompleted(response) => Some(response),
+                _ => None,
+            })
+            .expect("daily tick response");
+        let crate::interface::events::GameEventView::TickSummary { economy, .. } =
+            response.result.event
+        else {
+            panic!("expected tick summary");
+        };
+        assert_eq!(economy.local_goods_produced, 4);
+        assert_eq!(
+            economy.exported_goods, 1,
+            "the in-flight remote allocation holds three units out of outside export"
+        );
+        assert_eq!(
+            economy.manufacturing_tax, 1,
+            "only the outside-export unit pays now; allocated truck cargo pays after delivery"
+        );
+    }
+
+    #[test]
     fn matching_grant_applies_without_completing_a_second_tick() {
         // Retire-tickstate, P-a: the tick already completed when it asked
         // (previous test). A later reply for the SAME batch
@@ -3125,6 +3187,7 @@ mod tick_state_tests {
             candidates: vec![network],
             candidate_index: 0,
         };
+        let starting_money = runtime.state().world.resources.money;
 
         let grant = runtime.process_goods_supply_request(&attempt);
         assert!(grant.granted, "factory should accept a truck delivery");
@@ -3145,6 +3208,16 @@ mod tick_state_tests {
         assert_eq!(runtime.state().world.goods_orders.len(), 1);
         assert_eq!(runtime.state().world.tokens.len(), 1);
         assert_eq!(
+            crate::core::systems::economy::recent_business_profit(&runtime.state().world, factory),
+            0,
+            "dispatch alone must not book industrial profit"
+        );
+        assert_eq!(
+            runtime.state().world.resources.money,
+            starting_money,
+            "dispatch alone must not collect manufacturing tax"
+        );
+        assert_eq!(
             runtime.state().world.buildings[&factory].data,
             crate::core::components::BuildingData::Industrial {
                 goods: crate::core::components::FactoryGoodsState {
@@ -3163,6 +3236,11 @@ mod tick_state_tests {
 
         let delivery = routed_event(&runtime.process_event(arrival.clone()));
         assert!(matches!(delivery, RegionEvent::ApplyGoodsDelivery { .. }));
+        assert_eq!(
+            crate::core::systems::economy::recent_business_profit(&runtime.state().world, factory),
+            0,
+            "commercial delivery apply still waits for factory confirmation"
+        );
         let parked = runtime.process_event(RegionEvent::StepTravel {
             step: TravelStepId(2),
         });
@@ -3207,6 +3285,24 @@ mod tick_state_tests {
                 },
                 business: Default::default(),
             }
+        );
+        assert_eq!(
+            runtime.state().world.resources.money,
+            starting_money,
+            "manufacturing tax waits for the next economy settlement"
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .world
+                .pending_goods_delivery_revenue
+                .get(&factory)
+                .copied(),
+            Some(crate::core::world::GoodsDeliveryRevenue {
+                local_stored_units: GOODS_PER_TRUCK,
+                manufacturing_tax: 3,
+            }),
+            "confirmation queues delivered factory revenue for settlement"
         );
 
         let duplicate = runtime.process_event(arrival);
@@ -3386,7 +3482,7 @@ mod tick_state_tests {
 
     #[test]
     fn busy_factory_truck_denies_a_second_local_shipment() {
-        let (mut runtime, _factory, commercial, network) = local_goods_runtime();
+        let (mut runtime, factory, commercial, network) = local_goods_runtime();
         runtime.current_goods_request_id = UiRequestId(12);
         let first = GoodsSupplyRequest {
             request_id: UiRequestId(12),
@@ -3397,6 +3493,7 @@ mod tick_state_tests {
             commercial,
         };
         let second = GoodsSupplyRequest { token: 1, ..first };
+        let starting_money = runtime.state().world.resources.money;
 
         let first_grant = runtime.process_goods_supply_request(&GoodsSupplyAllocationRequest {
             request: first,
@@ -3412,6 +3509,16 @@ mod tick_state_tests {
         assert!(
             !second_grant.granted,
             "the single level-1 truck is busy until delivery returns"
+        );
+        assert_eq!(
+            crate::core::systems::economy::recent_business_profit(&runtime.state().world, factory),
+            0,
+            "a denied shipment must not book industrial profit"
+        );
+        assert_eq!(
+            runtime.state().world.resources.money,
+            starting_money,
+            "a denied shipment must not collect manufacturing tax"
         );
     }
 
