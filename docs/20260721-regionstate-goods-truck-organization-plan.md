@@ -93,8 +93,6 @@ Reason: these all read or mutate factory warehouse state.
 ```text
 reconcile_factory_trucks
 first_idle_truck
-accepts_truck_return
-apply_truck_return
 ```
 
 Reason: these manage stable truck entities and idle/busy state.
@@ -178,11 +176,12 @@ no behavior tests changed
 cargo test -q passes
 ```
 
-### P2: Optional test helper cleanup
+### P2: Deferred optional test helper cleanup
 
 Scope:
 
 ```text
+do not implement unless requested separately
 only if P1 leaves duplicated runtime-test movement loops hard to read
 move repeated test-only truck-delivery stepping into local test helpers
 no production changes
@@ -202,6 +201,7 @@ fn collect_destination_arrivals(runtime: &mut RegionRuntime, expected: usize) ->
 Review checks:
 
 ```text
+P2 is absent from the P1 diff unless explicitly requested
 test helper lives in the test module
 helper does not hide different behavior paths
 no production code touched in P2
@@ -243,6 +243,25 @@ impl RegionState {
     fn resume_persisted_goods_shipments(&mut self) { ... }
 }
 ```
+
+Keep `resume_persisted_goods_shipments` private if possible. It is called by
+the save/load rebuild code that remains in `mod.rs`; only widen it to
+`pub(super)`/`pub(crate)` if the compiler requires it after the mechanical move.
+
+## Explicit Stay-Put Boundary
+
+These methods stay in `mod.rs` because they are general traveler handoff logic,
+not goods-truck logic:
+
+```text
+resolve_pending_traveler_handoffs
+receive_traveler_handoff
+bounce_to_home
+accepts_inbound_home_traveler
+```
+
+They may call truck helpers from `goods_trucks.rs`, but they should not move in
+this refactor.
 
 ## Diagrams
 
@@ -315,4 +334,3 @@ run cargo clippy -- -D warnings
 run cargo test -q
 review diff with whitespace ignored if needed
 ```
-

@@ -253,6 +253,7 @@ pub struct RoadTravelerPanelSeedView {
     pub local_details: Vec<CitizenDetailView>,
     /// Local factory trucks on this road cell. Kept as a count for P2; cargo
     /// detail can be added once foreign truck handoff exists.
+    #[serde(default)]
     pub local_truck_count: usize,
     /// Endpoint summaries for visiting bodies whose home is elsewhere. Sorted
     /// and grouped: several visitors sharing the same home/work endpoint

@@ -953,7 +953,7 @@ mod tests {
                     region: RegionId(1),
                     building: Entity::new(RegionId(1), 0),
                 },
-                kind: TravelKind::Citizen { work: None },
+                kind: TravelKind::Work { work: None },
                 trip_gen: 1,
             },
             traveler: TravelerId {

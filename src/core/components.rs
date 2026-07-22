@@ -377,20 +377,20 @@ pub struct TravelToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TravelKind {
-    Citizen { work: Option<PlaceRef> },
-    Truck { shipment: Shipment },
+    Work { work: Option<PlaceRef> },
+    Shipment { shipment: Shipment, returning: bool },
 }
 
 impl TravelToken {
     pub(crate) fn citizen_work(&self) -> Option<PlaceRef> {
         match &self.kind {
-            TravelKind::Citizen { work } => *work,
-            TravelKind::Truck { .. } => None,
+            TravelKind::Work { work } => *work,
+            TravelKind::Shipment { .. } => None,
         }
     }
 
     pub(crate) fn set_citizen_work(&mut self, next_work: Option<PlaceRef>) {
-        if let TravelKind::Citizen { work } = &mut self.kind {
+        if let TravelKind::Work { work } = &mut self.kind {
             *work = next_work;
         }
     }
@@ -400,19 +400,18 @@ impl TravelToken {
         phase: crate::core::systems::schedule::SchedulePhase,
     ) -> PlaceRef {
         match &self.kind {
-            TravelKind::Citizen { work } => {
+            TravelKind::Work { work } => {
                 if phase == crate::core::systems::schedule::SchedulePhase::Work {
                     work.unwrap_or(self.home)
                 } else {
                     self.home
                 }
             }
-            TravelKind::Truck { shipment } => {
-                if self.state.destination == Some(self.home.building) {
-                    self.home
-                } else if self.state.destination == Some(shipment.commercial.building) {
-                    shipment.commercial
-                } else if self.state.building == Some(shipment.commercial.building) {
+            TravelKind::Shipment {
+                shipment,
+                returning,
+            } => {
+                if *returning {
                     self.home
                 } else {
                     shipment.commercial

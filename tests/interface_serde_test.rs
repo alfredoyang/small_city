@@ -50,6 +50,15 @@ fn command_result_round_trips_through_json() {
     }
 }
 
+#[test]
+fn road_traveler_panel_seed_defaults_missing_truck_count() {
+    let json = r#"{"local_details":[],"visitor_endpoints":[]}"#;
+    let recovered: RoadTravelerPanelSeedView =
+        serde_json::from_str(json).expect("deserialize legacy traveler panel seed");
+
+    assert_eq!(recovered.local_truck_count, 0);
+}
+
 // ── sample values ───────────────────────────────────────────────────────────
 
 fn sample_game_view() -> GameView {

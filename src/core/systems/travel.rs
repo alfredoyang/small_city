@@ -165,7 +165,7 @@ pub(crate) fn step_tokens(world: &mut World) {
                         removes.push((traveler_entity, true, token.trip_gen));
                     }
                     TokenArrival::Blocked => {
-                        if matches!(token.kind, TravelKind::Truck { .. }) {
+                        if matches!(token.kind, TravelKind::Shipment { .. }) {
                             handoffs.push(PendingHandoff::Rollback {
                                 traveler: TravelerId {
                                     entity: traveler_entity,
@@ -231,17 +231,27 @@ pub(crate) fn step_tokens(world: &mut World) {
         world.outgoing_destination_arrivals.push(arrival);
     }
     for (c, arrived_home, trip_gen) in removes {
-        world.tokens.remove(&c);
         if arrived_home && world.trucks.contains_key(&c) {
-            world.active_travelers.remove(&c);
-            if let Some(truck) = world.trucks.get_mut(&c) {
-                truck.arrival_action = crate::core::components::ArrivalAction::ReturnHome;
+            let can_complete = world.trucks.get(&c).is_some_and(|truck| {
+                truck.trip_generation == trip_gen
+                    && truck.shipment.is_none()
+                    && world.active_travelers.contains(&c)
+            });
+            if can_complete {
+                world.tokens.remove(&c);
+                world.active_travelers.remove(&c);
+                if let Some(truck) = world.trucks.get_mut(&c) {
+                    truck.arrival_action = crate::core::components::ArrivalAction::ReturnHome;
+                }
             }
         } else if arrived_home && home_accepts(world, c, trip_gen) {
+            world.tokens.remove(&c);
             world.active_travelers.remove(&c);
             if let Some(citizen) = world.citizens.get_mut(&c) {
                 citizen.arrival_action = crate::core::components::ArrivalAction::ReturnHome;
             }
+        } else {
+            world.tokens.remove(&c);
         }
     }
     // Prune a dead local resident/truck token; keep foreign visitors (home elsewhere).
@@ -306,7 +316,7 @@ fn begin_work_trip(
     Some(TravelToken {
         state,
         home,
-        kind: TravelKind::Citizen { work: Some(work) },
+        kind: TravelKind::Work { work: Some(work) },
         trip_gen,
     })
 }
@@ -321,7 +331,7 @@ fn destination_arrived_after_step(
     arrival: TokenArrival,
 ) -> Option<PendingDestinationArrival> {
     match &token.kind {
-        TravelKind::Citizen { work } => {
+        TravelKind::Work { work } => {
             let work = (*work)?;
             let was_parked_at_work = token.state.status
                 == crate::core::components::TravelStatus::AtWork
@@ -339,7 +349,7 @@ fn destination_arrived_after_step(
                     destination: work,
                 })
         }
-        TravelKind::Truck { shipment } => {
+        TravelKind::Shipment { shipment, .. } => {
             let destination = shipment.commercial;
             let was_parked_at_destination = token.state.status
                 == crate::core::components::TravelStatus::AtWork
@@ -969,7 +979,7 @@ mod tests {
                     region: world.region_id,
                     building: home,
                 },
-                kind: TravelKind::Citizen {
+                kind: TravelKind::Work {
                     work: Some(PlaceRef {
                         region: world.region_id,
                         building: work,
@@ -1008,7 +1018,7 @@ mod tests {
                     region: world.region_id,
                     building: home,
                 },
-                kind: TravelKind::Citizen {
+                kind: TravelKind::Work {
                     work: Some(PlaceRef {
                         region: world.region_id,
                         building: work,
@@ -1257,7 +1267,7 @@ mod tests {
                 region: world.region_id,
                 building: home,
             },
-            kind: TravelKind::Citizen {
+            kind: TravelKind::Work {
                 work: Some(crate::core::components::PlaceRef {
                     region: work.region(),
                     building: work,
@@ -1315,7 +1325,7 @@ mod tests {
                 region: world.region_id,
                 building: home,
             },
-            kind: TravelKind::Citizen {
+            kind: TravelKind::Work {
                 work: Some(crate::core::components::PlaceRef {
                     region: work.region(),
                     building: work,
@@ -1523,7 +1533,7 @@ mod tests {
                     region: world.region_id,
                     building: home,
                 },
-                kind: TravelKind::Citizen {
+                kind: TravelKind::Work {
                     work: Some(PlaceRef {
                         region: RegionId(7),
                         building: workplace,
@@ -1607,7 +1617,7 @@ mod tests {
                     region: world.region_id,
                     building: home,
                 },
-                kind: TravelKind::Citizen {
+                kind: TravelKind::Work {
                     work: Some(PlaceRef {
                         region: RegionId(7),
                         building: workplace,
@@ -1743,7 +1753,7 @@ mod tests {
                 region: RegionId(7),
                 building: home,
             },
-            kind: TravelKind::Citizen {
+            kind: TravelKind::Work {
                 work: Some(PlaceRef {
                     region: RegionId(0),
                     building: workplace,
@@ -1807,7 +1817,7 @@ mod tests {
                     region: RegionId(1),
                     building: Entity::new(RegionId(1), 1),
                 },
-                kind: TravelKind::Citizen {
+                kind: TravelKind::Work {
                     work: Some(PlaceRef {
                         region: RegionId(7),
                         building: Entity::new(RegionId(7), 2),
@@ -1861,7 +1871,7 @@ mod tests {
                 region: RegionId(7),
                 building: Entity::new(RegionId(7), 0),
             },
-            kind: TravelKind::Citizen {
+            kind: TravelKind::Work {
                 work: Some(PlaceRef {
                     region: RegionId(8),
                     building: Entity::new(RegionId(8), 0),

@@ -456,7 +456,8 @@ fn prepare_goods_flow(
         .map(|commercial| {
             let capacity = commercial_goods_capacity_for_entity(world, *commercial);
             let stored = commercial_goods_stored(world, *commercial);
-            (*commercial, (capacity - stored).max(0))
+            let inbound_reserved = commercial_inbound_reserved_units(world, *commercial);
+            (*commercial, (capacity - stored - inbound_reserved).max(0))
         })
         .collect::<HashMap<_, _>>();
     let mut regional_export_units_remaining = exported_goods_units as i32;
@@ -477,6 +478,12 @@ fn prepare_goods_flow(
             }
             *free_capacity -= supplied;
             remaining_goods -= supplied;
+            // TODO(goods-trucks): this books local storage/revenue from the
+            // virtual goods plan before a factory truck has actually accepted
+            // and completed the dispatch. Move manufacturing tax/profit and
+            // local_goods_stored credit to the successful delivery path, or add
+            // an explicit dispatched-goods ledger so denied shipments cannot
+            // generate revenue.
             local_goods_stored += supplied;
             let caller_network = road_network_analysis::access_for(world, commercial)
                 .network_id
@@ -591,7 +598,8 @@ fn goods_distribution_after_local_storage(world: &World) -> GoodsDistributionPla
         .map(|commercial| {
             let capacity = commercial_goods_capacity_for_entity(world, *commercial);
             let stored = commercial_goods_stored(world, *commercial);
-            (*commercial, (capacity - stored).max(0))
+            let inbound_reserved = commercial_inbound_reserved_units(world, *commercial);
+            (*commercial, (capacity - stored - inbound_reserved).max(0))
         })
         .collect::<HashMap<_, _>>();
 
@@ -741,6 +749,16 @@ pub(crate) fn commercial_goods_stored(world: &World, commercial: Entity) -> i32 
             BuildingData::Industrial { .. } | BuildingData::None => None,
         })
         .unwrap_or(0)
+}
+
+fn commercial_inbound_reserved_units(world: &World, commercial: Entity) -> i32 {
+    world
+        .goods_orders
+        .values()
+        .filter(|order| order.commercial == commercial)
+        .map(|order| order.inbound_reserved_units)
+        .sum::<i32>()
+        .max(0)
 }
 
 pub(crate) fn commercial_goods_capacity_for_entity(world: &World, commercial: Entity) -> i32 {
@@ -1027,8 +1045,9 @@ pub(crate) fn maintenance_for_building(kind: BuildingKind, level: u8) -> i32 {
 mod tests {
     use super::{EconomyIndex, assign_local_jobs, run};
     use crate::core::city_refs::CityCellRef;
-    use crate::core::components::WorkplaceAssignment;
+    use crate::core::components::{GoodsOrder, GoodsOrderId, WorkplaceAssignment};
     use crate::core::entity::Entity;
+    use crate::core::regional_types::UiRequestId;
     use crate::core::regions::RegionId;
     use crate::core::systems::{citizens, placement, road_network_analysis};
     use crate::core::world::World;
@@ -1185,6 +1204,47 @@ mod tests {
 
         assert!(attended.salaries_paid > 0);
         assert_eq!(attended.workplace_tax, expected_tax);
+    }
+
+    #[test]
+    fn inbound_goods_orders_reduce_commercial_demand_capacity() {
+        let mut world = World::new(4, 2);
+        placement::place_building(&mut world, 0, 0, BuildingKind::Industrial);
+        placement::place_building(&mut world, 1, 0, BuildingKind::Road);
+        placement::place_building(&mut world, 2, 0, BuildingKind::Commercial);
+        let industrial = world.grid.get(0, 0).expect("industrial");
+        let commercial = world.grid.get(2, 0).expect("commercial");
+        world.power_consumers.get_mut(&industrial).unwrap().powered = true;
+        world.power_consumers.get_mut(&commercial).unwrap().powered = true;
+        road_network_analysis::run(&mut world);
+
+        let order = GoodsOrderId {
+            commercial,
+            request_id: UiRequestId(99),
+            token: 0,
+        };
+        world.goods_orders.insert(
+            order,
+            GoodsOrder {
+                id: order,
+                commercial,
+                requested_units: 8,
+                inbound_reserved_units: super::commercial_goods_capacity_for_entity(
+                    &world, commercial,
+                ),
+                remaining_units: 8,
+            },
+        );
+
+        let prepared = super::prepare_goods_flow_for_current_world(&mut world, 0);
+        assert!(
+            prepared.local_grants().is_empty(),
+            "in-flight truck cargo must reserve the shelf space from local grants"
+        );
+        assert!(
+            super::commercial_goods_demands_after_local_distribution(&world).is_empty(),
+            "in-flight truck cargo must reserve the shelf space from export demand"
+        );
     }
 
     fn shopping_recovery_world(with_local_goods: bool, connected_shop: bool) -> (World, Entity) {

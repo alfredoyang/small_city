@@ -1,7 +1,7 @@
 //! Adapter that converts private ECS world data into UI-safe view and inspect models.
 
 use crate::core::city_refs::CityCellRef;
-use crate::core::components::{Citizen, Position, TravelToken};
+use crate::core::components::{Citizen, Position, TravelKind, TravelToken};
 use crate::core::entity::Entity;
 use crate::core::regions::RegionId;
 use crate::core::systems::{
@@ -104,10 +104,9 @@ fn game_time_view(time: crate::core::resources::GameTime) -> GameTimeView {
 /// contribute nothing. Multiple citizens sharing a cell collapse to one
 /// marker. No entity id or path leaks out.
 ///
-/// The unified `world.tokens` map holds both local tokens and foreign
-/// visiting tokens (the neighbour's body is in this region — the `home.region`
-/// is elsewhere). All tokens with a road cell render a dot; idle and
-/// home-region-away tokens don't have a road cell and contribute nothing.
+/// The unified `world.tokens` map also holds truck shipment tokens, but this
+/// view intentionally renders only citizen/work travel. Truck counts are shown
+/// in the road traveler panel instead of as citizen dots.
 fn traveler_views(world: &World) -> Vec<CitizenTravelView> {
     let self_region = world.region_id;
     let mut cells: Vec<(usize, usize)> = world
@@ -117,11 +116,8 @@ fn traveler_views(world: &World) -> Vec<CitizenTravelView> {
             // A local token: the citizen must still be alive (the stepper
             // prunes stale entries at the end of each sub-tick, but a paused
             // frame may see a not-yet-pruned entry).
-            world.citizens.contains_key(id)
-                || world.trucks.contains_key(id)
-                // A foreign token: the home is elsewhere, the citizen is not
-                // in this region's `world.citizens`. Always include.
-                || token.home.region != self_region
+            matches!(token.kind, TravelKind::Work { .. })
+                && (world.citizens.contains_key(id) || token.home.region != self_region)
         })
         .filter_map(|(_, token)| token.state.current_cell)
         .filter_map(|cell| world.positions.get(&cell))
@@ -203,9 +199,9 @@ pub(crate) fn inspect_world(world: &World, x: usize, y: usize) -> InspectView {
 }
 
 /// Count of travel tokens currently standing on the road cell at `(x, y)`.
-/// Zero for a non-road cell or an out-of-bounds coordinate. Hover-only summary;
-/// mirrors the same local-token-alive-or-visitor filter as [`traveler_views`] so
-/// the count always matches what the map dot shows.
+/// Zero for a non-road cell or an out-of-bounds coordinate. The Enter-panel
+/// count includes shipment trucks even though [`traveler_views`] renders only
+/// citizen/work travel dots.
 fn road_traveler_count(world: &World, x: usize, y: usize) -> usize {
     let Some(entity) = world.grid.get(x, y) else {
         return 0;
@@ -219,9 +215,11 @@ fn road_traveler_count(world: &World, x: usize, y: usize) -> usize {
         .tokens
         .iter()
         .filter(|(id, token)| {
-            world.citizens.contains_key(id)
-                || world.trucks.contains_key(id)
-                || token.home.region != self_region
+            if matches!(token.kind, TravelKind::Shipment { .. }) {
+                token.home.region == self_region && world.trucks.contains_key(id)
+            } else {
+                world.citizens.contains_key(id) || token.home.region != self_region
+            }
         })
         .filter(|(_, token)| token.state.current_cell == Some(entity))
         .count()
@@ -255,6 +253,12 @@ pub(crate) fn road_traveler_panel_seed(
     let mut seed = RoadTravelerPanelSeedView::default();
     let mut visitor_keys: Vec<(RegionId, Option<RegionId>, Option<CityCellRef>)> = Vec::new();
     for (id, token) in tokens {
+        if matches!(token.kind, TravelKind::Shipment { .. }) {
+            if token.home.region == world.region_id && world.trucks.contains_key(id) {
+                seed.local_truck_count += 1;
+            }
+            continue;
+        }
         if token.home.region == world.region_id {
             if world.trucks.contains_key(id) {
                 seed.local_truck_count += 1;
@@ -1168,7 +1172,7 @@ mod tests {
                         region: world.region_id,
                         building: id,
                     },
-                    kind: TravelKind::Citizen { work: None },
+                    kind: TravelKind::Work { work: None },
                     trip_gen: 0,
                 },
             );
@@ -1260,7 +1264,7 @@ mod tests {
                 region: RegionId(3),
                 building: Entity::new(RegionId(3), 0),
             },
-            kind: TravelKind::Citizen { work: None },
+            kind: TravelKind::Work { work: None },
             trip_gen: 1,
         };
         let _ = add_citizen(&mut world, 2, Some(r0)); // local on r0 too
@@ -1328,7 +1332,10 @@ mod tests {
                     region: world.region_id,
                     building: factory,
                 },
-                kind: TravelKind::Truck { shipment },
+                kind: TravelKind::Shipment {
+                    shipment,
+                    returning: false,
+                },
                 trip_gen: 1,
             },
         );
@@ -1367,7 +1374,7 @@ mod tests {
     }
 
     /// Local travelers and a visiting foreign token on the same road cell all
-    /// count, matching how many dots `traveler_views` would draw there.
+    /// count for Enter-panel selection.
     #[test]
     fn road_traveler_count_includes_local_and_visitor_tokens() {
         use crate::core::regions::RegionId;
@@ -1393,7 +1400,7 @@ mod tests {
                     region: RegionId(3),
                     building: Entity::new(RegionId(3), 0),
                 },
-                kind: TravelKind::Citizen { work: None },
+                kind: TravelKind::Work { work: None },
                 trip_gen: 1,
             },
         );
@@ -1428,7 +1435,7 @@ mod tests {
                     region: RegionId(3),
                     building: Entity::new(RegionId(3), 0),
                 },
-                kind: TravelKind::Citizen { work: None },
+                kind: TravelKind::Work { work: None },
                 trip_gen: 1,
             },
         );
@@ -1453,12 +1460,69 @@ mod tests {
         add_truck(&mut world, 7, r0);
 
         assert_eq!(super::inspect_world(&world, 0, 0).road_traveler_count, 1);
-        assert_eq!(
-            traveler_views(&world),
-            vec![CitizenTravelView { x: 0, y: 0 }]
-        );
+        assert!(traveler_views(&world).is_empty());
         let seed = super::road_traveler_panel_seed(&world, 0, 0);
         assert_eq!(seed.local_truck_count, 1);
+        assert!(seed.local_details.is_empty());
+        assert!(seed.visitor_endpoints.is_empty());
+    }
+
+    #[test]
+    fn road_traveler_count_excludes_foreign_trucks_that_panel_cannot_list() {
+        use crate::core::regions::RegionId;
+
+        let mut world = World::new(2, 1);
+        place_building(&mut world, 0, 0, BuildingKind::Road);
+        let r0 = world.grid.get(0, 0).expect("r0");
+        let commercial = Entity::new(world.region_id, 300);
+        let shipment = Shipment {
+            order: GoodsOrderId {
+                commercial,
+                request_id: UiRequestId(1),
+                token: 0,
+            },
+            allocation_key: ExportAllocationKey {
+                caller_region: world.region_id,
+                request_id: UiRequestId(1),
+                token: 0,
+            },
+            producer_network: RegionRoadNetworkId {
+                region: RegionId(3),
+                road_network: 0,
+            },
+            commercial: PlaceRef {
+                region: world.region_id,
+                building: commercial,
+            },
+            units: 1,
+        };
+        add_foreign_token(
+            &mut world,
+            Entity::new(RegionId(3), 7),
+            TravelToken {
+                state: TravelState {
+                    status: TravelStatus::Traveling,
+                    current_cell: Some(r0),
+                    destination: None,
+                    building: None,
+                    dwell: 0,
+                    prev_cell: None,
+                },
+                home: PlaceRef {
+                    region: RegionId(3),
+                    building: Entity::new(RegionId(3), 200),
+                },
+                kind: TravelKind::Shipment {
+                    shipment,
+                    returning: false,
+                },
+                trip_gen: 1,
+            },
+        );
+
+        assert_eq!(super::inspect_world(&world, 0, 0).road_traveler_count, 0);
+        let seed = super::road_traveler_panel_seed(&world, 0, 0);
+        assert_eq!(seed.local_truck_count, 0);
         assert!(seed.local_details.is_empty());
         assert!(seed.visitor_endpoints.is_empty());
     }
@@ -1512,7 +1576,7 @@ mod tests {
                     region: RegionId(3),
                     building: Entity::new(RegionId(3), 0),
                 },
-                kind: TravelKind::Citizen {
+                kind: TravelKind::Work {
                     work: Some(PlaceRef {
                         region: RegionId(5),
                         building: Entity::new(RegionId(5), 9),
@@ -1564,7 +1628,7 @@ mod tests {
                     region: RegionId(3),
                     building: Entity::new(RegionId(3), 0),
                 },
-                kind: TravelKind::Citizen {
+                kind: TravelKind::Work {
                     work: Some(PlaceRef {
                         region: region_id,
                         building: workplace,
@@ -1611,7 +1675,7 @@ mod tests {
                     region: RegionId(3),
                     building: Entity::new(RegionId(3), 0),
                 },
-                kind: TravelKind::Citizen { work: None },
+                kind: TravelKind::Work { work: None },
                 trip_gen: 1,
             },
         );
@@ -1654,7 +1718,7 @@ mod tests {
                 region: home_region,
                 building: Entity::new(home_region, local),
             },
-            kind: TravelKind::Citizen { work: None },
+            kind: TravelKind::Work { work: None },
             trip_gen: 1,
         };
         world

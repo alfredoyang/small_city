@@ -163,9 +163,12 @@ impl BuildingRules {
                     pair[1], pair[0]
                 ));
             }
-            if kind == BuildingKind::Industrial
-                && let Some(trucks) = &zone.truck_count_per_level
-            {
+            if let Some(trucks) = &zone.truck_count_per_level {
+                if kind != BuildingKind::Industrial {
+                    return Err(format!(
+                        "{key} truck_count_per_level is only supported for Industrial"
+                    ));
+                }
                 if trucks.len() < REQUIRED_LEVELS {
                     return Err(format!(
                         "{key} truck_count_per_level needs at least {REQUIRED_LEVELS} levels, got {}",
@@ -293,6 +296,14 @@ mod tests {
             "Commercial":{"footprint_area_per_level":[1,2,4]},
             "Industrial":{"footprint_area_per_level":[1,2,4],"truck_count_per_level":[1,0,4]}}}"#;
         assert!(BuildingRules::from_json(zero).is_err());
+    }
+
+    #[test]
+    fn truck_table_on_non_industrial_zone_is_rejected() {
+        let commercial_trucks = r#"{"buildings":{"Residential":{"footprint_area_per_level":[1,2,4]},
+            "Commercial":{"footprint_area_per_level":[1,2,4],"truck_count_per_level":[1,2,4]},
+            "Industrial":{"footprint_area_per_level":[1,2,4]}}}"#;
+        assert!(BuildingRules::from_json(commercial_trucks).is_err());
     }
 
     #[test]
